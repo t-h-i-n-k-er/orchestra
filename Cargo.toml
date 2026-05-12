@@ -49,9 +49,7 @@ clap = { version = "4.4", features = ["derive"] }
 sysinfo = "0.30"
 dialoguer = "0.11"
 toml = "0.8"
-
-[patch.crates-io]
-x11cap = { path = "vendor/x11cap" }
+urlencoding = "2.1"
 
 [profile.release]
 opt-level = "z"

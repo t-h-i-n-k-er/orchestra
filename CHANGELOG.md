@@ -793,6 +793,9 @@ All notable changes to Orchestra are documented here.
 
 ### Build
 
-- `cargo test --workspace --all-features` — **all tests pass** on Linux.
-- `cargo clippy --workspace --all-features -- -D warnings` — **zero warnings**.
+- Routine feature checks validate all agent features except `embedded_driver`,
+  which requires `SYS_DRIVER_PATH` or `ORCHESTRA_DRIVER_PATH` at build time.
+- Full `cargo test --workspace --all-features` and
+  `cargo clippy --workspace --all-features -- -D warnings` require that driver
+  environment variable to point to a valid XOR-encrypted `.sys` payload.
 - `cargo fmt --all` — workspace fully formatted.

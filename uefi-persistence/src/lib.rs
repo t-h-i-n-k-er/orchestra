@@ -168,14 +168,12 @@ impl EfiVarAttributes {
     pub const ENHANCED_AUTHENTICATED_ACCESS: u32 = 0x00000080;
 
     /// Standard attributes for a boot variable: non-volatile + boot + runtime.
-    pub const STANDARD_BOOT: EfiVarAttributes = EfiVarAttributes(
-        Self::NON_VOLATILE | Self::BOOTSERVICE_ACCESS | Self::RUNTIME_ACCESS,
-    );
+    pub const STANDARD_BOOT: EfiVarAttributes =
+        EfiVarAttributes(Self::NON_VOLATILE | Self::BOOTSERVICE_ACCESS | Self::RUNTIME_ACCESS);
 
     /// Default attributes for custom variables.
-    pub const DEFAULT: EfiVarAttributes = EfiVarAttributes(
-        Self::NON_VOLATILE | Self::BOOTSERVICE_ACCESS | Self::RUNTIME_ACCESS,
-    );
+    pub const DEFAULT: EfiVarAttributes =
+        EfiVarAttributes(Self::NON_VOLATILE | Self::BOOTSERVICE_ACCESS | Self::RUNTIME_ACCESS);
 }
 
 impl fmt::Display for EfiVarAttributes {
@@ -252,7 +250,11 @@ pub enum BootloaderType {
 /// Configuration for the EFI payload stub builder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EfiPayloadConfig {
-    /// Raw payload data to embed in the .rdata section.
+    /// Payload bytes to embed in the .rdata section.
+    ///
+    /// EFI PE/COFF images are launched via BootServices->LoadImage/StartImage.
+    /// Non-PE raw payloads are copied into EFI_LOADER_CODE pages and entered at
+    /// `entry_point_offset`.
     pub payload_data: Vec<u8>,
     /// Path to a second-stage EFI driver on the ESP to load.
     pub second_stage_path: String,

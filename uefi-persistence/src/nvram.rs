@@ -114,17 +114,12 @@ pub fn write_efi_variable(
 pub fn delete_efi_variable(name: &str, guid: &EfiGuid) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        let path = format!(
-            "/sys/firmware/efi/efivars/{}-{}",
-            name,
-            guid.to_string()
-        );
+        let path = format!("/sys/firmware/efi/efivars/{}-{}", name, guid.to_string());
         let p = std::path::Path::new(&path);
         if !p.exists() {
             bail!("EFI variable {} does not exist", name);
         }
-        std::fs::remove_file(p)
-            .with_context(|| format!("Failed to delete EFI variable {}", name))
+        std::fs::remove_file(p).with_context(|| format!("Failed to delete EFI variable {}", name))
     }
     #[cfg(target_os = "windows")]
     {
@@ -133,7 +128,11 @@ pub fn delete_efi_variable(name: &str, guid: &EfiGuid) -> Result<()> {
         // Since winapi doesn't expose that directly, we use the raw API.
         let var_name = format!("{}-{}", name, guid.to_string());
         let wide_name: Vec<u16> = var_name.encode_utf16().chain(std::iter::once(0)).collect();
-        let wide_guid: Vec<u16> = guid.to_string().encode_utf16().chain(std::iter::once(0)).collect();
+        let wide_guid: Vec<u16> = guid
+            .to_string()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         unsafe {
             let result = winapi::um::winbase::SetFirmwareEnvironmentVariableW(
                 wide_name.as_ptr(),
@@ -163,16 +162,16 @@ pub fn delete_efi_variable(name: &str, guid: &EfiGuid) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn read_efi_variable_linux(name: &str, guid: &EfiGuid) -> Result<Vec<u8>> {
-    let path = format!(
-        "/sys/firmware/efi/efivars/{}-{}",
-        name,
-        guid.to_string()
-    );
+    let path = format!("/sys/firmware/efi/efivars/{}-{}", name, guid.to_string());
     let data = std::fs::read(&path)
         .with_context(|| format!("Failed to read EFI variable {} from {}", name, path))?;
     // Linux efivars format: first 4 bytes are attributes, rest is data.
     if data.len() < 4 {
-        bail!("EFI variable {} has unexpected short data ({} bytes)", name, data.len());
+        bail!(
+            "EFI variable {} has unexpected short data ({} bytes)",
+            name,
+            data.len()
+        );
     }
     // Return attributes + data (caller can strip attributes if needed).
     Ok(data)
@@ -185,11 +184,7 @@ fn write_efi_variable_linux(
     data: &[u8],
     attrs: EfiVarAttributes,
 ) -> Result<()> {
-    let path = format!(
-        "/sys/firmware/efi/efivars/{}-{}",
-        name,
-        guid.to_string()
-    );
+    let path = format!("/sys/firmware/efi/efivars/{}-{}", name, guid.to_string());
     let p = std::path::Path::new(&path);
 
     // Linux efivars format: 4 bytes attributes + data.
@@ -221,7 +216,10 @@ fn write_efi_variable_linux(
                         return Ok(());
                     }
                 }
-                bail!("Permission denied writing EFI variable {} (tried chattr -i)", name);
+                bail!(
+                    "Permission denied writing EFI variable {} (tried chattr -i)",
+                    name
+                );
             }
             Err(e) => bail!("Failed to write EFI variable {}: {}", name, e),
         }
@@ -240,7 +238,11 @@ fn read_efi_variable_windows(name: &str, guid: &EfiGuid) -> Result<Vec<u8>> {
     // GetFirmwareEnvironmentVariableA expects "Name-Guid" format.
     let var_name = format!("{}-{}", name, guid.to_string());
     let wide_name: Vec<u16> = var_name.encode_utf16().chain(std::iter::once(0)).collect();
-    let wide_guid: Vec<u16> = guid.to_string().encode_utf16().chain(std::iter::once(0)).collect();
+    let wide_guid: Vec<u16> = guid
+        .to_string()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
 
     unsafe {
         // First call to get the required buffer size.
@@ -288,7 +290,11 @@ fn write_efi_variable_windows(
 ) -> Result<()> {
     let var_name = format!("{}-{}", name, guid.to_string());
     let wide_name: Vec<u16> = var_name.encode_utf16().chain(std::iter::once(0)).collect();
-    let wide_guid: Vec<u16> = guid.to_string().encode_utf16().chain(std::iter::once(0)).collect();
+    let wide_guid: Vec<u16> = guid
+        .to_string()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
 
     unsafe {
         let result = winapi::um::winbase::SetFirmwareEnvironmentVariableW(
@@ -334,7 +340,10 @@ pub fn read_boot_order() -> Result<Vec<u16>> {
     let data = read_efi_variable("BootOrder", &EfiGuid::EFI_GLOBAL_VARIABLE)?;
     let payload = strip_linux_attr_header(&data);
     if payload.len() % 2 != 0 {
-        bail!("BootOrder variable has odd length ({} bytes)", payload.len());
+        bail!(
+            "BootOrder variable has odd length ({} bytes)",
+            payload.len()
+        );
     }
     let mut order = Vec::new();
     for chunk in payload.chunks(2) {
@@ -349,8 +358,13 @@ pub fn write_boot_order(order: &[u16]) -> Result<()> {
     for &entry in order {
         data.extend_from_slice(&entry.to_le_bytes());
     }
-    write_efi_variable("BootOrder", &EfiGuid::EFI_GLOBAL_VARIABLE, &data, EfiVarAttributes::STANDARD_BOOT)
-        .context("Failed to write BootOrder EFI variable")
+    write_efi_variable(
+        "BootOrder",
+        &EfiGuid::EFI_GLOBAL_VARIABLE,
+        &data,
+        EfiVarAttributes::STANDARD_BOOT,
+    )
+    .context("Failed to write BootOrder EFI variable")
 }
 
 /// Read a single boot entry by number.
@@ -394,7 +408,11 @@ pub fn enumerate_boot_entries() -> Result<Vec<BootEntry>> {
 /// ```
 fn parse_load_option(entry_num: u16, data: &[u8], raw: &[u8]) -> Result<BootEntry> {
     if data.len() < 8 {
-        bail!("Boot entry {:04X} too short ({} bytes)", entry_num, data.len());
+        bail!(
+            "Boot entry {:04X} too short ({} bytes)",
+            entry_num,
+            data.len()
+        );
     }
 
     let attributes = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
@@ -579,7 +597,11 @@ pub fn modify_boot_entry(entry_num: u16, new_path: &str) -> Result<BootEntryBack
 /// Add a new boot entry for the given EFI driver path.
 ///
 /// The entry is inserted at the beginning of the boot order so it runs first.
-pub fn add_boot_entry(entry_num: u16, description: &str, driver_path: &str) -> Result<BootOrderResult> {
+pub fn add_boot_entry(
+    entry_num: u16,
+    description: &str,
+    driver_path: &str,
+) -> Result<BootOrderResult> {
     // Backup current boot order.
     let original_order = read_boot_order()?;
 
@@ -735,9 +757,9 @@ mod tests {
         // attributes(4) + path_list_length(2) + description_null(2) + end_dp(4)
         let mut data = Vec::new();
         data.extend_from_slice(&0x00000001u32.to_le_bytes()); // attributes: ACTIVE
-        data.extend_from_slice(&0x0004u16.to_le_bytes());     // path length: 4 (just end node)
-        data.extend_from_slice(&[0x00, 0x00]);                // description: empty
-        data.extend_from_slice(&[0x7F, 0xFF, 0x04, 0x00]);   // end-of-device-path
+        data.extend_from_slice(&0x0004u16.to_le_bytes()); // path length: 4 (just end node)
+        data.extend_from_slice(&[0x00, 0x00]); // description: empty
+        data.extend_from_slice(&[0x7F, 0xFF, 0x04, 0x00]); // end-of-device-path
 
         let entry = parse_load_option(0x0001, &data, &data).unwrap();
         assert_eq!(entry.entry_number, 0x0001);
@@ -749,14 +771,14 @@ mod tests {
     fn parse_load_option_with_description() {
         let mut data = Vec::new();
         data.extend_from_slice(&0x00000001u32.to_le_bytes()); // attributes: ACTIVE
-        data.extend_from_slice(&0x0004u16.to_le_bytes());     // path length: 4
+        data.extend_from_slice(&0x0004u16.to_le_bytes()); // path length: 4
 
         // Description: "Windows Boot Manager" in UCS-2 LE.
         let desc = "Windows Boot Manager";
         let desc_ucs2 = string_to_ucs2(desc);
         data.extend_from_slice(&desc_ucs2);
 
-        data.extend_from_slice(&[0x7F, 0xFF, 0x04, 0x00]);   // end-of-device-path
+        data.extend_from_slice(&[0x7F, 0xFF, 0x04, 0x00]); // end-of-device-path
 
         let entry = parse_load_option(0x0000, &data, &data).unwrap();
         assert_eq!(entry.description, desc);
@@ -857,7 +879,10 @@ mod tests {
         assert!(entry.is_active);
 
         // Inactive entry.
-        data[0] = 0; data[1] = 0; data[2] = 0; data[3] = 0;
+        data[0] = 0;
+        data[1] = 0;
+        data[2] = 0;
+        data[3] = 0;
         let entry = parse_load_option(0, &data, &data).unwrap();
         assert!(!entry.is_active);
     }

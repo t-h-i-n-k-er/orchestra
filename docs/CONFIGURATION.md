@@ -63,7 +63,7 @@ feature names used by the builder and server.
 | `com-hijack` | Registry-free COM hijack via activation contexts | Windows |
 | `uefi-persistence` | UEFI NVRAM/ESP/driver persistence framework | `uefi-persistence` crate |
 | `network-discovery` | ARP, ping, port, and DNS discovery operations | — |
-| `remote-assist` | Screen capture and input simulation | `enigo`, `image`, Linux `x11cap`, platform gates |
+| `remote-assist` | Screen capture and input simulation | `enigo`, `image`, Linux `x11rb`, platform gates |
 | `hci-research` | Consent-gated HCI timing telemetry; Linux uses built-in evdev polling | `chrono`, `twox-hash` |
 | `surveillance` | Screenshot, keylogger, clipboard monitoring | `image`; platform-gated implementations |
 | `browser-data` | Chrome/Edge/Firefox stored-data recovery | Windows |

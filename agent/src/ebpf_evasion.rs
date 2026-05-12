@@ -360,7 +360,7 @@ fn perf_event_open_tracepoint(tracepoint_id: u32) -> Result<RawFd> {
 
 /// Read a tracepoint's numeric ID from debugfs.
 fn read_tracepoint_id(category: &str, name: &str) -> Result<u32> {
-    let path = format!("/sys/kernel/debug/tracing/events/{}/id", name);
+    let path = format!("/sys/kernel/debug/tracing/events/{}/{}/id", category, name);
     let id_str = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read tracepoint ID from {}", path))?;
     id_str.trim().parse::<u32>().with_context(|| {

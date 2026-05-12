@@ -1025,7 +1025,10 @@ mod runtime_rewrite {
     /// * **Linux**: reads `/proc/self/exe`, parses the ELF static symbol table
     ///   with `goblin`, and returns the `st_size` field of the matching symbol.
     /// * Returns `None` if neither method can determine the size.
-    fn find_function_size(name: &str, #[allow(unused_variables)] addr: usize) -> Option<usize> {
+    fn find_function_size(
+        #[allow(unused_variables)] name: &str,
+        #[allow(unused_variables)] addr: usize,
+    ) -> Option<usize> {
         #[cfg(all(windows, target_arch = "x86_64"))]
         {
             find_function_size_pdata(addr)
@@ -1153,7 +1156,7 @@ mod runtime_rewrite {
             static FN_GPA: std::sync::OnceLock<Option<FnGetProcAddress>> =
                 std::sync::OnceLock::new();
 
-            let gpa = *FN_GPA.get_or_init(|| unsafe {
+            let gpa = *FN_GPA.get_or_init(|| {
                 let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
                 let addr = pe_resolve::get_proc_address_by_hash(
                     k32,
@@ -1162,7 +1165,7 @@ mod runtime_rewrite {
                 Some(std::mem::transmute::<usize, FnGetProcAddress>(addr))
             });
 
-            let gmha = *FN_GMHA.get_or_init(|| unsafe {
+            let gmha = *FN_GMHA.get_or_init(|| {
                 let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
                 let addr = pe_resolve::get_proc_address_by_hash(
                     k32,

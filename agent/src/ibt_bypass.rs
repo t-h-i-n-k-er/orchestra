@@ -96,7 +96,7 @@
 //
 // Windows x86_64 only.  Feature-gated behind `cet-bypass`.
 
-#![cfg(all(windows, feature = "cet-bypass"))]
+#![cfg(all(windows, feature = "cet-bypass", target_arch = "x86_64"))]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -447,10 +447,10 @@ fn decode_gadget_ops(bytes: &[u8]) -> Vec<GadgetOp> {
                 let modrm = bytes[payload_start + 2];
                 let mod_f = modrm >> 6;
                 match mod_f {
-                    0 => 3,  // Mod=00: at least 3 bytes
-                    1 => 4,  // Mod=01: 4 bytes
-                    2 => 6,  // Mod=10: 6 bytes
-                    3 => 3,  // Mod=11: 3 bytes (register operand)
+                    0 => 3, // Mod=00: at least 3 bytes
+                    1 => 4, // Mod=01: 4 bytes
+                    2 => 6, // Mod=10: 6 bytes
+                    3 => 3, // Mod=11: 3 bytes (register operand)
                     _ => 3,
                 }
             } else {
@@ -557,9 +557,8 @@ pub unsafe fn scan_module_for_endbr(
     module_base: usize,
     module_size: usize,
 ) -> IbtResult<Vec<EndbrGadget>> {
-    let text = find_text_section(module_base).ok_or_else(|| {
-        IbtError::ScanFailed("could not find .text section".to_string())
-    })?;
+    let text = find_text_section(module_base)
+        .ok_or_else(|| IbtError::ScanFailed("could not find .text section".to_string()))?;
 
     let (text_start, text_size) = text;
     if text_size < ENDBR64.len() {
@@ -749,7 +748,8 @@ static GADGET_DB: std::sync::OnceLock<IbtGadgetDb> = std::sync::OnceLock::new();
 /// Returns `true` if IBT bypass is ready for use.
 pub fn init_ibt_bypass() -> bool {
     if IBT_INITIALIZED.load(Ordering::Acquire) {
-        return IBT_AVAILABLE.load(Ordering::Acquire) && !GADGET_DB.get().map_or(true, |db| db.all_gadgets.is_empty());
+        return IBT_AVAILABLE.load(Ordering::Acquire)
+            && !GADGET_DB.get().map_or(true, |db| db.all_gadgets.is_empty());
     }
 
     let cpu_supports = cpuid_ibt_supported();
@@ -1102,7 +1102,7 @@ pub unsafe fn ibt_safe_syscall(ssn: u32, args: &[u64]) -> IbtResult<u64> {
         "4:",
 
         // ── Load syscall registers (Windows x64 syscall ABI) ──
-        "mov eax, {ssn}",       // syscall number
+        "mov eax, {ssn:e}",     // syscall number
         "mov r10, {a0}",        // 1st arg (R10 because syscall clobbers RCX)
         "mov rdx, {a1}",        // 2nd arg
         "mov r8,  {a2}",        // 3rd arg
@@ -1219,7 +1219,10 @@ mod tests {
         assert_eq!(format!("{}", EndbrCategory::FunctionEntry), "FunctionEntry");
         assert_eq!(format!("{}", EndbrCategory::MidFunction), "MidFunction");
         assert_eq!(format!("{}", EndbrCategory::AfterNop), "AfterNop");
-        assert_eq!(format!("{}", EndbrCategory::ExceptionEntry), "ExceptionEntry");
+        assert_eq!(
+            format!("{}", EndbrCategory::ExceptionEntry),
+            "ExceptionEntry"
+        );
     }
 
     #[test]
@@ -1337,9 +1340,15 @@ mod tests {
 
     #[test]
     fn test_ibt_error_display() {
-        assert_eq!(format!("{}", IbtError::NotSupported), "IBT not supported by CPU");
+        assert_eq!(
+            format!("{}", IbtError::NotSupported),
+            "IBT not supported by CPU"
+        );
         assert_eq!(format!("{}", IbtError::NotEnabled), "IBT not enabled");
-        assert_eq!(format!("{}", IbtError::NoGadgetsFound), "no suitable ENDBR64 gadgets found");
+        assert_eq!(
+            format!("{}", IbtError::NoGadgetsFound),
+            "no suitable ENDBR64 gadgets found"
+        );
         assert_eq!(
             format!("{}", IbtError::ModuleNotFound("test.dll".to_string())),
             "module not found: test.dll"
@@ -1348,8 +1357,14 @@ mod tests {
             format!("{}", IbtError::ScanFailed("bad pe".to_string())),
             "scan failed: bad pe"
         );
-        assert_eq!(format!("{}", IbtError::NotInitialized), "IBT bypass not initialized");
-        assert_eq!(format!("{}", IbtError::DatabaseEmpty), "gadget database is empty");
+        assert_eq!(
+            format!("{}", IbtError::NotInitialized),
+            "IBT bypass not initialized"
+        );
+        assert_eq!(
+            format!("{}", IbtError::DatabaseEmpty),
+            "gadget database is empty"
+        );
     }
 
     #[test]

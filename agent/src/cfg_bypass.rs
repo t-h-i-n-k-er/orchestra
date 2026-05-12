@@ -38,7 +38,7 @@
 //! Only effective when compiled with the `cfg-bypass` feature (which implies
 //! `direct-syscalls`).  Windows x86_64 only.
 
-#![cfg(all(windows, feature = "cfg-bypass"))]
+#![cfg(all(windows, feature = "cfg-bypass", target_arch = "x86_64"))]
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::OnceLock;

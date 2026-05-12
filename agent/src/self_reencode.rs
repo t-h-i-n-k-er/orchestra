@@ -539,6 +539,28 @@ fn current_pid() -> usize {
     }
 }
 
+/// Read the current thread ID from the TEB via TPIDR_EL0 (ARM64 Windows).
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn current_tid() -> usize {
+    unsafe {
+        let teb: *mut u8;
+        std::arch::asm!("mrs {}, tpidr_el0", out(reg) teb);
+        // TEB.ClientId is at offset 0x40; UniqueThread at 0x48.
+        ((teb as *const usize).add(0x48 / std::mem::size_of::<usize>())).read()
+    }
+}
+
+/// Read the current process ID from the TEB via TPIDR_EL0 (ARM64 Windows).
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn current_pid() -> usize {
+    unsafe {
+        let teb: *mut u8;
+        std::arch::asm!("mrs {}, tpidr_el0", out(reg) teb);
+        // TEB.ClientId.UniqueProcess at offset 0x40.
+        ((teb as *const usize).add(0x40 / std::mem::size_of::<usize>())).read()
+    }
+}
+
 /// threads, `NtOpenThread` + `NtSuspendThread` to freeze them.  All NT
 /// functions are resolved via `crate::syscalls` (PEB-walk SSN resolution) — no
 /// kernel32 IAT entries are added.

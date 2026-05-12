@@ -1,4 +1,7 @@
-//! Automated EDR bypass transformation engine.
+//! Automated EDR bypass transformation engine (x86-64).
+//!
+//! **This is the x86-64 implementation.** For ARM64, see
+//! `edr_bypass_transform_aarch64.rs`.
 //!
 //! Scans the agent's own compiled `.text` section for byte signatures known
 //! to be detected by EDR (YARA rules, entropy heuristics, known gadget chains
@@ -55,7 +58,7 @@
 //! entropy_threshold = 6.8
 //! ```
 
-#![cfg(feature = "evasion-transform")]
+#![cfg(all(feature = "evasion-transform", target_arch = "x86_64"))]
 
 // Static assertion: PAGE_READWRITE (0x04) must never be confused with
 // PAGE_EXECUTE_READWRITE (0x40).  RWX pages are the #1 EDR signal.

@@ -74,10 +74,10 @@ const KNOWN_BOOT_DESCRIPTIONS: &[&str] = &[
 
 /// Signatures that indicate implant artifacts.
 const IMPLANT_SIGNATURES: &[&str] = &[
-    "ORCH",       // Our implant magic.
-    "COBALT",     // Cobalt Strike.
-    "POWERSHELL", // PowerShell implant.
-    "MSBUILD",    // MSBuild-based.
+    "ORCH",        // Our implant magic.
+    "COBALT",      // Cobalt Strike.
+    "POWERSHELL",  // PowerShell implant.
+    "MSBUILD",     // MSBuild-based.
     "INSTALLUTIL", // InstallUtil-based.
 ];
 
@@ -260,9 +260,7 @@ pub fn remove_persistence(artifact: &PersistenceArtifact) -> Result<RemovalResul
         PersistenceArtifactType::BootEntry => remove_boot_entry_artifact(artifact),
         PersistenceArtifactType::EfiDriver => remove_efi_driver_artifact(artifact),
         PersistenceArtifactType::NvramVariable => remove_nvram_variable_artifact(artifact),
-        PersistenceArtifactType::BootloaderConfig => {
-            remove_bootloader_config_artifact(artifact)
-        }
+        PersistenceArtifactType::BootloaderConfig => remove_bootloader_config_artifact(artifact),
         PersistenceArtifactType::CapsuleArtifact => remove_capsule_artifact(artifact),
         PersistenceArtifactType::DxeDriver => remove_dxe_driver_artifact(artifact),
     }
@@ -291,11 +289,9 @@ fn scan_boot_entries() -> Result<Vec<ArtifactDetail>> {
                 artifact_type: PersistenceArtifactType::BootEntry,
                 risk_level: RiskLevel::Medium,
                 location: format!("Boot{:04X}", entry.entry_number),
-                reason: format!(
-                    "Unknown active boot entry: '{}'",
-                    entry.description
-                ),
-                recommendation: "Review and verify the boot entry. Remove if unauthorized.".to_string(),
+                reason: format!("Unknown active boot entry: '{}'", entry.description),
+                recommendation: "Review and verify the boot entry. Remove if unauthorized."
+                    .to_string(),
                 sha256_hash: None,
                 size: Some(entry.raw.len()),
                 removable: true,
@@ -314,11 +310,9 @@ fn scan_boot_entries() -> Result<Vec<ArtifactDetail>> {
                     artifact_type: PersistenceArtifactType::BootEntry,
                     risk_level: RiskLevel::High,
                     location: format!("Boot{:04X}", entry.entry_number),
-                    reason: format!(
-                        "Boot entry points to unknown path: '{}'",
-                        entry.device_path
-                    ),
-                    recommendation: "Remove if unauthorized. This may be a persistence implant.".to_string(),
+                    reason: format!("Boot entry points to unknown path: '{}'", entry.device_path),
+                    recommendation: "Remove if unauthorized. This may be a persistence implant."
+                        .to_string(),
                     sha256_hash: None,
                     size: Some(entry.raw.len()),
                     removable: true,
@@ -336,7 +330,9 @@ fn scan_boot_entries() -> Result<Vec<ArtifactDetail>> {
                             risk_level: RiskLevel::High,
                             location: format!("Boot{:04X}", entry.entry_number),
                             reason: format!("Contains implant signature: {}", sig),
-                            recommendation: "Remove immediately. This is likely a persistence implant.".to_string(),
+                            recommendation:
+                                "Remove immediately. This is likely a persistence implant."
+                                    .to_string(),
                             sha256_hash: None,
                             size: Some(entry.raw.len()),
                             removable: true,
@@ -366,10 +362,13 @@ fn scan_esp_files(esp_path: &str) -> Result<Vec<ArtifactDetail>> {
         let path = Path::new(file_path);
 
         // Check if the file is in an unknown vendor directory.
-        let relative = path.strip_prefix(Path::new(esp_path).join("EFI"))
+        let relative = path
+            .strip_prefix(Path::new(esp_path).join("EFI"))
             .unwrap_or(path);
 
-        let vendor_dir = relative.components().next()
+        let vendor_dir = relative
+            .components()
+            .next()
             .map(|c| c.as_os_str().to_string_lossy().to_string())
             .unwrap_or_default();
 
@@ -381,15 +380,19 @@ fn scan_esp_files(esp_path: &str) -> Result<Vec<ArtifactDetail>> {
         let file_data = std::fs::read(file_path).ok();
         let file_size = file_data.as_ref().map(|d| d.len()).unwrap_or(0);
 
-        let has_implant_sig = file_data.as_ref().map(|data| {
-            IMPLANT_SIGNATURES.iter().any(|sig| {
-                data.windows(sig.len()).any(|w| w == sig.as_bytes())
+        let has_implant_sig = file_data
+            .as_ref()
+            .map(|data| {
+                IMPLANT_SIGNATURES
+                    .iter()
+                    .any(|sig| data.windows(sig.len()).any(|w| w == sig.as_bytes()))
             })
-        }).unwrap_or(false);
+            .unwrap_or(false);
 
-        let is_valid_efi = file_data.as_ref().map(|data| {
-            crate::esp::validate_efi_pe(data).is_ok()
-        }).unwrap_or(false);
+        let is_valid_efi = file_data
+            .as_ref()
+            .map(|data| crate::esp::validate_efi_pe(data).is_ok())
+            .unwrap_or(false);
 
         if has_implant_sig {
             details.push(ArtifactDetail {
@@ -397,7 +400,8 @@ fn scan_esp_files(esp_path: &str) -> Result<Vec<ArtifactDetail>> {
                 risk_level: RiskLevel::High,
                 location: file_path.clone(),
                 reason: "Contains known implant signature".to_string(),
-                recommendation: "Remove immediately. This is likely a persistence implant.".to_string(),
+                recommendation: "Remove immediately. This is likely a persistence implant."
+                    .to_string(),
                 sha256_hash: file_data.as_ref().map(|d| sha256_hex(d)),
                 size: Some(file_size),
                 removable: true,
@@ -492,19 +496,19 @@ fn scan_bootloader_config(esp_path: &str) -> Result<Vec<ArtifactDetail>> {
                         // Look for unexpected chainloader entries.
                         for line in content.lines() {
                             if line.contains("chainloader") && !line.trim().starts_with('#') {
-                                let path = line.split("chainloader")
-                                    .nth(1)
-                                    .unwrap_or("")
-                                    .trim();
-                                if !path.contains("bootmgfw") && !path.contains("grub")
-                                    && !path.contains("shim") && !path.contains("fwup")
+                                let path = line.split("chainloader").nth(1).unwrap_or("").trim();
+                                if !path.contains("bootmgfw")
+                                    && !path.contains("grub")
+                                    && !path.contains("shim")
+                                    && !path.contains("fwup")
                                 {
                                     details.push(ArtifactDetail {
                                         artifact_type: PersistenceArtifactType::BootloaderConfig,
                                         risk_level: RiskLevel::Medium,
                                         location: grub_cfg.to_string_lossy().to_string(),
                                         reason: format!("Unexpected chainloader: {}", path),
-                                        recommendation: "Review the grub.cfg chainloader entry.".to_string(),
+                                        recommendation: "Review the grub.cfg chainloader entry."
+                                            .to_string(),
                                         sha256_hash: None,
                                         size: None,
                                         removable: false,
@@ -525,19 +529,22 @@ fn scan_bootloader_config(esp_path: &str) -> Result<Vec<ArtifactDetail>> {
                         if let Ok(content) = std::fs::read_to_string(entry.path()) {
                             for line in content.lines() {
                                 if line.starts_with("efi ") {
-                                    let path = line.split("efi ")
-                                        .nth(1)
-                                        .unwrap_or("")
-                                        .trim();
-                                    if !path.contains("systemd") && !path.contains("vmlinuz")
+                                    let path = line.split("efi ").nth(1).unwrap_or("").trim();
+                                    if !path.contains("systemd")
+                                        && !path.contains("vmlinuz")
                                         && !path.contains("shim")
                                     {
                                         details.push(ArtifactDetail {
-                                            artifact_type: PersistenceArtifactType::BootloaderConfig,
+                                            artifact_type:
+                                                PersistenceArtifactType::BootloaderConfig,
                                             risk_level: RiskLevel::Medium,
                                             location: entry.path().to_string_lossy().to_string(),
-                                            reason: format!("Unexpected EFI path in loader entry: {}", path),
-                                            recommendation: "Review the systemd-boot loader entry.".to_string(),
+                                            reason: format!(
+                                                "Unexpected EFI path in loader entry: {}",
+                                                path
+                                            ),
+                                            recommendation: "Review the systemd-boot loader entry."
+                                                .to_string(),
                                             sha256_hash: None,
                                             size: None,
                                             removable: true,
@@ -592,11 +599,9 @@ fn remove_boot_entry_artifact(artifact: &PersistenceArtifact) -> Result<RemovalR
     }
 
     // Remove the entry from boot order.
-    let mut order = crate::nvram::read_boot_order()
-        .context("Failed to read boot order")?;
+    let mut order = crate::nvram::read_boot_order().context("Failed to read boot order")?;
     order.retain(|&x| x != entry_num);
-    crate::nvram::write_boot_order(&order)
-        .context("Failed to update boot order")?;
+    crate::nvram::write_boot_order(&order).context("Failed to update boot order")?;
 
     // Delete the boot entry variable.
     let var_name = format!("Boot{:04X}", entry_num);
@@ -624,9 +629,7 @@ fn remove_efi_driver_artifact(artifact: &PersistenceArtifact) -> Result<RemovalR
     // Backup before removal.
     let backup_path = format!(
         "/tmp/{}.backup",
-        path.file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
+        path.file_name().unwrap_or_default().to_string_lossy()
     );
     std::fs::copy(path, &backup_path).ok();
 
@@ -660,16 +663,20 @@ fn remove_nvram_variable_artifact(artifact: &PersistenceArtifact) -> Result<Remo
 
 fn remove_bootloader_config_artifact(artifact: &PersistenceArtifact) -> Result<RemovalResult> {
     let path = Path::new(&artifact.path);
-    if path.exists() && path.is_dir() && path.file_name().map(|n| n == ".orchestra-backup").unwrap_or(false) {
+    if path.exists()
+        && path.is_dir()
+        && path
+            .file_name()
+            .map(|n| n == ".orchestra-backup")
+            .unwrap_or(false)
+    {
         std::fs::remove_dir_all(path)
             .with_context(|| format!("Failed to remove backup directory: {}", artifact.path))?;
     } else if path.exists() && path.is_file() {
         // Backup before removal.
         let backup_path = format!(
             "/tmp/{}.backup",
-            path.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
+            path.file_name().unwrap_or_default().to_string_lossy()
         );
         std::fs::copy(path, &backup_path).ok();
         std::fs::remove_file(path)
@@ -691,8 +698,8 @@ fn remove_capsule_artifact(artifact: &PersistenceArtifact) -> Result<RemovalResu
         let payload = if data.len() > 4 { &data[4..] } else { &data };
         if payload.len() >= 8 {
             let mut indications = u64::from_le_bytes([
-                payload[0], payload[1], payload[2], payload[3],
-                payload[4], payload[5], payload[6], payload[7],
+                payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
+                payload[7],
             ]);
             // Clear the capsule delivery flag.
             indications &= !0x04;

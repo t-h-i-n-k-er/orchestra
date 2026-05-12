@@ -260,22 +260,379 @@ unsafe fn _get_proc_address_by_hash_depth(
     None
 }
 
-/// No-op stub for non-Windows targets.
+/// Linux x86_64: walk the dynamic linker's `r_debug` link_map chain.
+///
+/// Returns the load-bias (`l_addr`) of the first loaded object whose
+/// basename hashes to `target_hash` with [`hash_str`].
 ///
 /// # Safety
 ///
-/// Safe to call on non-Windows targets (returns `None` immediately).
-#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+/// Reads from `_r_debug` and the link_map chain maintained by ld-linux.
+/// Safe for any dynamically-linked executable.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub unsafe fn get_module_handle_by_hash(target_hash: u32) -> Option<usize> {
+    // r_debug layout (64-bit):
+    //   +0  int r_version (4 bytes)
+    //   +4  padding (4 bytes, implicit alignment)
+    //   +8  struct link_map *r_map (8 bytes)
+    #[repr(C)]
+    struct RDebug {
+        r_version: i32,
+        _pad: u32,
+        r_map: *const LinkMap,
+    }
+    // link_map layout (64-bit):
+    //   +0  uintptr_t l_addr   – load bias
+    //   +8  char      *l_name  – full path
+    //   +16 ElfW(Dyn) *l_ld
+    //   +24 struct link_map *l_next
+    //   +32 struct link_map *l_prev
+    #[repr(C)]
+    struct LinkMap {
+        l_addr: usize,
+        l_name: *const u8,
+        l_ld: *const u8,
+        l_next: *const LinkMap,
+        l_prev: *const LinkMap,
+    }
+    extern "C" {
+        static _r_debug: RDebug;
+    }
+    let mut node = _r_debug.r_map;
+    while !node.is_null() {
+        let entry = &*node;
+        if !entry.l_name.is_null() {
+            let mut len = 0usize;
+            while *entry.l_name.add(len) != 0 {
+                len += 1;
+            }
+            let name_bytes = core::slice::from_raw_parts(entry.l_name, len);
+            // Use the basename (last path component) for hashing.
+            let basename = name_bytes.split(|&b| b == b'/').last().unwrap_or(name_bytes);
+            if !basename.is_empty() && hash_str(basename) == target_hash {
+                return Some(entry.l_addr);
+            }
+        }
+        node = entry.l_next;
+    }
+    None
+}
+
+/// Linux x86_64: parse the ELF64 dynamic symbol table of a loaded shared
+/// object to find an exported function whose name hashes to `target_hash`.
+///
+/// `dll_base` must be the load bias returned by [`get_module_handle_by_hash`]
+/// (i.e., the `l_addr` from the `link_map` entry for that library).
+///
+/// # Safety
+///
+/// `dll_base` must point to a valid, fully-mapped ELF64 shared-object image.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub unsafe fn get_proc_address_by_hash(dll_base: usize, target_hash: u32) -> Option<usize> {
+    if dll_base == 0 {
+        return None;
+    }
+    let base = dll_base as *const u8;
+
+    // Verify ELF magic (\x7fELF).
+    if *(base as *const u32) != 0x464C_457F {
+        return None;
+    }
+
+    // Elf64_Ehdr offsets we need:
+    //   +32  e_phoff     (u64) – file offset of program header table
+    //   +54  e_phentsize (u16) – size of each program header entry
+    //   +56  e_phnum     (u16) – number of program headers
+    let e_phoff = *(base.add(32) as *const u64) as usize;
+    let e_phentsize = *(base.add(54) as *const u16) as usize;
+    let e_phnum = *(base.add(56) as *const u16) as usize;
+
+    // Walk program headers to find PT_DYNAMIC (type 2).
+    let mut dyn_start: usize = 0;
+    for i in 0..e_phnum {
+        let ph = base.add(e_phoff + i * e_phentsize);
+        let p_type = *(ph as *const u32);
+        if p_type == 2 {
+            // Elf64_Phdr.p_vaddr is at offset +16; this is a VMA, so
+            // actual in-memory address = dll_base + p_vaddr.
+            let p_vaddr = *(ph.add(16) as *const u64) as usize;
+            dyn_start = dll_base + p_vaddr;
+            break;
+        }
+    }
+    if dyn_start == 0 {
+        return None;
+    }
+
+    // Parse the dynamic section for DT_SYMTAB (6), DT_STRTAB (5),
+    // DT_HASH (4), and DT_SYMENT (11).
+    // Elf64_Dyn: { i64 d_tag; u64 d_val/d_ptr } — 16 bytes each.
+    let mut symtab: usize = 0;
+    let mut strtab: usize = 0;
+    let mut hash_addr: usize = 0;
+    let mut syment: usize = 24; // sizeof(Elf64_Sym) default
+    {
+        let mut dyn_ptr = dyn_start as *const i64;
+        loop {
+            let tag = *dyn_ptr;
+            let val = *(dyn_ptr.add(1)) as usize; // interpret u64 as usize
+            if tag == 0 {
+                break; // DT_NULL
+            }
+            match tag {
+                5 => strtab = val,
+                6 => symtab = val,
+                4 => hash_addr = val,
+                11 => syment = val,
+                _ => {}
+            }
+            dyn_ptr = dyn_ptr.add(2); // advance 16 bytes
+        }
+    }
+    if symtab == 0 || strtab == 0 {
+        return None;
+    }
+
+    // Get symbol count from the SysV hash table: nchain (at offset +4) equals
+    // the total number of symbols in DT_SYMTAB.
+    let nsyms: usize = if hash_addr != 0 {
+        *((hash_addr + 4) as *const u32) as usize
+    } else {
+        2048 // conservative upper bound when no hash table is present
+    };
+
+    // Walk Elf64_Sym entries.
+    // Elf64_Sym layout:
+    //   +0   u32 st_name  – index into string table
+    //   +4   u8  st_info
+    //   +5   u8  st_other
+    //   +6   u16 st_shndx
+    //   +8   u64 st_value – VMA within the ELF file (relative to ELF base = 0)
+    //   +16  u64 st_size
+    for i in 0..nsyms {
+        let sym = (symtab + i * syment) as *const u8;
+        let st_name = *(sym as *const u32) as usize;
+        let st_value = *(sym.add(8) as *const u64) as usize;
+
+        if st_value == 0 || st_name == 0 {
+            continue;
+        }
+
+        let name_ptr = (strtab + st_name) as *const u8;
+        let mut len = 0usize;
+        while *name_ptr.add(len) != 0 && len < 512 {
+            len += 1;
+        }
+        if len == 0 {
+            continue;
+        }
+        let name_bytes = core::slice::from_raw_parts(name_ptr, len);
+
+        if hash_str(name_bytes) == target_hash {
+            // st_value is a VMA relative to ELF base (0 for PIC), so
+            // the actual in-memory address = load_bias + st_value.
+            return Some(dll_base + st_value);
+        }
+    }
+    None
+}
+
+/// macOS x86_64: enumerate dyld-loaded images to find a library whose
+/// basename hashes to `target_hash`.  Returns the Mach-O header address
+/// (i.e., the slide-adjusted image base).
+///
+/// # Safety
+///
+/// Calls dyld API functions (`_dyld_image_count`, `_dyld_get_image_header`,
+/// `_dyld_get_image_name`) which are part of macOS's stable dyld SPI.
+#[cfg(all(target_arch = "x86_64", target_os = "macos"))]
+pub unsafe fn get_module_handle_by_hash(target_hash: u32) -> Option<usize> {
+    extern "C" {
+        fn _dyld_image_count() -> u32;
+        fn _dyld_get_image_header(image_index: u32) -> *const u8;
+        fn _dyld_get_image_name(image_index: u32) -> *const u8;
+    }
+    let count = _dyld_image_count();
+    for i in 0..count {
+        let name_ptr = _dyld_get_image_name(i);
+        if name_ptr.is_null() {
+            continue;
+        }
+        let mut len = 0usize;
+        while *name_ptr.add(len) != 0 {
+            len += 1;
+        }
+        let name_bytes = core::slice::from_raw_parts(name_ptr, len);
+        let basename = name_bytes.split(|&b| b == b'/').last().unwrap_or(name_bytes);
+        if !basename.is_empty() && hash_str(basename) == target_hash {
+            let header = _dyld_get_image_header(i);
+            if !header.is_null() {
+                return Some(header as usize);
+            }
+        }
+    }
+    None
+}
+
+/// macOS x86_64: walk the Mach-O LC_SYMTAB symbol table of a loaded image
+/// to resolve a function whose name hashes to `target_hash`.
+///
+/// `dll_base` must be the Mach-O header address returned by
+/// [`get_module_handle_by_hash`].
+///
+/// # Safety
+///
+/// `dll_base` must point to a valid, fully-mapped Mach-O 64-bit image.
+#[cfg(all(target_arch = "x86_64", target_os = "macos"))]
+pub unsafe fn get_proc_address_by_hash(dll_base: usize, target_hash: u32) -> Option<usize> {
+    if dll_base == 0 {
+        return None;
+    }
+    let base = dll_base as *const u8;
+
+    // mach_header_64: magic(u32)+cputype(i32)+cpusubtype(i32)+filetype(u32)+
+    //                 ncmds(u32)+sizeofcmds(u32)+flags(u32)+reserved(u32) = 32 bytes
+    const MH_MAGIC_64: u32 = 0xFEED_FACF;
+    if *(base as *const u32) != MH_MAGIC_64 {
+        return None;
+    }
+    let ncmds = *(base.add(16) as *const u32) as usize;
+
+    // Walk load commands to find LC_SEGMENT_64 (__TEXT, __LINKEDIT) and
+    // LC_SYMTAB.
+    let mut text_vmaddr: usize = usize::MAX;
+    let mut linkedit_vmaddr: usize = 0;
+    let mut linkedit_fileoff: usize = 0;
+    let mut symoff: usize = 0;
+    let mut nsyms: usize = 0;
+    let mut stroff: usize = 0;
+
+    let mut cmd_ptr = base.add(32); // sizeof(mach_header_64)
+    for _ in 0..ncmds {
+        let cmd = *(cmd_ptr as *const u32);
+        let cmdsize = *(cmd_ptr.add(4) as *const u32) as usize;
+        if cmdsize < 8 {
+            break; // malformed
+        }
+        match cmd {
+            0x19 => {
+                // LC_SEGMENT_64
+                // segment_command_64: cmd(4)+cmdsize(4)+segname(16)+
+                //   vmaddr(8)+vmsize(8)+fileoff(8)+filesize(8)+...
+                let segname = core::slice::from_raw_parts(cmd_ptr.add(8), 16);
+                let vmaddr = *(cmd_ptr.add(24) as *const u64) as usize;
+                let fileoff = *(cmd_ptr.add(40) as *const u64) as usize;
+                if segname.starts_with(b"__TEXT\0") {
+                    text_vmaddr = vmaddr;
+                } else if segname.starts_with(b"__LINKEDIT\0") {
+                    linkedit_vmaddr = vmaddr;
+                    linkedit_fileoff = fileoff;
+                }
+            }
+            0x02 => {
+                // LC_SYMTAB
+                // symtab_command: cmd(4)+cmdsize(4)+symoff(4)+nsyms(4)+stroff(4)+strsize(4)
+                symoff = *(cmd_ptr.add(8) as *const u32) as usize;
+                nsyms = *(cmd_ptr.add(12) as *const u32) as usize;
+                stroff = *(cmd_ptr.add(16) as *const u32) as usize;
+            }
+            _ => {}
+        }
+        cmd_ptr = cmd_ptr.add(cmdsize);
+    }
+
+    if text_vmaddr == usize::MAX || symoff == 0 || nsyms == 0 || linkedit_vmaddr == 0 {
+        return None;
+    }
+
+    // Compute ASLR slide: actual mach_header address minus preferred __TEXT vmaddr.
+    let slide = dll_base.wrapping_sub(text_vmaddr);
+
+    // Symbol table and string table are in __LINKEDIT.
+    // in_memory = linkedit_vmaddr + slide + (fileoff - linkedit_fileoff)
+    let symtab_addr = linkedit_vmaddr
+        .wrapping_add(slide)
+        .wrapping_add(symoff)
+        .wrapping_sub(linkedit_fileoff);
+    let strtab_addr = linkedit_vmaddr
+        .wrapping_add(slide)
+        .wrapping_add(stroff)
+        .wrapping_sub(linkedit_fileoff);
+
+    // Walk nlist_64 entries (16 bytes each):
+    //   +0  u32 n_strx – string table index
+    //   +4  u8  n_type
+    //   +5  u8  n_sect
+    //   +6  u16 n_desc
+    //   +8  u64 n_value – symbol address (file VA; add slide for in-memory)
+    const NLIST64_SIZE: usize = 16;
+    const N_TYPE_MASK: u8 = 0x0E;
+    const N_SECT: u8 = 0x0E; // defined in a section (not undefined / common)
+
+    for i in 0..nsyms {
+        let sym = (symtab_addr + i * NLIST64_SIZE) as *const u8;
+        let n_strx = *(sym as *const u32) as usize;
+        let n_type = *sym.add(4);
+        let n_value = *(sym.add(8) as *const u64) as usize;
+
+        if n_value == 0 || n_strx == 0 {
+            continue;
+        }
+        // Skip undefined / absolute symbols; only resolve section-defined exports.
+        if (n_type & N_TYPE_MASK) != N_SECT {
+            continue;
+        }
+
+        let name_ptr = (strtab_addr + n_strx) as *const u8;
+        let mut len = 0usize;
+        while *name_ptr.add(len) != 0 && len < 512 {
+            len += 1;
+        }
+        if len == 0 {
+            continue;
+        }
+        let name_bytes = core::slice::from_raw_parts(name_ptr, len);
+
+        // Mach-O symbol names are prefixed with '_'; try both forms.
+        let stripped = if name_bytes.first() == Some(&b'_') {
+            &name_bytes[1..]
+        } else {
+            name_bytes
+        };
+        if hash_str(stripped) == target_hash || hash_str(name_bytes) == target_hash {
+            // n_value is the preferred VMA; add slide for the actual address.
+            return Some(slide.wrapping_add(n_value));
+        }
+    }
+    None
+}
+
+/// Fallback stub for non-Windows x86_64 platforms other than Linux and macOS.
+///
+/// # Safety
+///
+/// Always returns `None`.
+#[cfg(all(
+    target_arch = "x86_64",
+    not(target_os = "windows"),
+    not(target_os = "linux"),
+    not(target_os = "macos")
+))]
 pub unsafe fn get_module_handle_by_hash(_target_hash: u32) -> Option<usize> {
     None
 }
 
-/// No-op stub for non-Windows targets.
+/// Fallback stub for non-Windows x86_64 platforms other than Linux and macOS.
 ///
 /// # Safety
 ///
-/// Safe to call on non-Windows targets (returns `None` immediately).
-#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+/// Always returns `None`.
+#[cfg(all(
+    target_arch = "x86_64",
+    not(target_os = "windows"),
+    not(target_os = "linux"),
+    not(target_os = "macos")
+))]
 pub unsafe fn get_proc_address_by_hash(_dll_base: usize, _target_hash: u32) -> Option<usize> {
     None
 }

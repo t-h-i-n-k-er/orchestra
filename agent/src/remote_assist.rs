@@ -17,8 +17,6 @@ use enigo::{Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
 use std::cell::RefCell;
 #[cfg(target_os = "macos")]
 use std::ffi::c_void;
-#[cfg(target_os = "linux")]
-use x11cap::{Capturer, Screen};
 
 #[cfg(target_os = "macos")]
 type CFTypeRef = *const c_void;
@@ -115,17 +113,82 @@ where
 
 // ─────────────────────────── Linux screen-capture helpers ───────────────────
 
-/// Capture via the X11 root window using the vendored `x11cap` crate.
+/// Capture via the X11 root window using the pure-Rust `x11rb` backend.
 #[cfg(target_os = "linux")]
 fn capture_x11() -> Result<Vec<u8>> {
-    use image::{ImageBuffer, Rgb};
-    let mut capturer =
-        Capturer::new(Screen::Default).map_err(|_| anyhow!("failed to open X11 display"))?;
-    let (pixels, (width, height)) = capturer
-        .capture_frame()
-        .map_err(|e| anyhow!("X11 capture_frame failed: {:?}", e))?;
-    let raw: Vec<u8> = pixels.iter().flat_map(|p| [p.r, p.g, p.b]).collect();
-    let img = ImageBuffer::<Rgb<u8>, _>::from_raw(width, height, raw)
+    use image::{ImageBuffer, Rgba};
+    use x11rb::connection::Connection;
+    use x11rb::image::{BitsPerPixel, Image};
+
+    let (conn, screen_num) =
+        x11rb::connect(None).map_err(|e| anyhow!("X11 connect failed: {e}"))?;
+    let setup = conn.setup();
+    let screen = setup
+        .roots
+        .get(screen_num)
+        .ok_or_else(|| anyhow!("X11 screen index {} is out of range", screen_num))?;
+    let width = screen.width_in_pixels;
+    let height = screen.height_in_pixels;
+    if width == 0 || height == 0 {
+        return Err(anyhow!(
+            "X11 root window has invalid size {}x{}",
+            width,
+            height
+        ));
+    }
+
+    let (ximage, visual_id) = Image::get(&conn, screen.root, 0, 0, width, height)
+        .map_err(|e| anyhow!("X11 GetImage failed: {e}"))?;
+    let visual = screen
+        .allowed_depths
+        .iter()
+        .flat_map(|depth| depth.visuals.iter())
+        .find(|visual| visual.visual_id == visual_id)
+        .ok_or_else(|| anyhow!("X11 visual {visual_id} not found in screen visual list"))?;
+
+    let bytes_per_pixel = match ximage.bits_per_pixel() {
+        BitsPerPixel::B32 => 4,
+        BitsPerPixel::B24 => 3,
+        BitsPerPixel::B16 => 2,
+        other => {
+            return Err(anyhow!(
+                "unsupported X11 screenshot pixel format: {:?} bits per pixel",
+                other
+            ))
+        }
+    };
+    let row_bits = (width as usize)
+        .checked_mul(usize::from(ximage.bits_per_pixel()))
+        .ok_or_else(|| anyhow!("X11 row size overflow"))?;
+    let scanline_pad = usize::from(ximage.scanline_pad());
+    let stride_bits = ((row_bits + scanline_pad - 1) / scanline_pad) * scanline_pad;
+    let stride = stride_bits / 8;
+    let expected = (height as usize)
+        .checked_mul(stride)
+        .ok_or_else(|| anyhow!("X11 image size overflow"))?;
+    if ximage.data().len() < expected {
+        return Err(anyhow!(
+            "X11 image data is shorter than expected: {} < {}",
+            ximage.data().len(),
+            expected
+        ));
+    }
+
+    let mut rgba = vec![0u8; width as usize * height as usize * 4];
+    for y in 0..height as usize {
+        let row = &ximage.data()[y * stride..y * stride + stride];
+        for x in 0..width as usize {
+            let src = x * bytes_per_pixel;
+            let pixel = read_x11_pixel(&row[src..src + bytes_per_pixel], ximage.byte_order());
+            let dst = (y * width as usize + x) * 4;
+            rgba[dst] = x11_channel_to_u8(pixel, visual.red_mask);
+            rgba[dst + 1] = x11_channel_to_u8(pixel, visual.green_mask);
+            rgba[dst + 2] = x11_channel_to_u8(pixel, visual.blue_mask);
+            rgba[dst + 3] = 0xff;
+        }
+    }
+
+    let img = ImageBuffer::<Rgba<u8>, _>::from_raw(width as u32, height as u32, rgba)
         .ok_or_else(|| anyhow!("failed to create image buffer from X11 pixels"))?;
     let mut buffer = Vec::new();
     img.write_to(
@@ -133,6 +196,35 @@ fn capture_x11() -> Result<Vec<u8>> {
         image::ImageFormat::Png,
     )?;
     Ok(buffer)
+}
+
+#[cfg(target_os = "linux")]
+fn read_x11_pixel(bytes: &[u8], byte_order: x11rb::image::ImageOrder) -> u32 {
+    match byte_order {
+        x11rb::image::ImageOrder::LsbFirst => bytes
+            .iter()
+            .enumerate()
+            .fold(0u32, |acc, (idx, byte)| acc | ((*byte as u32) << (idx * 8))),
+        x11rb::image::ImageOrder::MsbFirst => bytes
+            .iter()
+            .fold(0u32, |acc, byte| (acc << 8) | (*byte as u32)),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn x11_channel_to_u8(pixel: u32, mask: u32) -> u8 {
+    if mask == 0 {
+        return 0;
+    }
+    let shift = mask.trailing_zeros();
+    let bits = 32 - mask.leading_zeros() - shift;
+    let value = (pixel & mask) >> shift;
+    if bits >= 8 {
+        (value >> (bits - 8)) as u8
+    } else {
+        let max = (1u32 << bits) - 1;
+        ((value * 255 + max / 2) / max) as u8
+    }
 }
 
 /// Capture the primary framebuffer via `/dev/fb0` (headless/VT fallback).
@@ -532,7 +624,7 @@ pub fn take_screenshot() -> Result<Vec<u8>> {
                 ),
             }
         }
-        // Priority 2: X11 via x11cap.
+        // Priority 2: X11 via x11rb.
         if std::env::var_os("DISPLAY").is_some() {
             match capture_x11() {
                 Ok(bytes) => return Ok(bytes),

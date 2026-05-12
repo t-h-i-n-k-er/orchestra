@@ -63,7 +63,7 @@
 //
 // Windows x86_64 only.  Feature-gated behind `cet-bypass`.
 
-#![cfg(all(windows, feature = "cet-bypass"))]
+#![cfg(all(windows, feature = "cet-bypass", target_arch = "x86_64"))]
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 

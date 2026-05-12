@@ -39,9 +39,9 @@
 // # Detection criteria
 //
 // - `min(nop_cycles) > 10`    → likely instrumentation
-// - `stddev(nop_cycles) > 10`  → likely instrumentation
-// - `median(cpuid_cycles) > 1000` → likely instrumentation
-// - `median(nop) / min(nop) > 5.0` → likely instrumentation
+// - `stddev(nop_cycles) > 25`  → likely instrumentation
+// - `median(cpuid_cycles) > 2000` → likely instrumentation
+// - `median(nop) / max(min(nop),2) > 8.0` → likely instrumentation
 //
 // # Constraints
 //
@@ -64,14 +64,18 @@ const MEASUREMENT_ITERATIONS: usize = 100;
 /// CPU is likely under instrumentation.
 const NOP_MIN_THRESHOLD: u64 = 10;
 
-/// NOP standard-deviation threshold: physical hardware produces σ < 1.
-const NOP_STDDEV_THRESHOLD: f64 = 10.0;
+/// NOP standard-deviation threshold: allow scheduler jitter on busy hosts.
+const NOP_STDDEV_THRESHOLD: f64 = 25.0;
 
-/// CPUID median threshold: physical hardware 100–250 cycles.
-const CPUID_MEDIAN_THRESHOLD: u64 = 1000;
+/// CPUID median threshold: allow modern host jitter and mitigation overhead.
+const CPUID_MEDIAN_THRESHOLD: u64 = 2000;
 
-/// NOP ratio threshold (median / min): physical ≈ 1.0–2.0.
-const NOP_RATIO_THRESHOLD: f64 = 5.0;
+/// NOP ratio threshold (median / floor(min)): physical usually remains < 5.
+const NOP_RATIO_THRESHOLD: f64 = 8.0;
+
+/// Floor the denominator for ratio checks so a single 0/1-cycle sample does
+/// not spuriously inflate the ratio on healthy systems.
+const NOP_RATIO_MIN_FLOOR: u64 = 2;
 
 /// Number of HPET/secondary-clocksource cross-check iterations.
 const HPET_CROSSCHECK_ITERS: usize = 50;
@@ -305,17 +309,27 @@ fn compute_timing_stats(label: &str, samples: &[u64]) -> InstructionTiming {
     let max_cycles = sorted[n - 1];
     let median_cycles = sorted[n / 2];
 
-    let sum: u64 = sorted.iter().sum();
-    let mean = sum as f64 / n as f64;
+    // Use trimmed statistics for mean/stddev on larger samples to avoid
+    // occasional scheduler/SMI outliers from dominating jitter metrics.
+    let trim = if n >= 20 { n / 10 } else { 0 }; // 10% from each tail
+    let core = if trim > 0 && (2 * trim) < n {
+        &sorted[trim..(n - trim)]
+    } else {
+        &sorted[..]
+    };
 
-    let variance: f64 = sorted
+    let core_n = core.len();
+    let sum: u64 = core.iter().sum();
+    let mean = sum as f64 / core_n as f64;
+
+    let variance: f64 = core
         .iter()
         .map(|&v| {
             let diff = v as f64 - mean;
             diff * diff
         })
         .sum::<f64>()
-        / n as f64;
+        / core_n as f64;
     let stddev = variance.sqrt();
 
     InstructionTiming {
@@ -376,17 +390,18 @@ pub fn analyze_timing_distribution() -> Option<TimingAnalysis> {
     let c1 = nop.min_cycles > NOP_MIN_THRESHOLD;
     if c1 { signals += 1; }
 
-    // Criterion 2: stddev(nop) > 10
+    // Criterion 2: stddev(nop) > 25
     let c2 = nop.stddev_cycles > NOP_STDDEV_THRESHOLD;
     if c2 { signals += 1; }
 
-    // Criterion 3: median(cpuid) > 1000
+    // Criterion 3: median(cpuid) > 2000
     let c3 = cpuid.median_cycles > CPUID_MEDIAN_THRESHOLD;
     if c3 { signals += 1; }
 
-    // Criterion 4: median(nop) / min(nop) > 5.0
-    let c4 = if nop.min_cycles > 0 {
-        (nop.median_cycles as f64 / nop.min_cycles as f64) > NOP_RATIO_THRESHOLD
+    // Criterion 4: median(nop) / max(min(nop), 2) > 8.0
+    let ratio_denom = nop.min_cycles.max(NOP_RATIO_MIN_FLOOR);
+    let c4 = if ratio_denom > 0 {
+        (nop.median_cycles as f64 / ratio_denom as f64) > NOP_RATIO_THRESHOLD
     } else {
         false
     };
@@ -497,15 +512,18 @@ fn hpet_cross_check_flagged() -> bool {
 ///
 /// Weight assignment:
 /// - 4 criteria positive: weight 30 (high confidence — single-step detected)
-/// - 2–3 criteria positive: weight 20 (medium confidence)
+/// - 3 criteria positive: weight 20 (medium confidence)
+/// - 2 criteria positive: weight 10 (low confidence / noisy host)
 /// - 0–1 criteria positive: weight 0 (likely physical hardware)
 pub fn instruction_timing_indicator() -> Option<common::SandboxIndicator> {
     let analysis = analyze_timing_distribution()?;
 
     let weight = if analysis.suspicion_score >= 4 {
         30
-    } else if analysis.suspicion_score >= 2 {
+    } else if analysis.suspicion_score >= 3 {
         20
+    } else if analysis.suspicion_score >= 2 {
+        10
     } else {
         0
     };
@@ -606,9 +624,10 @@ mod tests {
             return;
         }
         let timing = measure_cpuid_timing(MEASUREMENT_ITERATIONS);
-        // CPUID on physical hardware should be 50–500 cycles.
+        // CPUID cost can vary significantly with host load/mitigations; keep
+        // this aligned with the detection threshold to avoid host-only flakes.
         assert!(
-            timing.median_cycles < 1000,
+            timing.median_cycles < CPUID_MEDIAN_THRESHOLD,
             "CPUID median unexpectedly high: {} — possible instrumentation",
             timing.median_cycles
         );

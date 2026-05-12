@@ -181,9 +181,7 @@ impl Injector for LinuxPtraceInjector {
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             let _ = (self, payload);
-            Err(anyhow!(
-                "LinuxPtraceInjector: unsupported architecture"
-            ))
+            Err(anyhow!("LinuxPtraceInjector: unsupported architecture"))
         }
     }
 }
@@ -631,7 +629,11 @@ fn remote_mmap_rw_arm64(
 ) -> Result<usize> {
     let page_size = {
         let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        if ps > 0 { ps as usize } else { 4096 }
+        if ps > 0 {
+            ps as usize
+        } else {
+            4096
+        }
     };
     let min_len = requested_len.max(1);
     let alloc_len = ((min_len + page_size - 1) / page_size) * page_size;
@@ -640,13 +642,13 @@ fn remote_mmap_rw_arm64(
     let _patch = PcPatchGuard::install(pid, pc)?;
 
     let mut mmap_regs = *original_regs;
-    mmap_regs.regs[8] = arm64_sys::MMAP;          // x8 = syscall number
-    mmap_regs.regs[0] = 0;                         // x0 = addr (NULL)
-    mmap_regs.regs[1] = alloc_len as u64;           // x1 = length
+    mmap_regs.regs[8] = arm64_sys::MMAP; // x8 = syscall number
+    mmap_regs.regs[0] = 0; // x0 = addr (NULL)
+    mmap_regs.regs[1] = alloc_len as u64; // x1 = length
     mmap_regs.regs[2] = (libc::PROT_READ | libc::PROT_WRITE) as u64; // x2 = prot
     mmap_regs.regs[3] = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u64; // x3 = flags
-    mmap_regs.regs[4] = u64::MAX;                   // x4 = fd (-1)
-    mmap_regs.regs[5] = 0;                          // x5 = offset
+    mmap_regs.regs[4] = u64::MAX; // x4 = fd (-1)
+    mmap_regs.regs[5] = 0; // x5 = offset
 
     ptrace_setregs_arm64(pid, &mmap_regs)?;
     ptrace_continue_and_wait(pid)?;
@@ -675,7 +677,11 @@ fn remote_mprotect_rx_arm64(
 ) -> Result<()> {
     let page_size = {
         let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        if ps > 0 { ps as usize } else { 4096 }
+        if ps > 0 {
+            ps as usize
+        } else {
+            4096
+        }
     };
     let min_len = requested_len.max(1);
     let aligned_start = remote_addr & !(page_size - 1);
@@ -691,9 +697,9 @@ fn remote_mprotect_rx_arm64(
     let _patch = PcPatchGuard::install(pid, pc)?;
 
     let mut mprotect_regs = *original_regs;
-    mprotect_regs.regs[8] = arm64_sys::MPROTECT;   // x8 = syscall number
-    mprotect_regs.regs[0] = aligned_start as u64;    // x0 = addr
-    mprotect_regs.regs[1] = prot_len as u64;         // x1 = length
+    mprotect_regs.regs[8] = arm64_sys::MPROTECT; // x8 = syscall number
+    mprotect_regs.regs[0] = aligned_start as u64; // x0 = addr
+    mprotect_regs.regs[1] = prot_len as u64; // x1 = length
     mprotect_regs.regs[2] = (libc::PROT_READ | libc::PROT_EXEC) as u64; // x2 = prot
 
     ptrace_setregs_arm64(pid, &mprotect_regs)?;

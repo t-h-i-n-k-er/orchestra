@@ -136,8 +136,8 @@ pub fn check_uefi_capsule_support() -> Result<CapsuleSupport> {
             let payload = strip_attr_header(&data);
             if payload.len() >= 8 {
                 u64::from_le_bytes([
-                    payload[0], payload[1], payload[2], payload[3],
-                    payload[4], payload[5], payload[6], payload[7],
+                    payload[0], payload[1], payload[2], payload[3], payload[4], payload[5],
+                    payload[6], payload[7],
                 ])
             } else {
                 0
@@ -158,8 +158,8 @@ pub fn check_uefi_capsule_support() -> Result<CapsuleSupport> {
             let payload = strip_attr_header(&data);
             if payload.len() >= 8 {
                 u64::from_le_bytes([
-                    payload[0], payload[1], payload[2], payload[3],
-                    payload[4], payload[5], payload[6], payload[7],
+                    payload[0], payload[1], payload[2], payload[3], payload[4], payload[5],
+                    payload[6], payload[7],
                 ])
             } else {
                 0
@@ -205,12 +205,7 @@ pub fn install_runtime_driver(
     };
 
     // Write the driver to the ESP.
-    let write_result = crate::esp::write_efi_driver(
-        esp_path,
-        driver_name,
-        driver_bytes,
-        None,
-    )?;
+    let write_result = crate::esp::write_efi_driver(esp_path, driver_name, driver_bytes, None)?;
 
     if use_capsule {
         // Attempt capsule-based installation.
@@ -306,8 +301,7 @@ fn deliver_capsule_on_disk(
     let capsule_dir = std::path::PathBuf::from(esp_path)
         .join("EFI")
         .join("Capsule");
-    std::fs::create_dir_all(&capsule_dir)
-        .context("Failed to create Capsule directory on ESP")?;
+    std::fs::create_dir_all(&capsule_dir).context("Failed to create Capsule directory on ESP")?;
 
     let capsule_path = capsule_dir.join(format!("{}.cap", capsule_name));
     std::fs::write(&capsule_path, &capsule)
@@ -439,15 +433,11 @@ mod tests {
         assert_eq!(&capsule[0..16], &guid_bytes);
 
         // Verify HeaderSize at offset 16.
-        let header_size = u32::from_le_bytes([
-            capsule[16], capsule[17], capsule[18], capsule[19],
-        ]);
+        let header_size = u32::from_le_bytes([capsule[16], capsule[17], capsule[18], capsule[19]]);
         assert_eq!(header_size, 28);
 
         // Verify CapsuleImageSize at offset 24.
-        let image_size = u32::from_le_bytes([
-            capsule[24], capsule[25], capsule[26], capsule[27],
-        ]);
+        let image_size = u32::from_le_bytes([capsule[24], capsule[25], capsule[26], capsule[27]]);
         assert_eq!(image_size, 128);
     }
 

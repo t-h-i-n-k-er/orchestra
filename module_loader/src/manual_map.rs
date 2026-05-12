@@ -1,5 +1,6 @@
 //! Manual map PE loader for Windows.
 #![cfg(windows)]
+#![allow(non_snake_case)]
 
 use anyhow::{anyhow, Result};
 use goblin::pe::PE;
@@ -15,7 +16,7 @@ use winapi::um::winnt::{
     DLL_PROCESS_ATTACH, IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_EXPORT,
     IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ,
     IMAGE_SCN_MEM_WRITE, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE, PAGE_EXECUTE_READ,
-    PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+    PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
 };
 
 /// Minimal thread access for injection: THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION.
@@ -135,7 +136,7 @@ unsafe fn load_via_ldr(module_name: &str) -> *mut c_void {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    let mut us = winapi::shared::ntdef::UNICODE_STRING {
+    let us = winapi::shared::ntdef::UNICODE_STRING {
         Length: ((wide.len() - 1) * 2) as u16,
         MaximumLength: (wide.len() * 2) as u16,
         Buffer: wide.as_mut_ptr(),
@@ -583,17 +584,15 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
     impl Drop for AllocGuard {
         fn drop(&mut self) {
             if !self.success {
-                unsafe {
-                    let mut base = self.ptr;
-                    let mut size: usize = 0;
-                    let _ = nt_syscall::syscall!(
-                        "NtFreeVirtualMemory",
-                        -1isize as u64,
-                        &mut base as *mut _ as u64,
-                        &mut size as *mut _ as u64,
-                        MEM_RELEASE as u64,
-                    );
-                }
+                let mut base = self.ptr;
+                let mut size: usize = 0;
+                let _ = nt_syscall::syscall!(
+                    "NtFreeVirtualMemory",
+                    -1isize as u64,
+                    &mut base as *mut _ as u64,
+                    &mut size as *mut _ as u64,
+                    MEM_RELEASE as u64,
+                );
             }
         }
     }
@@ -925,6 +924,15 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
             if reloc_entry.virtual_address != 0 && reloc_entry.size > 0 {
                 let reloc_size = reloc_entry.size as usize;
                 let block_rva = reloc_entry.virtual_address as usize;
+                let reloc_range = checked_image_range(block_rva, reloc_size, image_size)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "manual_map: relocation directory out of image bounds (rva={:#x}, size={:#x}, image={:#x})",
+                            block_rva,
+                            reloc_size,
+                            image_size
+                        )
+                    })?;
                 // Snapshot the entire relocation directory into a local buffer
                 // *before* applying any patches.  Without this, a relocation
                 // entry whose target falls inside the .reloc section itself
@@ -933,9 +941,11 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
                 // are about to read on the next iteration, leading to
                 // unpredictable behaviour.  Reading from a pristine copy makes
                 // the iteration deterministic.
-                let reloc_data: Vec<u8> =
-                    std::slice::from_raw_parts(image_base.add(block_rva) as *const u8, reloc_size)
-                        .to_vec();
+                let reloc_data: Vec<u8> = std::slice::from_raw_parts(
+                    image_base.add(reloc_range.start) as *const u8,
+                    reloc_range.len(),
+                )
+                .to_vec();
 
                 let mut offset = 0usize;
                 while offset + 8 <= reloc_size {
@@ -946,7 +956,12 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
                         u32::from_le_bytes(reloc_data[offset + 4..offset + 8].try_into().unwrap())
                             as usize;
                     if block_size < 8 || offset + block_size > reloc_size {
-                        break;
+                        return Err(anyhow!(
+                            "manual_map: malformed relocation block (offset={:#x}, block_size={:#x}, reloc_size={:#x})",
+                            offset,
+                            block_size,
+                            reloc_size
+                        ));
                     }
                     let entries_count = (block_size - 8) / 2;
                     let entries_start = offset + 8;
@@ -958,11 +973,41 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
                         let reloc_offset = (entry & 0x0FFF) as usize;
                         if reloc_type == 10 {
                             // IMAGE_REL_BASED_DIR64: 64-bit absolute VA (x64, ARM64)
-                            let addr = image_base.add(page_rva + reloc_offset) as *mut isize;
-                            *addr += base_delta;
+                            let target_rva = page_rva.checked_add(reloc_offset).ok_or_else(|| {
+                                anyhow!("manual_map: relocation target RVA overflow")
+                            })?;
+                            let target_range = checked_image_range(
+                                target_rva,
+                                std::mem::size_of::<u64>(),
+                                image_size,
+                            )
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "manual_map: DIR64 relocation target out of bounds (rva={:#x}, image={:#x})",
+                                    target_rva,
+                                    image_size
+                                )
+                            })?;
+                            let addr = image_base.add(target_range.start) as *mut u64;
+                            *addr = (*addr).wrapping_add(base_delta as u64);
                         } else if reloc_type == 3 {
                             // IMAGE_REL_BASED_HIGHLOW: 32-bit absolute VA (x86, ARM32)
-                            let addr = image_base.add(page_rva + reloc_offset) as *mut i32;
+                            let target_rva = page_rva.checked_add(reloc_offset).ok_or_else(|| {
+                                anyhow!("manual_map: relocation target RVA overflow")
+                            })?;
+                            let target_range = checked_image_range(
+                                target_rva,
+                                std::mem::size_of::<i32>(),
+                                image_size,
+                            )
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "manual_map: HIGHLOW relocation target out of bounds (rva={:#x}, image={:#x})",
+                                    target_rva,
+                                    image_size
+                                )
+                            })?;
+                            let addr = image_base.add(target_range.start) as *mut i32;
                             *addr = (*addr as isize + base_delta) as i32;
                         } else if reloc_type == 5 || reloc_type == 7 {
                             // IMAGE_REL_BASED_ARM_MOV32 (5) / IMAGE_REL_BASED_THUMB_MOV32 (7):
@@ -973,7 +1018,22 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
                             //   upper word: bits[19:16]=imm4, bit[26]=i
                             //   lower word: bits[14:12]=imm3, bits[7:0]=imm8 → imm16 = (imm4<<12)|(i<<11)|(imm3<<8)|imm8
                             let is_thumb = reloc_type == 7;
-                            let movw_ptr = image_base.add(page_rva + reloc_offset) as *mut u32;
+                            let target_rva = page_rva.checked_add(reloc_offset).ok_or_else(|| {
+                                anyhow!("manual_map: relocation target RVA overflow")
+                            })?;
+                            let target_range = checked_image_range(
+                                target_rva,
+                                std::mem::size_of::<u32>() * 2,
+                                image_size,
+                            )
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "manual_map: ARM_MOV32 relocation target out of bounds (rva={:#x}, image={:#x})",
+                                    target_rva,
+                                    image_size
+                                )
+                            })?;
+                            let movw_ptr = image_base.add(target_range.start) as *mut u32;
                             let movt_ptr = movw_ptr.add(1);
                             let movw = u32::from_le(*movw_ptr);
                             let movt = u32::from_le(*movt_ptr);
@@ -1231,6 +1291,13 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
     // Some PE images intentionally set AddressOfEntryPoint to 0.
     let entry_rva = optional_header.standard_fields.address_of_entry_point as usize;
     if entry_rva != 0 {
+        checked_image_range(entry_rva, 1, image_size).ok_or_else(|| {
+            anyhow!(
+                "manual_map: AddressOfEntryPoint {:#x} is outside mapped image size {:#x}",
+                entry_rva,
+                image_size
+            )
+        })?;
         let entry_point_addr = image_base.add(entry_rva);
         let entry_point: extern "system" fn(*mut c_void, u32, *mut c_void) -> bool =
             std::mem::transmute(entry_point_addr);
@@ -2207,10 +2274,11 @@ pub unsafe fn load_dll_in_remote_process(
     // each callback with DLL_PROCESS_ATTACH before DllMain.
     //
     // IMAGE_DIRECTORY_ENTRY_TLS = 9
-    const IMAGE_DIRECTORY_ENTRY_TLS_REMOTE: usize = 9;
+    #[cfg(target_arch = "x86_64")]
     let mut tls_callback_vas: Vec<usize> = Vec::new();
     #[cfg(target_arch = "x86_64")]
     {
+        const IMAGE_DIRECTORY_ENTRY_TLS_REMOTE: usize = 9;
         if let Some(tls_entry) =
             opt.data_directories.data_directories[IMAGE_DIRECTORY_ENTRY_TLS_REMOTE]
         {
@@ -2372,9 +2440,6 @@ pub unsafe fn load_dll_in_remote_process(
                 (0usize, 0u32, 0usize) // no .pdata
             }
         };
-
-        #[cfg(not(target_arch = "x86_64"))]
-        let (pdata_va, pdata_count, rtl_add_fn_addr) = (0usize, 0u32, 0usize);
 
         // ── Step 5b: build the combined shellcode stub ───────────────────
         // Shellcode (x86-64, position-independent):

@@ -40,7 +40,7 @@
 //! Only effective when compiled with the `cet-bypass` feature (which implies
 //! `direct-syscalls`).  Windows-only.
 
-#![cfg(all(windows, feature = "cet-bypass"))]
+#![cfg(all(windows, feature = "cet-bypass", target_arch = "x86_64"))]
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::OnceLock;

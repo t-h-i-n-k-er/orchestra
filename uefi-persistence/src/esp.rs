@@ -109,17 +109,18 @@ pub fn write_efi_driver(
     vendor: Option<&str>,
 ) -> Result<EfiDriverWriteResult> {
     // Validate the driver is a valid PE/COFF with EFI subsystem.
-    validate_efi_pe(driver_bytes)
-        .context("Driver bytes are not a valid EFI PE/COFF binary")?;
+    validate_efi_pe(driver_bytes).context("Driver bytes are not a valid EFI PE/COFF binary")?;
 
     let vendor = vendor.unwrap_or("Boot");
-    let driver_dir = PathBuf::from(esp_path)
-        .join("EFI")
-        .join(vendor);
+    let driver_dir = PathBuf::from(esp_path).join("EFI").join(vendor);
 
     // Create the directory if it doesn't exist.
-    std::fs::create_dir_all(&driver_dir)
-        .with_context(|| format!("Failed to create EFI driver directory: {}", driver_dir.display()))?;
+    std::fs::create_dir_all(&driver_dir).with_context(|| {
+        format!(
+            "Failed to create EFI driver directory: {}",
+            driver_dir.display()
+        )
+    })?;
 
     let driver_path = driver_dir.join(format!("{}.efi", driver_name));
 
@@ -214,13 +215,21 @@ pub fn validate_efi_pe(data: &[u8]) -> Result<()> {
 
     // DOS header magic: MZ.
     if data[0] != b'M' || data[1] != b'Z' {
-        bail!("Invalid DOS header magic: expected MZ, got {:02X} {:02X}", data[0], data[1]);
+        bail!(
+            "Invalid DOS header magic: expected MZ, got {:02X} {:02X}",
+            data[0],
+            data[1]
+        );
     }
 
     // PE offset (at offset 0x3C).
     let pe_offset = u32::from_le_bytes([data[0x3C], data[0x3D], data[0x3E], data[0x3F]]) as usize;
     if pe_offset + 24 > data.len() {
-        bail!("PE offset ({}) points beyond data length ({})", pe_offset, data.len());
+        bail!(
+            "PE offset ({}) points beyond data length ({})",
+            pe_offset,
+            data.len()
+        );
     }
 
     // PE signature: PE\0\0.
@@ -248,7 +257,8 @@ pub fn validate_efi_pe(data: &[u8]) -> Result<()> {
     }
 
     // Optional header size (offset 16 in COFF header).
-    let opt_header_size = u16::from_le_bytes([data[coff_offset + 16], data[coff_offset + 17]]) as usize;
+    let opt_header_size =
+        u16::from_le_bytes([data[coff_offset + 16], data[coff_offset + 17]]) as usize;
     if opt_header_size == 0 {
         bail!("No optional header present");
     }
@@ -260,7 +270,10 @@ pub fn validate_efi_pe(data: &[u8]) -> Result<()> {
     if opt_magic != 0x20B {
         // PE32+ (0x20B). PE32 (0x10B) is also valid for 32-bit EFI.
         if opt_magic != 0x10B {
-            bail!("Invalid optional header magic: 0x{:04X} (expected 0x10B or 0x20B)", opt_magic);
+            bail!(
+                "Invalid optional header magic: 0x{:04X} (expected 0x10B or 0x20B)",
+                opt_magic
+            );
         }
     }
 
@@ -454,7 +467,12 @@ fn mount_esp_linux() -> Result<EspMountResult> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("Failed to mount ESP ({}) at {}: {}", esp_device, mount_point, stderr);
+        bail!(
+            "Failed to mount ESP ({}) at {}: {}",
+            esp_device,
+            mount_point,
+            stderr
+        );
     }
 
     let bootloader = detect_bootloader(mount_point);
@@ -570,9 +588,10 @@ fn mount_esp_windows() -> Result<EspMountResult> {
 // ─── Boot kit installation helpers ──────────────────────────────────────
 
 fn backup_bootloader_config(esp_path: &str, bootloader_type: BootloaderType) -> Result<String> {
-    let backup_dir = PathBuf::from(esp_path).join("EFI").join(".orchestra-backup");
-    std::fs::create_dir_all(&backup_dir)
-        .context("Failed to create backup directory")?;
+    let backup_dir = PathBuf::from(esp_path)
+        .join("EFI")
+        .join(".orchestra-backup");
+    std::fs::create_dir_all(&backup_dir).context("Failed to create backup directory")?;
 
     let backup_path = match bootloader_type {
         BootloaderType::WindowsBcd => {
@@ -597,7 +616,10 @@ fn backup_bootloader_config(esp_path: &str, bootloader_type: BootloaderType) -> 
                     return Ok(dst.to_string_lossy().to_string());
                 }
             }
-            backup_dir.join("grub.cfg.none").to_string_lossy().to_string()
+            backup_dir
+                .join("grub.cfg.none")
+                .to_string_lossy()
+                .to_string()
         }
         BootloaderType::SystemdBoot => {
             let src = PathBuf::from(esp_path).join("loader/loader.conf");
@@ -620,7 +642,13 @@ fn install_windows_bootkit(esp_path: &str, config: &BootKitConfig) -> Result<()>
 
     // Use bcdedit to create a new boot entry.
     let output = std::process::Command::new("bcdedit")
-        .args(["/create", "/d", "Windows Boot Manager", "/application", "osloader"])
+        .args([
+            "/create",
+            "/d",
+            "Windows Boot Manager",
+            "/application",
+            "osloader",
+        ])
         .output()
         .context("Failed to execute bcdedit")?;
 
@@ -670,7 +698,10 @@ fn install_windows_bootkit(esp_path: &str, config: &BootKitConfig) -> Result<()>
 
 fn install_grub_bootkit(esp_path: &str, config: &BootKitConfig) -> Result<()> {
     // Add a chainloader entry to GRUB's config.
-    let driver_path = format!("(hd0,gpt1)/EFI/{}/{}.efi", config.vendor_name, config.driver_name);
+    let driver_path = format!(
+        "(hd0,gpt1)/EFI/{}/{}.efi",
+        config.vendor_name, config.driver_name
+    );
 
     // Find the grub.cfg.
     let mut grub_cfg = None;
@@ -701,8 +732,7 @@ fn install_grub_bootkit(esp_path: &str, config: &BootKitConfig) -> Result<()> {
 fn install_systemd_boot_kit(esp_path: &str, config: &BootKitConfig) -> Result<()> {
     // Add a loader entry for systemd-boot.
     let entries_dir = PathBuf::from(esp_path).join("loader/entries");
-    std::fs::create_dir_all(&entries_dir)
-        .context("Failed to create loader entries directory")?;
+    std::fs::create_dir_all(&entries_dir).context("Failed to create loader entries directory")?;
 
     let entry_path = entries_dir.join(format!("{}.conf", config.driver_name));
     let driver_efi_path = format!("\\EFI\\{}\\{}.efi", config.vendor_name, config.driver_name);
@@ -718,8 +748,8 @@ fn install_systemd_boot_kit(esp_path: &str, config: &BootKitConfig) -> Result<()
     // Ensure our entry is first in the loader.conf default.
     let loader_conf_path = PathBuf::from(esp_path).join("loader/loader.conf");
     if loader_conf_path.exists() {
-        let mut conf = std::fs::read_to_string(&loader_conf_path)
-            .context("Failed to read loader.conf")?;
+        let mut conf =
+            std::fs::read_to_string(&loader_conf_path).context("Failed to read loader.conf")?;
         // Update or add the default entry.
         if conf.contains("default ") {
             conf = conf
@@ -755,8 +785,7 @@ fn install_refind_bootkit(esp_path: &str, config: &BootKitConfig) -> Result<()> 
         config.driver_name, driver_path
     );
 
-    let mut conf = std::fs::read_to_string(&refind_conf)
-        .context("Failed to read refind.conf")?;
+    let mut conf = std::fs::read_to_string(&refind_conf).context("Failed to read refind.conf")?;
     conf.push_str(&stanza);
     std::fs::write(&refind_conf, conf).context("Failed to write refind.conf")?;
 

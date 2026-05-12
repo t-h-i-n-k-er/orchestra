@@ -20,11 +20,11 @@ This guide walks you through deploying the Orchestra C2 server and agent on a
 | Rust toolchain (nightly or stable) | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
 | `openssl` CLI | `sudo apt install openssl` (certificate generation only) |
 | `pkg-config` | Optional for host packages that need it; default TLS builds use Rustls/ring and do not require `libssl-dev` |
-| X11 dev libraries (for `remote-assist`) | `sudo apt install libx11-dev libxrandr-dev libxext-dev` |
+| X11 session (for `remote-assist`) | No X11 development headers are required; X11 capture uses pure-Rust `x11rb` |
 | `libclang` (for `zbus` bindgen, Wayland screenshot) | `sudo apt install libclang-dev` |
 
-> **Tip:** If you only want basic commands (no screenshots), skip the X11/libclang
-> packages and omit `--features remote-assist` from the build commands.
+> **Tip:** If you only want basic commands (no screenshots), skip the optional
+> screenshot prerequisites and omit `--features remote-assist` from the build commands.
 
 ---
 
@@ -368,7 +368,7 @@ touch ~/.orchestra-consent
 The agent tries backends in this order:
 
 1. **Wayland** (if `$WAYLAND_DISPLAY` is set) → XDG Desktop Portal via D-Bus
-2. **X11** (if `$DISPLAY` is set) → `x11cap` crate captures the root window
+2. **X11** (if `$DISPLAY` is set) → `x11rb` crate captures the root window
 3. **Framebuffer** (`/dev/fb0`) → raw framebuffer read (headless / VT)
 
 For a standard Ubuntu desktop with X11, the X11 path will be used automatically.

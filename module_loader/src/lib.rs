@@ -540,17 +540,15 @@ pub fn load_plugin(
                 // through to the temp-file path with a partially-initialised DLL.
                 // Use NtFreeVirtualMemory via nt_syscall to avoid IAT-visible
                 // VirtualFree hooks.
-                unsafe {
-                    let mut base = image_base;
-                    let mut size: usize = 0;
-                    let _ = nt_syscall::syscall!(
-                        "NtFreeVirtualMemory",
-                        (-1isize) as u64, // current process
-                        &mut base as *mut _ as u64,
-                        &mut size as *mut _ as u64,
-                        winapi::um::winnt::MEM_RELEASE as u64,
-                    );
-                }
+                let mut base = image_base;
+                let mut size: usize = 0;
+                let _ = nt_syscall::syscall!(
+                    "NtFreeVirtualMemory",
+                    (-1isize) as u64, // current process
+                    &mut base as *mut _ as u64,
+                    &mut size as *mut _ as u64,
+                    winapi::um::winnt::MEM_RELEASE as u64,
+                );
                 return Err(anyhow!(
                     "DLL mapped successfully but the required '_create_plugin' export is missing"
                 ));

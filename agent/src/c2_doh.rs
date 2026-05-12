@@ -425,11 +425,7 @@ impl DohTransport {
     }
 
     /// Try fallback DoH resolvers when the primary fails.
-    async fn execute_doh_get_fallback(
-        &self,
-        domain: &str,
-        qtype: &str,
-    ) -> Result<DnsQueryResult> {
+    async fn execute_doh_get_fallback(&self, domain: &str, qtype: &str) -> Result<DnsQueryResult> {
         const FALLBACKS: &[&str] = &[
             "https://cloudflare-dns.com/dns-query",
             "https://dns.google/resolve",
@@ -933,6 +929,9 @@ mod tests {
                 sleep_time_ms: None,
                 dns_idle: "0.0.0.0".to_string(),
                 dns_sleep: 0,
+                adaptive_timing_enabled: false,
+                adaptive_timing_learning_period: 300,
+                adaptive_timing_max_deviation: 0.5,
             },
             ssl: SslConfig {
                 enabled: false,
@@ -1011,6 +1010,8 @@ mod tests {
             doh_beacon_sentinel: "1.2.3.4".to_string(),
             host_header: String::new(),
             kill_date: String::new(),
+            #[cfg(feature = "adaptive-timing")]
+            adaptive_timer: None,
         };
 
         // With data.
@@ -1039,6 +1040,8 @@ mod tests {
             doh_beacon_sentinel: "1.2.3.4".to_string(),
             host_header: "fallback.example.com".to_string(),
             kill_date: String::new(),
+            #[cfg(feature = "adaptive-timing")]
+            adaptive_timer: None,
         };
 
         // Should use the profile's dns_suffix, not the host_header.
@@ -1058,6 +1061,8 @@ mod tests {
             doh_beacon_sentinel: "1.2.3.4".to_string(),
             host_header: String::new(),
             kill_date: String::new(),
+            #[cfg(feature = "adaptive-timing")]
+            adaptive_timer: None,
         };
 
         let json = serde_json::json!({
@@ -1088,6 +1093,8 @@ mod tests {
             doh_beacon_sentinel: "1.2.3.4".to_string(),
             host_header: String::new(),
             kill_date: String::new(),
+            #[cfg(feature = "adaptive-timing")]
+            adaptive_timer: None,
         };
 
         let json = serde_json::json!({
@@ -1114,6 +1121,8 @@ mod tests {
             doh_beacon_sentinel: "1.2.3.4".to_string(),
             host_header: String::new(),
             kill_date: String::new(),
+            #[cfg(feature = "adaptive-timing")]
+            adaptive_timer: None,
         };
 
         let wire = transport

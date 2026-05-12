@@ -174,13 +174,11 @@ pub fn get_kernel_base() -> Result<u64> {
 
 /// Translate a kernel virtual address to a physical address.
 ///
-/// Delegates to the shared 4-level x64 page-table walk in
-/// `super::translate_va_to_pa()`.  The MmPteBase shortcut
-/// (`0xFFFFF68000000000`) was previously used here as a fast path,
-/// but it only works when the driver handles VA→PA internally.  The
-/// full page-table walk is correct for all driver types.
+/// Delegates to the shared page-table walk in `super::translate_va_to_pa()`.
+/// On x86-64 this is a 4-level PML4 walk; on ARM64 it is a 4-level
+/// VMSAv8-A translation table walk.
 ///
-/// # MmPteBase fast-path (kept for reference)
+/// # MmPteBase fast-path (kept for reference, x86-64 only)
 ///
 /// On Windows 10/11 x64, `MmPteBase = 0xFFFFF680_00000000`.
 /// PTE VA = MmPteBase + ((VA >> 9) & 0x7FFFFFFFF8).

