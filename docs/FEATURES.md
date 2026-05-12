@@ -63,8 +63,10 @@ profile `features = [...]` list. They are not separate fields in the current
 
 | Cargo feature | Description |
 |---------------|-------------|
+| `adcs-attacks` | Active Directory Certificate Services attack modules (ESC1-ESC8 enumeration and exploitation) |
 | `etw-check` | Pre-injection ETW auto-logger enumeration via registry APIs |
 | `thread-ctx-encrypt` | Encrypt thread CONTEXT, stack pointer, and TLS data during sleep obfuscation |
+| `container-escape` | Linux container escape, cloud metadata credential theft, and cloud IAM pivoting |
 | `phantom-dll-hollow` | Section-backed phantom DLL hollowing; implies `direct-syscalls` |
 | `seh-anti-debug` | SEH/VEH anti-debugging and anti-trace strategies |
 | `kerberos-relay` | Kerberos relay through COM cross-session activation |
@@ -74,11 +76,20 @@ profile `features = [...]` list. They are not separate fields in the current
 | `lolbin-xwizard` | COM scriptlet execution through xwizard.exe and fallback LOLBINs |
 | `wsl2-evasion` | WSL2 execution, relay, and graceful degradation helpers |
 | `com-hijack` | Registry-free COM hijack through activation contexts |
+| `entra-app-abuse` | Entra ID OAuth application abuse and persistent Graph API app access |
+| `entra-attacks` | Entra ID credential attack modules (PRT theft, token abuse, cloud privilege operations) |
 | `vss-pivot` | Volume Shadow Copy access for locked files such as SAM, SYSTEM, and NTDS.dit |
 | `office-addin` | Office add-in persistence through OneDrive-synced add-in paths |
 | `wmi-persistence` | COM-based WMI permanent event subscriptions |
 | `uefi-persistence` | UEFI NVRAM/ESP persistence support through the workspace UEFI crate |
 | `ebpf` | Linux eBPF process/file/network hiding; implies `direct-syscalls` |
+| `graph-transport` | Microsoft Graph API covert C2 transport |
+| `hardware-persistence` | Hardware/firmware persistence and DMA-oriented tradecraft modules |
+| `lpe` | Local privilege escalation modules |
+| `macos-postexp` | macOS post-exploitation modules (TCC/SIP/XPC/Keychain workflows) |
+| `pac-bypass` | ARM64 BTI/PAC bypass support |
+| `quic-transport` | QUIC/HTTP3 C2 transport |
+| `recon` | Automated internal reconnaissance and attack-path discovery modules |
 | `trampoline-spoof` | Multi-frame trampoline stack spoofing; implies `direct-syscalls` |
 | `cfg-bypass` | Control Flow Guard bypass strategies; implies `direct-syscalls` |
 | `adaptive-timing` | Learned callback timing model that degrades to standard jitter |
@@ -862,7 +873,7 @@ multiple levels of consent.
 - **Windows**: Specific registry key must be set
 
 **Screen capture:**
-- Linux: X11 via `x11cap` crate
+- Linux: X11 via `x11rb` crate
 - macOS: `screencapture` CLI with PNG validation
 - Windows: Returns unsupported error (input simulation works)
 

