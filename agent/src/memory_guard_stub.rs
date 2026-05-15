@@ -26,8 +26,8 @@
 
 #![cfg(not(feature = "memory-guard"))]
 
-use common::lock::MutexExt;
 use anyhow::Result;
+use common::lock::MutexExt;
 use std::ptr;
 use std::sync::Mutex;
 
@@ -302,7 +302,7 @@ pub fn init_schemes(_schemes: Vec<common::config::SleepScheme>, _rotation_interv
 ///
 /// `ptr` must point to at least `len` readable bytes.
 unsafe fn simple_hash(ptr: *mut u8, len: usize) -> [u8; 32] {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let slice = std::slice::from_raw_parts(ptr, len);
     let mut hasher = Sha256::new();
     hasher.update(slice);

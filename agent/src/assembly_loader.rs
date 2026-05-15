@@ -55,14 +55,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use once_cell::sync::Lazy;
+use crate::win_types::HANDLE;
+use crate::win_types::SECURITY_ATTRIBUTES;
+use crate::win_types::S_OK;
 use crate::win_types::{CLSID, REFIID};
 use crate::win_types::{DWORD, HMODULE, LPDWORD, LPVOID, ULONG};
 use crate::win_types::{HRESULT, LPCWSTR, LPWSTR};
-use crate::win_types::S_OK;
-use crate::win_types::SECURITY_ATTRIBUTES;
+use once_cell::sync::Lazy;
 use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
-use crate::win_types::HANDLE;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -1050,7 +1050,8 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
             loop {
                 let mut fetched: ULONG = 0;
                 let mut item: LPVOID = std::ptr::null_mut();
-                let hr = ((*enumerator2.vtable).next)(enum_ptr2 as *mut _, 1, &mut item, &mut fetched);
+                let hr =
+                    ((*enumerator2.vtable).next)(enum_ptr2 as *mut _, 1, &mut item, &mut fetched);
                 if hr != S_OK || fetched == 0 {
                     break;
                 }

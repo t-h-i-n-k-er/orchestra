@@ -111,16 +111,10 @@ pub enum CertSource {
     /// DER-encoded X.509 certificate + DER-encoded PKCS#8 or PKCS#1 RSA
     /// private key.  The key must be an RSA key (2048-bit minimum) — EC keys
     /// are not supported by this module (ring limitation for RS256).
-    Der {
-        cert_der: Vec<u8>,
-        key_der: Vec<u8>,
-    },
+    Der { cert_der: Vec<u8>, key_der: Vec<u8> },
     /// PEM-encoded certificate + PEM-encoded RSA private key.  The module
     /// strips PEM armour and base64-decodes the body at construction time.
-    Pem {
-        cert_pem: String,
-        key_pem: String,
-    },
+    Pem { cert_pem: String, key_pem: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -200,7 +194,12 @@ fn build_and_sign_jwt(
     let signing_input = format!("{header_b64}.{claims_b64}");
     let mut signature = vec![0u8; key_pair.public().modulus_len()];
     key_pair
-        .sign(&RSA_PKCS1_SHA256, &rng, signing_input.as_bytes(), &mut signature)
+        .sign(
+            &RSA_PKCS1_SHA256,
+            &rng,
+            signing_input.as_bytes(),
+            &mut signature,
+        )
         .map_err(|e| anyhow!("RSA PKCS#1 SHA-256 signing failed: {e:?}"))?;
 
     let sig_b64 = URL_SAFE_NO_PAD.encode(&signature);
@@ -216,9 +215,7 @@ fn build_and_sign_jwt(
 fn pem_to_der(pem: &str) -> Result<Vec<u8>> {
     let stripped = pem
         .lines()
-        .filter(|line| {
-            !line.starts_with("-----BEGIN") && !line.starts_with("-----END")
-        })
+        .filter(|line| !line.starts_with("-----BEGIN") && !line.starts_with("-----END"))
         .collect::<String>();
     base64::engine::general_purpose::STANDARD
         .decode(stripped.trim())
@@ -467,8 +464,7 @@ impl EntraPtcClientBuilder {
         // Build reqwest client with optional proxy.
         let mut http_builder = reqwest::Client::builder();
         if let Some(ref proxy) = self.http_proxy {
-            let proxy = reqwest::Proxy::all(proxy)
-                .context("invalid proxy URL")?;
+            let proxy = reqwest::Proxy::all(proxy).context("invalid proxy URL")?;
             http_builder = http_builder.proxy(proxy);
         }
         let http_client = http_builder
@@ -554,7 +550,10 @@ impl EntraPtcClient {
         let params = [
             ("grant_type", "client_credentials"),
             ("client_id", &self.client_id),
-            ("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+            (
+                "client_assertion_type",
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            ),
             ("client_assertion", &assertion),
             ("scope", &scope_str),
         ];
@@ -571,11 +570,7 @@ impl EntraPtcClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            bail!(
-                "Entra ID token request failed: HTTP {} — {}",
-                status,
-                body
-            );
+            bail!("Entra ID token request failed: HTTP {} — {}", status, body);
         }
 
         let token_response: TokenResponse = resp
@@ -678,7 +673,10 @@ impl EntraPtcClient {
             query.push(("$filter", filter_val.as_str()));
         }
         query.push(("$top", "999"));
-        query.push(("$select", "id,userPrincipalName,displayName,mail,jobTitle,department,accountEnabled"));
+        query.push((
+            "$select",
+            "id,userPrincipalName,displayName,mail,jobTitle,department,accountEnabled",
+        ));
 
         self.query_graph_api(access_token, "/v1.0/users", Some(&query))
             .await
@@ -697,7 +695,10 @@ impl EntraPtcClient {
             query.push(("$filter", filter_val.as_str()));
         }
         query.push(("$top", "999"));
-        query.push(("$select", "id,displayName,description,mail,securityEnabled,mailEnabled"));
+        query.push((
+            "$select",
+            "id,displayName,description,mail,securityEnabled,mailEnabled",
+        ));
 
         self.query_graph_api(access_token, "/v1.0/groups", Some(&query))
             .await
@@ -716,7 +717,10 @@ impl EntraPtcClient {
             query.push(("$filter", filter_val.as_str()));
         }
         query.push(("$top", "999"));
-        query.push(("$select", "id,appId,displayName,publisherDomain,signInAudience"));
+        query.push((
+            "$select",
+            "id,appId,displayName,publisherDomain,signInAudience",
+        ));
 
         self.query_graph_api(access_token, "/v1.0/applications", Some(&query))
             .await
@@ -735,7 +739,10 @@ impl EntraPtcClient {
             query.push(("$filter", filter_val.as_str()));
         }
         query.push(("$top", "999"));
-        query.push(("$select", "id,appId,displayName,servicePrincipalType,accountEnabled"));
+        query.push((
+            "$select",
+            "id,appId,displayName,servicePrincipalType,accountEnabled",
+        ));
 
         self.query_graph_api(access_token, "/v1.0/servicePrincipals", Some(&query))
             .await
@@ -746,9 +753,8 @@ impl EntraPtcClient {
         &self,
         access_token: &str,
     ) -> Result<GraphListResponse<GraphDirectoryRole>> {
-        let query: Vec<(&str, &str)> = vec![
-            ("$select", "id,displayName,description,roleTemplateId"),
-        ];
+        let query: Vec<(&str, &str)> =
+            vec![("$select", "id,displayName,description,roleTemplateId")];
         self.query_graph_api(access_token, "/v1.0/directoryRoles", Some(&query))
             .await
     }
@@ -924,9 +930,7 @@ mod tests {
         let err = res.unwrap_err().to_string();
         assert!(err.contains("tenant_id"), "error should mention tenant_id");
 
-        let res = EntraPtcClient::builder()
-            .tenant_id("test")
-            .build();
+        let res = EntraPtcClient::builder().tenant_id("test").build();
         assert!(res.is_err());
         let err = res.unwrap_err().to_string();
         assert!(err.contains("client_id"), "error should mention client_id");
@@ -937,7 +941,10 @@ mod tests {
             .build();
         assert!(res.is_err());
         let err = res.unwrap_err().to_string();
-        assert!(err.contains("cert_source"), "error should mention cert_source");
+        assert!(
+            err.contains("cert_source"),
+            "error should mention cert_source"
+        );
     }
 
     #[test]
@@ -976,7 +983,10 @@ mod tests {
         let resp: GraphListResponse<GraphUser> = serde_json::from_str(json).unwrap();
         assert_eq!(resp.value.len(), 1);
         assert_eq!(resp.value[0].display_name.as_deref(), Some("Alice"));
-        assert_eq!(resp.value[0].user_principal_name.as_deref(), Some("alice@contoso.com"));
+        assert_eq!(
+            resp.value[0].user_principal_name.as_deref(),
+            Some("alice@contoso.com")
+        );
     }
 
     #[test]
@@ -996,8 +1006,14 @@ mod tests {
 
     #[test]
     fn test_cloud_display() {
-        assert_eq!(format!("{}", CloudEnvironment::Commercial), "AzureCommercial");
-        assert_eq!(format!("{}", CloudEnvironment::Government), "AzureGovernment");
+        assert_eq!(
+            format!("{}", CloudEnvironment::Commercial),
+            "AzureCommercial"
+        );
+        assert_eq!(
+            format!("{}", CloudEnvironment::Government),
+            "AzureGovernment"
+        );
     }
 
     // Integration tests (require network access + valid credentials) are

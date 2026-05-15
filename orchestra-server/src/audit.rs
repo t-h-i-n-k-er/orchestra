@@ -106,7 +106,10 @@ impl AuditLog {
                     .mode(0o600) // owner read/write only
                     .open(key_path)
                     .map_err(|e| {
-                        anyhow::anyhow!("failed to create audit key file {}: {e}", key_path.display())
+                        anyhow::anyhow!(
+                            "failed to create audit key file {}: {e}",
+                            key_path.display()
+                        )
                     })?;
                 write!(f, "{b64}\n")?;
             }
@@ -117,7 +120,10 @@ impl AuditLog {
                     .write(true)
                     .open(key_path)
                     .map_err(|e| {
-                        anyhow::anyhow!("failed to create audit key file {}: {e}", key_path.display())
+                        anyhow::anyhow!(
+                            "failed to create audit key file {}: {e}",
+                            key_path.display()
+                        )
                     })?;
                 write!(f, "{b64}\n")?;
             }

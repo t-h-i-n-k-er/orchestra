@@ -50,7 +50,11 @@ fn cert_fingerprint(pem_bytes: &[u8]) -> Option<String> {
     )
 }
 
-pub async fn build(cert: Option<&Path>, key: Option<&Path>, dev_mode: bool) -> Result<RustlsConfig> {
+pub async fn build(
+    cert: Option<&Path>,
+    key: Option<&Path>,
+    dev_mode: bool,
+) -> Result<RustlsConfig> {
     match (cert, key) {
         (Some(c), Some(k)) => {
             let pem_bytes = std::fs::read(c)
@@ -94,7 +98,8 @@ pub async fn build(cert: Option<&Path>, key: Option<&Path>, dev_mode: bool) -> R
             ])
             .map_err(|e| anyhow::anyhow!("rcgen params failed: {e}"))?;
             params.is_ca = rcgen::IsCa::NoCa;
-            let cert = params.self_signed(&key_pair)
+            let cert = params
+                .self_signed(&key_pair)
                 .map_err(|e| anyhow::anyhow!("rcgen self-signed cert failed: {e}"))?;
             let pem_cert = cert.pem();
             if let Some(fp) = cert_fingerprint(pem_cert.as_bytes()) {

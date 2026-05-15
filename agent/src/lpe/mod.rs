@@ -31,8 +31,8 @@ pub mod named_pipe_impersonate;
 pub mod print_spooler;
 pub mod token_impersonate;
 
-use anyhow::{anyhow, Context, Result};
 use crate::win_types::HANDLE;
+use anyhow::{anyhow, Context, Result};
 
 // ── Result types ───────────────────────────────────────────────────────────
 
@@ -265,8 +265,7 @@ pub fn elevate_to_system() -> Result<String> {
 
     Ok(format!(
         "Elevated to SYSTEM via {} (token={:#x})",
-        result.method,
-        result.system_token as usize
+        result.method, result.system_token as usize
     ))
 }
 
@@ -334,21 +333,13 @@ pub fn check_prerequisites() -> Vec<(String, bool, String)> {
         }
         Err(e) => (false, format!("error: {e:#}")),
     };
-    results.push((
-        "token_impersonation".to_string(),
-        token_ok,
-        token_msg,
-    ));
+    results.push(("token_impersonation".to_string(), token_ok, token_msg));
 
     // Check named pipe impersonation prerequisites.
     // We need SeImpersonatePrivilege and the ability to create named pipes.
     let pipe_msg = "requires SeImpersonatePrivilege".to_string();
     let pipe_ok = token_ok; // Rough check — if we have elevated privs, pipe impersonation may work.
-    results.push((
-        "named_pipe_impersonation".to_string(),
-        pipe_ok,
-        pipe_msg,
-    ));
+    results.push(("named_pipe_impersonation".to_string(), pipe_ok, pipe_msg));
 
     // Check Print Spooler prerequisites.
     let (spooler_ok, spooler_msg) = match print_spooler::check_spooler_vulnerability() {
@@ -356,16 +347,15 @@ pub fn check_prerequisites() -> Vec<(String, bool, String)> {
             if vulnerable {
                 (true, "Print Spooler is running and accessible".to_string())
             } else {
-                (false, "Print Spooler is not running or not accessible".to_string())
+                (
+                    false,
+                    "Print Spooler is not running or not accessible".to_string(),
+                )
             }
         }
         Err(e) => (false, format!("error: {e:#}")),
     };
-    results.push((
-        "print_spooler".to_string(),
-        spooler_ok,
-        spooler_msg,
-    ));
+    results.push(("print_spooler".to_string(), spooler_ok, spooler_msg));
 
     results
 }
@@ -376,11 +366,7 @@ mod tests {
 
     #[test]
     fn lpe_result_success() {
-        let result = LpeResult::success(
-            "test_method",
-            0x1234 as HANDLE,
-            0x5678 as HANDLE,
-        );
+        let result = LpeResult::success("test_method", 0x1234 as HANDLE, 0x5678 as HANDLE);
         assert_eq!(result.method, "test_method");
         assert_eq!(result.system_token as usize, 0x1234);
         assert_eq!(result.original_token as usize, 0x5678);

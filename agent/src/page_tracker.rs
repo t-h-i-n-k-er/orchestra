@@ -151,7 +151,10 @@ fn query_page_size() -> usize {
                 tracing::info!("evanesco: system page size = {} bytes", sz);
                 sz
             } else {
-                tracing::warn!("evanesco: GetSystemInfo returned invalid page size {}, defaulting to 4096", sz);
+                tracing::warn!(
+                    "evanesco: GetSystemInfo returned invalid page size {}, defaulting to 4096",
+                    sz
+                );
                 4096
             }
         }
@@ -167,12 +170,16 @@ fn query_page_size() -> usize {
 /// For 4 KB pages this returns `!0xFFF = 0xFFFFF000`.
 /// For 16 KB pages this returns `!0x3FFF = 0xFFFFC000`.
 fn page_mask() -> usize {
-    *PAGE_MASK.get().expect("evanesco: page_mask() called before init()")
+    *PAGE_MASK
+        .get()
+        .expect("evanesco: page_mask() called before init()")
 }
 
 /// Return the system page size.
 fn page_size() -> usize {
-    *PAGE_SIZE.get().expect("evanesco: page_size() called before init()")
+    *PAGE_SIZE
+        .get()
+        .expect("evanesco: page_size() called before init()")
 }
 
 // ── XChaCha20-Poly1305 constants ─────────────────────────────────────────────
@@ -807,7 +814,11 @@ fn register_veh(inner: &Arc<PageTrackerInner>) -> Result<()> {
     // Dynamic resolution — no IAT entry for AddVectoredExceptionHandler.
     type FnAddVEH = unsafe extern "system" fn(
         u32,
-        Option<unsafe extern "system" fn(*mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) -> i32>,
+        Option<
+            unsafe extern "system" fn(
+                *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+            ) -> i32,
+        >,
     ) -> *mut std::ffi::c_void;
 
     let add_veh: FnAddVEH = (|| unsafe {

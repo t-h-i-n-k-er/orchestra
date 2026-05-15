@@ -11,8 +11,8 @@
 
 #![cfg(feature = "hci-research")]
 
-use common::lock::MutexExt;
 use chrono::Utc;
+use common::lock::MutexExt;
 use once_cell::sync::Lazy;
 use serde::Serialize;
 use std::collections::VecDeque;

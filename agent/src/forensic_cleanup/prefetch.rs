@@ -1740,7 +1740,9 @@ pub fn shutdown() {
                 drop(saved);
                 match unsafe { restore_prefetch_service(old_val) } {
                     Ok(()) => tracing::info!("prefetch: restored Prefetch service on shutdown"),
-                    Err(e) => tracing::warn!("prefetch: failed to restore service on shutdown: {}", e),
+                    Err(e) => {
+                        tracing::warn!("prefetch: failed to restore service on shutdown: {}", e)
+                    }
                 }
             }
         }

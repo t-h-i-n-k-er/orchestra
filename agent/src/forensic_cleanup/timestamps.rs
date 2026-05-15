@@ -1682,7 +1682,9 @@ pub unsafe fn timestomp_file(file_path: &[u16], reference_path: &[u16]) -> Resul
                 }
             }
         } else {
-            tracing::warn!("timestamps: could not open volume handle for $FN patching and USN cleanup");
+            tracing::warn!(
+                "timestamps: could not open volume handle for $FN patching and USN cleanup"
+            );
         }
     }
 

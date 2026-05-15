@@ -320,7 +320,10 @@ pub unsafe fn get_module_handle_by_hash(target_hash: u32) -> Option<usize> {
             }
             let name_bytes = core::slice::from_raw_parts(entry.l_name, len);
             // Use the basename (last path component) for hashing.
-            let basename = name_bytes.split(|&b| b == b'/').last().unwrap_or(name_bytes);
+            let basename = name_bytes
+                .split(|&b| b == b'/')
+                .last()
+                .unwrap_or(name_bytes);
             if !basename.is_empty() && hash_str(basename) == target_hash {
                 return Some(entry.l_addr);
             }
@@ -481,7 +484,10 @@ pub unsafe fn get_module_handle_by_hash(target_hash: u32) -> Option<usize> {
             len += 1;
         }
         let name_bytes = core::slice::from_raw_parts(name_ptr, len);
-        let basename = name_bytes.split(|&b| b == b'/').last().unwrap_or(name_bytes);
+        let basename = name_bytes
+            .split(|&b| b == b'/')
+            .last()
+            .unwrap_or(name_bytes);
         if !basename.is_empty() && hash_str(basename) == target_hash {
             let header = _dyld_get_image_header(i);
             if !header.is_null() {
@@ -965,8 +971,8 @@ mod tests {
     fn hash_wstr_non_ascii_preserves_all_bits() {
         // Non-ASCII u16 values should hash differently from just the low byte.
         let wide: Vec<u16> = vec![0x0100]; // Ā (Latin A with macron)
-        // Non-ASCII should produce a different hash than ASCII low byte only.
-        // hash_wstr processes non-ASCII as two separate steps (lo, hi).
+                                           // Non-ASCII should produce a different hash than ASCII low byte only.
+                                           // hash_wstr processes non-ASCII as two separate steps (lo, hi).
         let ascii_lo_only: Vec<u16> = vec![0x00]; // just byte 0x00
         let h_non_ascii = hash_wstr(&wide);
         let h_ascii_lo = hash_wstr(&ascii_lo_only);

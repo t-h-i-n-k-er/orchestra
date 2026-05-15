@@ -62,8 +62,7 @@ pub const C2_PSK_DERIVATION: &[u8] =
 /// encrypting register states (CONTEXT structs), stack pointers, and TLS
 /// data during sleep obfuscation.  Domain-separated from the region-encryption
 /// key so that a compromised per-region key does not leak thread contexts.
-pub const THREAD_CTX: &[u8] =
-    b"\x0d\x47\xb2\x8e\xc1\xf6\xa3\xd5\x72\xe9\x0b\x54\x8c\x3a\x6f\xd1";
+pub const THREAD_CTX: &[u8] = b"\x0d\x47\xb2\x8e\xc1\xf6\xa3\xd5\x72\xe9\x0b\x54\x8c\x3a\x6f\xd1";
 
 /// Trampoline-based stack spoofing — domain separation for the per-chain
 /// randomisation seed that determines which gadget sequence and frame layout

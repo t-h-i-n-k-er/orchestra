@@ -144,7 +144,9 @@ impl FakeAgent {
         let mut buf = vec![0u8; len as usize];
         self.r.read_exact(&mut buf).await.unwrap();
         let plain = self.session.decrypt(&buf).unwrap();
-        bincode::serde::decode_from_slice(&plain, bincode::config::legacy()).map(|(v, _)| v).unwrap()
+        bincode::serde::decode_from_slice(&plain, bincode::config::legacy())
+            .map(|(v, _)| v)
+            .unwrap()
     }
 
     async fn recv_operator_task(&mut self) -> (String, Command, Option<String>) {

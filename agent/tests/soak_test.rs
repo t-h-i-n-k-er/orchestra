@@ -159,7 +159,10 @@ async fn soak_handler_dispatch() {
     let mut iterations: u64 = 0;
 
     let commands = soak_commands();
-    eprintln!("soak: dispatching {} command variants per iteration", commands.len());
+    eprintln!(
+        "soak: dispatching {} command variants per iteration",
+        commands.len()
+    );
 
     let work = async {
         while started.elapsed() < test_duration {
@@ -212,7 +215,10 @@ async fn soak_handler_dispatch() {
 #[test]
 fn soak_commands_serde_roundtrip() {
     let commands = soak_commands();
-    assert!(commands.len() > 20, "soak command list should cover many variants");
+    assert!(
+        commands.len() > 20,
+        "soak command list should cover many variants"
+    );
 
     for cmd in &commands {
         let json = serde_json::to_string(cmd).expect("serialize soak command");

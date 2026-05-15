@@ -400,11 +400,7 @@ unsafe fn decrypt_elf64_sections(base: usize, key: &[u8; 32], nonce: &[u8; 12]) 
 
         // Read the 16-byte Poly1305 tag from the end of the section.
         let mut supplied_tag = [0u8; 16];
-        core::ptr::copy_nonoverlapping(
-            section_ptr.add(ct_size),
-            supplied_tag.as_mut_ptr(),
-            16,
-        );
+        core::ptr::copy_nonoverlapping(section_ptr.add(ct_size), supplied_tag.as_mut_ptr(), 16);
 
         let ciphertext = core::slice::from_raw_parts(section_ptr as *const u8, ct_size);
 
@@ -427,10 +423,7 @@ unsafe fn decrypt_elf64_sections(base: usize, key: &[u8; 32], nonce: &[u8; 12]) 
             libc::PROT_READ | libc::PROT_WRITE,
         );
 
-        tracing::debug!(
-            "decrypt_payload: ELF .data decrypted ({} bytes)",
-            ct_size
-        );
+        tracing::debug!("decrypt_payload: ELF .data decrypted ({} bytes)", ct_size);
         break;
     }
 }
@@ -663,7 +656,8 @@ unsafe fn decrypt_macho64_sections(base: usize, key: &[u8; 32], nonce: &[u8; 12]
         if cmd == 0x19 {
             // LC_SEGMENT_64
             let segname = core::slice::from_raw_parts((base + offset + 8) as *const u8, 16);
-            let is_data = segname.starts_with(b"__DATA\0") || segname.starts_with(b"__DATA\0\0\0\0\0\0\0\0\0\0");
+            let is_data = segname.starts_with(b"__DATA\0")
+                || segname.starts_with(b"__DATA\0\0\0\0\0\0\0\0\0\0");
 
             if is_data {
                 let nsects = u32::from_le_bytes(
@@ -690,25 +684,18 @@ unsafe fn decrypt_macho64_sections(base: usize, key: &[u8; 32], nonce: &[u8; 12]
                     //   offset:    +0x30 (4 bytes)
                     //   align:     +0x34 (4 bytes)
                     //   ...
-                    let sectname =
-                        core::slice::from_raw_parts((base + sect_off) as *const u8, 16);
+                    let sectname = core::slice::from_raw_parts((base + sect_off) as *const u8, 16);
 
                     if sectname.starts_with(b"__data\0") {
                         let sect_addr = u64::from_le_bytes(
-                            core::slice::from_raw_parts(
-                                (base + sect_off + 0x20) as *const u8,
-                                8,
-                            )
-                            .try_into()
-                            .unwrap(),
+                            core::slice::from_raw_parts((base + sect_off + 0x20) as *const u8, 8)
+                                .try_into()
+                                .unwrap(),
                         ) as usize;
                         let sect_size = u64::from_le_bytes(
-                            core::slice::from_raw_parts(
-                                (base + sect_off + 0x28) as *const u8,
-                                8,
-                            )
-                            .try_into()
-                            .unwrap(),
+                            core::slice::from_raw_parts((base + sect_off + 0x28) as *const u8, 8)
+                                .try_into()
+                                .unwrap(),
                         ) as usize;
 
                         if sect_size < 16 {
@@ -878,20 +865,14 @@ unsafe fn decrypt_macho32_sections(base: usize, key: &[u8; 32], nonce: &[u8; 12]
 
                     if sectname.starts_with(b"__data\0") {
                         let sect_addr = u32::from_le_bytes(
-                            core::slice::from_raw_parts(
-                                (base + sect_off + 0x20) as *const u8,
-                                4,
-                            )
-                            .try_into()
-                            .unwrap(),
+                            core::slice::from_raw_parts((base + sect_off + 0x20) as *const u8, 4)
+                                .try_into()
+                                .unwrap(),
                         ) as usize;
                         let sect_size = u32::from_le_bytes(
-                            core::slice::from_raw_parts(
-                                (base + sect_off + 0x24) as *const u8,
-                                4,
-                            )
-                            .try_into()
-                            .unwrap(),
+                            core::slice::from_raw_parts((base + sect_off + 0x24) as *const u8, 4)
+                                .try_into()
+                                .unwrap(),
                         ) as usize;
 
                         if sect_size < 16 {

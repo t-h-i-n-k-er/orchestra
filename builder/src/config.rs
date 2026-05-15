@@ -447,7 +447,6 @@ fn authority_from_address(address: &str) -> Option<&str> {
         .filter(|authority| !authority.is_empty())
 }
 
-
 /// Check for obviously weak (non-random) keys.
 pub fn is_weak_key(key: &[u8]) -> bool {
     if key.is_empty() {

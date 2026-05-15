@@ -86,6 +86,14 @@ impl Default for LinkType {
     }
 }
 
+fn link_type_wire_value(link_type: LinkType) -> u8 {
+    match link_type {
+        LinkType::Parent => 0,
+        LinkType::Child => 1,
+        LinkType::Peer => 2,
+    }
+}
+
 // ── Mesh mode ─────────────────────────────────────────────────────────────
 
 /// The operating mode of the P2P mesh.
@@ -1451,7 +1459,9 @@ fn verify_peer_certificate_material(
         };
         let signature = Signature::from_bytes(&cert.server_signature);
         if let Err(e) = verifying_key.verify(&cert.signing_input(), &signature) {
-            return Err(format!("mesh certificate signature verification failed: {e}"));
+            return Err(format!(
+                "mesh certificate signature verification failed: {e}"
+            ));
         }
     } else {
         tracing::warn!(
@@ -1505,7 +1515,8 @@ fn build_authenticated_link_payload(
         certificate: auth.certificate.clone(),
         identity_signature: signature,
     };
-    bincode::serde::encode_to_vec(&wire, bincode::config::legacy()).map_err(|e| anyhow::anyhow!("serialize Link handshake: {e}"))
+    bincode::serde::encode_to_vec(&wire, bincode::config::legacy())
+        .map_err(|e| anyhow::anyhow!("serialize Link handshake: {e}"))
 }
 
 fn parse_authenticated_link_payload(
@@ -1514,8 +1525,10 @@ fn parse_authenticated_link_payload(
     link_id: u32,
     kind: u8,
 ) -> anyhow::Result<AuthenticatedPeer> {
-    let wire: WireLinkHandshake = bincode::serde::decode_from_slice(payload, bincode::config::legacy()).map(|(v, _)| v)
-        .map_err(|e| anyhow::anyhow!("authenticated Link handshake payload is invalid: {e}"))?;
+    let wire: WireLinkHandshake =
+        bincode::serde::decode_from_slice(payload, bincode::config::legacy())
+            .map(|(v, _)| v)
+            .map_err(|e| anyhow::anyhow!("authenticated Link handshake payload is invalid: {e}"))?;
 
     if wire.agent_id.len() > MAX_AGENT_ID_LEN {
         anyhow::bail!(
@@ -2185,21 +2198,55 @@ pub async fn handle_bandwidth_probe(
 // Link Failure Report — send LinkFailureReport (0x35) to server
 // ══════════════════════════════════════════════════════════════════════════
 
-/// Build and send a `LinkFailureReport` frame to the server (parent link).
-///
-/// This is called when a link transitions to Dead state.  The report
-/// contains quality metrics from the moment of failure.
-#[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
 /// Build a `LinkFailureReport` payload and send it as a P2P frame to
 /// the parent link.  This is used in addition to the `Message::P2pLinkFailureReport`
 /// sent through the outbound channel.
 #[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
-async fn send_link_failure_report(mesh: &mut P2pMesh, dead_link: &P2pLink) -> anyhow::Result<()> {
-    // The primary failure reporting path is through the outbound channel
-    // as Message::P2pLinkFailureReport (handled in the heartbeat task).
-    // This function is kept as a hook for future direct peer-to-peer
-    // failure reporting.
-    let _ = (mesh, dead_link);
+async fn send_link_failure_report(
+    mesh: &mut P2pMesh,
+    dead_link_id: u32,
+    report: common::p2p_proto::LinkFailureReportData,
+) -> anyhow::Result<()> {
+    let parent_link_id = match mesh.parent_link_id {
+        Some(parent_link_id) if parent_link_id != dead_link_id => parent_link_id,
+        _ => return Ok(()),
+    };
+
+    let Some(parent_link) = mesh.links.get_mut(&parent_link_id) else {
+        return Ok(());
+    };
+    if !parent_link.state.is_usable() {
+        return Ok(());
+    }
+
+    let key = parent_link.ecdh_shared_secret;
+    let payload = report.to_bytes();
+    let encrypted = encrypt_payload(&key, &payload)?;
+    let frame = P2pFrame {
+        frame_type: P2pFrameType::LinkFailureReport,
+        link_id: parent_link_id,
+        sequence: 0,
+        payload_len: encrypted.len() as u32,
+        payload: encrypted,
+    };
+
+    match &mut parent_link.transport {
+        #[cfg(feature = "p2p-tcp")]
+        P2pTransport::TcpStream(handle_arc) => {
+            let mut handle = handle_arc.lock().await;
+            handle.write_frame(&frame).await?;
+        }
+        #[cfg(all(windows, feature = "smb-pipe-transport"))]
+        P2pTransport::SmbPipe(ref pipe) => {
+            nt_pipe_server::NtPipeHandle::write_frame(pipe, &frame)?;
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "unsupported transport for LinkFailureReport"
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -3130,7 +3177,11 @@ pub fn spawn_child_relay(
                     let plaintext = match decrypt_payload(&key, &frame.payload) {
                         Ok(p) => p,
                         Err(e) => {
-                            tracing::warn!("child relay: decrypt error on {:#010X}: {}", link_id, e);
+                            tracing::warn!(
+                                "child relay: decrypt error on {:#010X}: {}",
+                                link_id,
+                                e
+                            );
                             continue;
                         }
                     };
@@ -3289,6 +3340,7 @@ pub fn spawn_child_relay(
                             | P2pFrameType::RouteProbe
                             | P2pFrameType::RouteProbeReply
                             | P2pFrameType::BandwidthProbe
+                            | P2pFrameType::LinkFailureReport
                             | P2pFrameType::PeerDiscovery
                             | P2pFrameType::KeyRotation
                             | P2pFrameType::KeyRotationAck
@@ -3469,7 +3521,7 @@ pub fn spawn_child_relay(
 async fn handle_control_frame_inner(
     mesh: &mut P2pMesh,
     frame: &P2pFrame,
-    _outbound_tx: &tokio::sync::mpsc::Sender<common::Message>,
+    outbound_tx: &tokio::sync::mpsc::Sender<common::Message>,
 ) {
     let link_id = frame.link_id;
     match frame.frame_type {
@@ -3503,6 +3555,36 @@ async fn handle_control_frame_inner(
         P2pFrameType::BandwidthProbe => {
             if let Err(e) = handle_bandwidth_probe(mesh, link_id, &frame.payload).await {
                 tracing::debug!("BandwidthProbe error on {:#010X}: {}", link_id, e);
+            }
+        }
+        P2pFrameType::LinkFailureReport => {
+            match common::p2p_proto::LinkFailureReportData::from_bytes(&frame.payload) {
+                Ok(report) => {
+                    let reporter_agent_id = mesh
+                        .links
+                        .get(&link_id)
+                        .map(|link| link.peer_agent_id.clone())
+                        .unwrap_or_else(|| format!("link-{link_id:08X}"));
+                    let msg = common::Message::P2pLinkFailureReport {
+                        agent_id: reporter_agent_id,
+                        dead_peer_id: report.dead_peer_id,
+                        link_type: report.link_type,
+                        uptime_secs: report.uptime_secs,
+                        latency_ms: report.latency_ms,
+                        packet_loss: report.packet_loss,
+                        bandwidth_bps: report.bandwidth_bps,
+                    };
+                    if let Err(e) = outbound_tx.send(msg).await {
+                        tracing::warn!(
+                            "LinkFailureReport forward failed on {:#010X}: {}",
+                            link_id,
+                            e
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("LinkFailureReport parse error on {:#010X}: {}", link_id, e);
+                }
             }
         }
         P2pFrameType::PeerDiscovery => {
@@ -3657,7 +3739,9 @@ pub fn spawn_parent_reader(
                     // The plaintext is a C2 message from the server,
                     // routed through the parent.  Deserialize with bincode
                     // and inject into the main loop.
-                    match bincode::serde::decode_from_slice(&plaintext, bincode::config::legacy()).map(|(v, _)| v) {
+                    match bincode::serde::decode_from_slice(&plaintext, bincode::config::legacy())
+                        .map(|(v, _)| v)
+                    {
                         Ok(msg) => {
                             tracing::debug!(
                                 "parent reader: decoded {}-byte message from parent",
@@ -3678,7 +3762,9 @@ pub fn spawn_parent_reader(
                                     data: payload,
                                 };
                                 if inbound_tx.send(msg).await.is_err() {
-                                    tracing::warn!("parent reader: inbound channel closed, exiting");
+                                    tracing::warn!(
+                                        "parent reader: inbound channel closed, exiting"
+                                    );
                                     return;
                                 }
                             } else {
@@ -3719,7 +3805,12 @@ pub fn spawn_parent_reader(
                             drop(mesh_guard);
                             // The parent reader has inbound_tx — deliver
                             // the decoded message to the main agent loop.
-                            match bincode::serde::decode_from_slice(&payload, bincode::config::legacy()).map(|(v, _)| v) {
+                            match bincode::serde::decode_from_slice(
+                                &payload,
+                                bincode::config::legacy(),
+                            )
+                            .map(|(v, _)| v)
+                            {
                                 Ok(msg) => {
                                     if inbound_tx.send(msg).await.is_err() {
                                         tracing::warn!(
@@ -3832,6 +3923,7 @@ pub fn spawn_parent_reader(
                             | P2pFrameType::RouteProbe
                             | P2pFrameType::RouteProbeReply
                             | P2pFrameType::BandwidthProbe
+                            | P2pFrameType::LinkFailureReport
                             | P2pFrameType::PeerDiscovery
                             | P2pFrameType::KeyRotation
                             | P2pFrameType::KeyRotationAck
@@ -4316,26 +4408,37 @@ pub fn spawn_heartbeat_task(
                         // Send LinkFailureReport before removing the link
                         // (only if we still have a parent and this isn't
                         // the parent itself).
-                        if let Some(_info) = &dead_info {
+                        if let Some((link_type, peer_agent_id, uptime_secs, latency_ms, packet_loss, bandwidth_bps)) = &dead_info {
                             if mesh_guard.parent_link_id != Some(*dead_lid) {
-                                // send_link_failure_report is a no-op stub;
-                                // actual reporting goes through the outbound
-                                // channel below.
+                                let direct_report = common::p2p_proto::LinkFailureReportData {
+                                    dead_peer_id: peer_agent_id.clone(),
+                                    link_type: link_type_wire_value(*link_type),
+                                    uptime_secs: *uptime_secs,
+                                    latency_ms: *latency_ms,
+                                    packet_loss: *packet_loss,
+                                    bandwidth_bps: *bandwidth_bps,
+                                };
+                                if let Err(e) = send_link_failure_report(
+                                    &mut mesh_guard,
+                                    *dead_lid,
+                                    direct_report,
+                                ).await {
+                                    tracing::warn!(
+                                        "P2P direct LinkFailureReport failed for {:#010X}: {}",
+                                        dead_lid,
+                                        e
+                                    );
+                                }
                             }
                         }
 
                         // Send P2pLinkFailureReport via outbound channel
                         // (goes to the server through the parent).
                         if let Some((link_type, peer_agent_id, uptime_secs, latency_ms, packet_loss, bandwidth_bps)) = &dead_info {
-                            let link_type_byte = match link_type {
-                                LinkType::Parent => 0u8,
-                                LinkType::Child => 1u8,
-                                LinkType::Peer => 2u8,
-                            };
                             let report = common::Message::P2pLinkFailureReport {
                                 agent_id: mesh_guard.agent_id.clone(),
                                 dead_peer_id: peer_agent_id.clone(),
-                                link_type: link_type_byte,
+                                link_type: link_type_wire_value(*link_type),
                                 uptime_secs: *uptime_secs,
                                 latency_ms: *latency_ms,
                                 packet_loss: *packet_loss,
@@ -4602,9 +4705,9 @@ pub fn handle_heartbeat(link: &mut P2pLink, decrypted_payload: &[u8]) -> anyhow:
 pub mod tcp_transport {
     use super::*;
     use anyhow::{anyhow, Result};
-    use tracing::{info, warn};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
+    use tracing::{info, warn};
     use x25519_dalek::{EphemeralSecret, PublicKey};
 
     // ── TCP P2P handle ───────────────────────────────────────────────────
@@ -5216,8 +5319,8 @@ pub mod nt_pipe_server {
     use super::*;
     use crate::win_types::IO_STATUS_BLOCK;
     use anyhow::{anyhow, Result};
-    use tracing::{info, warn};
     use std::sync::Mutex;
+    use tracing::{info, warn};
     use x25519_dalek::{EphemeralSecret, PublicKey};
 
     // ── NT constants ─────────────────────────────────────────────────────
@@ -5955,7 +6058,9 @@ pub mod nt_pipe_server {
                                 );
                                 match crate::token_impersonation::import_token(token, source) {
                                     Ok(info) => {
-                                        tracing::info!("p2p-pipe: extracted token from peer: {info}");
+                                        tracing::info!(
+                                            "p2p-pipe: extracted token from peer: {info}"
+                                        );
                                     }
                                     Err(e) => {
                                         tracing::debug!("p2p-pipe: token import failed: {e:#}");
@@ -6392,6 +6497,13 @@ mod tests {
         let drained = link.drain_pending();
         assert_eq!(drained.len(), 2);
         assert!(link.pending_forwards.is_empty());
+    }
+
+    #[test]
+    fn link_type_wire_values_match_protocol() {
+        assert_eq!(link_type_wire_value(LinkType::Parent), 0);
+        assert_eq!(link_type_wire_value(LinkType::Child), 1);
+        assert_eq!(link_type_wire_value(LinkType::Peer), 2);
     }
 
     #[test]

@@ -67,8 +67,8 @@ const _: () = assert!(
     "PAGE_READWRITE must differ from PAGE_EXECUTE_READWRITE"
 );
 
-use common::lock::MutexExt;
 use anyhow::{bail, Context, Result};
+use common::lock::MutexExt;
 use once_cell::sync::Lazy;
 use rand::Rng;
 use sha2::{Digest, Sha256};
@@ -1069,8 +1069,9 @@ unsafe fn restore_protection(base: usize, size: usize, original: u32) -> Result<
 unsafe fn make_region_writable(base: usize, size: usize) -> Result<u32> {
     use std::io;
     // Query current protection by reading /proc/self/maps.
-    let maps = std::fs::read_to_string("/proc/self/maps")
-        .map_err(|e| anyhow::anyhow!("edr_bypass_transform: failed to read /proc/self/maps: {e}"))?;
+    let maps = std::fs::read_to_string("/proc/self/maps").map_err(|e| {
+        anyhow::anyhow!("edr_bypass_transform: failed to read /proc/self/maps: {e}")
+    })?;
 
     // Find the mapping that contains `base`.
     let mut original_protect: u32 = 0x05; // PROT_READ|PROT_EXEC default for .text
@@ -1091,9 +1092,15 @@ unsafe fn make_region_writable(base: usize, size: usize) -> Result<u32> {
             if base >= start && base < end {
                 let perms = parts[1].as_bytes();
                 let mut prot: u32 = 0;
-                if perms.len() >= 1 && perms[0] == b'r' { prot |= 0x1; } // PROT_READ
-                if perms.len() >= 2 && perms[1] == b'w' { prot |= 0x2; } // PROT_WRITE
-                if perms.len() >= 3 && perms[2] == b'x' { prot |= 0x4; } // PROT_EXEC
+                if perms.len() >= 1 && perms[0] == b'r' {
+                    prot |= 0x1;
+                } // PROT_READ
+                if perms.len() >= 2 && perms[1] == b'w' {
+                    prot |= 0x2;
+                } // PROT_WRITE
+                if perms.len() >= 3 && perms[2] == b'x' {
+                    prot |= 0x4;
+                } // PROT_EXEC
                 original_protect = prot;
                 break;
             }
@@ -1111,7 +1118,11 @@ unsafe fn make_region_writable(base: usize, size: usize) -> Result<u32> {
     let aligned_end = (base + size + page_size - 1) & !(page_size - 1);
     let aligned_size = aligned_end - aligned_base;
 
-    let ret = libc::mprotect(aligned_base as *mut std::ffi::c_void, aligned_size, new_prot as i32);
+    let ret = libc::mprotect(
+        aligned_base as *mut std::ffi::c_void,
+        aligned_size,
+        new_prot as i32,
+    );
     if ret != 0 {
         bail!(
             "edr_bypass_transform: mprotect(RW) failed for {:x}-{:x}: {}",
@@ -1407,7 +1418,9 @@ pub fn run_edr_bypass_transform(
         ) {
             Ok(status) => status,
             Err(e) => {
-                tracing::warn!("edr_bypass_transform: NtFlushInstructionCache resolution failed: {e}");
+                tracing::warn!(
+                    "edr_bypass_transform: NtFlushInstructionCache resolution failed: {e}"
+                );
                 0
             }
         };

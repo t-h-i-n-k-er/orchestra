@@ -28,8 +28,8 @@
 //! No files are written to disk.
 
 use anyhow::Result;
-use tracing::info;
 use serde::{Deserialize, Serialize};
+use tracing::info;
 
 use super::ad_enum::AdReconData;
 use super::attack_paths::AttackPath;
@@ -132,12 +132,7 @@ pub fn generate_recon_report(
     let timestamp = chrono_now_iso();
 
     // Build summary from available data
-    let summary = build_summary(
-        &ad_data,
-        &attack_paths,
-        &cloud_env,
-        &cred_attacks,
-    );
+    let summary = build_summary(&ad_data, &attack_paths, &cloud_env, &cred_attacks);
 
     info!(
         "Recon report: {} users, {} attack paths, cloud={}, {} kerberoast hashes",
@@ -184,13 +179,20 @@ fn build_summary(
         let kerb = data.users.iter().filter(|u| u.is_kerberoastable).count();
         let asrep = data.users.iter().filter(|u| u.is_asrep_roastable).count();
         let priv_groups = data.groups.iter().filter(|g| g.is_privileged).count();
-        let unc = data.delegations.iter().filter(|d| d.delegation_type == "unconstrained").count();
+        let unc = data
+            .delegations
+            .iter()
+            .filter(|d| d.delegation_type == "unconstrained")
+            .count();
 
         if kerb > 0 {
             risk_indicators.push(format!("{} Kerberoastable accounts found", kerb));
         }
         if asrep > 0 {
-            risk_indicators.push(format!("{} AS-REP Roastable accounts (DONT_REQUIRE_PREAUTH)", asrep));
+            risk_indicators.push(format!(
+                "{} AS-REP Roastable accounts (DONT_REQUIRE_PREAUTH)",
+                asrep
+            ));
         }
         if unc > 0 {
             risk_indicators.push(format!("{} accounts with unconstrained delegation", unc));
@@ -427,13 +429,7 @@ mod tests {
     #[test]
     fn test_generate_report_with_ad_data() {
         let ad_data = make_test_ad_data();
-        let report = generate_recon_report(
-            Some(ad_data),
-            vec![],
-            None,
-            None,
-            None,
-        );
+        let report = generate_recon_report(Some(ad_data), vec![], None, None, None);
 
         assert!(report.ad_recon.is_some());
         assert_eq!(report.summary.total_users, 2);
@@ -444,13 +440,7 @@ mod tests {
 
     #[test]
     fn test_generate_report_empty() {
-        let report = generate_recon_report(
-            None,
-            vec![],
-            None,
-            None,
-            None,
-        );
+        let report = generate_recon_report(None, vec![], None, None, None);
 
         assert!(report.ad_recon.is_none());
         assert_eq!(report.summary.total_users, 0);
@@ -472,13 +462,7 @@ mod tests {
             summary: "MemberOf → DA".to_string(),
         }];
 
-        let report = generate_recon_report(
-            Some(ad_data),
-            paths,
-            None,
-            None,
-            None,
-        );
+        let report = generate_recon_report(Some(ad_data), paths, None, None, None);
 
         assert_eq!(report.summary.total_attack_paths, 1);
         assert_eq!(report.summary.shortest_path_to_da, Some(1));
@@ -499,13 +483,7 @@ mod tests {
             imds_raw: String::new(),
         };
 
-        let report = generate_recon_report(
-            None,
-            vec![],
-            Some(cloud_env),
-            None,
-            None,
-        );
+        let report = generate_recon_report(None, vec![], Some(cloud_env), None, None);
 
         assert_eq!(report.summary.cloud_provider, "AWS");
         assert!(report.summary.imds_accessible);
@@ -513,13 +491,7 @@ mod tests {
 
     #[test]
     fn test_serialize_report() {
-        let report = generate_recon_report(
-            None,
-            vec![],
-            None,
-            None,
-            None,
-        );
+        let report = generate_recon_report(None, vec![], None, None, None);
 
         let bytes = serialize_report(&report).unwrap();
         assert!(!bytes.is_empty());
@@ -531,13 +503,7 @@ mod tests {
 
     #[test]
     fn test_deserialize_report() {
-        let report = generate_recon_report(
-            None,
-            vec![],
-            None,
-            None,
-            None,
-        );
+        let report = generate_recon_report(None, vec![], None, None, None);
 
         let bytes = serialize_report(&report).unwrap();
         let de = deserialize_report(&bytes).unwrap();
@@ -549,27 +515,19 @@ mod tests {
     #[test]
     fn test_risk_indicators() {
         let ad_data = make_test_ad_data();
-        let report = generate_recon_report(
-            Some(ad_data),
-            vec![],
-            None,
-            None,
-            None,
-        );
+        let report = generate_recon_report(Some(ad_data), vec![], None, None, None);
 
         assert!(!report.summary.risk_indicators.is_empty());
-        assert!(report.summary.risk_indicators.iter().any(|ri| ri.contains("Kerberoastable")));
+        assert!(report
+            .summary
+            .risk_indicators
+            .iter()
+            .any(|ri| ri.contains("Kerberoastable")));
     }
 
     #[test]
     fn test_report_json_structure() {
-        let report = generate_recon_report(
-            None,
-            vec![],
-            None,
-            None,
-            None,
-        );
+        let report = generate_recon_report(None, vec![], None, None, None);
 
         let json = serialize_report_string(&report).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();

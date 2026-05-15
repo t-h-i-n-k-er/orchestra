@@ -215,7 +215,7 @@ impl SleepConfig {
         if let Some(ms) = self.base_interval_ms {
             if ms == 0 {
                 return Err(
-                    "sleep.base-interval-ms must be greater than zero when present".to_string()
+                    "sleep.base-interval-ms must be greater than zero when present".to_string(),
                 );
             }
             let secs_from_ms = ms.saturating_add(999) / 1000; // ceiling division

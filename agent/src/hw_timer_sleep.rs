@@ -117,11 +117,7 @@ impl HardwareTimerSleeper {
     /// points to a single `ret` instruction, it returns immediately and
     /// the wait completes normally.  The purpose is purely to place a
     /// clean return address on the kernel APC dispatch stack frame.
-    fn wait_with_apc_gadget(
-        &mut self,
-        duration: Duration,
-        callback_address: usize,
-    ) -> Result<()> {
+    fn wait_with_apc_gadget(&mut self, duration: Duration, callback_address: usize) -> Result<()> {
         let _start_ts = hw_timestamp();
 
         set_timer_with_apc_gadget(self.timer_handle, duration, callback_address)?;

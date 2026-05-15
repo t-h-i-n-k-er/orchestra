@@ -78,7 +78,9 @@ fn reject_sentinel_credentials(cfg: &ServerConfig, dev_mode: bool) -> Result<()>
         violations.push("agent_shared_secret is the default sentinel value");
     }
     if cfg.module_aes_key.as_deref() == Some(SENTINEL_MODULE_AES_KEY) {
-        violations.push("module_aes_key is the well-known base64 sentinel (\"this is a 32-byte aes key!\")");
+        violations.push(
+            "module_aes_key is the well-known base64 sentinel (\"this is a 32-byte aes key!\")",
+        );
     }
 
     // Check for well-known weak base64 patterns in module_aes_key.
@@ -101,7 +103,7 @@ fn reject_sentinel_credentials(cfg: &ServerConfig, dev_mode: bool) -> Result<()>
     if cfg.allow_local_builds {
         violations.push(
             "allow_local_builds is true — this permits SSRF via builder requests \
-             to private/loopback IPs. Disable in production."
+             to private/loopback IPs. Disable in production.",
         );
     }
 
@@ -109,7 +111,7 @@ fn reject_sentinel_credentials(cfg: &ServerConfig, dev_mode: bool) -> Result<()>
         violations.push(
             "redirector_secret is not set — anyone can register arbitrary redirectors \
              and inject entries into the C2 mesh. Set redirector_secret to a strong \
-             random value (e.g., openssl rand -base64 32)."
+             random value (e.g., openssl rand -base64 32).",
         );
     }
 
@@ -396,7 +398,12 @@ async fn main() -> Result<()> {
         cfg.build_retention_days,
     );
 
-    let tls_cfg = tls::build(cfg.tls_cert_path.as_deref(), cfg.tls_key_path.as_deref(), cli.dev).await?;
+    let tls_cfg = tls::build(
+        cfg.tls_cert_path.as_deref(),
+        cfg.tls_key_path.as_deref(),
+        cli.dev,
+    )
+    .await?;
 
     // Agent listener (TLS-encrypted TCP).
     {

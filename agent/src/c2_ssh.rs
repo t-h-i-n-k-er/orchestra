@@ -49,14 +49,14 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use common::config::{MalleableProfile, SshAuthConfig};
 use common::{CryptoSession, Message, Transport};
-use tracing::info;
 use russh::client;
-use russh::keys::ssh_key;
 use russh::keys::key::PrivateKeyWithHashAlg;
+use russh::keys::ssh_key;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::Duration;
+use tracing::info;
 
 // Maximum acceptable frame payload size: 16 MiB.  Rejects corrupt or
 // malicious length fields without allocating unbounded memory.
@@ -268,8 +268,9 @@ impl SshTransport {
             SshAuthConfig::Key { key_path } => {
                 let key_data = std::fs::read_to_string(key_path)
                     .map_err(|e| anyhow!("ssh-transport: failed to read key '{key_path}': {e}"))?;
-                let key_pair = russh::keys::decode_secret_key(&key_data, None)
-                    .map_err(|e| anyhow!("ssh-transport: failed to decode key '{key_path}': {e}"))?;
+                let key_pair = russh::keys::decode_secret_key(&key_data, None).map_err(|e| {
+                    anyhow!("ssh-transport: failed to decode key '{key_path}': {e}")
+                })?;
                 let hash_alg = handle
                     .best_supported_rsa_hash()
                     .await
@@ -290,15 +291,14 @@ impl SshTransport {
                 // agent-based publickey authentication in russh 0.60+).
                 #[cfg(unix)]
                 {
-                    let mut agent_client =
-                        russh::keys::agent::client::AgentClient::connect_env()
-                            .await
-                            .map_err(|e| {
-                                anyhow!(
-                                    "ssh-transport: failed to connect to ssh-agent \
+                    let mut agent_client = russh::keys::agent::client::AgentClient::connect_env()
+                        .await
+                        .map_err(|e| {
+                            anyhow!(
+                                "ssh-transport: failed to connect to ssh-agent \
                                      (ensure SSH_AUTH_SOCK is set and ssh-agent is running): {e}"
-                                )
-                            })?;
+                            )
+                        })?;
                     authenticate_with_agent(&mut handle, username, &mut agent_client).await?
                 }
 
@@ -313,12 +313,8 @@ impl SshTransport {
                         .await
                         {
                             Ok(mut agent_client) => {
-                                authenticate_with_agent(
-                                    &mut handle,
-                                    username,
-                                    &mut agent_client,
-                                )
-                                .await?
+                                authenticate_with_agent(&mut handle, username, &mut agent_client)
+                                    .await?
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -334,12 +330,8 @@ impl SshTransport {
                                                  Pageant: {e2}"
                                             )
                                         })?;
-                                authenticate_with_agent(
-                                    &mut handle,
-                                    username,
-                                    &mut agent_client,
-                                )
-                                .await?
+                                authenticate_with_agent(&mut handle, username, &mut agent_client)
+                                    .await?
                             }
                         }
                     } else {
@@ -531,7 +523,9 @@ impl Transport for SshTransport {
                     self.recv_buf.drain(..4 + payload_len);
 
                     let plaintext = self.crypto_session.decrypt(&frame)?;
-                    let message: Message = bincode::serde::decode_from_slice(&plaintext, bincode::config::legacy()).map(|(v, _)| v)?;
+                    let message: Message =
+                        bincode::serde::decode_from_slice(&plaintext, bincode::config::legacy())
+                            .map(|(v, _)| v)?;
                     return Ok(message);
                 }
             }
@@ -556,7 +550,9 @@ impl Transport for SshTransport {
                 }
                 Err(e) => {
                     // Read error — attempt reopen before giving up.
-                    tracing::info!("ssh-transport: recv read error ({e:#}), attempting channel reopen");
+                    tracing::info!(
+                        "ssh-transport: recv read error ({e:#}), attempting channel reopen"
+                    );
                     match self.reopen_channel().await {
                         Ok(()) => continue, // Channel reopened, keep receiving.
                         Err(reopen_err) => {

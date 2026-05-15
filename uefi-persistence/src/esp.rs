@@ -638,11 +638,7 @@ fn mount_esp_macos() -> Result<EspMountResult> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "diskutil mount {} failed: {}",
-            esp_device,
-            stderr.trim()
-        );
+        bail!("diskutil mount {} failed: {}", esp_device, stderr.trim());
     }
 
     // After mounting, the ESP should be at /Volumes/EFI.

@@ -1304,7 +1304,10 @@ pub unsafe fn inject_delayed_stomp(
     std::thread::Builder::new()
         .name("delayed-stomp-phase2".into())
         .spawn(move || {
-            tracing::info!("[delayed-stomp] Phase 2 thread: waiting {}s for EDR scan window...", delay_secs);
+            tracing::info!(
+                "[delayed-stomp] Phase 2 thread: waiting {}s for EDR scan window...",
+                delay_secs
+            );
             std::thread::sleep(std::time::Duration::from_secs(delay_secs as u64));
 
             match phase2_stomp_and_execute(pending) {

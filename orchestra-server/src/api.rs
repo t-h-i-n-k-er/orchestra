@@ -1699,9 +1699,7 @@ async fn ws_handler(
         let origin_host = origin_host.split(':').next().unwrap_or(origin_host);
         let request_host = host.split(':').next().unwrap_or(host);
         let allowed = if state.dev_mode {
-            origin_host == request_host
-                || origin_host == "localhost"
-                || origin_host == "127.0.0.1"
+            origin_host == request_host || origin_host == "localhost" || origin_host == "127.0.0.1"
         } else {
             origin_host == request_host
         };

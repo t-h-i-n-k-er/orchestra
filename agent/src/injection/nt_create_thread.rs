@@ -29,7 +29,10 @@ impl Injector for NtCreateThreadInjector {
             };
         }
 
-        use windows_sys::Win32::System::Threading::{PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_WRITE};
+        use windows_sys::Win32::System::Threading::{
+            PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
+            PROCESS_VM_WRITE,
+        };
         let access_mask = PROCESS_VM_OPERATION
             | PROCESS_VM_WRITE
             | PROCESS_CREATE_THREAD

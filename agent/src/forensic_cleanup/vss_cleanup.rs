@@ -35,8 +35,8 @@ use std::mem;
 use std::ptr;
 
 use anyhow::{anyhow, bail, Result};
-use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
 
 use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
 
@@ -44,8 +44,8 @@ use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
 
 // ole32.dll — COM initialization and instance creation
 const HASH_OLE32_DLL: u32 = hash_wstr_const(&[
-    'o' as u16, 'l' as u16, 'e' as u16, '3' as u16, '2' as u16, '.' as u16,
-    'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'o' as u16, 'l' as u16, 'e' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16,
+    'l' as u16, 0,
 ]);
 const FN_CO_INITIALIZE_EX: u32 = hash_str_const(b"CoInitializeEx");
 const FN_CO_UNINITIALIZE: u32 = hash_str_const(b"CoUninitialize");
@@ -54,8 +54,8 @@ const FN_CO_SET_PROXY_BLANKET: u32 = hash_str_const(b"CoSetProxyBlanket");
 
 // oleaut32.dll — VARIANT and BSTR operations
 const HASH_OLEAUT32_DLL: u32 = hash_wstr_const(&[
-    'o' as u16, 'l' as u16, 'e' as u16, 'a' as u16, 'u' as u16, 't' as u16,
-    '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'o' as u16, 'l' as u16, 'e' as u16, 'a' as u16, 'u' as u16, 't' as u16, '3' as u16, '2' as u16,
+    '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
 ]);
 const FN_SYS_ALLOC_STRING: u32 = hash_str_const(b"SysAllocString");
 const FN_SYS_FREE_STRING: u32 = hash_str_const(b"SysFreeString");
@@ -64,15 +64,20 @@ const FN_VARIANT_CLEAR: u32 = hash_str_const(b"VariantClear");
 
 // ── Windows type imports ────────────────────────────────────────────────────
 
-use crate::win_types::{CLSID, IID};
 use crate::win_types::DWORD;
-use windows_sys::Win32::System::Com::{RPC_C_AUTHN_LEVEL_CALL, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, RPC_C_IMP_LEVEL_IMPERSONATE};
-use windows_sys::Win32::System::Com::{CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER};
 use crate::win_types::HRESULT;
+use crate::win_types::{CLSID, IID};
 use windows_sys::Win32::System::Com::COINIT_MULTITHREADED;
 use windows_sys::Win32::System::Com::EOLE_AUTHENTICATION_CAPABILITIES;
-use windows_sys::Win32::System::Wmi::{CLSID_WbemLocator, IEnumWbemClassObject, IID_IWbemLocator, IWbemClassObject, IWbemLocator, IWbemServices, WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_INFINITE};
+use windows_sys::Win32::System::Com::{CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER};
+use windows_sys::Win32::System::Com::{
+    RPC_C_AUTHN_LEVEL_CALL, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, RPC_C_IMP_LEVEL_IMPERSONATE,
+};
 use windows_sys::Win32::System::Wmi::IID_IWbemServices;
+use windows_sys::Win32::System::Wmi::{
+    CLSID_WbemLocator, IEnumWbemClassObject, IID_IWbemLocator, IWbemClassObject, IWbemLocator,
+    IWbemServices, WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_INFINITE,
+};
 // ── COM helper types ────────────────────────────────────────────────────────
 
 /// BSTR type alias (pointer to wide string with length prefix).
@@ -126,8 +131,7 @@ impl Drop for CoUninitializeGuard {
                 Some(a) => a,
                 None => return,
             };
-            let co_uninit: unsafe extern "system" fn() =
-                mem::transmute(co_uninit);
+            let co_uninit: unsafe extern "system" fn() = mem::transmute(co_uninit);
             co_uninit();
         }
     }
@@ -253,19 +257,25 @@ unsafe fn wmi_connect_cimv2() -> Result<(CoUninitializeGuard, *mut IWbemServices
     // Step 4 — CoSetProxyBlanket
     let co_blanket: unsafe extern "system" fn(
         *mut c_void,
-        DWORD, DWORD, *mut c_void, DWORD, DWORD, *mut c_void, DWORD,
+        DWORD,
+        DWORD,
+        *mut c_void,
+        DWORD,
+        DWORD,
+        *mut c_void,
+        DWORD,
     ) -> HRESULT = resolve_ole32(FN_CO_SET_PROXY_BLANKET)
         .ok_or_else(|| anyhow!("cannot resolve CoSetProxyBlanket"))?;
 
     let hr = co_blanket(
         services as *mut c_void,
-        RPC_C_AUTHN_WINNT,            // dwAuthnSvc
-        RPC_C_AUTHZ_NONE,             // dwAuthzSvc
-        ptr::null_mut(),              // pServerPrincName
-        RPC_C_AUTHN_LEVEL_CALL,       // dwAuthnLevel
-        RPC_C_IMP_LEVEL_IMPERSONATE,  // dwImpersonationLevel
-        ptr::null_mut(),              // pAuthInfo
-        EOAC_NONE as DWORD,           // dwCapabilities
+        RPC_C_AUTHN_WINNT,           // dwAuthnSvc
+        RPC_C_AUTHZ_NONE,            // dwAuthzSvc
+        ptr::null_mut(),             // pServerPrincName
+        RPC_C_AUTHN_LEVEL_CALL,      // dwAuthnLevel
+        RPC_C_IMP_LEVEL_IMPERSONATE, // dwImpersonationLevel
+        ptr::null_mut(),             // pAuthInfo
+        EOAC_NONE as DWORD,          // dwCapabilities
     );
     if !hr_ok(hr) {
         (*(*services).lpVtbl).Release(services);
@@ -393,9 +403,7 @@ fn enumerate_via_wmi() -> Result<Vec<ShadowCopyInfo>> {
 
         if !hr_ok(hr) {
             (*(*services).lpVtbl).Release(services);
-            bail!(
-                "IWbemServices::ExecQuery(SELECT * FROM Win32_ShadowCopy) failed: {hr:#010x}"
-            );
+            bail!("IWbemServices::ExecQuery(SELECT * FROM Win32_ShadowCopy) failed: {hr:#010x}");
         }
 
         let mut copies = Vec::new();
@@ -418,10 +426,8 @@ fn enumerate_via_wmi() -> Result<Vec<ShadowCopyInfo>> {
             let set_id = get_bstr_property(obj, "SetID").unwrap_or_default();
             let volume_name = get_bstr_property(obj, "VolumeName").unwrap_or_default();
             let device_object = get_bstr_property(obj, "DeviceObject").unwrap_or_default();
-            let origin_machine =
-                get_bstr_property(obj, "OriginatingMachine").unwrap_or_default();
-            let service_machine =
-                get_bstr_property(obj, "ServiceMachine").unwrap_or_default();
+            let origin_machine = get_bstr_property(obj, "OriginatingMachine").unwrap_or_default();
+            let service_machine = get_bstr_property(obj, "ServiceMachine").unwrap_or_default();
             let install_date = get_bstr_property(obj, "InstallDate").unwrap_or_default();
             let used_bytes = get_u64_property(obj, "UsedBytes");
 
@@ -463,15 +469,27 @@ fn parse_vssadmin_output(output: &str) -> Result<Vec<ShadowCopyInfo>> {
                 copies.push(built);
             }
             current = ShadowCopyInfoBuilder::default();
-            current.id = line.trim_start_matches("Shadow Copy ID:").trim().to_string();
+            current.id = line
+                .trim_start_matches("Shadow Copy ID:")
+                .trim()
+                .to_string();
         } else if line.starts_with("Shadow Copy Set ID:") {
-            current.set_id = line.trim_start_matches("Shadow Copy Set ID:").trim().to_string();
+            current.set_id = line
+                .trim_start_matches("Shadow Copy Set ID:")
+                .trim()
+                .to_string();
         } else if line.starts_with("Volume Name:") {
             current.volume_name = line.trim_start_matches("Volume Name:").trim().to_string();
         } else if line.starts_with("Originating Machine:") {
-            current.origin_machine = line.trim_start_matches("Originating Machine:").trim().to_string();
+            current.origin_machine = line
+                .trim_start_matches("Originating Machine:")
+                .trim()
+                .to_string();
         } else if line.starts_with("Service Machine:") {
-            current.service = line.trim_start_matches("Service Machine:").trim().to_string();
+            current.service = line
+                .trim_start_matches("Service Machine:")
+                .trim()
+                .to_string();
         } else if line.starts_with("Installed:") {
             current.install_date = line.trim_start_matches("Installed:").trim().to_string();
         } else if line.contains("HarddiskVolumeShadowCopy") {

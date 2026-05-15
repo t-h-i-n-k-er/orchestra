@@ -784,14 +784,15 @@ impl HttpEcdhClient {
         // Verify server's HMAC tag: HMAC(psk, client_pub || server_pub)
         let expected_tag = compute_auth_tag(&self.psk, self.public.as_bytes(), &server_pub);
         if !hmac_verify(&expected_tag, server_tag) {
-            anyhow::bail!(
-                "HTTP ECDH: server HMAC verification failed — PSK mismatch or MITM"
-            );
+            anyhow::bail!("HTTP ECDH: server HMAC verification failed — PSK mismatch or MITM");
         }
 
         // ECDH key agreement.
         let server_public = PublicKey::from(server_pub);
-        let secret = self.secret.take().expect("derive_session_from_response called twice");
+        let secret = self
+            .secret
+            .take()
+            .expect("derive_session_from_response called twice");
         let shared = secret.diffie_hellman(&server_public);
 
         // Derive session key: HKDF(salt=fs_salt, ikm=shared, info=FS_HTTP_SESSION)
@@ -857,9 +858,7 @@ impl HttpEcdhServerSession {
         // Verify client's self-HMAC: HMAC(psk, client_pub || client_pub)
         let expected_self_tag = compute_auth_tag(psk, &client_pub, &client_pub);
         if !hmac_verify(&expected_self_tag, client_self_tag) {
-            anyhow::bail!(
-                "HTTP ECDH: client self-HMAC verification failed — PSK mismatch"
-            );
+            anyhow::bail!("HTTP ECDH: client self-HMAC verification failed — PSK mismatch");
         }
 
         // Generate server's ephemeral keypair.
@@ -1033,7 +1032,10 @@ mod tests {
     fn derive_rotated_psk_different_base_psks() {
         let r1 = derive_rotated_psk(b"psk-a", 1);
         let r2 = derive_rotated_psk(b"psk-b", 1);
-        assert_ne!(r1, r2, "different base PSKs must produce different rotations");
+        assert_ne!(
+            r1, r2,
+            "different base PSKs must produce different rotations"
+        );
     }
 
     #[test]
@@ -1138,7 +1140,9 @@ mod tests {
         let client_pub = [0x01; 32];
         let server_pub = [0x02; 32];
         let tag = compute_auth_tag(psk, &client_pub, &server_pub);
-        assert!(state.verify_auth_tag(&client_pub, &server_pub, &tag).is_ok());
+        assert!(state
+            .verify_auth_tag(&client_pub, &server_pub, &tag)
+            .is_ok());
     }
 
     #[test]
@@ -1147,17 +1151,16 @@ mod tests {
         let client_pub = [0x01; 32];
         let server_pub = [0x02; 32];
         let tag = compute_auth_tag(b"wrong-psk", &client_pub, &server_pub);
-        assert!(state.verify_auth_tag(&client_pub, &server_pub, &tag).is_err());
+        assert!(state
+            .verify_auth_tag(&client_pub, &server_pub, &tag)
+            .is_err());
     }
 
     // ── negotiate_session_key (async, via duplex pipe) ──────────────────
 
     /// Create a bidirectional in-memory pipe for testing.
     /// Returns (client_stream, server_stream).
-    fn duplex_pipe() -> (
-        tokio::io::DuplexStream,
-        tokio::io::DuplexStream,
-    ) {
+    fn duplex_pipe() -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
         tokio::io::duplex(4096)
     }
 
@@ -1166,12 +1169,10 @@ mod tests {
         let (mut client, mut server) = duplex_pipe();
         let psk = b"shared-secret-for-test";
 
-        let client_handle = tokio::spawn(async move {
-            negotiate_session_key(&mut client, psk, true).await
-        });
-        let server_handle = tokio::spawn(async move {
-            negotiate_session_key(&mut server, psk, false).await
-        });
+        let client_handle =
+            tokio::spawn(async move { negotiate_session_key(&mut client, psk, true).await });
+        let server_handle =
+            tokio::spawn(async move { negotiate_session_key(&mut server, psk, false).await });
 
         let client_session = client_handle.await.unwrap().unwrap();
         let server_session = server_handle.await.unwrap().unwrap();
@@ -1187,12 +1188,14 @@ mod tests {
     async fn negotiate_session_key_different_psk_fails() {
         let (mut client, mut server) = duplex_pipe();
 
-        let client_handle = tokio::spawn(async move {
-            negotiate_session_key(&mut client, b"client-psk", true).await
-        });
-        let server_handle = tokio::spawn(async move {
-            negotiate_session_key(&mut server, b"server-psk", false).await
-        });
+        let client_handle =
+            tokio::spawn(
+                async move { negotiate_session_key(&mut client, b"client-psk", true).await },
+            );
+        let server_handle =
+            tokio::spawn(
+                async move { negotiate_session_key(&mut server, b"server-psk", false).await },
+            );
 
         let client_result = client_handle.await.unwrap();
         let server_result = server_handle.await.unwrap();
@@ -1225,8 +1228,14 @@ mod tests {
         impl Duplex {
             fn new() -> Self {
                 Self {
-                    a_to_b: Arc::new(Mutex::new(Pipe { buf: Vec::new(), read_pos: 0 })),
-                    b_to_a: Arc::new(Mutex::new(Pipe { buf: Vec::new(), read_pos: 0 })),
+                    a_to_b: Arc::new(Mutex::new(Pipe {
+                        buf: Vec::new(),
+                        read_pos: 0,
+                    })),
+                    b_to_a: Arc::new(Mutex::new(Pipe {
+                        buf: Vec::new(),
+                        read_pos: 0,
+                    })),
                 }
             }
         }
@@ -1366,8 +1375,8 @@ mod tests {
         let psk = b"test-psk";
         let mut client = HttpEcdhClient::new(psk);
         // Forge a response with wrong keys.
-        let fake_response = base64::engine::general_purpose::STANDARD
-            .encode([0xFF; HTTP_ECDH_MSG_LEN]);
+        let fake_response =
+            base64::engine::general_purpose::STANDARD.encode([0xFF; HTTP_ECDH_MSG_LEN]);
         let result = client.derive_session_from_response(&fake_response);
         assert!(
             result.is_err(),

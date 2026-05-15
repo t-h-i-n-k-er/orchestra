@@ -333,7 +333,8 @@ unsafe fn read_pe_timestamp(base: usize) -> u32 {
     if dos.e_magic != 0x5A4D {
         return 0;
     }
-    let nt = &*((base + dos.e_lfanew as usize) as *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64);
+    let nt = &*((base + dos.e_lfanew as usize)
+        as *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64);
     nt.FileHeader.TimeDateStamp
 }
 
@@ -618,7 +619,8 @@ unsafe fn resolve_kernel_export_rva(
     sys_read: SyscallTarget,
 ) -> Option<usize> {
     // Read the DOS header.
-    let mut dos_buf = [0u8; std::mem::size_of::<windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER>()];
+    let mut dos_buf =
+        [0u8; std::mem::size_of::<windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER>()];
     let mut bytes_read: usize = 0;
     let status = do_syscall(
         sys_read.ssn,
@@ -1225,7 +1227,9 @@ unsafe fn infer_ssn_halo_gate(ntdll_base: usize, target_addr: usize) -> Option<S
 /// (x86-64).  Returns the gadget's address, or `None` if none was found.
 #[cfg(all(windows, target_arch = "x86_64"))]
 unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
-    use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER,
+    };
     use windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER;
 
     let dos = &*(ntdll_base as *const IMAGE_DOS_HEADER);
@@ -1271,7 +1275,9 @@ unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
 /// instructions, so the scan walks in 4-byte (u32) steps.
 #[cfg(all(windows, target_arch = "aarch64"))]
 unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
-    use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER,
+    };
     use windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER;
 
     let dos = &*(ntdll_base as *const IMAGE_DOS_HEADER);
@@ -1859,16 +1865,16 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
                 stack_ptr = in(reg) stack_ptr_a64 as u64,
                 gadget = in(reg) gadget_addr as u64,
                 status = out(reg) status,
-                // AAPCS64 caller-saved GPRs: x0-x18, x30 (LR).
-                // x18 is the platform register (reserved) but we declare it
-                // for completeness.  x19 is reserved by LLVM on Windows
-                // ARM64 and cannot appear as an explicit operand.
+                // AAPCS64 caller-saved GPRs: x0-x17, x30 (LR).
+                // x18 is the Windows ARM64 platform register (TEB pointer)
+                // and cannot appear as an explicit operand. x19 is reserved
+                // by LLVM on Windows ARM64 and cannot appear either.
                 out("x0")  _, out("x1")  _, out("x2")  _, out("x3")  _,
                 out("x4")  _, out("x5")  _, out("x6")  _, out("x7")  _,
                 out("x8")  _,
                 out("x9")  _, out("x10") _, out("x11") _,
                 out("x12") _, out("x13") _, out("x14") _, out("x15") _,
-                out("x16") _, out("x17") _, out("x18") _,
+                out("x16") _, out("x17") _,
                 out("x20") _,
                 out("x30") _,
                 // AAPCS64 caller-saved NEON/FP registers.
@@ -1938,13 +1944,15 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
                 nstack = in(reg) nstack_a64 as u64,
                 stack_ptr = in(reg) stack_ptr_a64 as u64,
                 lateout("x0") status,
-                // AAPCS64 caller-saved GPRs: x1-x18, x30 (LR).
+                // AAPCS64 caller-saved GPRs: x1-x17, x30 (LR).
+                // x18 is the Windows ARM64 platform register (TEB pointer)
+                // and cannot appear as an explicit operand.
                 out("x1")  _, out("x2")  _, out("x3")  _,
                 out("x4")  _, out("x5")  _, out("x6")  _, out("x7")  _,
                 out("x8")  _,
                 out("x9")  _, out("x10") _, out("x11") _,
                 out("x12") _, out("x13") _, out("x14") _, out("x15") _,
-                out("x16") _, out("x17") _, out("x18") _,
+                out("x16") _, out("x17") _,
                 out("x20") _,
                 out("x30") _,
                 // AAPCS64 caller-saved NEON/FP registers.
@@ -1965,6 +1973,28 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
         let _ = (ssn, gadget_addr, args);
         // Unsupported architecture; return STATUS_NOT_IMPLEMENTED.
         0xC000_0002u32 as i32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expected_ssn_range_covers_critical_syscalls() {
+        let (lo, hi) = expected_ssn_range("NtAllocateVirtualMemory", 22631).unwrap();
+        assert!(lo <= hi);
+        assert!(lo <= 0x0028);
+        assert!(hi >= 0x0010);
+        assert!(expected_ssn_range("NtDefinitelyNotReal", 22631).is_none());
+    }
+
+    #[test]
+    fn compare_export_name_orders_prefixes_correctly() {
+        assert_eq!(compare_export_name(b"NtClose\0", b"NtClose"), 0);
+        assert!(compare_export_name(b"NtCreateThreadEx\0", b"NtCreate") > 0);
+        assert!(compare_export_name(b"NtAllocateVirtualMemory\0", b"NtClose") < 0);
+        assert!(compare_export_name(b"NtRead\0", b"NtReadVirtualMemory") > 0);
     }
 }
 

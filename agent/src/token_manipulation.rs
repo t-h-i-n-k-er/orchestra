@@ -11,12 +11,14 @@
 
 #![cfg(windows)]
 
-use common::lock::MutexExt;
-use anyhow::{anyhow, Context, Result};
-use std::sync::{Mutex, OnceLock};
-use windows_sys::Win32::Security::{SecurityImpersonation, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_QUERY};
 use crate::win_types::HANDLE;
+use anyhow::{anyhow, Context, Result};
+use common::lock::MutexExt;
+use std::sync::{Mutex, OnceLock};
 use windows_sys::Win32::Security::TokenImpersonation;
+use windows_sys::Win32::Security::{
+    SecurityImpersonation, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_QUERY,
+};
 // CloseHandle removed — using NtClose indirect syscall exclusively.
 
 /// Dynamically-resolved GetLastError (reads TEB, no IAT entry).
@@ -184,7 +186,9 @@ unsafe fn nt_set_thread_token(thread: HANDLE, token: HANDLE) -> i32 {
     let target = match crate::syscalls::get_syscall_id("NtSetInformationThread") {
         Ok(t) => t,
         Err(e) => {
-            tracing::error!("token_manipulation: failed to resolve NtSetInformationThread SSN: {e}");
+            tracing::error!(
+                "token_manipulation: failed to resolve NtSetInformationThread SSN: {e}"
+            );
             return -1;
         }
     };

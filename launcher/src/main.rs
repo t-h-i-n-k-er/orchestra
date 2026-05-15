@@ -312,11 +312,13 @@ fn verify_poly_mac(blob_key: &[u8], authenticated_data: &[u8], expected_tag: &[u
     hkdf.expand(b"orchestra-poly-mac", &mut mac_key)
         .map_err(|_| anyhow!("HKDF expand failed for poly MAC key"))?;
 
-    let mut mac = HmacSha256::new_from_slice(&mac_key)
-        .expect("HMAC-SHA256 accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(&mac_key).expect("HMAC-SHA256 accepts any key length");
     mac.update(authenticated_data);
-    mac.verify_slice(expected_tag)
-        .map_err(|_| anyhow!("POLY blob authentication tag verification failed — blob may be tampered or corrupted"))?;
+    mac.verify_slice(expected_tag).map_err(|_| {
+        anyhow!(
+            "POLY blob authentication tag verification failed — blob may be tampered or corrupted"
+        )
+    })?;
     Ok(())
 }
 
@@ -421,7 +423,11 @@ fn poly_exec_raw_stub_software(ct: &[u8], stub: &[u8]) -> Result<Vec<u8>> {
         let overhead = stub.len() - ct.len();
         if overhead <= MAX_XOR_CODE {
             let keystream = &stub[stub.len() - ct.len()..];
-            let output: Vec<u8> = ct.iter().zip(keystream.iter()).map(|(c, k)| c ^ k).collect();
+            let output: Vec<u8> = ct
+                .iter()
+                .zip(keystream.iter())
+                .map(|(c, k)| c ^ k)
+                .collect();
             tracing::info!(
                 ct_bytes = ct.len(),
                 stub_bytes = stub.len(),
@@ -496,7 +502,12 @@ fn poly_exec_raw_stub_macos(ct: &[u8], stub: &[u8]) -> Result<Vec<u8>> {
     unsafe {
         let f: extern "C" fn(*const u8, usize, *const u8, *mut u8) =
             core::mem::transmute(stub_page);
-        f(ct.as_ptr(), ct.len(), core::ptr::null(), output.as_mut_ptr());
+        f(
+            ct.as_ptr(),
+            ct.len(),
+            core::ptr::null(),
+            output.as_mut_ptr(),
+        );
     }
 
     unsafe {

@@ -9,9 +9,9 @@
 //! All NT API calls go through `syscall!`.
 //! All strings through `string_crypt`.
 
-use common::lock::MutexExt;
 use super::driver_db::{self, DriverMapping, VulnerableDriver};
 use anyhow::{bail, Context, Result};
+use common::lock::MutexExt;
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
 
@@ -270,8 +270,7 @@ fn derive_driver_key(session_key: &[u8]) -> [u8; DRIVER_XOR_KEY_LEN] {
 fn find_driver_in_system_paths(driver: &VulnerableDriver) -> Option<String> {
     use std::path::Path;
 
-    let system_root =
-        std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
 
     // Fixed system-driver directories.
     let candidates = [
@@ -286,10 +285,7 @@ fn find_driver_in_system_paths(driver: &VulnerableDriver) -> Option<String> {
     }
 
     // DriverStore: one level of sub-directories under FileRepository.
-    let driverstore = format!(
-        "{}\\System32\\DriverStore\\FileRepository",
-        system_root
-    );
+    let driverstore = format!("{}\\System32\\DriverStore\\FileRepository", system_root);
     if let Ok(entries) = std::fs::read_dir(&driverstore) {
         for entry in entries.flatten() {
             let candidate = entry.path().join(driver.name);
@@ -467,7 +463,11 @@ static EMBEDDED_DRIVER_BYTES: &[u8] = include_bytes!(env!("SYS_DRIVER_PATH"));
 /// When the `embedded_driver` feature is enabled but no driver path was
 /// provided and the build is running under CI/EMBEDDED_DRIVER_ALLOW_MISSING,
 /// fall back to the placeholder bytes so the code compiles as a no-op stub.
-#[cfg(all(feature = "embedded_driver", not(has_sys_driver_path), embedded_driver_missing))]
+#[cfg(all(
+    feature = "embedded_driver",
+    not(has_sys_driver_path),
+    embedded_driver_missing
+))]
 static EMBEDDED_DRIVER_BYTES: &[u8] = PLACEHOLDER_DRIVER_BYTES;
 
 /// When the `embedded_driver` feature is enabled, no driver path was provided,

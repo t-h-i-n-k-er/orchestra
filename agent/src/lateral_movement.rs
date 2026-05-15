@@ -418,12 +418,12 @@ pub fn psexec_exec(
 // in the IAT — all function pointers are obtained through the pe_resolve
 // API-hashing resolver at runtime.
 
-use crate::win_types::{GUID, REFIID};
-use crate::win_types::HRESULT;
+use crate::win_types::IUnknown;
 use crate::win_types::BSTR;
+use crate::win_types::HRESULT;
+use crate::win_types::{GUID, REFIID};
 use windows_sys::Win32::System::Com::CLSCTX_INPROC_SERVER;
 use windows_sys::Win32::System::Variant::VARIANT;
-use crate::win_types::IUnknown;
 
 type LONG = crate::win_types::LONG;
 
@@ -1191,7 +1191,8 @@ pub fn dcom_exec(
         identity.Flags = SEC_WINNT_AUTH_IDENTITY_UNICODE;
 
         // Set up COAUTHINFO
-        let mut auth_info: windows_sys::Win32::System::Com::COAUTHINFO = unsafe { std::mem::zeroed() };
+        let mut auth_info: windows_sys::Win32::System::Com::COAUTHINFO =
+            unsafe { std::mem::zeroed() };
         auth_info.dwAuthnSvc = RPC_C_AUTHN_WINNT;
         auth_info.dwAuthzSvc = RPC_C_AUTHZ_NONE;
         auth_info.pwszServerPrincName = ptr::null_mut();

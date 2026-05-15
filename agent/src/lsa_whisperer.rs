@@ -41,15 +41,15 @@
 
 #![cfg(all(windows, feature = "lsa-whisperer"))]
 
-use common::lock::MutexExt;
+use crate::win_types::HANDLE;
+use crate::win_types::{PVOID, ULONG, UNICODE_STRING};
 use anyhow::{anyhow, bail, Context, Result};
+use common::lock::MutexExt;
 use once_cell::sync::Lazy;
 use serde::Serialize;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
-use crate::win_types::{PVOID, ULONG, UNICODE_STRING};
-use crate::win_types::HANDLE;
 
 // ── NTSTATUS helpers ───────────────────────────────────────────────────────
 

@@ -492,17 +492,14 @@ async fn handle_agent(
                 // Try each platform extension until we find one that exists.
                 // The first match wins; if none exist the agent receives an
                 // empty ModuleResponse.
-                let (module_path, matched_ext) = match PLATFORM_EXTS
-                    .iter()
-                    .find_map(|&ext| {
-                        let p =
-                            std::path::Path::new(module_dir).join(format!("{module_id}.{ext}"));
-                        if p.exists() {
-                            Some((p, ext))
-                        } else {
-                            None
-                        }
-                    }) {
+                let (module_path, matched_ext) = match PLATFORM_EXTS.iter().find_map(|&ext| {
+                    let p = std::path::Path::new(module_dir).join(format!("{module_id}.{ext}"));
+                    if p.exists() {
+                        Some((p, ext))
+                    } else {
+                        None
+                    }
+                }) {
                     Some(found) => found,
                     None => {
                         tracing::warn!(

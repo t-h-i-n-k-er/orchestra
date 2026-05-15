@@ -254,3 +254,43 @@ pub fn harden_with_resources(
 
     Ok(result)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_options_enable_all_operations() {
+        let opts = HardenOptions::default();
+        assert!(opts.randomize_timestamp);
+        assert!(opts.remove_rich_header);
+        assert!(opts.randomize_section_names);
+        assert!(opts.replace_dos_stub);
+        assert!(opts.strip_overlay);
+        assert!(opts.strip_signature);
+        assert!(opts.strip_debug_directory);
+        assert!(opts.replace_pdb_path);
+        assert!(opts.add_entropy_padding);
+        assert!(opts.recalculate_checksum);
+    }
+
+    #[test]
+    fn is_pe_requires_mz_magic() {
+        assert!(HardeningResult::is_pe(b"MZ\0\0"));
+        assert!(!HardeningResult::is_pe(b"M"));
+        assert!(!HardeningResult::is_pe(b"ZM\0\0"));
+    }
+
+    #[test]
+    fn harden_skips_non_pe_buffers() {
+        let mut buf = b"not a pe file".to_vec();
+        let before = buf.clone();
+        let result = harden_default(&mut buf);
+
+        assert_eq!(buf, before);
+        assert_eq!(result.operations_applied, 0);
+        assert_eq!(result.operations_total, 10);
+        assert_eq!(result.size_before, before.len());
+        assert_eq!(result.size_after, before.len());
+    }
+}

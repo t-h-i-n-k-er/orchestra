@@ -651,3 +651,54 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_profile() -> Profile {
+        Profile {
+            profile: Some(ProfileInfo {
+                name: "lab-profile".to_string(),
+            }),
+            http_get: Some(HttpTransaction {
+                uri: vec!["/api/v1/checkin".to_string()],
+            }),
+            http_post: Some(HttpTransaction {
+                uri: vec!["/api/v1/tasks".to_string()],
+            }),
+        }
+    }
+
+    #[test]
+    fn profile_collects_get_and_post_c2_uris() {
+        let uris = test_profile().c2_uris();
+        assert!(uris.contains("/api/v1/checkin"));
+        assert!(uris.contains("/api/v1/tasks"));
+        assert_eq!(uris.len(), 2);
+    }
+
+    #[test]
+    fn redirector_state_matches_exact_and_query_paths() {
+        let profile = test_profile();
+        let state =
+            RedirectorState::new(&profile, "https://c2.example.test".to_string(), None, None);
+
+        assert!(state.is_c2_request("/api/v1/checkin"));
+        assert!(state.is_c2_request("/api/v1/checkin?id=1"));
+        assert!(!state.is_c2_request("/cover/index.html"));
+    }
+
+    #[test]
+    fn content_type_mapping_covers_common_assets() {
+        assert_eq!(
+            guess_content_type(&PathBuf::from("index.html")),
+            "text/html"
+        );
+        assert_eq!(guess_content_type(&PathBuf::from("app.css")), "text/css");
+        assert_eq!(
+            guess_content_type(&PathBuf::from("payload.bin")),
+            "application/octet-stream"
+        );
+    }
+}

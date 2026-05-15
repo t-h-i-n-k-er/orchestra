@@ -36,8 +36,8 @@ use std::mem;
 use std::ptr;
 
 use anyhow::{anyhow, bail, Context, Result};
-use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
 
 use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
 
@@ -46,8 +46,8 @@ use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
 // ═══════════════════════════════════════════════════════════════════════════
 
 const WLDAP32_DLL_W: &[u16] = &[
-    'w' as u16, 'l' as u16, 'd' as u16, 'a' as u16, 'p' as u16, '3' as u16,
-    '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'w' as u16, 'l' as u16, 'd' as u16, 'a' as u16, 'p' as u16, '3' as u16, '2' as u16, '.' as u16,
+    'd' as u16, 'l' as u16, 'l' as u16, 0,
 ];
 const HASH_WLDAP32_DLL: u32 = hash_wstr_const(WLDAP32_DLL_W);
 
@@ -67,8 +67,8 @@ const FN_LDAP_GET_NEXT_PAGE: u32 = hash_str_const(b"ldap_get_next_page");
 
 // netapi32.dll — DC discovery
 const NETAPI32_DLL_W: &[u16] = &[
-    'n' as u16, 'e' as u16, 't' as u16, 'a' as u16, 'p' as u16, 'i' as u16,
-    '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'n' as u16, 'e' as u16, 't' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '3' as u16, '2' as u16,
+    '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
 ];
 const HASH_NETAPI32_DLL: u32 = hash_wstr_const(NETAPI32_DLL_W);
 const FN_DS_GET_DC_NAME_W: u32 = hash_str_const(b"DsGetDcNameW");
@@ -315,11 +315,11 @@ fn discover_dc() -> Result<String> {
         .ok_or_else(|| anyhow!("netapi32.dll not found"))?;
 
     let ds_get_dc_name_w: unsafe fn(
-        *const u16,     // ComputerName
-        *const u16,     // DomainName
-        *mut [u8; 16],  // DomainGuid
-        *const u16,     // SiteName
-        u32,            // Flags
+        *const u16,    // ComputerName
+        *const u16,    // DomainName
+        *mut [u8; 16], // DomainGuid
+        *const u16,    // SiteName
+        u32,           // Flags
         *mut *mut DOMAIN_CONTROLLER_INFO_W,
     ) -> HRESULT = unsafe {
         mem::transmute(
@@ -377,9 +377,8 @@ struct LdapFns {
     ldap_init_w: unsafe extern "system" fn(*const u16, u32, u32) -> PLDAP,
     ldap_bind_s_w: unsafe extern "system" fn(PLDAP, *const u16, *mut c_void, u32) -> u32,
     ldap_unbind: unsafe extern "system" fn(PLDAP) -> u32,
-    ldap_search_s_w: unsafe fn(
-        PLDAP, *const u16, u32, *const u16, *mut *const u16, u32, *mut PLDAPMSG,
-    ) -> u32,
+    ldap_search_s_w:
+        unsafe fn(PLDAP, *const u16, u32, *const u16, *mut *const u16, u32, *mut PLDAPMSG) -> u32,
     ldap_first_entry: unsafe extern "system" fn(PLDAP, PLDAPMSG) -> PLDAPMSG,
     ldap_next_entry: unsafe extern "system" fn(PLDAP, PLDAPMSG) -> PLDAPMSG,
     ldap_get_values_w: unsafe extern "system" fn(PLDAP, PLDAPMSG, *const u16) -> *mut *mut u16,
@@ -442,7 +441,8 @@ impl LdapConnection {
             bail!("ldap_initW failed for {}", dc_hostname);
         }
 
-        let res = unsafe { (fns.ldap_bind_s_w)(ld, ptr::null(), ptr::null_mut(), LDAP_AUTH_NEGOTIATE) };
+        let res =
+            unsafe { (fns.ldap_bind_s_w)(ld, ptr::null(), ptr::null_mut(), LDAP_AUTH_NEGOTIATE) };
         if res != LDAP_SUCCESS {
             bail!("ldap_bind_sW failed: error {}", res);
         }
@@ -599,10 +599,7 @@ fn ldap_time_to_iso(raw: &str) -> String {
         let hour = &raw[8..10];
         let min = &raw[10..12];
         let sec = &raw[12..14];
-        return format!(
-            "{}-{}-{}T{}:{}:{}Z",
-            year, month, day, hour, min, sec
-        );
+        return format!("{}-{}-{}T{}:{}:{}Z", year, month, day, hour, min, sec);
     }
 
     raw.to_string()
@@ -686,17 +683,38 @@ fn enumerate_users(conn: &LdapConnection, base_dn: &str) -> Result<Vec<AdUser>> 
     let mut users = Vec::with_capacity(count as usize);
     for entry in conn.iter_entries(result) {
         unsafe {
-            let sam = conn.get_string_value(entry, "sAMAccountName").unwrap_or_default();
-            let display = conn.get_string_value(entry, "displayName").unwrap_or_default();
-            let dn = conn.get_string_value(entry, "distinguishedName").unwrap_or_default();
+            let sam = conn
+                .get_string_value(entry, "sAMAccountName")
+                .unwrap_or_default();
+            let display = conn
+                .get_string_value(entry, "displayName")
+                .unwrap_or_default();
+            let dn = conn
+                .get_string_value(entry, "distinguishedName")
+                .unwrap_or_default();
             let member_of = conn.get_multi_values(entry, "memberOf");
-            let uac_str = conn.get_string_value(entry, "userAccountControl").unwrap_or_default();
+            let uac_str = conn
+                .get_string_value(entry, "userAccountControl")
+                .unwrap_or_default();
             let uac: u32 = uac_str.parse().unwrap_or(0);
             let spns = conn.get_multi_values(entry, "servicePrincipalName");
-            let description = conn.get_string_value(entry, "description").unwrap_or_default();
-            let last_logon = ldap_time_to_iso(&conn.get_string_value(entry, "lastLogon").unwrap_or_default());
-            let pwd_last_set = ldap_time_to_iso(&conn.get_string_value(entry, "pwdLastSet").unwrap_or_default());
-            let admin_count: bool = conn.get_string_value(entry, "adminCount").map(|s| s != "0" && !s.is_empty()).unwrap_or(false);
+            let description = conn
+                .get_string_value(entry, "description")
+                .unwrap_or_default();
+            let last_logon = ldap_time_to_iso(
+                &conn
+                    .get_string_value(entry, "lastLogon")
+                    .unwrap_or_default(),
+            );
+            let pwd_last_set = ldap_time_to_iso(
+                &conn
+                    .get_string_value(entry, "pwdLastSet")
+                    .unwrap_or_default(),
+            );
+            let admin_count: bool = conn
+                .get_string_value(entry, "adminCount")
+                .map(|s| s != "0" && !s.is_empty())
+                .unwrap_or(false);
 
             users.push(AdUser {
                 sam_account_name: sam,
@@ -732,7 +750,14 @@ fn enumerate_groups(conn: &LdapConnection, base_dn: &str) -> Result<Vec<AdGroup>
     let (result, count) = conn.search(
         base_dn,
         "(objectClass=group)",
-        &["cn", "distinguishedName", "member", "memberOf", "groupType", "description"],
+        &[
+            "cn",
+            "distinguishedName",
+            "member",
+            "memberOf",
+            "groupType",
+            "description",
+        ],
     )?;
     defer!(conn.free_result(result));
 
@@ -740,16 +765,22 @@ fn enumerate_groups(conn: &LdapConnection, base_dn: &str) -> Result<Vec<AdGroup>
     for entry in conn.iter_entries(result) {
         unsafe {
             let cn = conn.get_string_value(entry, "cn").unwrap_or_default();
-            let dn = conn.get_string_value(entry, "distinguishedName").unwrap_or_default();
+            let dn = conn
+                .get_string_value(entry, "distinguishedName")
+                .unwrap_or_default();
             let members = conn.get_multi_values(entry, "member");
             let member_of = conn.get_multi_values(entry, "memberOf");
-            let gt_str = conn.get_string_value(entry, "groupType").unwrap_or_default();
+            let gt_str = conn
+                .get_string_value(entry, "groupType")
+                .unwrap_or_default();
             let group_type: i32 = gt_str.parse().unwrap_or(0);
-            let description = conn.get_string_value(entry, "description").unwrap_or_default();
+            let description = conn
+                .get_string_value(entry, "description")
+                .unwrap_or_default();
 
-            let is_privileged = PRIVILEGED_GROUPS.iter().any(|pg| {
-                cn.eq_ignore_ascii_case(pg)
-            });
+            let is_privileged = PRIVILEGED_GROUPS
+                .iter()
+                .any(|pg| cn.eq_ignore_ascii_case(pg));
 
             groups.push(AdGroup {
                 cn,
@@ -772,7 +803,15 @@ fn enumerate_computers(conn: &LdapConnection, base_dn: &str) -> Result<Vec<AdCom
     let (result, count) = conn.search(
         base_dn,
         "(objectClass=computer)",
-        &["cn", "distinguishedName", "operatingSystem", "dNSHostName", "servicePrincipalName", "lastLogon", "userAccountControl"],
+        &[
+            "cn",
+            "distinguishedName",
+            "operatingSystem",
+            "dNSHostName",
+            "servicePrincipalName",
+            "lastLogon",
+            "userAccountControl",
+        ],
     )?;
     defer!(conn.free_result(result));
 
@@ -780,12 +819,24 @@ fn enumerate_computers(conn: &LdapConnection, base_dn: &str) -> Result<Vec<AdCom
     for entry in conn.iter_entries(result) {
         unsafe {
             let cn = conn.get_string_value(entry, "cn").unwrap_or_default();
-            let dn = conn.get_string_value(entry, "distinguishedName").unwrap_or_default();
-            let os = conn.get_string_value(entry, "operatingSystem").unwrap_or_default();
-            let dns = conn.get_string_value(entry, "dNSHostName").unwrap_or_default();
+            let dn = conn
+                .get_string_value(entry, "distinguishedName")
+                .unwrap_or_default();
+            let os = conn
+                .get_string_value(entry, "operatingSystem")
+                .unwrap_or_default();
+            let dns = conn
+                .get_string_value(entry, "dNSHostName")
+                .unwrap_or_default();
             let spns = conn.get_multi_values(entry, "servicePrincipalName");
-            let last_logon = ldap_time_to_iso(&conn.get_string_value(entry, "lastLogon").unwrap_or_default());
-            let uac_str = conn.get_string_value(entry, "userAccountControl").unwrap_or_default();
+            let last_logon = ldap_time_to_iso(
+                &conn
+                    .get_string_value(entry, "lastLogon")
+                    .unwrap_or_default(),
+            );
+            let uac_str = conn
+                .get_string_value(entry, "userAccountControl")
+                .unwrap_or_default();
             let uac: u32 = uac_str.parse().unwrap_or(0);
 
             computers.push(AdComputer {
@@ -816,9 +867,15 @@ fn enumerate_gpos(conn: &LdapConnection, base_dn: &str) -> Result<Vec<AdGpo>> {
     let mut gpos = Vec::with_capacity(count as usize);
     for entry in conn.iter_entries(result) {
         unsafe {
-            let display = conn.get_string_value(entry, "displayName").unwrap_or_default();
-            let dn = conn.get_string_value(entry, "distinguishedName").unwrap_or_default();
-            let path = conn.get_string_value(entry, "gPCFileSysPath").unwrap_or_default();
+            let display = conn
+                .get_string_value(entry, "displayName")
+                .unwrap_or_default();
+            let dn = conn
+                .get_string_value(entry, "distinguishedName")
+                .unwrap_or_default();
+            let path = conn
+                .get_string_value(entry, "gPCFileSysPath")
+                .unwrap_or_default();
             gpos.push(AdGpo {
                 display_name: display,
                 distinguished_name: dn,
@@ -838,17 +895,31 @@ fn enumerate_trusts(conn: &LdapConnection, base_dn: &str) -> Result<Vec<AdTrust>
     let (result, count) = conn.search(
         &trust_base,
         "(objectClass=trustedDomain)",
-        &["trustPartner", "trustType", "trustDirection", "trustAttributes", "distinguishedName"],
+        &[
+            "trustPartner",
+            "trustType",
+            "trustDirection",
+            "trustAttributes",
+            "distinguishedName",
+        ],
     )?;
     defer!(conn.free_result(result));
 
     let mut trusts = Vec::with_capacity(count as usize);
     for entry in conn.iter_entries(result) {
         unsafe {
-            let partner = conn.get_string_value(entry, "trustPartner").unwrap_or_default();
-            let tt_str = conn.get_string_value(entry, "trustType").unwrap_or_default();
-            let td_str = conn.get_string_value(entry, "trustDirection").unwrap_or_default();
-            let ta_str = conn.get_string_value(entry, "trustAttributes").unwrap_or_default();
+            let partner = conn
+                .get_string_value(entry, "trustPartner")
+                .unwrap_or_default();
+            let tt_str = conn
+                .get_string_value(entry, "trustType")
+                .unwrap_or_default();
+            let td_str = conn
+                .get_string_value(entry, "trustDirection")
+                .unwrap_or_default();
+            let ta_str = conn
+                .get_string_value(entry, "trustAttributes")
+                .unwrap_or_default();
 
             let trust_type: u32 = tt_str.parse().unwrap_or(0);
             let trust_direction: u32 = td_str.parse().unwrap_or(0);
@@ -880,15 +951,23 @@ fn enumerate_spns(conn: &LdapConnection, base_dn: &str) -> Result<Vec<AdSpn>> {
     let (result, count) = conn.search(
         base_dn,
         "(&(objectCategory=person)(objectClass=user)(servicePrincipalName=*))",
-        &["sAMAccountName", "distinguishedName", "servicePrincipalName"],
+        &[
+            "sAMAccountName",
+            "distinguishedName",
+            "servicePrincipalName",
+        ],
     )?;
     defer!(conn.free_result(result));
 
     let mut spns = Vec::with_capacity(count as usize);
     for entry in conn.iter_entries(result) {
         unsafe {
-            let sam = conn.get_string_value(entry, "sAMAccountName").unwrap_or_default();
-            let dn = conn.get_string_value(entry, "distinguishedName").unwrap_or_default();
+            let sam = conn
+                .get_string_value(entry, "sAMAccountName")
+                .unwrap_or_default();
+            let dn = conn
+                .get_string_value(entry, "distinguishedName")
+                .unwrap_or_default();
             let spn_list = conn.get_multi_values(entry, "servicePrincipalName");
 
             spns.push(AdSpn {
@@ -915,8 +994,12 @@ fn enumerate_delegations(conn: &LdapConnection, base_dn: &str) -> Result<Vec<AdD
     let mut delegations = Vec::with_capacity(count_uc as usize);
     for entry in conn.iter_entries(result_uc) {
         unsafe {
-            let sam = conn.get_string_value(entry, "sAMAccountName").unwrap_or_default();
-            let dn = conn.get_string_value(entry, "distinguishedName").unwrap_or_default();
+            let sam = conn
+                .get_string_value(entry, "sAMAccountName")
+                .unwrap_or_default();
+            let dn = conn
+                .get_string_value(entry, "distinguishedName")
+                .unwrap_or_default();
             delegations.push(AdDelegation {
                 sam_account_name: sam,
                 distinguished_name: dn,
@@ -931,13 +1014,21 @@ fn enumerate_delegations(conn: &LdapConnection, base_dn: &str) -> Result<Vec<AdD
     let (result_cd, count_cd) = conn.search(
         base_dn,
         "(msDS-AllowedToDelegateTo=*)",
-        &["sAMAccountName", "distinguishedName", "msDS-AllowedToDelegateTo"],
+        &[
+            "sAMAccountName",
+            "distinguishedName",
+            "msDS-AllowedToDelegateTo",
+        ],
     )?;
 
     for entry in conn.iter_entries(result_cd) {
         unsafe {
-            let sam = conn.get_string_value(entry, "sAMAccountName").unwrap_or_default();
-            let dn = conn.get_string_value(entry, "distinguishedName").unwrap_or_default();
+            let sam = conn
+                .get_string_value(entry, "sAMAccountName")
+                .unwrap_or_default();
+            let dn = conn
+                .get_string_value(entry, "distinguishedName")
+                .unwrap_or_default();
             let targets = conn.get_multi_values(entry, "msDS-AllowedToDelegateTo");
 
             delegations.push(AdDelegation {
@@ -963,20 +1054,35 @@ fn enumerate_delegations(conn: &LdapConnection, base_dn: &str) -> Result<Vec<AdD
 fn enumerate_adcs(conn: &LdapConnection, base_dn: &str) -> Result<Vec<AdCertTemplate>> {
     // Certificate templates live under:
     // CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,<base_dn>
-    let config_base = format!("CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,{}", base_dn);
+    let config_base = format!(
+        "CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,{}",
+        base_dn
+    );
 
     let (result, count) = conn.search(
         &config_base,
         "(objectClass=pkicertificatetemplate)",
-        &["displayName", "distinguishedName", "msPKI-Cert-Template-OID", "pKIExpirationPeriod", "pKIOverlapPeriod"],
+        &[
+            "displayName",
+            "distinguishedName",
+            "msPKI-Cert-Template-OID",
+            "pKIExpirationPeriod",
+            "pKIOverlapPeriod",
+        ],
     )?;
 
     let mut templates = Vec::with_capacity(count as usize);
     for entry in conn.iter_entries(result) {
         unsafe {
-            let display = conn.get_string_value(entry, "displayName").unwrap_or_default();
-            let dn = conn.get_string_value(entry, "distinguishedName").unwrap_or_default();
-            let oid = conn.get_string_value(entry, "msPKI-Cert-Template-OID").unwrap_or_default();
+            let display = conn
+                .get_string_value(entry, "displayName")
+                .unwrap_or_default();
+            let dn = conn
+                .get_string_value(entry, "distinguishedName")
+                .unwrap_or_default();
+            let oid = conn
+                .get_string_value(entry, "msPKI-Cert-Template-OID")
+                .unwrap_or_default();
 
             // Detect weak settings (ESC indicators)
             let mut weak = Vec::new();
@@ -1003,7 +1109,10 @@ fn enumerate_adcs(conn: &LdapConnection, base_dn: &str) -> Result<Vec<AdCertTemp
 }
 
 /// Query domain-level information (lockout policy, functional level, SID).
-fn query_domain_info(conn: &LdapConnection, base_dn: &str) -> Result<(u32, u32, String, String, String)> {
+fn query_domain_info(
+    conn: &LdapConnection,
+    base_dn: &str,
+) -> Result<(u32, u32, String, String, String)> {
     let (result, _) = conn.search(
         base_dn,
         "(objectClass=domain)",
@@ -1019,13 +1128,15 @@ fn query_domain_info(conn: &LdapConnection, base_dn: &str) -> Result<(u32, u32, 
 
     for entry in conn.iter_entries(result) {
         unsafe {
-            let threshold: u32 = conn.get_string_value(entry, "lockoutThreshold")
+            let threshold: u32 = conn
+                .get_string_value(entry, "lockoutThreshold")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
 
             // lockoutDuration is in 100-ns intervals; convert to minutes.
             // Negative value means it's a delta from current time.
-            let duration_ticks: i64 = conn.get_string_value(entry, "lockoutDuration")
+            let duration_ticks: i64 = conn
+                .get_string_value(entry, "lockoutDuration")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
             let duration_minutes = if duration_ticks < 0 {
@@ -1034,7 +1145,8 @@ fn query_domain_info(conn: &LdapConnection, base_dn: &str) -> Result<(u32, u32, 
                 (duration_ticks / 600_000_000) as u32
             };
 
-            let functional_level = match conn.get_string_value(entry, "msDS-Behavior-Version")
+            let functional_level = match conn
+                .get_string_value(entry, "msDS-Behavior-Version")
                 .and_then(|s| s.parse::<i32>().ok())
                 .unwrap_or(0)
             {
@@ -1140,7 +1252,10 @@ pub fn enumerate_ad() -> Result<AdReconData> {
     let kerberoastable = users.iter().filter(|u| u.is_kerberoastable).count();
     let asrep_roastable = users.iter().filter(|u| u.is_asrep_roastable).count();
     let privileged = groups.iter().filter(|g| g.is_privileged).count();
-    let unconstrained = delegations.iter().filter(|d| d.delegation_type == "unconstrained").count();
+    let unconstrained = delegations
+        .iter()
+        .filter(|d| d.delegation_type == "unconstrained")
+        .count();
 
     info!(
         "AD enum complete: {} users ({} kerberoastable, {} AS-REP roastable), {} groups ({} privileged), \
@@ -1278,12 +1393,15 @@ mod tests {
             _ => "disabled".to_string(),
         };
         assert_eq!(desc_1, "inbound");
-        assert_eq!(match 3u32 {
-            1 => "inbound".to_string(),
-            2 => "outbound".to_string(),
-            3 => "bidirectional".to_string(),
-            _ => "disabled".to_string(),
-        }, "bidirectional");
+        assert_eq!(
+            match 3u32 {
+                1 => "inbound".to_string(),
+                2 => "outbound".to_string(),
+                3 => "bidirectional".to_string(),
+                _ => "disabled".to_string(),
+            },
+            "bidirectional"
+        );
     }
 
     #[test]

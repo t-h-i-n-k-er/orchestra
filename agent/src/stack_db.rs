@@ -242,7 +242,7 @@ unsafe fn has_valid_unwind_info(addr: usize) -> bool {
 ///
 /// Must be called with a valid process state (modules loaded, PEB walkable).
 unsafe fn build_address_db() -> HashMap<String, Vec<usize>> {
-    use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_NT_HEADERS64};
+    use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64;
     use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY};
 
     let mut db = HashMap::new();

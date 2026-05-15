@@ -191,7 +191,8 @@ pub struct AppState {
     /// Shell output buffers keyed by (agent_id, session_id).
     /// Accumulates output from agent `Message::ShellOutput` events for
     /// operator polling via GET /api/agents/:id/shell/:sid/output.
-    pub shell_output_buffers: DashMap<(String, u32), std::sync::Mutex<std::collections::VecDeque<String>>>,
+    pub shell_output_buffers:
+        DashMap<(String, u32), std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 
 impl AppState {

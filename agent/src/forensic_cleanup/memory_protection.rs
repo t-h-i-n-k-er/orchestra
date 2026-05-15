@@ -30,8 +30,8 @@ use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use anyhow::{anyhow, bail, Context, Result};
-use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // NT Constants
@@ -327,7 +327,7 @@ unsafe fn virtual_alloc(mut size: usize) -> Result<*mut std::ffi::c_void> {
         CURRENT_PROCESS,
         // BaseAddress (in/out) — we pass a null pointer to let the system choose.
         &mut std::ptr::null_mut::<std::ffi::c_void>() as *mut _ as u64,
-        0u64, // ZeroBits
+        0u64,                           // ZeroBits
         &mut size as *mut usize as u64, // RegionSize (in/out)
         (MEM_COMMIT | MEM_RESERVE) as u64,
         PAGE_READWRITE as u64,
@@ -357,7 +357,11 @@ unsafe fn virtual_alloc(mut size: usize) -> Result<*mut std::ffi::c_void> {
 }
 
 /// VirtualProtect — change memory protection.
-unsafe fn virtual_protect(mut addr: *mut std::ffi::c_void, mut size: usize, protect: u32) -> Result<u32> {
+unsafe fn virtual_protect(
+    mut addr: *mut std::ffi::c_void,
+    mut size: usize,
+    protect: u32,
+) -> Result<u32> {
     let mut old_protect: u32 = 0;
 
     let status = crate::syscall!(
@@ -414,14 +418,14 @@ unsafe fn add_veh(handler: usize) -> Result<*mut std::ffi::c_void> {
 
 /// Remove a Vectored Exception Handler.
 unsafe fn remove_veh(handle: *mut std::ffi::c_void) -> Result<()> {
-    let status = crate::syscall!(
-        "RtlRemoveVectoredExceptionHandler",
-        handle as u64,
-    )
-    .map_err(|e| anyhow!("RtlRemoveVectoredExceptionHandler: {}", e))?;
+    let status = crate::syscall!("RtlRemoveVectoredExceptionHandler", handle as u64,)
+        .map_err(|e| anyhow!("RtlRemoveVectoredExceptionHandler: {}", e))?;
 
     if status != STATUS_SUCCESS {
-        bail!("RtlRemoveVectoredExceptionHandler failed: 0x{:08X}", status as u32);
+        bail!(
+            "RtlRemoveVectoredExceptionHandler failed: 0x{:08X}",
+            status as u32
+        );
     }
 
     Ok(())
@@ -581,9 +585,7 @@ const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 /// memory scanning tool is reading our process memory.  Sets the global
 /// `DUMP_DETECTED` flag on suspicious exceptions and lets guard-page
 /// violations through (they are expected — our own guard pages fire these).
-unsafe extern "system" fn dump_veh_handler(
-    exception_info: *mut ExceptionPointers,
-) -> i32 {
+unsafe extern "system" fn dump_veh_handler(exception_info: *mut ExceptionPointers) -> i32 {
     if exception_info.is_null() {
         return EXCEPTION_CONTINUE_SEARCH;
     }
@@ -728,8 +730,8 @@ unsafe fn install_guard_page() -> Result<*mut std::ffi::c_void> {
 
     // Fill with sentinel pattern.
     let sentinel: [u8; 16] = [
-        0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
-        0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+        0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA,
+        0xBE,
     ];
     let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, GUARD_PAGE_SIZE);
     for chunk in slice.chunks_mut(16) {
@@ -963,7 +965,10 @@ mod tests {
         let config = DumpProtectionConfig::default();
         let json = serde_json::to_string(&config).unwrap();
         let decoded: DumpProtectionConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.debug_poll_interval_ms, config.debug_poll_interval_ms);
+        assert_eq!(
+            decoded.debug_poll_interval_ms,
+            config.debug_poll_interval_ms
+        );
         assert_eq!(decoded.dump_tool_names.len(), config.dump_tool_names.len());
     }
 

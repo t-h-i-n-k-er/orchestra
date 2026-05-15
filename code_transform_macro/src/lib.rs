@@ -9,6 +9,113 @@ use std::process::Command;
 use std::sync::OnceLock;
 use syn::{parse_macro_input, visit::Visit, FnArg, ItemFn, Macro, Pat, ReturnType, Type};
 
+#[derive(Debug, Clone)]
+struct TargetInfo {
+    triple: Option<String>,
+    arch: String,
+    os: String,
+    display: String,
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_arch_from_triple(triple: &str) -> Option<&'static str> {
+    if triple.starts_with("x86_64") {
+        Some("x86_64")
+    } else if triple.starts_with("aarch64") {
+        Some("aarch64")
+    } else if triple.starts_with("i686") || triple.starts_with("i586") {
+        Some("x86")
+    } else if triple.starts_with("arm") {
+        Some("arm")
+    } else {
+        None
+    }
+}
+
+fn parse_os_from_triple(triple: &str) -> Option<&'static str> {
+    if triple.contains("linux") {
+        Some("linux")
+    } else if triple.contains("windows") {
+        Some("windows")
+    } else if triple.contains("darwin") || triple.contains("apple") {
+        Some("macos")
+    } else if triple.contains("freebsd") {
+        Some("freebsd")
+    } else {
+        None
+    }
+}
+
+fn infer_target_triple(arch: &str, os: &str) -> String {
+    match (arch, os) {
+        ("x86_64", "linux") => "x86_64-unknown-linux-gnu".to_string(),
+        ("aarch64", "linux") => "aarch64-unknown-linux-gnu".to_string(),
+        ("x86_64", "windows") => "x86_64-pc-windows-msvc".to_string(),
+        ("aarch64", "windows") => "aarch64-pc-windows-msvc".to_string(),
+        ("x86_64", "macos") => "x86_64-apple-darwin".to_string(),
+        ("aarch64", "macos") => "aarch64-apple-darwin".to_string(),
+        _ => format!("{arch}-{os}"),
+    }
+}
+
+fn current_target_info() -> TargetInfo {
+    let triple = nonempty_env("TARGET");
+    let host = nonempty_env("HOST");
+    let cfg_arch = nonempty_env("CARGO_CFG_TARGET_ARCH");
+    let cfg_os = nonempty_env("CARGO_CFG_TARGET_OS");
+
+    let arch = cfg_arch
+        .or_else(|| {
+            triple
+                .as_deref()
+                .and_then(parse_arch_from_triple)
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            host.as_deref()
+                .and_then(parse_arch_from_triple)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| std::env::consts::ARCH.to_string());
+    let os = cfg_os
+        .or_else(|| {
+            triple
+                .as_deref()
+                .and_then(parse_os_from_triple)
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            host.as_deref()
+                .and_then(parse_os_from_triple)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| std::env::consts::OS.to_string());
+
+    let display = triple
+        .clone()
+        .or_else(|| {
+            if arch != "unknown" && os != "unknown" {
+                Some(infer_target_triple(&arch, &os))
+            } else {
+                host.clone()
+            }
+        })
+        .unwrap_or_else(|| format!("{arch}-{os}"));
+
+    TargetInfo {
+        triple,
+        arch,
+        os,
+        display,
+    }
+}
+
 // ─── ASM detection ────────────────────────────────────────────────────────────
 
 struct AsmVisitor {
@@ -153,10 +260,8 @@ fn compile_helper_obj(func: &ItemFn) -> Result<std::path::PathBuf, String> {
         .arg("-o")
         .arg(&obj_path)
         .arg(&src_path);
-    if let Ok(target) = std::env::var("TARGET") {
-        if !target.trim().is_empty() {
-            cmd.arg("--target").arg(target.trim());
-        }
+    if let Some(target) = current_target_info().triple {
+        cmd.arg("--target").arg(target);
     }
 
     let out = cmd
@@ -209,11 +314,7 @@ fn resolve_objdump_command(target: &str) -> Command {
     };
 
     for candidate in &cross_candidates {
-        if Command::new(candidate)
-            .arg("--version")
-            .output()
-            .is_ok()
-        {
+        if Command::new(candidate).arg("--version").output().is_ok() {
             return Command::new(candidate);
         }
     }
@@ -232,11 +333,10 @@ fn resolve_objdump_command(target: &str) -> Command {
 }
 
 fn parse_objdump_bytes(obj: &std::path::Path) -> Result<Vec<u8>, String> {
-    let target = std::env::var("TARGET").unwrap_or_default();
-    let mut cmd = resolve_objdump_command(&target);
+    let target = current_target_info();
+    let mut cmd = resolve_objdump_command(&target.display);
     let out = cmd
         .arg("-d")
-        .arg("--section=.text")
         .arg(obj)
         .output()
         .map_err(|e| format!("failed to run objdump: {}", e))?;
@@ -361,16 +461,15 @@ pub fn transform(attrs: TokenStream, item: TokenStream) -> TokenStream {
     // compilation target up front and produce a clear compile_error!
     // on all other platforms so the operator knows immediately that
     // the #[transform] attribute cannot be used.
-    let target = std::env::var("TARGET").unwrap_or_default();
-    let is_linux_x86_64 = target.starts_with("x86_64") && target.contains("linux");
+    let target = current_target_info();
+    let is_linux_x86_64 = target.arch == "x86_64" && target.os == "linux";
     if !is_linux_x86_64 {
         let msg = format!(
             "#[code_transform::transform]: code transformation is only supported \
              on linux+x86_64 targets (current target: '{}'). \
              Remove the #[transform] attribute from function '{}' or compile \
              for a supported target.",
-            target,
-            func.sig.ident
+            target.display, func.sig.ident
         );
         return compile_error(&msg);
     }

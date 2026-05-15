@@ -499,8 +499,7 @@ impl EnvReport {
                 // uptime (cap 25), hardware (cap 20).  To reach 50+, at least
                 // 3 categories must fire or 2 categories must fire strongly,
                 // which is extremely unlikely on a legitimate host.
-                let multi_category_heuristic = self.sandbox_score >= 50
-                    && self.sandbox_score < 60;
+                let multi_category_heuristic = self.sandbox_score >= 50 && self.sandbox_score < 60;
                 if multi_category_heuristic {
                     // Check whether the score actually came from diverse
                     // sources.  If the sandbox module produced a score of 50+,
@@ -938,14 +937,7 @@ fn host_init_system_detected() -> bool {
         let name = comm.trim();
         matches!(
             name,
-            "systemd"
-                | "init"
-                | "upstart"
-                | "openrc"
-                | "runit"
-                | "s6-svscan"
-                | "svc"
-                | "launchd"  // macOS init (for completeness)
+            "systemd" | "init" | "upstart" | "openrc" | "runit" | "s6-svscan" | "svc" | "launchd" // macOS init (for completeness)
         )
     } else {
         // Cannot read /proc/1/comm — conservatively assume host.
@@ -1223,9 +1215,7 @@ fn is_expected_hypervisor() -> bool {
                             // Record local-virtualisation detection for
                             // logging but do NOT set found_hypervisor —
                             // these are analyst VM candidates, not cloud.
-                            if line.contains("vmwarevirtual")
-                                || line.contains("prlvirtual")
-                            {
+                            if line.contains("vmwarevirtual") || line.contains("prlvirtual") {
                                 tracing::debug!(
                                     "env_check: is_expected_hypervisor: \
                                      local virtualisation detected (VMware/Parallels) \
@@ -1260,7 +1250,9 @@ fn is_expected_hypervisor() -> bool {
                 }
 
                 if timed_out {
-                    tracing::debug!("env_check: is_expected_hypervisor ioreg -l timed out after 2s");
+                    tracing::debug!(
+                        "env_check: is_expected_hypervisor ioreg -l timed out after 2s"
+                    );
                 }
             }
         }
@@ -1336,8 +1328,9 @@ fn is_cloud_instance_macos() -> bool {
         fn dns_name_resolves(hostname: &str) -> bool {
             use std::net::ToSocketAddrs;
             let addr = format!("{}:0", hostname);
-            addr.to_socket_addrs().is_ok()
-                && addr.to_socket_addrs().map(|it| !it.is_empty()).unwrap_or(false)
+            addr.to_socket_addrs()
+                .map(|mut addrs| addrs.next().is_some())
+                .unwrap_or(false)
         }
 
         if dns_name_resolves("metadata.google.internal") {
@@ -1657,10 +1650,7 @@ fn is_cloud_instance() -> bool {
                     let mut buf = [0u8; 512];
                     if has_budget_for_io("Azure IMDS read") {
                         if let Ok(n) = stream.read(&mut buf) {
-                            if n > 12
-                                && buf.starts_with(b"HTTP/1.")
-                                && &buf[9..12] == b"200"
-                            {
+                            if n > 12 && buf.starts_with(b"HTTP/1.") && &buf[9..12] == b"200" {
                                 // Validate body contains Azure IMDS keys.
                                 if let Some(body_start) = buf[..n]
                                     .windows(4)
@@ -1668,21 +1658,15 @@ fn is_cloud_instance() -> bool {
                                     .map(|p| p + 4)
                                 {
                                     let body = &buf[body_start..n];
-                                    if !body.starts_with(b"<")
-                                        && !body.starts_with(b"<!")
-                                    {
-                                        let body_str =
-                                            String::from_utf8_lossy(body);
+                                    if !body.starts_with(b"<") && !body.starts_with(b"<!") {
+                                        let body_str = String::from_utf8_lossy(body);
                                         let azure_keys = [
                                             "vmId",
                                             "location",
                                             "resourceGroupName",
                                             "subscriptionId",
                                         ];
-                                        if azure_keys
-                                            .iter()
-                                            .any(|k| body_str.contains(k))
-                                        {
+                                        if azure_keys.iter().any(|k| body_str.contains(k)) {
                                             tracing::debug!(
                                                 "env_check: cloud instance detected via Azure IMDS"
                                             );
@@ -1714,10 +1698,7 @@ fn is_cloud_instance() -> bool {
                     let mut buf = [0u8; 512];
                     if has_budget_for_io("GCP IMDS read") {
                         if let Ok(n) = stream.read(&mut buf) {
-                            if n > 12
-                                && buf.starts_with(b"HTTP/1.")
-                                && &buf[9..12] == b"200"
-                            {
+                            if n > 12 && buf.starts_with(b"HTTP/1.") && &buf[9..12] == b"200" {
                                 // Validate body contains GCP metadata paths.
                                 if let Some(body_start) = buf[..n]
                                     .windows(4)
@@ -1725,20 +1706,10 @@ fn is_cloud_instance() -> bool {
                                     .map(|p| p + 4)
                                 {
                                     let body = &buf[body_start..n];
-                                    if !body.starts_with(b"<")
-                                        && !body.starts_with(b"<!")
-                                    {
-                                        let body_str =
-                                            String::from_utf8_lossy(body);
-                                        let gcp_keys = [
-                                            "instance/",
-                                            "project/",
-                                            "oslogin/",
-                                        ];
-                                        if gcp_keys
-                                            .iter()
-                                            .any(|k| body_str.contains(k))
-                                        {
+                                    if !body.starts_with(b"<") && !body.starts_with(b"<!") {
+                                        let body_str = String::from_utf8_lossy(body);
+                                        let gcp_keys = ["instance/", "project/", "oslogin/"];
+                                        if gcp_keys.iter().any(|k| body_str.contains(k)) {
                                             tracing::debug!(
                                                 "env_check: cloud instance detected via GCP IMDS"
                                             );
@@ -1792,10 +1763,7 @@ fn is_cloud_instance() -> bool {
                     break;
                 }
                 if let Ok(n) = stream.read(&mut buf) {
-                    if n > 12
-                        && buf.starts_with(b"HTTP/1.")
-                        && &buf[9..12] == b"200"
-                    {
+                    if n > 12 && buf.starts_with(b"HTTP/1.") && &buf[9..12] == b"200" {
                         // Validate body: reject HTML, accept any non-HTML
                         // body (JSON metadata from these providers).
                         if let Some(body_start) = buf[..n]
@@ -1808,10 +1776,7 @@ fn is_cloud_instance() -> bool {
                                 && !body.starts_with(b"<!")
                                 && !body.is_empty()
                             {
-                                tracing::debug!(
-                                    "env_check: cloud instance detected via {}",
-                                    label
-                                );
+                                tracing::debug!("env_check: cloud instance detected via {}", label);
                                 return true;
                             }
                         }
@@ -2106,7 +2071,12 @@ pub fn get_ram_gb() -> u64 {
             .args(["-n", "hw.memsize"])
             .output()
             .ok()
-            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok())
+            .and_then(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+            })
             .map(|bytes| bytes / (1024 * 1024 * 1024))
             .unwrap_or(0)
     }
@@ -2317,7 +2287,11 @@ pub fn detect_vm_strict() -> (bool, u32, u32) {
     let production_server = is_likely_production_server();
     let num_indicators = indicators.len();
     let is_borderline = strict_total >= 30 && strict_total <= 35 && num_indicators <= 2;
-    let strict_threshold: u32 = if production_server && is_borderline { 40 } else { 30 };
+    let strict_threshold: u32 = if production_server && is_borderline {
+        40
+    } else {
+        30
+    };
     // A score of 0 means no indicators at all; that is safe to ignore.
     let is_vm = strict_total > 0 && strict_total >= strict_threshold;
     (is_vm, strict_total, strict_threshold)
@@ -2339,22 +2313,23 @@ pub fn detect_vm_strict() -> (bool, u32, u32) {
 /// should be zeroed when this returns `true`.
 fn is_ci_environment() -> bool {
     // Single definitive CI variables (set by the CI system itself).
-    if std::env::var_os("CI").is_some() && std::env::var("CI").map(|v| v == "true").unwrap_or(false) {
+    if std::env::var_os("CI").is_some() && std::env::var("CI").map(|v| v == "true").unwrap_or(false)
+    {
         return true;
     }
     // Platform-specific CI indicators.
     const CI_VARS: &[&str] = &[
-        "GITHUB_ACTIONS",       // GitHub Actions
-        "GITLAB_CI",            // GitLab CI
-        "JENKINS_URL",          // Jenkins
-        "TRAVIS",               // Travis CI
-        "CIRCLECI",             // CircleCI
-        "BUILDKITE",            // Buildkite
-        "TF_BUILD",             // Azure Pipelines
-        "HEROKU_TEST_RUN_ID",   // Heroku CI
+        "GITHUB_ACTIONS",         // GitHub Actions
+        "GITLAB_CI",              // GitLab CI
+        "JENKINS_URL",            // Jenkins
+        "TRAVIS",                 // Travis CI
+        "CIRCLECI",               // CircleCI
+        "BUILDKITE",              // Buildkite
+        "TF_BUILD",               // Azure Pipelines
+        "HEROKU_TEST_RUN_ID",     // Heroku CI
         "BITBUCKET_BUILD_NUMBER", // Bitbucket Pipelines
-        "TEAMCITY_VERSION",     // TeamCity
-        "CODEBUILD_BUILD_ID",   // AWS CodeBuild
+        "TEAMCITY_VERSION",       // TeamCity
+        "CODEBUILD_BUILD_ID",     // AWS CodeBuild
     ];
     for var in CI_VARS {
         if std::env::var_os(var).is_some() {
@@ -4702,7 +4677,12 @@ fn hardware_topology_indicators(indicators: &mut Vec<common::SandboxIndicator>) 
         .args(["-n", "hw.memsize"])
         .output()
         .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
         .map(|bytes| bytes / (1024 * 1024 * 1024))
         .unwrap_or(0);
     if ram_gb < 2 {
@@ -4845,9 +4825,7 @@ fn classify_ancestor_process_name(
 
     Some(common::SandboxIndicator {
         category: "lineage".to_string(),
-        detail: format!(
-            "Analysis-framework {relation} detected (depth={depth}): {ancestor_name}"
-        ),
+        detail: format!("Analysis-framework {relation} detected (depth={depth}): {ancestor_name}"),
         weight,
         source: "lineage".to_string(),
     })
@@ -4952,9 +4930,7 @@ fn process_lineage_indicator() -> Option<common::SandboxIndicator> {
     };
 
     // ── Check immediate parent (depth 1) ─────────────────────────────────
-    let parent_name = proc_map
-        .get(&current_pid)
-        .map(|(_, name)| name.to_string());
+    let parent_name = proc_map.get(&current_pid).map(|(_, name)| name.to_string());
 
     if let Some(ind) = classify_parent_process_name(parent_name.as_deref()) {
         return Some(ind);
@@ -5453,10 +5429,10 @@ mod tests {
     #[test]
     fn cloud_ci_environment_does_not_auto_refuse() {
         let report = EnvReport {
-            vm_detected: true,  // Cloud hypervisor detected.
-            vm_detected_strict: true,  // Strict mode also detects it.
-            sandbox_score: 45,  // Moderate score from headless probe.
-            domain_match: None, // No domain requirement configured.
+            vm_detected: true,        // Cloud hypervisor detected.
+            vm_detected_strict: true, // Strict mode also detects it.
+            sandbox_score: 45,        // Moderate score from headless probe.
+            domain_match: None,       // No domain requirement configured.
             ..EnvReport::default()
         };
         assert!(

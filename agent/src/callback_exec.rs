@@ -1,10 +1,12 @@
 #[cfg(windows)]
+use crate::win_types::HANDLE;
+use crate::win_types::PVOID;
+#[cfg(windows)]
 use crate::win_types::{BOOL, FALSE, LPARAM};
 #[cfg(windows)]
-use crate::win_types::HANDLE;
-#[cfg(windows)]
-use windows_sys::Win32::System::Threading::{PTP_CALLBACK_INSTANCE, PTP_WORK, WT_EXECUTEINTIMERTHREAD};
-use crate::win_types::PVOID;
+use windows_sys::Win32::System::Threading::{
+    PTP_CALLBACK_INSTANCE, PTP_WORK, WT_EXECUTEINTIMERTHREAD,
+};
 
 // ── Dynamic resolution helpers (no IAT entries) ──────────────────────────
 //
@@ -157,10 +159,7 @@ where
 }
 
 #[cfg(windows)]
-extern "system" fn child_windows_callback(
-    _hwnd: crate::win_types::HWND,
-    lparam: LPARAM,
-) -> BOOL {
+extern "system" fn child_windows_callback(_hwnd: crate::win_types::HWND, lparam: LPARAM) -> BOOL {
     if lparam != 0 {
         let closure: Box<Box<dyn FnOnce() + Send>> = unsafe { Box::from_raw(lparam as *mut _) };
         closure();

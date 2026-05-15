@@ -220,7 +220,6 @@ pub struct GlobalConfig {
     pub dns_sleep: u64,
 
     // ── Adaptive timing configuration ──────────────────────────────────
-
     /// Enable the adaptive C2 timing engine.  When `true`, the agent
     /// learns the target network's traffic patterns and adjusts its
     /// callback timing to blend in, replacing the simple fixed-percentage

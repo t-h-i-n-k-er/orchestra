@@ -126,18 +126,45 @@ const fn const_hash_wstr(units: &[u16]) -> u32 {
 // ─── Pre-computed DLL wide-string hashes ────────────────────────────────────
 
 const NTDLL_DLL_HASH: u32 = const_hash_wstr(&[
-    b'n' as u16, b't' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
-    b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
+    b'n' as u16,
+    b't' as u16,
+    b'd' as u16,
+    b'l' as u16,
+    b'l' as u16,
+    b'.' as u16,
+    b'd' as u16,
+    b'l' as u16,
+    b'l' as u16,
 ]);
 const KERNEL32_DLL_HASH: u32 = const_hash_wstr(&[
-    b'k' as u16, b'e' as u16, b'r' as u16, b'n' as u16, b'e' as u16,
-    b'l' as u16, b'3' as u16, b'2' as u16, b'.' as u16, b'd' as u16,
-    b'l' as u16, b'l' as u16,
+    b'k' as u16,
+    b'e' as u16,
+    b'r' as u16,
+    b'n' as u16,
+    b'e' as u16,
+    b'l' as u16,
+    b'3' as u16,
+    b'2' as u16,
+    b'.' as u16,
+    b'd' as u16,
+    b'l' as u16,
+    b'l' as u16,
 ]);
 const KERNELBASE_DLL_HASH: u32 = const_hash_wstr(&[
-    b'k' as u16, b'e' as u16, b'r' as u16, b'n' as u16, b'e' as u16,
-    b'l' as u16, b'b' as u16, b'a' as u16, b's' as u16, b'e' as u16,
-    b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
+    b'k' as u16,
+    b'e' as u16,
+    b'r' as u16,
+    b'n' as u16,
+    b'e' as u16,
+    b'l' as u16,
+    b'b' as u16,
+    b'a' as u16,
+    b's' as u16,
+    b'e' as u16,
+    b'.' as u16,
+    b'd' as u16,
+    b'l' as u16,
+    b'l' as u16,
 ]);
 
 // ─── Pre-computed function name hashes ──────────────────────────────────────
@@ -228,7 +255,11 @@ impl core::fmt::Display for CfgError {
             CfgError::BitsetNotFound => write!(f, "CFG bitset not found"),
             CfgError::NotAligned => write!(f, "address not aligned to 16-byte CFG granularity"),
             CfgError::ProtectionChangeFailed(s) => {
-                write!(f, "NtProtectVirtualMemory failed: NTSTATUS {:#010X}", *s as u32)
+                write!(
+                    f,
+                    "NtProtectVirtualMemory failed: NTSTATUS {:#010X}",
+                    *s as u32
+                )
             }
             CfgError::ResolutionFailed => write!(f, "API resolution failed"),
             CfgError::NoTrampolines => write!(f, "no CFG-valid trampolines found"),
@@ -449,9 +480,7 @@ pub fn status_json() -> String {
 /// arbitrary addresses is a detectable modification if the bitset is
 /// integrity-checked by the kernel or a security product.
 pub fn promote_address(addr: usize) -> Result<()> {
-    let info = BITSET_INFO
-        .get()
-        .ok_or(CfgError::BitsetNotFound)?;
+    let info = BITSET_INFO.get().ok_or(CfgError::BitsetNotFound)?;
 
     if addr % 16 != 0 {
         return Err(CfgError::NotAligned);
@@ -465,9 +494,7 @@ pub fn promote_address(addr: usize) -> Result<()> {
 /// After demotion, the address will no longer be considered a valid indirect
 /// call target, and any indirect call to it will trigger a CFG violation.
 pub fn demote_address(addr: usize) -> Result<()> {
-    let info = BITSET_INFO
-        .get()
-        .ok_or(CfgError::BitsetNotFound)?;
+    let info = BITSET_INFO.get().ok_or(CfgError::BitsetNotFound)?;
 
     if addr % 16 != 0 {
         return Err(CfgError::NotAligned);
@@ -485,9 +512,7 @@ pub fn demote_address(addr: usize) -> Result<()> {
 /// initial alignment check), all previously promoted bits are rolled back
 /// so the bitset is left in a consistent state.
 pub fn promote_addresses(addrs: &[usize]) -> Result<()> {
-    let info = BITSET_INFO
-        .get()
-        .ok_or(CfgError::BitsetNotFound)?;
+    let info = BITSET_INFO.get().ok_or(CfgError::BitsetNotFound)?;
 
     // Validate all addresses first.
     for &addr in addrs {
@@ -774,9 +799,8 @@ fn resolve_bitset_from_load_config() -> Option<CfgBitsetInfo> {
 /// read the bitset pointer from the appropriate offset.
 fn resolve_bitset_from_ldr_init_block() -> Option<CfgBitsetInfo> {
     let ntdll_base = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) }?;
-    let init_block = unsafe {
-        pe_resolve::get_proc_address_by_hash(ntdll_base, HASH_LDRSYSTEMDLLINITBLOCK)
-    }?;
+    let init_block =
+        unsafe { pe_resolve::get_proc_address_by_hash(ntdll_base, HASH_LDRSYSTEMDLLINITBLOCK) }?;
 
     // LdrSystemDllInitBlock is an exported **variable** (not a function).
     // The resolved address points directly to the SYSTEM_DLL_INIT_BLOCK.
@@ -949,9 +973,9 @@ fn scan_dll_for_trampolines(
     // call r11  = 41 FF D3
     let patterns: &[(&[u8], usize)] = &[
         // (pattern, instruction_length)
-        (&[0xFF, 0xD0], 2), // call rax
-        (&[0xFF, 0xD1], 2), // call rcx
-        (&[0xFF, 0xD2], 2), // call rdx
+        (&[0xFF, 0xD0], 2),       // call rax
+        (&[0xFF, 0xD1], 2),       // call rcx
+        (&[0xFF, 0xD2], 2),       // call rdx
         (&[0x41, 0xFF, 0xD0], 3), // call r8
         (&[0x41, 0xFF, 0xD1], 3), // call r9
         (&[0x41, 0xFF, 0xD2], 3), // call r10
@@ -1194,7 +1218,10 @@ pub fn remove_dispatch_override() -> Result<()> {
         return Err(CfgError::OverrideNotActive);
     }
 
-    let original = ORIGINAL_GUARD_FPTR.get().copied().ok_or(CfgError::OverrideNotActive)?;
+    let original = ORIGINAL_GUARD_FPTR
+        .get()
+        .copied()
+        .ok_or(CfgError::OverrideNotActive)?;
     let guard_fptr = find_guard_check_icall_fptr()?;
 
     // Restore the original function pointer.
@@ -1306,7 +1333,11 @@ pub fn prepare_call(target_addr: usize) -> Result<()> {
             }
         }
         Err(e) => {
-            tracing::warn!("cfg_bypass: prepare_call failed for {:#x}: {}", target_addr, e);
+            tracing::warn!(
+                "cfg_bypass: prepare_call failed for {:#x}: {}",
+                target_addr,
+                e
+            );
             Err(e)
         }
     }
@@ -1346,8 +1377,15 @@ mod tests {
     #[test]
     fn test_const_hash_wstr_consistency() {
         let test_wstr: &[u16] = &[
-            b'n' as u16, b't' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
-            b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
+            b'n' as u16,
+            b't' as u16,
+            b'd' as u16,
+            b'l' as u16,
+            b'l' as u16,
+            b'.' as u16,
+            b'd' as u16,
+            b'l' as u16,
+            b'l' as u16,
         ];
         let const_hash = const_hash_wstr(test_wstr);
         let runtime_hash = pe_resolve::hash_wstr(test_wstr);
@@ -1358,16 +1396,32 @@ mod tests {
     fn test_dll_hash_consistency() {
         // Verify our pre-computed hashes match what pe_resolve would produce.
         let ntdll_wstr: &[u16] = &[
-            b'n' as u16, b't' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
-            b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
+            b'n' as u16,
+            b't' as u16,
+            b'd' as u16,
+            b'l' as u16,
+            b'l' as u16,
+            b'.' as u16,
+            b'd' as u16,
+            b'l' as u16,
+            b'l' as u16,
         ];
         let runtime = pe_resolve::hash_wstr(ntdll_wstr);
         assert_eq!(NTDLL_DLL_HASH, runtime);
 
         let k32_wstr: &[u16] = &[
-            b'k' as u16, b'e' as u16, b'r' as u16, b'n' as u16, b'e' as u16,
-            b'l' as u16, b'3' as u16, b'2' as u16, b'.' as u16, b'd' as u16,
-            b'l' as u16, b'l' as u16,
+            b'k' as u16,
+            b'e' as u16,
+            b'r' as u16,
+            b'n' as u16,
+            b'e' as u16,
+            b'l' as u16,
+            b'3' as u16,
+            b'2' as u16,
+            b'.' as u16,
+            b'd' as u16,
+            b'l' as u16,
+            b'l' as u16,
         ];
         let runtime_k32 = pe_resolve::hash_wstr(k32_wstr);
         assert_eq!(KERNEL32_DLL_HASH, runtime_k32);
@@ -1426,10 +1480,7 @@ mod tests {
 
     #[test]
     fn test_cfg_error_display() {
-        assert_eq!(
-            CfgError::CfgNotEnabled.to_string(),
-            "CFG is not enabled"
-        );
+        assert_eq!(CfgError::CfgNotEnabled.to_string(), "CFG is not enabled");
         assert_eq!(
             CfgError::NotAligned.to_string(),
             "address not aligned to 16-byte CFG granularity"

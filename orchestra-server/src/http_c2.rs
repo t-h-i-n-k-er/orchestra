@@ -229,9 +229,7 @@ async fn handle_get(
                 .into_response();
             if let Some(ref hdr) = ecdh_response_header {
                 resp.headers_mut().insert(
-                    axum::http::HeaderName::from_static(
-                        common::forward_secrecy::ECDH_HEADER_NAME,
-                    ),
+                    axum::http::HeaderName::from_static(common::forward_secrecy::ECDH_HEADER_NAME),
                     axum::http::HeaderValue::from_str(hdr).unwrap(),
                 );
             }
@@ -373,9 +371,7 @@ async fn handle_post(
     // Add ECDH response header if handshake just completed.
     if let Some(ref hdr) = ecdh_response_header {
         resp.headers_mut().insert(
-            axum::http::HeaderName::from_static(
-                common::forward_secrecy::ECDH_HEADER_NAME,
-            ),
+            axum::http::HeaderName::from_static(common::forward_secrecy::ECDH_HEADER_NAME),
             axum::http::HeaderValue::from_str(hdr).unwrap(),
         );
     }
@@ -451,18 +447,11 @@ fn process_ecdh_header(
             let response_header = server_ecdh.response_header_value();
             http_session.ecdh_session = Some(Arc::new(server_ecdh.into_session()));
             http_session.ecdh_handshake_pending = None; // cleared — session is ready
-            tracing::info!(
-                "ECDH session established for HTTP agent '{}'",
-                session_id
-            );
+            tracing::info!("ECDH session established for HTTP agent '{}'", session_id);
             Some(response_header)
         }
         Err(e) => {
-            tracing::warn!(
-                "ECDH handshake failed for session '{}': {}",
-                session_id,
-                e
-            );
+            tracing::warn!("ECDH handshake failed for session '{}': {}", session_id, e);
             None
         }
     }
@@ -601,7 +590,9 @@ async fn process_task_output(state: &HttpC2State, session_id: &str, output: &[u8
         session_id
     );
 
-    let msg: Message = match bincode::serde::decode_from_slice(output, bincode::config::legacy()).map(|(v, _)| v) {
+    let msg: Message = match bincode::serde::decode_from_slice(output, bincode::config::legacy())
+        .map(|(v, _)| v)
+    {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(

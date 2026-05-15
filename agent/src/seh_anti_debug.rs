@@ -114,13 +114,13 @@ struct ExceptionRecord {
 /// Windows x64 CONTEXT structure — enough fields for anti-debug manipulation.
 #[repr(C)]
 struct Context {
-    _pad1: [u8; 0x44],       // P1Home..ContextFlags
-    EFlags: u32,             // offset 0x44
-    _pad2: [u8; 0x98 - 0x48], // Dr0..Rbp
-    Rsp: u64,                // offset 0x98
+    _pad1: [u8; 0x44],         // P1Home..ContextFlags
+    EFlags: u32,               // offset 0x44
+    _pad2: [u8; 0x98 - 0x48],  // Dr0..Rbp
+    Rsp: u64,                  // offset 0x98
     _pad3: [u8; 0xF80 - 0xA0], // Rsi..FltSave
-    Rip: u64,                // offset 0xF80
-    _pad4: [u8; 0x4D0],      // remaining CONTEXT fields
+    Rip: u64,                  // offset 0xF80
+    _pad4: [u8; 0x4D0],        // remaining CONTEXT fields
 }
 
 /// Windows EXCEPTION_POINTERS.
@@ -185,10 +185,7 @@ fn resolve_close_handle() -> Option<unsafe extern "system" fn(isize) -> i32> {
 fn resolve_get_current_thread_id() -> Option<unsafe extern "system" fn() -> u32> {
     let module = unsafe { pe_resolve::get_module_handle_by_hash(HASH_KERNEL32_DLL) }?;
     let addr = unsafe {
-        pe_resolve::get_proc_address_by_hash(
-            module,
-            pe_resolve::hash_str(b"GetCurrentThreadId\0"),
-        )
+        pe_resolve::get_proc_address_by_hash(module, pe_resolve::hash_str(b"GetCurrentThreadId\0"))
     }?;
     unsafe { Some(std::mem::transmute(addr)) }
 }
@@ -198,18 +195,14 @@ fn resolve_nt_set_context_thread() -> Option<unsafe extern "system" fn(isize, *c
 {
     let module = unsafe { pe_resolve::get_module_handle_by_hash(HASH_NTDLL_DLL) }?;
     let addr = unsafe {
-        pe_resolve::get_proc_address_by_hash(
-            module,
-            pe_resolve::hash_str(b"NtSetContextThread\0"),
-        )
+        pe_resolve::get_proc_address_by_hash(module, pe_resolve::hash_str(b"NtSetContextThread\0"))
     }?;
     unsafe { Some(std::mem::transmute(addr)) }
 }
 
 /// Resolve NtQueryInformationProcess from ntdll.
 fn resolve_nt_query_information_process(
-) -> Option<unsafe extern "system" fn(isize, u32, *mut std::ffi::c_void, u32, *mut u32) -> i32>
-{
+) -> Option<unsafe extern "system" fn(isize, u32, *mut std::ffi::c_void, u32, *mut u32) -> i32> {
     let module = unsafe { pe_resolve::get_module_handle_by_hash(HASH_NTDLL_DLL) }?;
     let addr = unsafe {
         pe_resolve::get_proc_address_by_hash(
@@ -252,9 +245,15 @@ struct VehHandle(PVOID);
 unsafe impl Send for VehHandle {}
 unsafe impl Sync for VehHandle {}
 impl VehHandle {
-    fn new(p: PVOID) -> Self { Self(p) }
-    fn get(self) -> PVOID { self.0 }
-    fn is_null(self) -> bool { self.0.is_null() }
+    fn new(p: PVOID) -> Self {
+        Self(p)
+    }
+    fn get(self) -> PVOID {
+        self.0
+    }
+    fn is_null(self) -> bool {
+        self.0.is_null()
+    }
 }
 
 /// Handles to registered VEH handlers (for removal).
@@ -802,7 +801,11 @@ pub unsafe fn build_nested_seh_chain(depth: usize) -> Option<SehChain> {
     let add_veh = resolve_add_veh()?;
     let remove_veh = resolve_remove_veh();
 
-    let effective_depth = if depth == 0 { DEFAULT_CHAIN_DEPTH } else { depth };
+    let effective_depth = if depth == 0 {
+        DEFAULT_CHAIN_DEPTH
+    } else {
+        depth
+    };
     let mut handles: Vec<VehHandle> = Vec::with_capacity(effective_depth);
 
     // Core check handlers in order.
@@ -833,7 +836,9 @@ pub unsafe fn build_nested_seh_chain(depth: usize) -> Option<SehChain> {
             // Failed to install — clean up.
             if let Some(remove) = remove_veh {
                 for h in &handles {
-                    unsafe { remove(h.get()); }
+                    unsafe {
+                        remove(h.get());
+                    }
                 }
             }
             return None;
@@ -882,9 +887,9 @@ pub unsafe fn run_anti_debug_checks() -> AntiDebugResult {
                 // Set trap flag via pushf / or / popf
                 std::arch::asm!(
                     "pushfq",
-                    "or dword ptr [rsp], 0x100",  // TF = bit 8
+                    "or dword ptr [rsp], 0x100", // TF = bit 8
                     "popfq",
-                    "nop",  // The single-step fires after this instruction
+                    "nop", // The single-step fires after this instruction
                     options(nostack)
                 );
             }
@@ -921,10 +926,7 @@ pub unsafe fn run_anti_debug_checks() -> AntiDebugResult {
     // ── Check 3: INT 0x2D ───────────────────────────────────────────────
     INT2D_FIRED.store(1, Ordering::SeqCst);
     unsafe {
-        std::arch::asm!(
-            "int 0x2D",
-            options(nostack)
-        );
+        std::arch::asm!("int 0x2D", options(nostack));
     }
     let int2d_fired = INT2D_FIRED.load(Ordering::SeqCst) == 2;
     if !int2d_fired {
@@ -937,7 +939,7 @@ pub unsafe fn run_anti_debug_checks() -> AntiDebugResult {
     ICEBP_FIRED.store(1, Ordering::SeqCst);
     unsafe {
         std::arch::asm!(
-            ".byte 0xF1",  // icebp / int1
+            ".byte 0xF1", // icebp / int1
             options(nostack)
         );
     }
@@ -952,7 +954,7 @@ pub unsafe fn run_anti_debug_checks() -> AntiDebugResult {
     PREFIX_SEG_FIRED.store(1, Ordering::SeqCst);
     unsafe {
         std::arch::asm!(
-            "lock mov byte ptr [0], 0",  // lock prefix on invalid target → exception
+            "lock mov byte ptr [0], 0", // lock prefix on invalid target → exception
             options(nostack)
         );
     }
@@ -1287,10 +1289,10 @@ mod tests {
         // Test that fragment XOR encoding is reversible.
         let original: [u8; FRAGMENT_SIZE] = [
             0x48, 0x89, 0x5C, 0x24, 0x08, // mov [rsp+8], rbx
-            0x57,                         // push rdi
-            0x48, 0x83, 0xEC, 0x20,       // sub rsp, 0x20
-            0x48, 0x8B, 0xD9,             // mov rbx, rcx
-            0xE8, 0x10, 0x00,             // call +N (truncated to fit 16)
+            0x57, // push rdi
+            0x48, 0x83, 0xEC, 0x20, // sub rsp, 0x20
+            0x48, 0x8B, 0xD9, // mov rbx, rcx
+            0xE8, 0x10, 0x00, // call +N (truncated to fit 16)
         ];
 
         let mut encoded = original;

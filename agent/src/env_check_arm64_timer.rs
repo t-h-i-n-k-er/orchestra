@@ -166,19 +166,20 @@ unsafe fn try_read_pmccntr() -> Option<u64> {
     // raises an exception.
     //
     // We use a cached availability flag to avoid probing on every call.
-    PMU_AVAILABLE.get_or_init(|| probe_pmccntr()).and_then(|&available| {
-        if available {
+    match *PMU_AVAILABLE.get_or_init(probe_pmccntr) {
+        Some(true) => {
             let val: u64;
-            std::arch::asm!(
-                "mrs {}, pmccntr_el0",
-                out(reg) val,
-                options(nomem, nostack)
-            );
+            unsafe {
+                std::arch::asm!(
+                    "mrs {}, pmccntr_el0",
+                    out(reg) val,
+                    options(nomem, nostack)
+                );
+            }
             Some(val)
-        } else {
-            None
         }
-    })
+        _ => None,
+    }
 }
 
 /// Cached PMU availability.
@@ -686,7 +687,7 @@ pub struct PmuFingerprint {
 /// and compare against CNTVCT_EL0 timing.  Physical hardware shows tight
 /// correlation; VMs / emulators show high variance or implausible ratios.
 pub fn analyze_pmu_fingerprint() -> Option<PmuFingerprint> {
-    let _pmu = try_read_pmccntr()?;
+    let _pmu = unsafe { try_read_pmccntr()? };
 
     const WORKLOAD_ITERS: u64 = 5_000_000;
 
@@ -932,7 +933,7 @@ pub fn is_available() -> bool {
 
 /// Check whether PMU (PMCCNTR_EL0) is accessible from userspace.
 pub fn pmu_available() -> bool {
-    try_read_pmccntr().is_some()
+    unsafe { try_read_pmccntr().is_some() }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────

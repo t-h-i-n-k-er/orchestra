@@ -2,9 +2,9 @@ use anyhow::Result;
 use common::config::SleepConfig;
 #[cfg(windows)]
 use common::config::SleepMethod;
+use rand::{thread_rng, Rng, RngCore as _};
 use tracing::debug;
 use tracing::info;
-use rand::{thread_rng, Rng, RngCore as _};
 
 // ── Windows IAT-free constants ────────────────────────────────────────────────
 #[cfg(windows)]
@@ -844,7 +844,9 @@ pub mod crypto {
         #[cfg(not(feature = "memory-guard"))]
         unsafe {
             if !SESSION_INITIALIZED.with(|c| c.get()) {
-                tracing::warn!("decrypt_sections: called without prior encrypt_sections — skipping");
+                tracing::warn!(
+                    "decrypt_sections: called without prior encrypt_sections — skipping"
+                );
                 return;
             }
             SESSION_INITIALIZED.with(|c| c.set(false));
@@ -1037,7 +1039,9 @@ pub mod crypto {
     pub fn decrypt_sections() {
         unsafe {
             if !SESSION_INITIALIZED.with(|c| c.get()) {
-                tracing::warn!("decrypt_sections: called without prior encrypt_sections — skipping");
+                tracing::warn!(
+                    "decrypt_sections: called without prior encrypt_sections — skipping"
+                );
                 return;
             }
             SESSION_INITIALIZED.with(|c| c.set(false));

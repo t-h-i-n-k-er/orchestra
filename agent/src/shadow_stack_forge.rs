@@ -274,10 +274,7 @@ unsafe fn incsspq(count: u32) {
 /// This saves the current SSP into a model-specific register so it can
 /// be restored later by RSTORSSP.  Used for shadow-stack switching.
 unsafe fn saveprevssp() {
-    std::arch::asm!(
-        "saveprevssp",
-        options(nostack, nomem, preserves_flags)
-    );
+    std::arch::asm!("saveprevssp", options(nostack, nomem, preserves_flags));
 }
 
 // ─── Initialization ───────────────────────────────────────────────────────
@@ -875,10 +872,7 @@ pub unsafe fn set_ssp(new_ssp: u64) -> ShadowResult<()> {
 /// - Must be called before `spoof_call`.
 /// - Must be called on the same thread that will execute `spoof_call`.
 /// - The cookie must be consumed (restored) after `spoof_call` returns.
-pub unsafe fn prepare_spoofed_return(
-    spoofed_ret: usize,
-    actual_ret: usize,
-) -> ShadowStackCookie {
+pub unsafe fn prepare_spoofed_return(spoofed_ret: usize, actual_ret: usize) -> ShadowStackCookie {
     // Check if shadow stack forging is available.
     if !is_shadow_forge_available() {
         tracing::trace!(

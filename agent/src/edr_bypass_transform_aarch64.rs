@@ -72,8 +72,8 @@ const _: () = assert!(
     "PAGE_READWRITE must differ from PAGE_EXECUTE_READWRITE"
 );
 
-use common::lock::MutexExt;
 use anyhow::{bail, Context, Result};
+use common::lock::MutexExt;
 use once_cell::sync::Lazy;
 use rand::Rng;
 use sha2::{Digest, Sha256};
@@ -543,7 +543,9 @@ fn read_insn(text: &[u8], offset: usize) -> Option<u32> {
     if offset + 4 > text.len() {
         return None;
     }
-    Some(u32::from_le_bytes(text[offset..offset + 4].try_into().ok()?))
+    Some(u32::from_le_bytes(
+        text[offset..offset + 4].try_into().ok()?,
+    ))
 }
 
 // ── Scan engine ─────────────────────────────────────────────────────────────
@@ -1115,12 +1117,10 @@ fn transform_instruction_reorder(
         // A writes → B reads dependency?
         // (If A's destination is one of B's sources, can't reorder)
         let a_writes_b_reads = (a_rd != 31 && a_rd != 0)
-            && ((a_rd == b_rn && b_rn != 31)
-                || (a_rd == b_rm && b_rm != 31));
+            && ((a_rd == b_rn && b_rn != 31) || (a_rd == b_rm && b_rm != 31));
         // B writes → A reads dependency?
         let b_writes_a_reads = (b_rd != 31 && b_rd != 0)
-            && ((b_rd == a_rn && a_rn != 31)
-                || (b_rd == a_rm && a_rm != 31));
+            && ((b_rd == a_rn && a_rn != 31) || (b_rd == a_rm && a_rm != 31));
 
         if a_writes_b_reads || b_writes_a_reads {
             continue;
@@ -1294,8 +1294,9 @@ unsafe fn restore_protection(base: usize, size: usize, original: u32) -> Result<
 #[cfg(not(windows))]
 unsafe fn make_region_writable(base: usize, size: usize) -> Result<u32> {
     use std::io;
-    let maps = std::fs::read_to_string("/proc/self/maps")
-        .map_err(|e| anyhow::anyhow!("edr_bypass_transform: failed to read /proc/self/maps: {e}"))?;
+    let maps = std::fs::read_to_string("/proc/self/maps").map_err(|e| {
+        anyhow::anyhow!("edr_bypass_transform: failed to read /proc/self/maps: {e}")
+    })?;
 
     let mut original_protect: u32 = 0x05;
     for line in maps.lines() {
@@ -1314,9 +1315,15 @@ unsafe fn make_region_writable(base: usize, size: usize) -> Result<u32> {
             if base >= start && base < end {
                 let perms = parts[1].as_bytes();
                 let mut prot: u32 = 0;
-                if perms.len() >= 1 && perms[0] == b'r' { prot |= 0x1; }
-                if perms.len() >= 2 && perms[1] == b'w' { prot |= 0x2; }
-                if perms.len() >= 3 && perms[2] == b'x' { prot |= 0x4; }
+                if perms.len() >= 1 && perms[0] == b'r' {
+                    prot |= 0x1;
+                }
+                if perms.len() >= 2 && perms[1] == b'w' {
+                    prot |= 0x2;
+                }
+                if perms.len() >= 3 && perms[2] == b'x' {
+                    prot |= 0x4;
+                }
                 original_protect = prot;
                 break;
             }
@@ -1332,7 +1339,11 @@ unsafe fn make_region_writable(base: usize, size: usize) -> Result<u32> {
     let aligned_end = (base + size + page_size - 1) & !(page_size - 1);
     let aligned_size = aligned_end - aligned_base;
 
-    let ret = libc::mprotect(aligned_base as *mut std::ffi::c_void, aligned_size, new_prot as i32);
+    let ret = libc::mprotect(
+        aligned_base as *mut std::ffi::c_void,
+        aligned_size,
+        new_prot as i32,
+    );
     if ret != 0 {
         bail!(
             "edr_bypass_transform: mprotect(RW) failed for {:x}-{:x}: {}",
@@ -1541,7 +1552,9 @@ pub fn run_edr_bypass_transform(
         ) {
             Ok(status) => status,
             Err(e) => {
-                tracing::warn!("edr_bypass_transform: NtFlushInstructionCache resolution failed: {e}");
+                tracing::warn!(
+                    "edr_bypass_transform: NtFlushInstructionCache resolution failed: {e}"
+                );
                 0
             }
         };
@@ -1853,25 +1866,41 @@ mod tests {
         assert_eq!(recs.len(), 1, "Should transform 1 NOP");
         assert_eq!(recs[0].transform_type, "arm64_nop_to_mov_x0_x0");
         let insn = read_insn(&code, 0).unwrap();
-        assert_eq!(insn, enc_mov_x(0, 0), "NOP should be replaced with MOV X0, X0");
+        assert_eq!(
+            insn,
+            enc_mov_x(0, 0),
+            "NOP should be replaced with MOV X0, X0"
+        );
 
         // Apply zero-reg substitution.
         let recs = transform_zero_reg_substitution(&mut code, &excluded, &actionable);
         assert_eq!(recs.len(), 1, "Should transform 1 MOVZ X5, #0");
         let insn = read_insn(&code, 4).unwrap();
-        assert_eq!(insn, enc_eor_x(5, 5, 5), "MOVZ X5,#0 should be replaced with EOR X5,X5,X5");
+        assert_eq!(
+            insn,
+            enc_eor_x(5, 5, 5),
+            "MOVZ X5,#0 should be replaced with EOR X5,X5,X5"
+        );
 
         // Apply ADD/SUB swap.
         let recs = transform_add_sub_swap(&mut code, &excluded, &actionable);
         assert_eq!(recs.len(), 1, "Should transform 1 ADD #0");
         let insn = read_insn(&code, 8).unwrap();
-        assert_eq!(insn, enc_sub_x_imm(9, 10, 0), "ADD #0 should be replaced with SUB #0");
+        assert_eq!(
+            insn,
+            enc_sub_x_imm(9, 10, 0),
+            "ADD #0 should be replaced with SUB #0"
+        );
 
         // Apply MOV reg substitution.
         let recs = transform_mov_reg_substitution(&mut code, &excluded, &actionable);
         assert_eq!(recs.len(), 1, "Should transform 1 MOV X9, X10");
         let insn = read_insn(&code, 12).unwrap();
-        assert_eq!(insn, enc_add_x_imm(9, 10, 0), "MOV X9,X10 should be replaced with ADD X9,X10,#0");
+        assert_eq!(
+            insn,
+            enc_add_x_imm(9, 10, 0),
+            "MOV X9,X10 should be replaced with ADD X9,X10,#0"
+        );
 
         // Apply RET obfuscation.
         let recs = transform_ret_obfuscation(&mut code, &excluded, &actionable);

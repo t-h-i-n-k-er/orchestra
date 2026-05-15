@@ -1152,7 +1152,10 @@ fn align_up(val: usize, align: usize) -> usize {
 /// This is the internal helper used by [`apply_all`] to coalesce resources.
 /// The public [`inject_version_info`] wrapper calls this and then writes the
 /// section immediately.
-fn add_version_info_to_builder(rsrc: &mut ResourceSectionBuilder, cfg: &VersionInfoConfig) -> Result<()> {
+fn add_version_info_to_builder(
+    rsrc: &mut ResourceSectionBuilder,
+    cfg: &VersionInfoConfig,
+) -> Result<()> {
     // If clone_from is set, try to extract version info from the reference PE.
     // On the build host (likely Linux) the reference PE probably doesn't exist;
     // fall back to config-based generation silently.
@@ -1255,7 +1258,7 @@ pub fn inject_icon(buf: &mut Vec<u8>, ico_path: &str) -> Result<()> {
 fn add_manifest_to_builder(rsrc: &mut ResourceSectionBuilder, manifest: &str) {
     let xml = manifest_xml(manifest);
     let xml_bytes = xml.into_bytes(); // UTF-8
-    // RT_MANIFEST = 24, name = 1 (executable), lang = 0.
+                                      // RT_MANIFEST = 24, name = 1 (executable), lang = 0.
     rsrc.add(24, 1, 0, xml_bytes);
 }
 
@@ -1470,8 +1473,7 @@ pub fn apply_all(buf: &mut Vec<u8>, cfg: &PayloadConfig) -> Result<()> {
         }
 
         if let Some(ref icon) = cfg.icon_path {
-            add_icon_to_builder(&mut rsrc, icon)
-                .context("artifact kit: icon build failed")?;
+            add_icon_to_builder(&mut rsrc, icon).context("artifact kit: icon build failed")?;
             info!("artifact kit: icon prepared");
         }
 

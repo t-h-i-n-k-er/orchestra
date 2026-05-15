@@ -1155,45 +1155,59 @@ fn emit_handler(
             // Perform the ALU operation: rdx OP= rax
             match op {
                 VmOp::Add => {
-                    let mut alu = Instruction::with2(Code::Add_r64_rm64, Register::RDX, Register::RAX).unwrap();
+                    let mut alu =
+                        Instruction::with2(Code::Add_r64_rm64, Register::RDX, Register::RAX)
+                            .unwrap();
                     alu.set_ip(next_ip());
                     out.push(alu);
                 }
                 VmOp::Sub => {
-                    let mut alu = Instruction::with2(Code::Sub_r64_rm64, Register::RDX, Register::RAX).unwrap();
+                    let mut alu =
+                        Instruction::with2(Code::Sub_r64_rm64, Register::RDX, Register::RAX)
+                            .unwrap();
                     alu.set_ip(next_ip());
                     out.push(alu);
                 }
                 VmOp::And => {
-                    let mut alu = Instruction::with2(Code::And_r64_rm64, Register::RDX, Register::RAX).unwrap();
+                    let mut alu =
+                        Instruction::with2(Code::And_r64_rm64, Register::RDX, Register::RAX)
+                            .unwrap();
                     alu.set_ip(next_ip());
                     out.push(alu);
                 }
                 VmOp::Or => {
-                    let mut alu = Instruction::with2(Code::Or_r64_rm64, Register::RDX, Register::RAX).unwrap();
+                    let mut alu =
+                        Instruction::with2(Code::Or_r64_rm64, Register::RDX, Register::RAX)
+                            .unwrap();
                     alu.set_ip(next_ip());
                     out.push(alu);
                 }
                 VmOp::Xor => {
-                    let mut alu = Instruction::with2(Code::Xor_r64_rm64, Register::RDX, Register::RAX).unwrap();
+                    let mut alu =
+                        Instruction::with2(Code::Xor_r64_rm64, Register::RDX, Register::RAX)
+                            .unwrap();
                     alu.set_ip(next_ip());
                     out.push(alu);
                 }
                 VmOp::Shl => {
                     // Shift dst by cl (low byte of src). Use rcx for shift count.
                     // rax already has src value; move low byte to cl.
-                    let mut mov_cl = Instruction::with2(Code::Mov_rm8_r8, Register::CL, Register::AL).unwrap();
+                    let mut mov_cl =
+                        Instruction::with2(Code::Mov_rm8_r8, Register::CL, Register::AL).unwrap();
                     mov_cl.set_ip(next_ip());
                     out.push(mov_cl);
-                    let mut alu = Instruction::with2(Code::Shl_rm64_CL, Register::RDX, Register::CL).unwrap();
+                    let mut alu =
+                        Instruction::with2(Code::Shl_rm64_CL, Register::RDX, Register::CL).unwrap();
                     alu.set_ip(next_ip());
                     out.push(alu);
                 }
                 VmOp::Shr => {
-                    let mut mov_cl = Instruction::with2(Code::Mov_rm8_r8, Register::CL, Register::AL).unwrap();
+                    let mut mov_cl =
+                        Instruction::with2(Code::Mov_rm8_r8, Register::CL, Register::AL).unwrap();
                     mov_cl.set_ip(next_ip());
                     out.push(mov_cl);
-                    let mut alu = Instruction::with2(Code::Shr_rm64_CL, Register::RDX, Register::CL).unwrap();
+                    let mut alu =
+                        Instruction::with2(Code::Shr_rm64_CL, Register::RDX, Register::CL).unwrap();
                     alu.set_ip(next_ip());
                     out.push(alu);
                 }

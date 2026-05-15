@@ -18,10 +18,10 @@ use std::cell::RefCell;
 
 #[cfg(target_os = "macos")]
 use crate::macos_ffi::{
-    CFDataGetBytePtr, CFDataGetLength, CFRelease, CGDataProviderCopyData, CGDisplayBounds,
-    CGImageGetBitsPerPixel, CGImageGetBytesPerRow, CGImageGetDataProvider, CGImageGetHeight,
-    CGImageGetWidth, CGMainDisplayID, CGWindowListCreateImage, CFDataRef, CFTypeRef,
-    CGDataProviderRef, CGImageRef, CGRect, KCG_NULL_WINDOW_ID, KCG_WINDOW_IMAGE_DEFAULT,
+    CFDataGetBytePtr, CFDataGetLength, CFDataRef, CFRelease, CFTypeRef, CGDataProviderCopyData,
+    CGDataProviderRef, CGDisplayBounds, CGImageGetBitsPerPixel, CGImageGetBytesPerRow,
+    CGImageGetDataProvider, CGImageGetHeight, CGImageGetWidth, CGImageRef, CGMainDisplayID, CGRect,
+    CGWindowListCreateImage, KCG_NULL_WINDOW_ID, KCG_WINDOW_IMAGE_DEFAULT,
     KCG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY,
 };
 
@@ -586,10 +586,10 @@ pub fn take_screenshot() -> Result<Vec<u8>> {
     #[cfg(windows)]
     {
         check_consent()?;
-        use std::io::Cursor;
-        use windows_sys::Win32::Graphics::Gdi::{BI_RGB, DIB_RGB_COLORS, SRCCOPY};
         use crate::win_types::BITMAPINFO;
+        use std::io::Cursor;
         use windows_sys::Win32::Graphics::Gdi::BITMAPINFOHEADER;
+        use windows_sys::Win32::Graphics::Gdi::{BI_RGB, DIB_RGB_COLORS, SRCCOPY};
         use windows_sys::Win32::UI::WindowsAndMessaging::{SM_CXSCREEN, SM_CYSCREEN};
 
         // SAFETY: All Win32 handles are checked for null before use and are

@@ -256,7 +256,9 @@ fn check_boot_mode_macos() -> Result<BootMode> {
         .output()
         .context("failed to run uname -m")?;
 
-    let arch = String::from_utf8_lossy(&arch_output.stdout).trim().to_string();
+    let arch = String::from_utf8_lossy(&arch_output.stdout)
+        .trim()
+        .to_string();
 
     if arch == "arm64" {
         // Apple Silicon uses iBoot, not UEFI.  Standard UEFI NVRAM
@@ -1426,10 +1428,7 @@ fn install_uefi_driver_macos(driver_data: &[u8]) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::warn!(
-            "bless --setBoot failed (may need root): {}",
-            stderr.trim()
-        );
+        tracing::warn!("bless --setBoot failed (may need root): {}", stderr.trim());
         // Not a hard failure — the driver is on disk, bless just sets the
         // active boot entry.  An operator can manually bless later.
     }
@@ -1494,7 +1493,11 @@ fn find_esp_mount_macos() -> Result<String> {
     // Parse mount point from diskutil output.
     // Output format: "Volume EFI on /Volumes/EFI mounted"
     let mount_text = String::from_utf8_lossy(&mount_output.stdout);
-    if let Some(mp) = mount_text.split("on ").nth(1).and_then(|s| s.split(' ').next()) {
+    if let Some(mp) = mount_text
+        .split("on ")
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+    {
         return Ok(mp.to_string());
     }
 

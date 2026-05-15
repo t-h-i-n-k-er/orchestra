@@ -382,17 +382,30 @@ impl Default for SECURITY_ATTRIBUTES {
     }
 }
 
-// ── CONTEXT (x86_64) ───────────────────────────────────────────────────────
+// ── CONTEXT ────────────────────────────────────────────────────────────────
 //
-// Minimal definition matching the Windows x86_64 CONTEXT structure.
-// Only the register fields needed for Get/SetThreadContext are defined.
-// The full structure is 928 bytes on Windows x86_64.
+// Architecture-specific local definitions matching the Windows CONTEXT
+// structures closely enough for NtGetContextThread/NtSetContextThread. These
+// are type-only definitions and do not create IAT imports.
 
-pub const CONTEXT_INTEGER: DWORD = 0x00000002;
-pub const CONTEXT_CONTROL: DWORD = 0x00000001;
-pub const CONTEXT_FULL: DWORD = CONTEXT_CONTROL | CONTEXT_INTEGER | 0x00000004;
-pub const CONTEXT_DEBUG_REGISTERS: DWORD = 0x00100000;
+#[cfg(target_arch = "x86_64")]
+pub const CONTEXT_ARCH: DWORD = 0x00100000;
+#[cfg(target_arch = "aarch64")]
+pub const CONTEXT_ARCH: DWORD = 0x00400000;
 
+pub const CONTEXT_CONTROL: DWORD = CONTEXT_ARCH | 0x00000001;
+pub const CONTEXT_INTEGER: DWORD = CONTEXT_ARCH | 0x00000002;
+#[cfg(target_arch = "x86_64")]
+pub const CONTEXT_FLOATING_POINT: DWORD = CONTEXT_ARCH | 0x00000008;
+#[cfg(target_arch = "aarch64")]
+pub const CONTEXT_FLOATING_POINT: DWORD = CONTEXT_ARCH | 0x00000004;
+#[cfg(target_arch = "x86_64")]
+pub const CONTEXT_DEBUG_REGISTERS: DWORD = CONTEXT_ARCH | 0x00000010;
+#[cfg(target_arch = "aarch64")]
+pub const CONTEXT_DEBUG_REGISTERS: DWORD = CONTEXT_ARCH | 0x00000008;
+pub const CONTEXT_FULL: DWORD = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_FLOATING_POINT;
+
+#[cfg(target_arch = "x86_64")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CONTEXT {
@@ -444,6 +457,7 @@ pub struct CONTEXT {
     pub LastExceptionFromRip: u64,
 }
 
+#[cfg(target_arch = "x86_64")]
 impl Default for CONTEXT {
     fn default() -> Self {
         Self {
@@ -493,6 +507,137 @@ impl Default for CONTEXT {
             LastBranchFromRip: 0,
             LastExceptionToRip: 0,
             LastExceptionFromRip: 0,
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ARM64_INTEGER_CONTEXT {
+    pub X0: u64,
+    pub X1: u64,
+    pub X2: u64,
+    pub X3: u64,
+    pub X4: u64,
+    pub X5: u64,
+    pub X6: u64,
+    pub X7: u64,
+    pub X8: u64,
+    pub X9: u64,
+    pub X10: u64,
+    pub X11: u64,
+    pub X12: u64,
+    pub X13: u64,
+    pub X14: u64,
+    pub X15: u64,
+    pub X16: u64,
+    pub X17: u64,
+    pub X18: u64,
+    pub X19: u64,
+    pub X20: u64,
+    pub X21: u64,
+    pub X22: u64,
+    pub X23: u64,
+    pub X24: u64,
+    pub X25: u64,
+    pub X26: u64,
+    pub X27: u64,
+    pub X28: u64,
+    pub Fp: u64,
+    pub Lr: u64,
+}
+
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union CONTEXT_REGS {
+    pub s: ARM64_INTEGER_CONTEXT,
+    pub X: [u64; 31],
+}
+
+#[cfg(target_arch = "aarch64")]
+impl CONTEXT_REGS {
+    #[inline]
+    pub fn s(&self) -> &ARM64_INTEGER_CONTEXT {
+        unsafe { &self.s }
+    }
+
+    #[inline]
+    pub fn s_mut(&mut self) -> &mut ARM64_INTEGER_CONTEXT {
+        unsafe { &mut self.s }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Default for CONTEXT_REGS {
+    fn default() -> Self {
+        Self { X: [0; 31] }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ARM64_NT_NEON128_0 {
+    pub Low: u64,
+    pub High: i64,
+}
+
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union ARM64_NT_NEON128 {
+    pub Anonymous: ARM64_NT_NEON128_0,
+    pub D: [f64; 2],
+    pub S: [f32; 4],
+    pub H: [u16; 8],
+    pub B: [u8; 16],
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Default for ARM64_NT_NEON128 {
+    fn default() -> Self {
+        Self {
+            Anonymous: ARM64_NT_NEON128_0 { Low: 0, High: 0 },
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CONTEXT {
+    pub ContextFlags: DWORD,
+    pub Cpsr: DWORD,
+    pub u: CONTEXT_REGS,
+    pub Sp: u64,
+    pub Pc: u64,
+    pub V: [ARM64_NT_NEON128; 32],
+    pub Fpcr: DWORD,
+    pub Fpsr: DWORD,
+    pub Bcr: [DWORD; 8],
+    pub Bvr: [u64; 8],
+    pub Wcr: [DWORD; 2],
+    pub Wvr: [u64; 2],
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Default for CONTEXT {
+    fn default() -> Self {
+        Self {
+            ContextFlags: 0,
+            Cpsr: 0,
+            u: CONTEXT_REGS::default(),
+            Sp: 0,
+            Pc: 0,
+            V: [ARM64_NT_NEON128::default(); 32],
+            Fpcr: 0,
+            Fpsr: 0,
+            Bcr: [0; 8],
+            Bvr: [0; 8],
+            Wcr: [0; 2],
+            Wvr: [0; 2],
         }
     }
 }

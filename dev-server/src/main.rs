@@ -58,3 +58,23 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("shutdown signal received");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn cli_defaults_to_local_port_and_current_directory() {
+        let cli = Cli::parse_from(["dev-server"]);
+        assert_eq!(cli.port, 8000);
+        assert_eq!(cli.directory, PathBuf::from("."));
+    }
+
+    #[test]
+    fn cli_parses_port_and_directory_overrides() {
+        let cli = Cli::parse_from(["dev-server", "--port", "8123", "--directory", "./payloads"]);
+        assert_eq!(cli.port, 8123);
+        assert_eq!(cli.directory, PathBuf::from("./payloads"));
+    }
+}

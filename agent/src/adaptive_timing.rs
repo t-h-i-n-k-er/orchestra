@@ -338,11 +338,7 @@ impl AdaptiveTimer {
     ///
     /// Reads `base_interval`, `max_deviation`, and `learning_period` from the
     /// configuration.  Falls back to sensible defaults when fields are absent.
-    pub fn from_config(
-        base_interval_secs: u64,
-        jitter_percent: u32,
-        max_deviation: f64,
-    ) -> Self {
+    pub fn from_config(base_interval_secs: u64, jitter_percent: u32, max_deviation: f64) -> Self {
         let base = Duration::from_secs(base_interval_secs.max(1));
         let deviation = if max_deviation > 0.0 {
             max_deviation
@@ -484,10 +480,7 @@ impl AdaptiveTimer {
         self.learn_profile_inner(&inner)
     }
 
-    fn learn_profile_inner(
-        &self,
-        inner: &TimerInner,
-    ) -> Result<TrafficProfile, anyhow::Error> {
+    fn learn_profile_inner(&self, inner: &TimerInner) -> Result<TrafficProfile, anyhow::Error> {
         let n = inner.observation_window.len();
         if n < inner.learning_observations_needed {
             return Err(anyhow::anyhow!(
@@ -591,10 +584,7 @@ impl AdaptiveTimer {
     ///
     /// A burst is a sequence of 3+ observations within a short time window
     /// (e.g., < 30 seconds apart) with above-average byte counts.
-    fn detect_burst_patterns(
-        &self,
-        observations: &[TrafficObservation],
-    ) -> Vec<BurstPattern> {
+    fn detect_burst_patterns(&self, observations: &[TrafficObservation]) -> Vec<BurstPattern> {
         if observations.len() < 3 {
             return Vec::new();
         }
@@ -694,10 +684,7 @@ impl AdaptiveTimer {
                 // Use the learned inter-arrival distribution, but bound it
                 // relative to the configured base interval.
                 let max_drift = base * inner.max_deviation;
-                let learned_clamped = learned_mean.clamp(
-                    base - max_drift,
-                    base + max_drift,
-                );
+                let learned_clamped = learned_mean.clamp(base - max_drift, base + max_drift);
 
                 // Apply Gaussian jitter using the learned stddev (capped at
                 // max_deviation of the base interval).
@@ -802,7 +789,10 @@ impl AdaptiveTimer {
             } else {
                 TimerState::Learning
             };
-            tracing::debug!("adaptive_timing: exited Evasion phase, now {:?}", inner.state);
+            tracing::debug!(
+                "adaptive_timing: exited Evasion phase, now {:?}",
+                inner.state
+            );
         }
     }
 
@@ -1024,8 +1014,14 @@ mod tests {
 
     #[test]
     fn learning_threshold_is_reasonable() {
-        assert!(LEARNING_THRESHOLD >= 20, "need enough observations to learn");
-        assert!(LEARNING_THRESHOLD <= 200, "should not take too long to learn");
+        assert!(
+            LEARNING_THRESHOLD >= 20,
+            "need enough observations to learn"
+        );
+        assert!(
+            LEARNING_THRESHOLD <= 200,
+            "should not take too long to learn"
+        );
     }
 
     #[test]
@@ -1246,7 +1242,11 @@ mod tests {
 
         // At least one peak should include hour 10.
         let includes_10 = peaks.iter().any(|p| p.start <= 10 && p.end >= 10);
-        assert!(includes_10, "expected a peak including hour 10, got {:?}", peaks);
+        assert!(
+            includes_10,
+            "expected a peak including hour 10, got {:?}",
+            peaks
+        );
     }
 
     #[test]
@@ -1295,11 +1295,7 @@ mod tests {
         // Verify intervals are within bounds.
         for _ in 0..50 {
             let dur = timer.next_callback_time();
-            assert!(
-                dur >= Duration::from_secs(5),
-                "interval {:?} < min 5s",
-                dur,
-            );
+            assert!(dur >= Duration::from_secs(5), "interval {:?} < min 5s", dur,);
             assert!(
                 dur <= Duration::from_secs(600),
                 "interval {:?} > max 600s",

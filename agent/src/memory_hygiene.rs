@@ -825,7 +825,9 @@ pub unsafe fn scrub_handle_table() {
                 // STATUS_INFO_LENGTH_MISMATCH or resolution failed — grow buffer.
                 if buf_len > 0x1000000 {
                     // 16 MB safety limit.
-                    tracing::warn!("[memory_hygiene] handle table buffer exceeded 16 MB, giving up");
+                    tracing::warn!(
+                        "[memory_hygiene] handle table buffer exceeded 16 MB, giving up"
+                    );
                     break;
                 }
                 buf_len = if ret_len > buf_len {

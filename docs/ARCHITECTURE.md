@@ -996,9 +996,9 @@ Inside the encrypted payload (protocol v2):
 └────────────┴──────────────┴─────────────────────────────┘
 ```
 
-- **Salt**: 32 random bytes per message, used for HKDF key derivation
-- **Nonce**: 12 random bytes per message
-- **Key derivation**: `HKDF-SHA256(salt, psk, info=b"orchestra-v2")` → 32-byte per-message key
+- **Salt**: 32-byte session/rekey HKDF salt carried with each encrypted payload
+- **Nonce**: 12 bytes: 4-byte random prefix + 8-byte monotonic big-endian counter, reset when the session rekeys
+- **Key derivation**: `HKDF-SHA256(salt, psk, info=common::hkdf_info::AES_GCM)` → 32-byte AES-256-GCM key
 - **Ciphertext**: bincode-serialized `Message`, encrypted with AES-256-GCM
 
 ### Message Variants
@@ -1039,7 +1039,7 @@ When the `forward-secrecy` feature is enabled:
 1. Both sides generate X25519 ephemeral keypairs
 2. Exchange public keys over the encrypted channel
 3. Compute shared secret: `X25519(my_secret, peer_public)`
-4. Derive session key: `HKDF-SHA256(shared_secret, SHA256(PSK), "orchestra-fs-v1")`
+4. Derive session key: `HKDF-SHA256(shared_secret, derived salt, info=common::hkdf_info::FS_SESSION)`
 5. All subsequent frames use the derived session key
 
 Key ordering uses canonical comparison to ensure both sides derive the same key regardless of role.
@@ -1967,7 +1967,7 @@ to immediately return without executing any monitoring logic.
 | 6 | procexp152.sys | Process Explorer | PhysicalMemory | Scan only |
 
 Top 3 drivers (indices 0–2) are XOR-obfuscated and embedded in the agent binary.  Decryption
-key is derived from the HKDF session key with info `"orchestra-driver-key"`.
+key is derived from the HKDF session key with `common::hkdf_info::DRIVER_KEY`.
 
 ### Callback Types
 
@@ -2605,15 +2605,22 @@ HKDF-SHA256 is used throughout the codebase for key derivation. The `info` param
 
 | Context | IKM | Salt | Info | Output |
 |---------|-----|------|------|--------|
-| **Per-message encryption** | PSK | Random 32-byte salt per message | `"orchestra-v2"` | 32-byte AES-256-GCM key |
-| **Forward secrecy session** | X25519 ECDH shared secret | `HKDF(PSK, "orchestra-fs-hkdf-salt")` | `"orchestra-forward-secret-v1"` | 32-byte session key |
-| **HMAC auth key** | PSK | — | `"orchestra-hmac-auth-key"` | HMAC-SHA256 key |
-| **P2P link key** | X25519 shared | `None` | `"orchestra-p2p-link-key"` | 32-byte link encryption key |
-| **DLL side-load payload** | Build-time seed | `enc_str!("ORCHESTRA_HKDF_SALT")` | `"orchestra-dll-sideload"` | 32-byte XChaCha20-Poly1305 key |
-| **Sleep obfuscation** | Master key | — | `"orchestra-sleep-v1"` | Sleep encryption key |
-| **Sleep key rotation** | Previous key input | — | `"orchestra-key-rotate"` | New sleep key |
-| **Optimizer dead-code values** | `STUB_SEED` | `None` | `index.to_le_bytes()` | 8-byte dead-code value |
-| **BYOVD driver XOR key** | Session key | Session salt | `"orchestra-driver-key"` | 32-byte XOR key |
+| **Wire AES-GCM encryption** | PSK or FS session secret | Current 32-byte session/rekey salt | `common::hkdf_info::AES_GCM` | 32-byte AES-256-GCM key |
+| **Forward secrecy HKDF salt** | PSK | None | `common::hkdf_info::FS_SALT` | 32-byte salt material |
+| **Forward secrecy session** | X25519 ECDH shared secret | Derived FS salt | `common::hkdf_info::FS_SESSION` | 32-byte session key |
+| **Forward secrecy HMAC auth key** | PSK | None | `common::hkdf_info::FS_HMAC` | HMAC-SHA256 key |
+| **HTTP/DoH FS session** | X25519 ECDH shared secret | Derived FS salt | `common::hkdf_info::FS_HTTP_SESSION` | 32-byte request/session key |
+| **PSK rotation** | Previous PSK | None | `common::hkdf_info::PSK_ROTATION` | Rotated PSK material |
+| **P2P link key** | X25519 shared secret | None | `common::hkdf_info::P2P_LINK` | 32-byte ChaCha20-Poly1305 key |
+| **DLL side-load AES payload** | Build-time seed | Build salt | `common::hkdf_info::DLL_SIDELOAD_AES` | 32-byte payload key |
+| **DLL side-load RC4 re-encode** | Build-time seed | Build salt | `common::hkdf_info::DLL_SIDELOAD_RC4` | RC4 key material |
+| **BYOVD driver XOR key** | Session key | Session salt | `common::hkdf_info::DRIVER_KEY` | 32-byte XOR key |
+| **Thread context encryption** | Session or master key | Context salt | `common::hkdf_info::THREAD_CTX` | XChaCha20-Poly1305 key |
+| **Self-reencode seed** | Runtime seed material | None | `common::hkdf_info::REENCODE_SEED` | Re-encode PRNG seed |
+| **Trampoline stack spoofing** | Session/random seed material | None | `common::hkdf_info::TRAMPOLINE_SPOOF` | Chain selection seed |
+| **Adaptive timing** | Session/random seed material | None | `common::hkdf_info::ADAPTIVE_TIMING` | Timing jitter seed |
+| **Reflective loader randomization** | Loader seed material | None | `common::hkdf_info::REFLECTIVE_LOADER` | Loader randomization key |
+| **SSP shared memory name** | Session key | None | `common::hkdf_info::SSP_SHM` | Shared-memory name material |
 
 ### CryptoSession
 
@@ -2645,7 +2652,7 @@ Encrypted payload side-loading that masquerades as a legitimate DLL:
 
 1. **Build time** (`orchestra-side-load-gen`): Generates a DLL with a legitimate-looking export table. The payload is encrypted with ChaCha20.
 2. **Runtime** (`injection/dll_sideload.rs`): Agent receives the encrypted payload via `InjectSideLoad` command.
-3. **Key derivation**: `HKDF-SHA256(build_seed, salt, "orchestra-dll-sideload")` → 32-byte XChaCha20-Poly1305 key.
+3. **Key derivation**: `HKDF-SHA256(build_seed, salt, info=common::hkdf_info::DLL_SIDELOAD_AES)` → 32-byte payload key.
 4. **Execution**: Decrypt → `NtOpenProcess` → `NtAllocateVirtualMemory(RW)` → `NtWriteVirtualMemory` → `NtProtectVirtualMemory(RX)` → `NtCreateThreadEx`.
 5. **Export forwarding**: Patches export table entries to forward to the real target DLL resolved via PEB walk.
 

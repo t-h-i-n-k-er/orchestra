@@ -431,9 +431,7 @@ impl DohRuntime {
         // The agent encodes the ECDH payload as URL-safe base64 without
         // padding for DNS subdomain compatibility.  Convert back to standard
         // base64 so `HttpEcdhServerSession::new` can decode it.
-        let standard_b64 = init_data
-            .replace('-', "+")
-            .replace('_', "/");
+        let standard_b64 = init_data.replace('-', "+").replace('_', "/");
 
         let server_session = match HttpEcdhServerSession::new(&self.psk, &standard_b64) {
             Ok(s) => s,
@@ -791,7 +789,10 @@ fn try_reassemble_messages(sess: &mut DohSession, crypto: &CryptoSession) -> Vec
 
             if let Some(ciphertext) = b32_decode(&assembled) {
                 if let Ok(plain) = crypto.decrypt(&ciphertext) {
-                    if let Ok(msg) = bincode::serde::decode_from_slice(&plain, bincode::config::legacy()).map(|(v, _)| v) {
+                    if let Ok(msg) =
+                        bincode::serde::decode_from_slice(&plain, bincode::config::legacy())
+                            .map(|(v, _)| v)
+                    {
                         resolved = Some((seq, msg));
                         break;
                     }

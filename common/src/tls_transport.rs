@@ -820,10 +820,7 @@ mod tests {
         let mut server_transport: TlsTransport<_> =
             TlsTransport::new(server_io, CryptoSession::from_key(server_key));
 
-        client_transport
-            .send(Message::Shutdown)
-            .await
-            .unwrap();
+        client_transport.send(Message::Shutdown).await.unwrap();
         // Decryption should fail because keys don't match.
         let result = server_transport.recv().await;
         assert!(result.is_err(), "recv with wrong key should fail");
@@ -840,7 +837,11 @@ mod tests {
 
         // Write a frame length that exceeds MAX_FRAME_BYTES directly.
         use tokio::io::AsyncWriteExt;
-        client_transport.stream.write_u32_le(MAX_FRAME_BYTES + 1).await.unwrap();
+        client_transport
+            .stream
+            .write_u32_le(MAX_FRAME_BYTES + 1)
+            .await
+            .unwrap();
         let result = server_transport.recv().await;
         assert!(result.is_err(), "oversized frame should be rejected");
     }
@@ -877,6 +878,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport for TlsTransport<S> {
         let mut buffer = vec![0u8; len as usize];
         self.stream.read_exact(&mut buffer).await?;
         let decrypted = self.session.decrypt(&buffer)?;
-        Ok(bincode::serde::decode_from_slice(&decrypted, bincode::config::legacy()).map(|(v, _)| v)?)
+        Ok(
+            bincode::serde::decode_from_slice(&decrypted, bincode::config::legacy())
+                .map(|(v, _)| v)?,
+        )
     }
 }

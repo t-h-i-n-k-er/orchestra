@@ -90,8 +90,10 @@ extern "C" {
     pub fn CFRelease(cf: CFTypeRef);
     pub fn CFDataGetLength(data: CFDataRef) -> isize;
     pub fn CFDataGetBytePtr(data: CFDataRef) -> *const u8;
-    pub fn CFDictionaryGetValue(dict: CFDictionaryRef, key: *const std::ffi::c_void)
-        -> *const std::ffi::c_void;
+    pub fn CFDictionaryGetValue(
+        dict: CFDictionaryRef,
+        key: *const std::ffi::c_void,
+    ) -> *const std::ffi::c_void;
     pub fn CFDictionaryCreate(
         alloc: CFAllocatorRef,
         keys: *const *const std::ffi::c_void,

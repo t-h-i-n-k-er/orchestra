@@ -81,22 +81,24 @@ fn build_tls_client_config(profile: &QuicC2Profile) -> Result<rustls::ClientConf
 
     if !profile.custom_ca.is_empty() {
         // Load custom CA from PEM file.
-        let ca_data =
-            std::fs::read(&profile.custom_ca).with_context(|| {
-                format!("failed to read custom CA from {}", profile.custom_ca)
-            })?;
+        let ca_data = std::fs::read(&profile.custom_ca)
+            .with_context(|| format!("failed to read custom CA from {}", profile.custom_ca))?;
         let mut cursor = std::io::Cursor::new(&ca_data);
         let certs = rustls_pemfile::certs(&mut cursor)
             .collect::<Result<Vec<_>, _>>()
             .context("failed to parse custom CA PEM")?;
         for cert in certs {
-            root_store.add(cert).context("failed to add custom CA cert")?;
+            root_store
+                .add(cert)
+                .context("failed to add custom CA cert")?;
         }
     } else {
         // Use platform native certificates.
         let native_certs = rustls_native_certs::load_native_certs();
         for cert in native_certs.certs {
-            root_store.add(cert).context("failed to add native root cert")?;
+            root_store
+                .add(cert)
+                .context("failed to add native root cert")?;
         }
     }
 
@@ -109,9 +111,7 @@ fn build_tls_client_config(profile: &QuicC2Profile) -> Result<rustls::ClientConf
         tls_config
             .dangerous()
             .set_certificate_verifier(Arc::new(AcceptAnyCertVerifier));
-        tracing::warn!(
-            "QUIC TLS: insecure mode — accepting any server certificate (testing only)"
-        );
+        tracing::warn!("QUIC TLS: insecure mode — accepting any server certificate (testing only)");
     } else if profile.cert_pinning {
         tls_config
             .dangerous()
@@ -150,8 +150,7 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCertVerifier {
         message: &[u8],
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-    {
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         rustls::crypto::verify_tls12_signature(
             message,
             cert,
@@ -165,8 +164,7 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCertVerifier {
         message: &[u8],
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-    {
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         rustls::crypto::verify_tls13_signature(
             message,
             cert,
@@ -207,11 +205,7 @@ impl rustls::client::danger::ServerCertVerifier for FingerprintCertVerifier {
         let expected_lower = self.expected_fingerprint.to_lowercase();
 
         // Constant-time comparison to prevent timing side-channel attacks.
-        if !bool::from(
-            hex_fp
-                .as_bytes()
-                .ct_eq(expected_lower.as_bytes()),
-        ) {
+        if !bool::from(hex_fp.as_bytes().ct_eq(expected_lower.as_bytes())) {
             tracing::error!("QUIC cert pinning: fingerprint mismatch — rejecting connection");
             return Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::UnknownIssuer,
@@ -221,9 +215,7 @@ impl rustls::client::danger::ServerCertVerifier for FingerprintCertVerifier {
 
         // Verify hostname/SAN — same check applied by the HTTP and TLS transports.
         if !common::tls_transport::verify_cert_hostname(end_entity.as_ref(), server_name) {
-            tracing::warn!(
-                "QUIC cert pinning: fingerprint matched but hostname validation failed"
-            );
+            tracing::warn!("QUIC cert pinning: fingerprint matched but hostname validation failed");
             return Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::NotValidForName,
             ));
@@ -254,8 +246,7 @@ impl rustls::client::danger::ServerCertVerifier for FingerprintCertVerifier {
         message: &[u8],
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-    {
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         rustls::crypto::verify_tls12_signature(
             message,
             cert,
@@ -269,8 +260,7 @@ impl rustls::client::danger::ServerCertVerifier for FingerprintCertVerifier {
         message: &[u8],
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-    {
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         rustls::crypto::verify_tls13_signature(
             message,
             cert,
@@ -601,11 +591,7 @@ impl<'a> H3Compat<'a> {
         // Build the simplified H3 header block.
         let mut header_block = Vec::new();
         self.append_header(&mut header_block, ":method", "POST");
-        self.append_header(
-            &mut header_block,
-            ":path",
-            &self.connection.profile.h3_path,
-        );
+        self.append_header(&mut header_block, ":path", &self.connection.profile.h3_path);
         self.append_header(&mut header_block, ":scheme", "https");
         self.append_header(
             &mut header_block,
@@ -639,8 +625,7 @@ impl<'a> H3Compat<'a> {
             .await
             .context("H3Compat: failed to write request body")?;
 
-        send.finish()
-            .context("H3Compat: failed to close stream")?;
+        send.finish().context("H3Compat: failed to close stream")?;
 
         tracing::debug!(
             "H3Compat: sent POST {} ({} bytes body + {} bytes headers)",
@@ -865,7 +850,11 @@ impl QuicTransport {
 
     /// Handle a connection failure with exponential backoff.
     async fn handle_connection_failure(&mut self, e: anyhow::Error) -> anyhow::Error {
-        tracing::warn!("QUIC: connection error: {}; backing off {}s", e, self.backoff_secs);
+        tracing::warn!(
+            "QUIC: connection error: {}; backing off {}s",
+            e,
+            self.backoff_secs
+        );
         self.connection = None;
 
         let backoff = Duration::from_secs(self.backoff_secs);
@@ -895,7 +884,8 @@ impl QuicTransport {
             .session
             .decrypt(ciphertext)
             .map_err(|e| anyhow!("QUIC decrypt failed: {:?}", e))?;
-        let msg: Message = bincode::serde::decode_from_slice(&plaintext, bincode::config::legacy()).map(|(v, _)| v)
+        let msg: Message = bincode::serde::decode_from_slice(&plaintext, bincode::config::legacy())
+            .map(|(v, _)| v)
             .context("failed to deserialize message from QUIC transport")?;
         Ok(msg)
     }
@@ -919,8 +909,7 @@ impl Transport for QuicTransport {
         if let Some(ecdh) = self.ecdh_client.as_ref() {
             let mut ecdh_guard = ecdh.lock_recover();
             let ecdh_b64 = ecdh_guard.header_value();
-            let frame =
-                common::forward_secrecy::encode_ecdh_bin_frame(&ecdh_b64);
+            let frame = common::forward_secrecy::encode_ecdh_bin_frame(&ecdh_b64);
             let mut combined = frame;
             combined.append(&mut ciphertext);
             ciphertext = combined;
@@ -946,12 +935,13 @@ impl Transport for QuicTransport {
         match result {
             Ok(()) => {
                 self.record_success();
-                tracing::debug!("QUIC: message sent successfully ({} bytes)", ciphertext.len());
+                tracing::debug!(
+                    "QUIC: message sent successfully ({} bytes)",
+                    ciphertext.len()
+                );
                 Ok(())
             }
-            Err(e) => {
-                Err(self.handle_connection_failure(e).await)
-            }
+            Err(e) => Err(self.handle_connection_failure(e).await),
         }
     }
 
@@ -1114,7 +1104,10 @@ mod tests {
         let serialized = bincode::serde::encode_to_vec(&msg, bincode::config::legacy()).unwrap();
         let ciphertext = session.encrypt(&serialized);
         let plaintext = session.decrypt(&ciphertext).unwrap();
-        let deserialized: Message = bincode::serde::decode_from_slice(&plaintext, bincode::config::legacy()).map(|(v, _)| v).unwrap();
+        let deserialized: Message =
+            bincode::serde::decode_from_slice(&plaintext, bincode::config::legacy())
+                .map(|(v, _)| v)
+                .unwrap();
 
         if let Message::Heartbeat {
             timestamp,

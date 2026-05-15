@@ -751,8 +751,9 @@ fn is_cloud_instance_sandbox() -> bool {
                 // Append a dummy port for ToSocketAddrs; we only care whether
                 // the name resolves, not the actual address.
                 let addr = format!("{}:0", hostname);
-                addr.to_socket_addrs().is_ok()
-                    && addr.to_socket_addrs().map(|it| !it.is_empty()).unwrap_or(false)
+                addr.to_socket_addrs()
+                    .map(|mut addrs| addrs.next().is_some())
+                    .unwrap_or(false)
             }
 
             // GCP Mac instances (if/when available): metadata.google.internal

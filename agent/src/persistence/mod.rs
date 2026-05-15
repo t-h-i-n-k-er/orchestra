@@ -2792,9 +2792,7 @@ pub mod macos {
                     // stdout means it is not currently loaded.
                     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     if stdout.is_empty() {
-                        tracing::warn!(
-                            "LaunchDaemon::verify: plist exists but service not loaded"
-                        );
+                        tracing::warn!("LaunchDaemon::verify: plist exists but service not loaded");
                         return Ok(false);
                     }
                 }
@@ -3519,7 +3517,13 @@ pub mod linux {
                 Some(h) => h,
                 None => return Ok(()),
             };
-            for profile_name in &[".zshrc", ".bashrc", ".profile", ".bash_profile", ".config/fish/config.fish"] {
+            for profile_name in &[
+                ".zshrc",
+                ".bashrc",
+                ".profile",
+                ".bash_profile",
+                ".config/fish/config.fish",
+            ] {
                 let path = home.join(profile_name);
                 if !path.exists() {
                     continue;
@@ -3538,7 +3542,13 @@ pub mod linux {
                 Some(h) => h,
                 None => return Ok(false),
             };
-            for profile_name in &[".zshrc", ".bashrc", ".profile", ".bash_profile", ".config/fish/config.fish"] {
+            for profile_name in &[
+                ".zshrc",
+                ".bashrc",
+                ".profile",
+                ".bash_profile",
+                ".config/fish/config.fish",
+            ] {
                 let path = home.join(profile_name);
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     if content.contains(SHELL_MARKER_BEGIN) || content.contains("# system-update-")

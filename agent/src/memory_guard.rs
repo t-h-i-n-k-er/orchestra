@@ -45,13 +45,13 @@
 
 #![cfg(feature = "memory-guard")]
 
-use common::lock::MutexExt;
 use anyhow::Result;
 use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng},
     ChaCha20Poly1305, XChaCha20Poly1305, XNonce,
 };
 use common::config::SleepScheme;
+use common::lock::MutexExt;
 use rand::RngCore;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};

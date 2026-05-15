@@ -107,18 +107,45 @@ const fn const_hash_wstr(units: &[u16]) -> u32 {
 // ─── Pre-computed hashes for excluded DLLs ──────────────────────────────────
 
 const NTDLL_HASH: u32 = const_hash_wstr(&[
-    b'n' as u16, b't' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
-    b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
+    b'n' as u16,
+    b't' as u16,
+    b'd' as u16,
+    b'l' as u16,
+    b'l' as u16,
+    b'.' as u16,
+    b'd' as u16,
+    b'l' as u16,
+    b'l' as u16,
 ]);
 const KERNEL32_HASH: u32 = const_hash_wstr(&[
-    b'k' as u16, b'e' as u16, b'r' as u16, b'n' as u16, b'e' as u16,
-    b'l' as u16, b'3' as u16, b'2' as u16, b'.' as u16, b'd' as u16,
-    b'l' as u16, b'l' as u16,
+    b'k' as u16,
+    b'e' as u16,
+    b'r' as u16,
+    b'n' as u16,
+    b'e' as u16,
+    b'l' as u16,
+    b'3' as u16,
+    b'2' as u16,
+    b'.' as u16,
+    b'd' as u16,
+    b'l' as u16,
+    b'l' as u16,
 ]);
 const KERNELBASE_HASH: u32 = const_hash_wstr(&[
-    b'k' as u16, b'e' as u16, b'r' as u16, b'n' as u16, b'e' as u16,
-    b'l' as u16, b'b' as u16, b'a' as u16, b's' as u16, b'e' as u16,
-    b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
+    b'k' as u16,
+    b'e' as u16,
+    b'r' as u16,
+    b'n' as u16,
+    b'e' as u16,
+    b'l' as u16,
+    b'b' as u16,
+    b'a' as u16,
+    b's' as u16,
+    b'e' as u16,
+    b'.' as u16,
+    b'd' as u16,
+    b'l' as u16,
+    b'l' as u16,
 ]);
 
 // ─── Code Cave Allocator ──────────────────────────────────────────────────
@@ -379,9 +406,7 @@ unsafe fn enumerate_modules() -> Vec<ModuleInfo> {
             let name_hash = pe_resolve::hash_wstr(name_slice);
 
             // Skip critical DLLs.
-            if name_hash != NTDLL_HASH
-                && name_hash != KERNEL32_HASH
-                && name_hash != KERNELBASE_HASH
+            if name_hash != NTDLL_HASH && name_hash != KERNEL32_HASH && name_hash != KERNELBASE_HASH
             {
                 if let Some(text_info) = find_text_section(dll_base, size_of_image) {
                     result.push(ModuleInfo {
@@ -407,7 +432,10 @@ unsafe fn enumerate_modules() -> Vec<ModuleInfo> {
 /// Parse PE headers to find the `.text` section RVA and size.
 ///
 /// Returns `Some((rva, virtual_size))` if a `.text` section is found.
-unsafe fn find_text_section(base: *mut std::ffi::c_void, image_size: usize) -> Option<(usize, usize)> {
+unsafe fn find_text_section(
+    base: *mut std::ffi::c_void,
+    image_size: usize,
+) -> Option<(usize, usize)> {
     let base_ptr = base as *const u8;
 
     // Check DOS signature "MZ".
@@ -435,14 +463,8 @@ unsafe fn find_text_section(base: *mut std::ffi::c_void, image_size: usize) -> O
     // COFF header starts at e_lfanew + 4.
     //   NumberOfSections at +2 (2 bytes)
     //   SizeOfOptionalHeader at +16 (2 bytes)
-    let num_sections = u16::from_le_bytes([
-        *pe_sig.add(6),
-        *pe_sig.add(7),
-    ]);
-    let size_of_optional = u16::from_le_bytes([
-        *pe_sig.add(20),
-        *pe_sig.add(21),
-    ]) as usize;
+    let num_sections = u16::from_le_bytes([*pe_sig.add(6), *pe_sig.add(7)]);
+    let size_of_optional = u16::from_le_bytes([*pe_sig.add(20), *pe_sig.add(21)]) as usize;
 
     // Section headers start after the optional header.
     let section_start = e_lfanew + 4 + 20 + size_of_optional;
@@ -459,18 +481,11 @@ unsafe fn find_text_section(base: *mut std::ffi::c_void, image_size: usize) -> O
         let name = &*std::ptr::slice_from_raw_parts(sec, 8);
         if name[..6] == *b".text\0" {
             // VirtualAddress at +12 (4 bytes), VirtualSize at +8 (4 bytes).
-            let virtual_size = u32::from_le_bytes([
-                *sec.add(8),
-                *sec.add(9),
-                *sec.add(10),
-                *sec.add(11),
-            ]) as usize;
-            let virtual_address = u32::from_le_bytes([
-                *sec.add(12),
-                *sec.add(13),
-                *sec.add(14),
-                *sec.add(15),
-            ]) as usize;
+            let virtual_size =
+                u32::from_le_bytes([*sec.add(8), *sec.add(9), *sec.add(10), *sec.add(11)]) as usize;
+            let virtual_address =
+                u32::from_le_bytes([*sec.add(12), *sec.add(13), *sec.add(14), *sec.add(15)])
+                    as usize;
 
             return Some((virtual_address, virtual_size));
         }
@@ -566,19 +581,17 @@ unsafe fn query_protection(addr: *mut std::ffi::c_void) -> Option<u32> {
     let status = crate::syscall!(
         "NtQueryVirtualMemory",
         CURRENT_PROCESS as u64,             // ProcessHandle
-        addr as u64,                         // BaseAddress
-        0u64,                                // MemoryInformationClass (MemoryBasicInformation)
-        mbi.as_mut_ptr() as u64,             // MemoryInformation
-        mbi.len() as u64,                    // MemoryInformationLength
-        std::ptr::null_mut::<u64>() as u64,  // ReturnLength
+        addr as u64,                        // BaseAddress
+        0u64,                               // MemoryInformationClass (MemoryBasicInformation)
+        mbi.as_mut_ptr() as u64,            // MemoryInformation
+        mbi.len() as u64,                   // MemoryInformationLength
+        std::ptr::null_mut::<u64>() as u64, // ReturnLength
     );
 
     match status {
         Ok(s) if s >= 0 => {
             // Protect is at offset 0x24 (4 bytes).
-            let protect = u32::from_le_bytes([
-                mbi[0x24], mbi[0x25], mbi[0x26], mbi[0x27],
-            ]);
+            let protect = u32::from_le_bytes([mbi[0x24], mbi[0x25], mbi[0x26], mbi[0x27]]);
             Some(protect)
         }
         _ => None,

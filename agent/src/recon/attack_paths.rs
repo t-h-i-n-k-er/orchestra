@@ -32,8 +32,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
 
 use super::ad_enum::{AdComputer, AdDelegation, AdGroup, AdReconData, AdUser};
 
@@ -101,10 +101,10 @@ pub struct AttackPath {
 /// Node in the relationship graph.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum GraphNode {
-    User(String),      // DN
-    Group(String),     // DN
-    Computer(String),  // DN
-    Domain(String),    // Domain FQDN
+    User(String),     // DN
+    Group(String),    // DN
+    Computer(String), // DN
+    Domain(String),   // Domain FQDN
 }
 
 /// Edge in the relationship graph.
@@ -144,14 +144,11 @@ impl RelationshipGraph {
                 description: desc.to_string(),
             });
 
-        self.reverse
-            .entry(to)
-            .or_default()
-            .push(GraphEdge {
-                target: from,
-                edge_type: edge_type.to_string(),
-                description: desc.to_string(),
-            });
+        self.reverse.entry(to).or_default().push(GraphEdge {
+            target: from,
+            edge_type: edge_type.to_string(),
+            description: desc.to_string(),
+        });
     }
 
     fn neighbors(&self, node: &GraphNode) -> &[GraphEdge] {
@@ -179,13 +176,19 @@ fn build_graph(ad_data: &AdReconData) -> RelationshipGraph {
     let mut graph = RelationshipGraph::new();
 
     // Identify Domain Admins group DN
-    let da_group_dn = ad_data.groups.iter()
+    let da_group_dn = ad_data
+        .groups
+        .iter()
         .find(|g| g.cn.eq_ignore_ascii_case("Domain Admins"))
         .map(|g| g.distinguished_name.clone());
 
     // Collect all DA member DNs
     if let Some(da_dn) = &da_group_dn {
-        if let Some(da_group) = ad_data.groups.iter().find(|g| g.distinguished_name.eq_ignore_ascii_case(da_dn)) {
+        if let Some(da_group) = ad_data
+            .groups
+            .iter()
+            .find(|g| g.distinguished_name.eq_ignore_ascii_case(da_dn))
+        {
             for member_dn in &da_group.members {
                 graph.da_members.insert(member_dn.to_ascii_lowercase());
             }
@@ -200,7 +203,11 @@ fn build_graph(ad_data: &AdReconData) -> RelationshipGraph {
                 user_node.clone(),
                 GraphNode::Group(group_dn.clone()),
                 "MemberOf",
-                &format!("{} is a member of {}", user.sam_account_name, short_dn(group_dn)),
+                &format!(
+                    "{} is a member of {}",
+                    user.sam_account_name,
+                    short_dn(group_dn)
+                ),
             );
         }
     }
@@ -222,15 +229,18 @@ fn build_graph(ad_data: &AdReconData) -> RelationshipGraph {
     // If a user is in "Administrators" or a local admin group, they have
     // admin access to computers. We approximate by linking privileged
     // group members to all computers.
-    let admin_group_dns: Vec<String> = ad_data.groups.iter()
+    let admin_group_dns: Vec<String> = ad_data
+        .groups
+        .iter()
         .filter(|g| g.is_privileged || g.cn.eq_ignore_ascii_case("Administrators"))
         .map(|g| g.distinguished_name.clone())
         .collect();
 
     for user in &ad_data.users {
-        let is_admin = user.member_of.iter().any(|m| {
-            admin_group_dns.iter().any(|ag| m.eq_ignore_ascii_case(ag))
-        });
+        let is_admin = user
+            .member_of
+            .iter()
+            .any(|m| admin_group_dns.iter().any(|ag| m.eq_ignore_ascii_case(ag)));
 
         if is_admin {
             for computer in &ad_data.computers {
@@ -464,9 +474,10 @@ fn summarize_path(steps: &[AttackStep], target: &str) -> String {
         return format!("Already a member of {}", short_dn(target));
     }
 
-    let mut parts: Vec<String> = steps.iter().map(|s| {
-        format!("{} → {}", s.edge_type, short_description(&s.description))
-    }).collect();
+    let mut parts: Vec<String> = steps
+        .iter()
+        .map(|s| format!("{} → {}", s.edge_type, short_description(&s.description)))
+        .collect();
     parts.push(format!("→ DA ({})", short_dn(target)));
     parts.join(" ")
 }
@@ -520,7 +531,9 @@ pub fn find_paths_to_da(ad_data: &AdReconData, current_user_dn: &str) -> Vec<Att
     // Determine starting user
     let start_dn = if current_user_dn.is_empty() {
         // Try to find a reasonable starting user
-        ad_data.users.iter()
+        ad_data
+            .users
+            .iter()
             .find(|u| !u.is_disabled)
             .map(|u| u.distinguished_name.clone())
             .unwrap_or_default()
@@ -538,7 +551,10 @@ pub fn find_paths_to_da(ad_data: &AdReconData, current_user_dn: &str) -> Vec<Att
     let paths = find_paths_bfs(&graph, &start_dn, 50, 10);
 
     if paths.is_empty() {
-        info!("Attack paths: no path to Domain Admins found from {}", short_dn(&start_dn));
+        info!(
+            "Attack paths: no path to Domain Admins found from {}",
+            short_dn(&start_dn)
+        );
     } else {
         info!(
             "Attack paths: found {} paths to Domain Admins (shortest: {} hops)",
@@ -551,8 +567,13 @@ pub fn find_paths_to_da(ad_data: &AdReconData, current_user_dn: &str) -> Vec<Att
 }
 
 /// Find the shortest attack path to DA (convenience function).
-pub fn find_shortest_path_to_da(ad_data: &AdReconData, current_user_dn: &str) -> Option<AttackPath> {
-    find_paths_to_da(ad_data, current_user_dn).into_iter().next()
+pub fn find_shortest_path_to_da(
+    ad_data: &AdReconData,
+    current_user_dn: &str,
+) -> Option<AttackPath> {
+    find_paths_to_da(ad_data, current_user_dn)
+        .into_iter()
+        .next()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -665,7 +686,10 @@ mod tests {
     #[test]
     fn test_short_dn() {
         assert_eq!(short_dn("CN=admin,CN=Users,DC=test,DC=local"), "CN=admin");
-        assert_eq!(short_dn("CN=Domain Admins,CN=Users,DC=test,DC=local"), "CN=Domain Admins");
+        assert_eq!(
+            short_dn("CN=Domain Admins,CN=Users,DC=test,DC=local"),
+            "CN=Domain Admins"
+        );
     }
 
     #[test]
@@ -754,7 +778,14 @@ mod tests {
     #[test]
     fn test_graph_edge_types() {
         // Verify all expected edge types exist as strings
-        let edge_types = ["MemberOf", "AdminTo", "HasSession", "GenericAll", "WriteDacl", "AllowedToDelegate"];
+        let edge_types = [
+            "MemberOf",
+            "AdminTo",
+            "HasSession",
+            "GenericAll",
+            "WriteDacl",
+            "AllowedToDelegate",
+        ];
         for et in &edge_types {
             assert!(!et.is_empty());
         }

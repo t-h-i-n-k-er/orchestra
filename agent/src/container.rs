@@ -270,9 +270,8 @@ pub fn escape_via_cgroup_escape() -> Result<EscapeResult> {
 
     // Capture a single atomic snapshot of /proc/mounts so that the host-fs
     // path lookup does not race with other mount table reads.
-    let snapshot = MountTableSnapshot::capture().context(
-        "container/cgroup: failed to read /proc/mounts for host path detection",
-    )?;
+    let snapshot = MountTableSnapshot::capture()
+        .context("container/cgroup: failed to read /proc/mounts for host path detection")?;
 
     let cgroup_dir = "/tmp/cgrp_escape";
     let host_path = match snapshot.find_host_fs_path() {
@@ -541,9 +540,7 @@ pub fn escape_via_mount_propagation() -> Result<EscapeResult> {
     let lower_dirs = snapshot.find_overlay_lower_dirs();
     let host_lower_dir = lower_dirs.into_iter().next();
 
-    let host_path = snapshot
-        .find_host_fs_path()
-        .or(host_lower_dir);
+    let host_path = snapshot.find_host_fs_path().or(host_lower_dir);
 
     match host_path {
         Some(ref hp) => Ok(EscapeResult::ok(
@@ -613,8 +610,7 @@ struct MountTableSnapshot {
 impl MountTableSnapshot {
     /// Read `/proc/mounts` once and parse every line into a snapshot.
     fn capture() -> Result<Self> {
-        let raw =
-            std::fs::read_to_string("/proc/mounts").context("failed to read /proc/mounts")?;
+        let raw = std::fs::read_to_string("/proc/mounts").context("failed to read /proc/mounts")?;
         let mut entries = Vec::new();
         for line in raw.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();

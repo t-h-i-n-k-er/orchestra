@@ -614,3 +614,67 @@ async fn run_mouse_repl(transport: &mut dyn Transport) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn cli_parses_ping_command() {
+        let cli = Cli::parse_from([
+            "orchestra-console",
+            "--target",
+            "127.0.0.1:9000",
+            "--key",
+            "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=",
+            "ping",
+        ]);
+
+        assert_eq!(cli.target, "127.0.0.1:9000");
+        assert!(!cli.tls);
+        assert!(matches!(cli.command, Commands::Ping));
+    }
+
+    #[test]
+    fn cli_requires_key_or_repl_for_key_command() {
+        let cli = Cli::try_parse_from([
+            "orchestra-console",
+            "--target",
+            "127.0.0.1:9000",
+            "--key",
+            "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=",
+            "key",
+            "--repl",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Commands::Key {
+                key: None,
+                repl: true
+            }
+        ));
+    }
+
+    #[test]
+    fn cli_rejects_tls_options_without_tls_flag() {
+        let result = Cli::try_parse_from([
+            "orchestra-console",
+            "--target",
+            "127.0.0.1:9000",
+            "--key",
+            "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=",
+            "--ca-cert",
+            "ca.pem",
+            "ping",
+        ]);
+        let err = match result {
+            Ok(_) => panic!("--ca-cert without --tls should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+}

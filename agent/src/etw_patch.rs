@@ -26,8 +26,6 @@
 //! and memory protection changes are performed via NtProtectVirtualMemory
 //! indirect syscall (no kernel32 IAT entries).
 
-#[cfg(windows)]
-use common::lock::MutexExt;
 use std::sync::atomic::AtomicU8;
 
 /// Saved original first byte of `EtwEventWrite` (0 = never patched).
@@ -45,6 +43,7 @@ static ORIG_NT_TRACE: AtomicU8 = AtomicU8::new(0);
 #[cfg(windows)]
 mod imp {
     use super::{ORIG_ETW_WRITE, ORIG_ETW_WRITE_EX, ORIG_NT_TRACE};
+    use common::lock::MutexExt;
     use std::sync::atomic::Ordering;
     use std::sync::Mutex;
 
@@ -127,16 +126,22 @@ mod imp {
                 // Near relative jmp: destination = addr + 5 + rel32
                 let rel = *(addr.wrapping_add(1) as *const i32) as isize;
                 let d = (addr as isize).wrapping_add(5).wrapping_add(rel) as usize;
-                if d == 0 { break; }
+                if d == 0 {
+                    break;
+                }
                 d
             } else if first == 0xFF && *(addr.wrapping_add(1) as *const u8) == 0x25 {
                 // RIP-relative indirect jmp: slot = addr + 6 + disp32
                 // absolute target = *slot (8-byte pointer)
                 let disp = *(addr.wrapping_add(2) as *const i32) as isize;
                 let slot = (addr as isize).wrapping_add(6).wrapping_add(disp) as usize;
-                if slot == 0 { break; }
+                if slot == 0 {
+                    break;
+                }
                 let d = *(slot as *const usize);
-                if d == 0 { break; }
+                if d == 0 {
+                    break;
+                }
                 d
             } else {
                 // No further hook — addr is the real function body.
@@ -394,7 +399,9 @@ pub unsafe fn patch_etw_with_mode(mode: common::config::EtwPatchMode) -> anyhow:
             }
         }
         EtwPatchMode::Always => {
-            tracing::debug!("etw_patch: mode=always; applying ETW patch regardless of build number");
+            tracing::debug!(
+                "etw_patch: mode=always; applying ETW patch regardless of build number"
+            );
         }
     }
 

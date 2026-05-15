@@ -87,9 +87,8 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::entra_ptc::{
-    CloudEnvironment, GraphApplication, GraphDirectoryRole, GraphGroup,
-    GraphListResponse, GraphRoleAssignment, GraphServicePrincipal, GraphUser,
-    TokenResponse,
+    CloudEnvironment, GraphApplication, GraphDirectoryRole, GraphGroup, GraphListResponse,
+    GraphRoleAssignment, GraphServicePrincipal, GraphUser, TokenResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -257,10 +256,7 @@ pub fn high_value_permissions() -> Vec<GraphPermission> {
         GraphPermission::new(graph_permissions::MAIL_READ, "Mail.Read"),
         GraphPermission::new(graph_permissions::FILES_READ_ALL, "Files.Read.All"),
         GraphPermission::new(graph_permissions::USER_READ_ALL, "User.Read.All"),
-        GraphPermission::new(
-            graph_permissions::DIRECTORY_READ_ALL,
-            "Directory.Read.All",
-        ),
+        GraphPermission::new(graph_permissions::DIRECTORY_READ_ALL, "Directory.Read.All"),
         GraphPermission::new(
             graph_permissions::ROLE_MANAGEMENT_READ_WRITE_DIR,
             "RoleManagement.ReadWrite.Directory",
@@ -370,11 +366,7 @@ impl fmt::Display for TenantInfo {
         writeln!(f, "Users:               {}", self.users.len())?;
         writeln!(f, "Groups:              {}", self.groups.len())?;
         writeln!(f, "Applications:        {}", self.applications.len())?;
-        writeln!(
-            f,
-            "Service Principals:  {}",
-            self.service_principals.len()
-        )?;
+        writeln!(f, "Service Principals:  {}", self.service_principals.len())?;
         writeln!(f, "Directory Roles:     {}", self.directory_roles.len())?;
         writeln!(f, "Role Assignments:    {}", self.role_assignments.len())?;
 
@@ -722,8 +714,7 @@ impl EntraAppAbuse {
             password_credential: PasswordCredentialDefinition {
                 display_name: "Secret created by Azure AD Health Service".to_string(),
                 end_date_time: Some(
-                    chrono_now_plus_days(730)
-                        .unwrap_or_else(|| "2028-01-01T00:00:00Z".to_string()),
+                    chrono_now_plus_days(730).unwrap_or_else(|| "2028-01-01T00:00:00Z".to_string()),
                 ),
             },
         };
@@ -758,8 +749,11 @@ impl EntraAppAbuse {
             .ok_or_else(|| anyhow!("addPassword response missing keyId"))?;
 
         // Encrypt the secret via HKDF before storing.
-        let credential = AppCredential::encrypt_secret(&secret_value, &self.session_key)?
-            .with_ids("", app_object_id, &secret_id);
+        let credential = AppCredential::encrypt_secret(&secret_value, &self.session_key)?.with_ids(
+            "",
+            app_object_id,
+            &secret_id,
+        );
 
         tracing::info!(
             "added client secret to app object_id={} (secret_id={})",
@@ -806,9 +800,7 @@ impl EntraAppAbuse {
             .ok_or_else(|| anyhow!("service principal response missing id"))?;
 
         // Step 3b: Get the Microsoft Graph service principal (resource).
-        let graph_sp = self
-            .get_graph_service_principal(access_token)
-            .await?;
+        let graph_sp = self.get_graph_service_principal(access_token).await?;
         let graph_sp_id = graph_sp
             .id
             .ok_or_else(|| anyhow!("Graph SP response missing id"))?;
@@ -844,7 +836,11 @@ impl EntraAppAbuse {
             let body = resp.text().await.unwrap_or_default();
             // Already exists is OK
             if !body.contains("AlreadyExists") && !body.contains("PermissionGrantExists") {
-                tracing::warn!("delegated permission grant failed (non-fatal): HTTP {} — {}", status, body);
+                tracing::warn!(
+                    "delegated permission grant failed (non-fatal): HTTP {} — {}",
+                    status,
+                    body
+                );
             }
         }
 
@@ -946,7 +942,11 @@ impl EntraAppAbuse {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            bail!("service principal creation failed: HTTP {} — {}", status, body);
+            bail!(
+                "service principal creation failed: HTTP {} — {}",
+                status,
+                body
+            );
         }
 
         resp.json()
@@ -1034,11 +1034,7 @@ impl EntraAppAbuse {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            bail!(
-                "client credentials auth failed: HTTP {} — {}",
-                status,
-                body
-            );
+            bail!("client credentials auth failed: HTTP {} — {}", status, body);
         }
 
         let token_response: TokenResponse = resp
@@ -1097,26 +1093,60 @@ impl EntraAppAbuse {
 
         // Fire all queries in parallel for speed.
         let (users_res, groups_res, apps_res, sps_res, roles_res, assignments_res) = tokio::join!(
-            self.graph_list_all::<GraphUser>(access_token, "/v1.0/users", Some(&[
-                ("$select", "id,userPrincipalName,displayName,mail,jobTitle,department,accountEnabled"),
-                ("$top", "999"),
-            ])),
-            self.graph_list_all::<GraphGroup>(access_token, "/v1.0/groups", Some(&[
-                ("$select", "id,displayName,description,mail,securityEnabled,mailEnabled"),
-                ("$top", "999"),
-            ])),
-            self.graph_list_all::<GraphApplication>(access_token, "/v1.0/applications", Some(&[
-                ("$select", "id,appId,displayName,publisherDomain,signInAudience"),
-                ("$top", "999"),
-            ])),
-            self.graph_list_all::<GraphServicePrincipal>(access_token, "/v1.0/servicePrincipals", Some(&[
-                ("$select", "id,appId,displayName,servicePrincipalType,accountEnabled"),
-                ("$top", "999"),
-            ])),
-            self.graph_list_all::<GraphDirectoryRole>(access_token, "/v1.0/directoryRoles", Some(&[
-                ("$select", "id,displayName,description,roleTemplateId"),
-            ])),
-            self.graph_list_all::<GraphRoleAssignment>(access_token, "/v1.0/roleManagement/directory/roleAssignments", None),
+            self.graph_list_all::<GraphUser>(
+                access_token,
+                "/v1.0/users",
+                Some(&[
+                    (
+                        "$select",
+                        "id,userPrincipalName,displayName,mail,jobTitle,department,accountEnabled"
+                    ),
+                    ("$top", "999"),
+                ])
+            ),
+            self.graph_list_all::<GraphGroup>(
+                access_token,
+                "/v1.0/groups",
+                Some(&[
+                    (
+                        "$select",
+                        "id,displayName,description,mail,securityEnabled,mailEnabled"
+                    ),
+                    ("$top", "999"),
+                ])
+            ),
+            self.graph_list_all::<GraphApplication>(
+                access_token,
+                "/v1.0/applications",
+                Some(&[
+                    (
+                        "$select",
+                        "id,appId,displayName,publisherDomain,signInAudience"
+                    ),
+                    ("$top", "999"),
+                ])
+            ),
+            self.graph_list_all::<GraphServicePrincipal>(
+                access_token,
+                "/v1.0/servicePrincipals",
+                Some(&[
+                    (
+                        "$select",
+                        "id,appId,displayName,servicePrincipalType,accountEnabled"
+                    ),
+                    ("$top", "999"),
+                ])
+            ),
+            self.graph_list_all::<GraphDirectoryRole>(
+                access_token,
+                "/v1.0/directoryRoles",
+                Some(&[("$select", "id,displayName,description,roleTemplateId"),])
+            ),
+            self.graph_list_all::<GraphRoleAssignment>(
+                access_token,
+                "/v1.0/roleManagement/directory/roleAssignments",
+                None
+            ),
         );
 
         let users = users_res.context("failed to list users")?;
@@ -1145,11 +1175,18 @@ impl EntraAppAbuse {
         user_id: &str,
     ) -> Result<Vec<EmailMessage>> {
         let path = format!("/v1.0/users/{user_id}/messages");
-        self.graph_list_all::<EmailMessage>(access_token, &path, Some(&[
-            ("$select", "id,subject,bodyPreview,body,receivedDateTime,isRead,from"),
-            ("$top", "999"),
-            ("$orderby", "receivedDateTime desc"),
-        ]))
+        self.graph_list_all::<EmailMessage>(
+            access_token,
+            &path,
+            Some(&[
+                (
+                    "$select",
+                    "id,subject,bodyPreview,body,receivedDateTime,isRead,from",
+                ),
+                ("$top", "999"),
+                ("$orderby", "receivedDateTime desc"),
+            ]),
+        )
         .await
         .context("failed to read user mailbox")
     }
@@ -1163,10 +1200,17 @@ impl EntraAppAbuse {
         user_id: &str,
     ) -> Result<Vec<CloudFile>> {
         let path = format!("/v1.0/users/{user_id}/drive/root/children");
-        self.graph_list_all::<CloudFile>(access_token, &path, Some(&[
-            ("$select", "id,name,size,lastModifiedDateTime,@microsoft.graph.downloadUrl,file"),
-            ("$top", "999"),
-        ]))
+        self.graph_list_all::<CloudFile>(
+            access_token,
+            &path,
+            Some(&[
+                (
+                    "$select",
+                    "id,name,size,lastModifiedDateTime,@microsoft.graph.downloadUrl,file",
+                ),
+                ("$top", "999"),
+            ]),
+        )
         .await
         .context("failed to read user OneDrive files")
     }
@@ -1185,9 +1229,7 @@ impl EntraAppAbuse {
         let graph_url = self.graph_url();
 
         // First, activate the Global Admin role template (idempotent).
-        let activate_url = format!(
-            "{graph_url}/v1.0/directoryRoles",
-        );
+        let activate_url = format!("{graph_url}/v1.0/directoryRoles",);
         let activate_body = serde_json::json!({
             "roleTemplateId": role_templates::GLOBAL_ADMIN
         });
@@ -1212,9 +1254,10 @@ impl EntraAppAbuse {
             .graph_list_all::<GraphDirectoryRole>(
                 access_token,
                 "/v1.0/directoryRoles",
-                Some(&[
-                    ("$filter", format!("roleTemplateId eq '{}'", role_templates::GLOBAL_ADMIN).as_str()),
-                ]),
+                Some(&[(
+                    "$filter",
+                    format!("roleTemplateId eq '{}'", role_templates::GLOBAL_ADMIN).as_str(),
+                )]),
             )
             .await
             .context("failed to find Global Admin role")?;
@@ -1230,9 +1273,7 @@ impl EntraAppAbuse {
 
         // Add the target user as a member.
         let ref_body = DirectoryObjectRef {
-            odata_id: format!(
-                "{graph_url}/v1.0/directoryObjects/{target_user_id}"
-            ),
+            odata_id: format!("{graph_url}/v1.0/directoryObjects/{target_user_id}"),
         };
 
         let url = format!("{graph_url}/v1.0/directoryRoles/{role_id}/members/$ref");
@@ -1250,10 +1291,7 @@ impl EntraAppAbuse {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             if body.contains("AlreadyExists") {
-                tracing::info!(
-                    "user {} is already a Global Admin",
-                    target_user_id
-                );
+                tracing::info!("user {} is already a Global Admin", target_user_id);
                 return Ok(());
             }
             bail!(
@@ -1263,10 +1301,7 @@ impl EntraAppAbuse {
             );
         }
 
-        tracing::warn!(
-            "elevated user {} to Global Administrator",
-            target_user_id
-        );
+        tracing::warn!("elevated user {} to Global Administrator", target_user_id);
 
         Ok(())
     }
@@ -1324,15 +1359,15 @@ impl EntraAppAbuse {
     /// - High-privilege `requiredResourceAccess`
     /// - Client secrets with long expiry
     /// - No publisher domain or unusual domain
-    pub async fn list_suspicious_apps(
-        &self,
-        access_token: &str,
-    ) -> Result<Vec<GraphApplication>> {
+    pub async fn list_suspicious_apps(&self, access_token: &str) -> Result<Vec<GraphApplication>> {
         self.graph_list_all::<GraphApplication>(
             access_token,
             "/v1.0/applications",
             Some(&[
-                ("$select", "id,appId,displayName,publisherDomain,signInAudience,createdDateTime"),
+                (
+                    "$select",
+                    "id,appId,displayName,publisherDomain,signInAudience,createdDateTime",
+                ),
                 ("$top", "999"),
             ]),
         )
@@ -1497,13 +1532,12 @@ impl EntraAppAbuse {
                 break;
             }
 
-            let page: GraphListResponse<T> = resp.json().await.unwrap_or_else(|_| {
-                GraphListResponse {
+            let page: GraphListResponse<T> =
+                resp.json().await.unwrap_or_else(|_| GraphListResponse {
                     odata_context: None,
                     odata_next_link: None,
                     value: vec![],
-                }
-            });
+                });
 
             next_link = page.odata_next_link;
             all_items.extend(page.value);
@@ -1619,7 +1653,10 @@ mod tests {
     #[test]
     fn test_high_value_permissions_not_empty() {
         let perms = high_value_permissions();
-        assert!(!perms.is_empty(), "high-value permissions must not be empty");
+        assert!(
+            !perms.is_empty(),
+            "high-value permissions must not be empty"
+        );
         assert!(perms.len() >= 5, "should have at least 5 permissions");
 
         // All must have non-empty IDs and names.

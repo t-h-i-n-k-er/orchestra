@@ -143,12 +143,13 @@ pub fn delete_efi_variable(name: &str, guid: &EfiGuid) -> Result<()> {
             .chain(std::iter::once(0))
             .collect();
         unsafe {
-            let result = windows_sys::Win32::System::WindowsProgramming::SetFirmwareEnvironmentVariableW(
-                wide_name.as_ptr(),
-                wide_guid.as_ptr(),
-                std::ptr::null_mut(),
-                0,
-            );
+            let result =
+                windows_sys::Win32::System::WindowsProgramming::SetFirmwareEnvironmentVariableW(
+                    wide_name.as_ptr(),
+                    wide_guid.as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                );
             if result == 0 {
                 let err = windows_sys::Win32::Foundation::GetLastError();
                 bail!(
@@ -325,12 +326,13 @@ fn write_efi_variable_windows(
         .collect();
 
     unsafe {
-        let result = windows_sys::Win32::System::WindowsProgramming::SetFirmwareEnvironmentVariableW(
-            wide_name.as_ptr(),
-            wide_guid.as_ptr(),
-            data.as_ptr() as *mut _,
-            data.len() as u32,
-        );
+        let result =
+            windows_sys::Win32::System::WindowsProgramming::SetFirmwareEnvironmentVariableW(
+                wide_name.as_ptr(),
+                wide_guid.as_ptr(),
+                data.as_ptr() as *mut _,
+                data.len() as u32,
+            );
         if result == 0 {
             let err = windows_sys::Win32::Foundation::GetLastError();
             bail!(

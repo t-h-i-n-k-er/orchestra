@@ -205,7 +205,12 @@ pub fn poly_serialize(blob: &PolyBlob, seed: u64) -> Vec<u8> {
 /// key via HKDF-SHA256 with info `b"orchestra-poly-mac"` (empty salt).
 /// This provides Encrypt-then-MAC integrity: any tampering with scheme,
 /// padding, key, or ciphertext is detected before decryption.
-pub fn poly_serialize_with_params(blob: &PolyBlob, seed: u64, use_le: bool, pad_len: u8) -> Vec<u8> {
+pub fn poly_serialize_with_params(
+    blob: &PolyBlob,
+    seed: u64,
+    use_le: bool,
+    pad_len: u8,
+) -> Vec<u8> {
     let mut rng = rand::thread_rng();
 
     // Build the per-build magic — must not equal b"POLY" (0x504f4c59).
@@ -245,8 +250,7 @@ pub fn poly_serialize_with_params(blob: &PolyBlob, seed: u64, use_le: bool, pad_
     // Encrypt-then-MAC: derive the HMAC key from the blob's encryption key
     // via HKDF-SHA256, then compute HMAC-SHA256 over all preceding bytes.
     let mac_key = derive_poly_mac_key(&blob.key);
-    let mut mac = HmacSha256::new_from_slice(&mac_key)
-        .expect("HMAC-SHA256 accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(&mac_key).expect("HMAC-SHA256 accepts any key length");
     mac.update(&out);
     let tag = mac.finalize().into_bytes();
     out.extend_from_slice(&tag);
@@ -1172,7 +1176,7 @@ mod tests {
         };
         let seed = 42u64;
         let use_le = false; // big-endian
-        let pad_len = 0u8;  // no padding
+        let pad_len = 0u8; // no padding
         let serialized = poly_serialize_with_params(&blob, seed, use_le, pad_len);
 
         let flags = serialized[5];

@@ -41,6 +41,6 @@ pub use boot_persistence::{
     install_vbr_persistence, remove_persistence, BootMode, PersistenceArtifact,
 };
 pub use thunderbolt_dma::{
-    check_dma_vulnerability, detect_thunderbolt_controller, dma_read_physical,
-    prepare_dma_payload, DmaPayload, DmaVulnerability, ThunderboltInfo,
+    check_dma_vulnerability, detect_thunderbolt_controller, dma_read_physical, prepare_dma_payload,
+    DmaPayload, DmaVulnerability, ThunderboltInfo,
 };

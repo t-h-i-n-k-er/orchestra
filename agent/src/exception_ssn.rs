@@ -131,8 +131,8 @@ struct ExceptionRecord {
 ///   Rax–R15 (16 regs × 8 B = 0x80) → Rip starts at 0x78+0x80 = 0xF8.
 #[repr(C)]
 struct Context {
-    _pad: [u8; 0xF8], // P1Home .. R15 (offsets 0x00 – 0xF7)
-    Rip: u64,         // offset 0xF8
+    _pad: [u8; 0xF8],   // P1Home .. R15 (offsets 0x00 – 0xF7)
+    Rip: u64,           // offset 0xF8
     _pad2: [u8; 0x3D0], // FltSave .. end (total CONTEXT = 0x4D0)
 }
 
@@ -186,7 +186,8 @@ fn get_ntdll_range() -> Option<(usize, usize)> {
         let ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)?;
 
         // Read the PE headers to determine SizeOfImage.
-        let dos = &*(ntdll_base as *const windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER);
+        let dos =
+            &*(ntdll_base as *const windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER);
         if dos.e_magic != 0x5A4D {
             return None;
         }
@@ -287,11 +288,7 @@ unsafe fn walk_hook_chain_and_extract_ssn(addr: usize) -> Option<u32> {
         // Not an unhooked prologue — try to follow the hook.
         match follow_hook_hop(current) {
             Some(next) => {
-                tracing::trace!(
-                    "exception_ssn: hook hop {:#x} → {:#x}",
-                    current,
-                    next
-                );
+                tracing::trace!("exception_ssn: hook hop {:#x} → {:#x}", current, next);
                 current = next;
             }
             None => {
@@ -492,7 +489,11 @@ fn install_veh_handler() -> bool {
     }
 
     VEH_INSTALLED.store(true, Ordering::Release);
-    tracing::info!("exception_ssn: VEH handler installed successfully (ntdll range {:#x}–{:#x})", range.0, range.1);
+    tracing::info!(
+        "exception_ssn: VEH handler installed successfully (ntdll range {:#x}–{:#x})",
+        range.0,
+        range.1
+    );
     true
 }
 
@@ -596,8 +597,7 @@ pub fn resolve_ssn_via_exception(func_name: &str) -> Option<u32> {
     // Obtain the raw pointer to the thread-local Cell's inner value so the
     // inline asm can write to it without an intervening Rust call (which
     // would corrupt the asm layout and invalidate the LEA-computed offset).
-    let resume_rip_ptr: *mut usize =
-        FAULT_RESUME_RIP.with(|c| c.as_ptr() as *mut usize);
+    let resume_rip_ptr: *mut usize = FAULT_RESUME_RIP.with(|c| c.as_ptr() as *mut usize);
 
     unsafe {
         std::arch::asm!(

@@ -65,8 +65,7 @@ const EFI_GUID_SIZE: usize = 16;
 /// EFI_LOADED_IMAGE_PROTOCOL GUID: {5B1B31A1-9562-11D2-8E3F-00A0C969723B}
 /// in little-endian wire format (UEFI spec layout).
 const EFI_LOADED_IMAGE_PROTOCOL_GUID: [u8; EFI_GUID_SIZE] = [
-    0xA1, 0x31, 0x1B, 0x5B, 0x62, 0x95, 0xD2, 0x11, 0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72,
-    0x3B,
+    0xA1, 0x31, 0x1B, 0x5B, 0x62, 0x95, 0xD2, 0x11, 0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B,
 ];
 
 /// EFI_BOOT_SERVICES offsets used by the x64 entry stub.
@@ -295,7 +294,7 @@ fn patch_adr_instruction(
 
     let offset = offset as i32;
     let immhi = (offset >> 3) & 0x7FFFF; // bits [23:5] → 19 bits
-    let immlo = (offset & 0x3) as u32;   // bits [30:29] → 2 bits
+    let immlo = (offset & 0x3) as u32; // bits [30:29] → 2 bits
 
     // Read existing instruction to preserve Rd.
     let existing = u32::from_le_bytes([
@@ -1328,7 +1327,10 @@ mod a64 {
     #[inline]
     pub fn stp_pre(text: &mut Vec<u8>, rt1: u32, rt2: u32, rn: u32, imm8: i32) {
         let imm7 = (imm8 >> 3) & 0x7F;
-        emit(text, STP_PRE_INDEXED | ((imm7 as u32) << 15) | (rt2 << 10) | (rn << 5) | rt1);
+        emit(
+            text,
+            STP_PRE_INDEXED | ((imm7 as u32) << 15) | (rt2 << 10) | (rn << 5) | rt1,
+        );
     }
 
     /// LDP Xt1, Xt2, [Xn], #imm  (post-indexed, 64-bit)
@@ -1336,7 +1338,10 @@ mod a64 {
     #[inline]
     pub fn ldp_post(text: &mut Vec<u8>, rt1: u32, rt2: u32, rn: u32, imm8: i32) {
         let imm7 = (imm8 >> 3) & 0x7F;
-        emit(text, LDP_POST_INDEXED | ((imm7 as u32) << 15) | (rt2 << 10) | (rn << 5) | rt1);
+        emit(
+            text,
+            LDP_POST_INDEXED | ((imm7 as u32) << 15) | (rt2 << 10) | (rn << 5) | rt1,
+        );
     }
 
     /// LDR Xt, [Xn, #imm]  (unsigned offset, 64-bit)
@@ -1478,14 +1483,14 @@ mod a64 {
         if instr_end > text.len() || target_offset > text.len() {
             anyhow::bail!(
                 "{label} branch patch out of range (instr={}, target={}, len={})",
-                instr_offset, target_offset, text.len()
+                instr_offset,
+                target_offset,
+                text.len()
             );
         }
         let offset = (target_offset as isize - instr_offset as isize) >> 2;
         if offset < -(1 << 19) as isize || offset >= (1 << 19) as isize {
-            anyhow::bail!(
-                "{label} conditional branch offset {offset:#x} out of ±1MiB range"
-            );
+            anyhow::bail!("{label} conditional branch offset {offset:#x} out of ±1MiB range");
         }
         let existing = u32::from_le_bytes([
             text[instr_offset],
@@ -1594,7 +1599,10 @@ fn a64_store_pair_signed(text: &mut Vec<u8>, rt1: u32, rt2: u32, rn: u32, imm_by
     // STP signed offset: 10 101 0 010 0 imm7 Rt2 Rn Rt
     let base: u32 = 0xA9000000;
     let imm7 = (imm_bytes >> 3) & 0x7F;
-    emit(text, base | ((imm7 as u32) << 15) | (rt2 << 10) | (rn << 5) | rt1);
+    emit(
+        text,
+        base | ((imm7 as u32) << 15) | (rt2 << 10) | (rn << 5) | rt1,
+    );
 }
 
 /// Helper: LDP Xt1, Xt2, [Xn, #imm]  (signed offset, 64-bit)
@@ -1604,7 +1612,10 @@ fn a64_load_pair_signed(text: &mut Vec<u8>, rt1: u32, rt2: u32, rn: u32, imm_byt
     // LDP signed offset: 10 101 0 010 1 imm7 Rt2 Rn Rt
     let base: u32 = 0xA9400000;
     let imm7 = (imm_bytes >> 3) & 0x7F;
-    emit(text, base | ((imm7 as u32) << 15) | (rt2 << 10) | (rn << 5) | rt1);
+    emit(
+        text,
+        base | ((imm7 as u32) << 15) | (rt2 << 10) | (rn << 5) | rt1,
+    );
 }
 
 /// AArch64 embedded EFI PE/COFF image loader.
@@ -1630,12 +1641,12 @@ fn emit_embedded_efi_image_loader_a64(
     //   BOOLEAN ParentImageHandle... but on AArch64 it's passed as UINTN.
     //   UEFI LoadImage: arg0=BootPolicy, arg1=ParentImageHandle, arg2=DevicePath,
     //                   arg3=SourceBuffer, arg4=SourceSize, arg5=&ImageHandle
-    movz(&mut text, X0, 0, 0);             // BootPolicy = FALSE
-    mov_reg(&mut text, X1, X19);            // ParentImageHandle = ImageHandle
-    movz(&mut text, X2, 0, 0);             // DevicePath = NULL
-    // x3 already = SourceBuffer (from ADR above)
+    movz(&mut text, X0, 0, 0); // BootPolicy = FALSE
+    mov_reg(&mut text, X1, X19); // ParentImageHandle = ImageHandle
+    movz(&mut text, X2, 0, 0); // DevicePath = NULL
+                               // x3 already = SourceBuffer (from ADR above)
     mov_imm64(&mut text, X4, payload_len as u64); // SourceSize
-    add_imm(&mut text, X5, SP, 16);         // &new_handle on stack (above saved regs)
+    add_imm(&mut text, X5, SP, 16); // &new_handle on stack (above saved regs)
 
     // ldr x8, [x21, #0xC8]  (BootServices->LoadImage)
     ldr_unsigned(&mut text, X8, X21, 0xC8);
@@ -1645,9 +1656,9 @@ fn emit_embedded_efi_image_loader_a64(
     let load_failed = cbnz_placeholder(&mut text, X0);
 
     // Load new_handle from stack and call StartImage.
-    ldr_unsigned(&mut text, X0, SP, 16);    // x0 = new_handle
-    movz(&mut text, X1, 0, 0);              // ExitDataSize = NULL
-    movz(&mut text, X2, 0, 0);              // ExitData = NULL
+    ldr_unsigned(&mut text, X0, SP, 16); // x0 = new_handle
+    movz(&mut text, X1, 0, 0); // ExitDataSize = NULL
+    movz(&mut text, X2, 0, 0); // ExitData = NULL
     ldr_unsigned(&mut text, X8, X21, 0xD0); // BootServices->StartImage
     blr(&mut text, X8);
 
@@ -1682,16 +1693,16 @@ fn emit_raw_payload_loader_a64(
     stp_pre(&mut text, X22, X23, SP, -16);
 
     // AllocatePages(AllocateAnyPages=0, EfiLoaderCode=2, pages, &entry_buf)
-    movz(&mut text, X0, 0, 0);                 // AllocateAnyPages
-    movz(&mut text, X1, 2, 0);                 // EfiLoaderCode
-    mov_imm64(&mut text, X2, pages as u64);      // NumberOfPages
-    add_imm(&mut text, X3, SP, 16);             // &entry_buf on stack
-    ldr_unsigned(&mut text, X8, X21, 0x28);     // BootServices->AllocatePages
+    movz(&mut text, X0, 0, 0); // AllocateAnyPages
+    movz(&mut text, X1, 2, 0); // EfiLoaderCode
+    mov_imm64(&mut text, X2, pages as u64); // NumberOfPages
+    add_imm(&mut text, X3, SP, 16); // &entry_buf on stack
+    ldr_unsigned(&mut text, X8, X21, 0x28); // BootServices->AllocatePages
     blr(&mut text, X8);
     let alloc_failed = cbnz_placeholder(&mut text, X0);
 
     // Load entry_buf from stack.
-    ldr_unsigned(&mut text, X22, SP, 16);       // x22 = entry_buf
+    ldr_unsigned(&mut text, X22, SP, 16); // x22 = entry_buf
 
     // ADR x2, payload_data  (source = .rdata, will be patched)
     let payload_instr = adr_placeholder(&mut text, X2);
@@ -1706,7 +1717,7 @@ fn emit_raw_payload_loader_a64(
     // Use a simple byte-copy loop to avoid alignment issues.
     // Save loop registers.
     emit(&mut text, 0xD503201F); // NOP (alignment padding)
-    // loop:
+                                 // loop:
     let loop_start = text.len();
     // cbz x1, done_copy
     let copy_done = cbz_placeholder(&mut text, X1);
@@ -1722,7 +1733,7 @@ fn emit_raw_payload_loader_a64(
     // b loop_start
     let loop_branch = text.len();
     emit(&mut text, 0x14000000u32); // B (unconditional) placeholder
-    // Patch the B instruction.
+                                    // Patch the B instruction.
     {
         let offset = (loop_start as isize - loop_branch as isize) >> 2;
         let imm26 = (offset as u32) & 0x3FFFFFF;
@@ -1735,15 +1746,15 @@ fn emit_raw_payload_loader_a64(
     a64::patch_cond_branch(text, copy_done, done_copy_offset, "copy_done")?;
 
     // Compute entry point: entry_buf + entry_point_offset
-    mov_reg(&mut text, X0, X22);              // x0 = entry_buf
+    mov_reg(&mut text, X0, X22); // x0 = entry_buf
     if config.entry_point_offset != 0 {
         add_imm(&mut text, X0, X0, config.entry_point_offset);
     }
 
     // Call entry_buf(ImageHandle, SystemTable)
-    mov_reg(&mut text, X8, X0);               // x8 = entry point address
-    mov_reg(&mut text, X0, X19);              // x0 = ImageHandle
-    mov_reg(&mut text, X1, X20);              // x1 = SystemTable
+    mov_reg(&mut text, X8, X0); // x8 = entry point address
+    mov_reg(&mut text, X0, X19); // x0 = ImageHandle
+    mov_reg(&mut text, X1, X20); // x1 = SystemTable
     blr(&mut text, X8);
 
     let done = text.len();
@@ -1790,19 +1801,24 @@ fn emit_path_image_loader_a64(mut text: &mut Vec<u8>) -> Result<PathLoaderPatche
     // x1 = &EFI_LOADED_IMAGE_PROTOCOL_GUID  (ADR, to be patched)
     let guid_instr = adr_placeholder(&mut text, X1);
     // x2 = &iface (on stack)
-    add_imm(&mut text, X2, SP, 48);            // above saved regs
-    // x3 = ImageHandle (AgentHandle)
+    add_imm(&mut text, X2, SP, 48); // above saved regs
+                                    // x3 = ImageHandle (AgentHandle)
     mov_reg(&mut text, X3, X19);
     // x4 = NULL (ControllerHandle)
     movz(&mut text, X4, 0, 0);
     // x5 = EFI_OPEN_PROTOCOL_BY_HANDLE_PROTOCOL (0x20)
-    movz(&mut text, X5, EFI_OPEN_PROTOCOL_BY_HANDLE_PROTOCOL as u16, 0);
-    ldr_unsigned(&mut text, X8, X21, 0x118);   // BootServices->OpenProtocol
+    movz(
+        &mut text,
+        X5,
+        EFI_OPEN_PROTOCOL_BY_HANDLE_PROTOCOL as u16,
+        0,
+    );
+    ldr_unsigned(&mut text, X8, X21, 0x118); // BootServices->OpenProtocol
     blr(&mut text, X8);
     let open_failed = cbnz_placeholder(&mut text, X0);
 
     // Check iface is non-null.
-    ldr_unsigned(&mut text, X22, SP, 48);       // x22 = loaded_image_iface
+    ldr_unsigned(&mut text, X22, SP, 48); // x22 = loaded_image_iface
     let null_iface = cbz_placeholder(&mut text, X22);
 
     // x9 = LoadedImage->DeviceHandle (offset 0x18)
@@ -1810,22 +1826,22 @@ fn emit_path_image_loader_a64(mut text: &mut Vec<u8>) -> Result<PathLoaderPatche
     let null_device = cbz_placeholder(&mut text, X9);
 
     // LoadImage(FALSE, ImageHandle, DevicePath, DeviceHandle, NULL, &new_handle)
-    movz(&mut text, X0, 0, 0);                 // BootPolicy = FALSE
-    mov_reg(&mut text, X1, X19);               // ParentImageHandle
-    // x2 = DevicePath (ADR, to be patched)
+    movz(&mut text, X0, 0, 0); // BootPolicy = FALSE
+    mov_reg(&mut text, X1, X19); // ParentImageHandle
+                                 // x2 = DevicePath (ADR, to be patched)
     let dp_instr = adr_placeholder(&mut text, X2);
-    mov_reg(&mut text, X3, X9);                // DeviceHandle
-    movz(&mut text, X4, 0, 0);                 // SourceSize = 0 (from device)
-    add_imm(&mut text, X5, SP, 56);            // &new_handle
-    ldr_unsigned(&mut text, X8, X21, 0xC8);    // BootServices->LoadImage
+    mov_reg(&mut text, X3, X9); // DeviceHandle
+    movz(&mut text, X4, 0, 0); // SourceSize = 0 (from device)
+    add_imm(&mut text, X5, SP, 56); // &new_handle
+    ldr_unsigned(&mut text, X8, X21, 0xC8); // BootServices->LoadImage
     blr(&mut text, X8);
     let load_failed = cbnz_placeholder(&mut text, X0);
 
     // StartImage(new_handle, NULL, NULL)
-    ldr_unsigned(&mut text, X0, SP, 56);       // x0 = new_handle
-    movz(&mut text, X1, 0, 0);                 // ExitDataSize = NULL
-    movz(&mut text, X2, 0, 0);                 // ExitData = NULL
-    ldr_unsigned(&mut text, X8, X21, 0xD0);    // BootServices->StartImage
+    ldr_unsigned(&mut text, X0, SP, 56); // x0 = new_handle
+    movz(&mut text, X1, 0, 0); // ExitDataSize = NULL
+    movz(&mut text, X2, 0, 0); // ExitData = NULL
+    ldr_unsigned(&mut text, X8, X21, 0xD0); // BootServices->StartImage
     blr(&mut text, X8);
 
     let done = text.len();
@@ -1841,8 +1857,12 @@ fn emit_path_image_loader_a64(mut text: &mut Vec<u8>) -> Result<PathLoaderPatche
     ldp_post(&mut text, X22, X23, SP, 32);
 
     Ok(PathLoaderPatchesA64 {
-        device_path_patch: AdrPatch { instr_offset: dp_instr },
-        loaded_image_guid_patch: AdrPatch { instr_offset: guid_instr },
+        device_path_patch: AdrPatch {
+            instr_offset: dp_instr,
+        },
+        loaded_image_guid_patch: AdrPatch {
+            instr_offset: guid_instr,
+        },
     })
 }
 

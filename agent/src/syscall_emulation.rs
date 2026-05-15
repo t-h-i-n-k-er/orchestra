@@ -60,11 +60,11 @@ use std::sync::OnceLock;
 use tracing::{debug, warn};
 // Type-only imports — no function imports to avoid IAT entries.
 // All win32 API calls are resolved dynamically via pe_resolve.
-use crate::win_types::SIZE_T;
-use crate::win_types::{BOOL, DWORD, LPVOID};
-use crate::win_types::ULONG;
-use windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION;
 use crate::win_types::HANDLE;
+use crate::win_types::SIZE_T;
+use crate::win_types::ULONG;
+use crate::win_types::{BOOL, DWORD, LPVOID};
+use windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION;
 
 // ── NTSTATUS helpers ─────────────────────────────────────────────────────────
 

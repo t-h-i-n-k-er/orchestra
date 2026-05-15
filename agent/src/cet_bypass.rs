@@ -525,7 +525,9 @@ fn detect_cet_state() {
         tracing::info!("cet_bypass: CET is enabled and CAN be disabled via policy");
         CET_STATE.store(CET_ENABLED_CAN_DISABLE, Ordering::SeqCst);
     } else {
-        tracing::info!("cet_bypass: CET is enabled and CANNOT be disabled (insufficient privileges)");
+        tracing::info!(
+            "cet_bypass: CET is enabled and CANNOT be disabled (insufficient privileges)"
+        );
         CET_STATE.store(CET_ENABLED_CANNOT_DISABLE, Ordering::SeqCst);
     }
 }
@@ -1062,7 +1064,6 @@ pub fn call_via_chain(func_name: &str, args: &[u64]) -> Option<i32> {
 /// Execute a single call chain step by resolving the function and
 /// dispatching with the correct arity.
 fn call_single_step(step: &CallChainStep, args: &[u64]) -> Option<i32> {
-
     // Resolve the DLL base and function address directly from the
     // pre-computed hashes.  No plaintext strings involved.
     let dll_base = match unsafe { pe_resolve::get_module_handle_by_hash(step.dll_hash) } {
@@ -1260,7 +1261,9 @@ fn get_kernel_base() -> Option<u64> {
             0,
             &mut buf_size as *mut u32
         ) {
-            tracing::warn!("cet_bypass: NtQuerySystemInformation (size query) resolution failed: {e}");
+            tracing::warn!(
+                "cet_bypass: NtQuerySystemInformation (size query) resolution failed: {e}"
+            );
             return None;
         }
     }
@@ -1787,7 +1790,9 @@ fn install_veh_shadow_fix() {
     } {
         Some(b) => b,
         None => {
-            tracing::error!("cet_bypass: failed to resolve kernel32 for AddVectoredExceptionHandler");
+            tracing::error!(
+                "cet_bypass: failed to resolve kernel32 for AddVectoredExceptionHandler"
+            );
             return;
         }
     };
