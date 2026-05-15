@@ -20,7 +20,7 @@ impl Injector for NtCreateThreadInjector {
     fn inject(&self, pid: u32, payload: &[u8]) -> Result<()> {
         // Forward PE payloads to process hollowing.
         if payload_has_valid_pe_headers(payload) {
-            log::info!(
+            tracing::info!(
                 "PE payload detected, forwarding to process hollowing's inject_into_process"
             );
             return match hollowing::windows_impl::inject_into_process(pid, payload) {
@@ -29,10 +29,7 @@ impl Injector for NtCreateThreadInjector {
             };
         }
 
-        use winapi::um::winnt::{
-            PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
-            PROCESS_VM_WRITE,
-        };
+        use windows_sys::Win32::System::Threading::{PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_WRITE};
         let access_mask = PROCESS_VM_OPERATION
             | PROCESS_VM_WRITE
             | PROCESS_CREATE_THREAD

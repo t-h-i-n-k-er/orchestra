@@ -45,10 +45,11 @@
 
 #![cfg(feature = "memory-guard")]
 
+use common::lock::MutexExt;
 use anyhow::Result;
 use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng},
-    XChaCha20Poly1305, XNonce,
+    ChaCha20Poly1305, XChaCha20Poly1305, XNonce,
 };
 use common::config::SleepScheme;
 use rand::RngCore;
@@ -135,32 +136,32 @@ pub fn init_schemes(schemes: Vec<SleepScheme>, rotation_interval: u32) {
         schemes
     };
     let _ = SCHEME_TABLE.set(table);
-    ROTATION_INTERVAL.store(rotation_interval, Ordering::Relaxed);
-    SCHEME_INDEX.store(0, Ordering::Relaxed);
-    CYCLE_COUNTER.store(0, Ordering::Relaxed);
+    ROTATION_INTERVAL.store(rotation_interval, Ordering::Release);
+    SCHEME_INDEX.store(0, Ordering::Release);
+    CYCLE_COUNTER.store(0, Ordering::Release);
 }
 
 /// Return the current scheme (the one that will be used for the next lock).
 fn current_scheme() -> SleepScheme {
     let table = SCHEME_TABLE.get_or_init(|| vec![SleepScheme::XChaCha20Poly1305]);
-    let idx = SCHEME_INDEX.load(Ordering::Relaxed) as usize;
+    let idx = SCHEME_INDEX.load(Ordering::Acquire) as usize;
     table[idx % table.len()]
 }
 
 /// Advance to the next scheme if the cycle counter has reached the rotation
 /// interval.  Called at the end of each `lock()` cycle.
 fn maybe_advance_scheme() {
-    let interval = ROTATION_INTERVAL.load(Ordering::Relaxed);
+    let interval = ROTATION_INTERVAL.load(Ordering::Acquire);
     if interval == 0 {
         return;
     }
-    let count = CYCLE_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+    let count = CYCLE_COUNTER.fetch_add(1, Ordering::AcqRel) + 1;
     if count >= interval {
         // Advance the scheme index and reset the cycle counter.
         let table = SCHEME_TABLE.get_or_init(|| vec![SleepScheme::XChaCha20Poly1305]);
-        let old = SCHEME_INDEX.load(Ordering::Relaxed);
-        SCHEME_INDEX.store((old + 1) % (table.len() as u32), Ordering::Relaxed);
-        CYCLE_COUNTER.store(0, Ordering::Relaxed);
+        let old = SCHEME_INDEX.load(Ordering::Acquire);
+        SCHEME_INDEX.store((old + 1) % (table.len() as u32), Ordering::Release);
+        CYCLE_COUNTER.store(0, Ordering::Release);
         tracing::debug!("[memory-guard] scheme advanced to {:?}", current_scheme());
     }
 }
@@ -210,21 +211,26 @@ fn encrypt_region(
             Ok((nonce_buf, nonce_len as u8, tag))
         }
         SleepScheme::ChaCha20 => {
-            use chacha20::cipher::{KeyIvInit, StreamCipher};
-            let nonce = chacha20::Nonce::from_slice(&nonce_buf[..12]);
-            let cipher_key = chacha20::Key::from_slice(key);
-            let mut cipher = chacha20::ChaCha20::new(cipher_key, nonce);
-            cipher.apply_keystream(buf);
-            // No authentication tag for unauthenticated ChaCha20.
-            Ok((nonce_buf, nonce_len as u8, [0u8; MAX_TAG_LEN]))
+            let cipher = ChaCha20Poly1305::new_from_slice(key)
+                .map_err(|_| anyhow::anyhow!("ChaCha20-Poly1305 key init failed"))?;
+            let cnonce = chacha20poly1305::Nonce::from_slice(&nonce_buf[..12]);
+            let ct = cipher
+                .encrypt(cnonce, buf as &[u8])
+                .map_err(|_| anyhow::anyhow!("ChaCha20-Poly1305 encryption failed"))?;
+            let ct_len = ct.len() - 16;
+            buf[..ct_len].copy_from_slice(&ct[..ct_len]);
+            let mut tag = [0u8; MAX_TAG_LEN];
+            tag.copy_from_slice(&ct[ct_len..]);
+            Ok((nonce_buf, nonce_len as u8, tag))
         }
     }
 }
 
 /// Decrypt `buf` in-place using the given `scheme`, `key`, `nonce`, and `tag`.
 ///
-/// For authenticated schemes the tag is verified; for ChaCha20 the tag is
-/// ignored.
+/// For all schemes (including ChaCha20-Poly1305) the tag is verified on
+/// decryption; a mismatch aborts the agent rather than continuing with
+/// corrupt data.
 fn decrypt_region(
     scheme: SleepScheme,
     key: &[u8; 32],
@@ -271,11 +277,20 @@ fn decrypt_region(
             Ok(())
         }
         SleepScheme::ChaCha20 => {
-            use chacha20::cipher::{KeyIvInit, StreamCipher};
-            let cnonce = chacha20::Nonce::from_slice(&nonce[..12]);
-            let cipher_key = chacha20::Key::from_slice(key);
-            let mut cipher = chacha20::ChaCha20::new(cipher_key, cnonce);
-            cipher.apply_keystream(buf);
+            let cipher = ChaCha20Poly1305::new_from_slice(key)
+                .map_err(|_| anyhow::anyhow!("ChaCha20-Poly1305 key init failed"))?;
+            let cnonce = chacha20poly1305::Nonce::from_slice(&nonce[..12]);
+            let mut combined = Vec::with_capacity(buf.len() + 16);
+            combined.extend_from_slice(buf);
+            combined.extend_from_slice(tag);
+            let pt = cipher.decrypt(cnonce, combined.as_slice()).map_err(|_| {
+                anyhow::anyhow!(
+                    "[memory-guard] ChaCha20-Poly1305 tag mismatch for \
+                     region '{}': memory may have been tampered with",
+                    label
+                )
+            })?;
+            buf.copy_from_slice(&pt);
             Ok(())
         }
     }
@@ -288,7 +303,7 @@ fn decrypt_region(
 /// Register a mutable byte slice as a sensitive region.
 ///
 /// The slice must outlive all calls to [`lock`] and [`unlock`].  In practice
-/// this means passing `'static` buffers (e.g. contents of `lazy_static!` or
+/// this means passing `'static` buffers (e.g. contents of `once_cell::sync::Lazy` or
 /// `Box::leak`-ed heap data).
 ///
 /// # Safety
@@ -296,7 +311,7 @@ fn decrypt_region(
 /// The caller must ensure that no other thread reads or writes `buf` between a
 /// call to [`lock`] and the corresponding call to [`unlock`].
 pub unsafe fn register(buf: &'static mut [u8], label: &'static str) {
-    let mut reg = registry().lock().unwrap();
+    let mut reg = registry().lock_recover();
     reg.push(GuardedRegion {
         ptr: buf.as_mut_ptr(),
         len: buf.len(),
@@ -380,7 +395,7 @@ pub fn lock() -> Result<KeyHandle> {
     let scheme = current_scheme();
 
     {
-        let mut reg = registry().lock().unwrap();
+        let mut reg = registry().lock_recover();
 
         for region in reg.iter_mut() {
             if region.locked {
@@ -428,7 +443,7 @@ pub fn unlock(handle: KeyHandle) -> Result<()> {
     let mut key_bytes = handle.retrieve();
 
     {
-        let mut reg = registry().lock().unwrap();
+        let mut reg = registry().lock_recover();
         for region in reg.iter_mut() {
             if !region.locked {
                 tracing::warn!(
@@ -486,7 +501,7 @@ pub fn rotate_key(handle: KeyHandle) -> Result<KeyHandle> {
     let mut old_key = handle.retrieve();
 
     {
-        let mut reg = registry().lock().unwrap();
+        let mut reg = registry().lock_recover();
         for region in reg.iter_mut() {
             if !region.locked {
                 continue;
@@ -519,7 +534,7 @@ pub fn rotate_key(handle: KeyHandle) -> Result<KeyHandle> {
 
     // 3. Re-encrypt all regions with the new key and (possibly new) scheme.
     {
-        let mut reg = registry().lock().unwrap();
+        let mut reg = registry().lock_recover();
 
         for region in reg.iter_mut() {
             if !region.locked {
@@ -948,7 +963,7 @@ mod tests {
 
     fn fresh_registry() {
         if let Some(reg) = REGISTRY.get() {
-            reg.lock().unwrap().clear();
+            reg.lock_recover().clear();
         }
     }
 
@@ -962,7 +977,7 @@ mod tests {
     /// unlock it, verify plaintext restored.
     #[test]
     fn roundtrip_encrypt_decrypt() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock_recover();
         fresh_registry();
 
         let plaintext_orig = b"super-secret-session-key-1234567";
@@ -1001,7 +1016,7 @@ mod tests {
     /// to unlock, because h1's key is irrecoverable after h2 overwrites the stash.
     #[test]
     fn second_lock_skips_already_locked_region() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock_recover();
         fresh_registry();
 
         let content = b"data-to-protect";
@@ -1040,7 +1055,7 @@ mod tests {
     /// Tag mismatch: mutate a byte while locked, expect unlock to fail.
     #[test]
     fn tag_mismatch_detected() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock_recover();
         fresh_registry();
 
         let boxed: Box<[u8]> = b"tamper-me-if-you-can".to_vec().into_boxed_slice();
@@ -1064,7 +1079,7 @@ mod tests {
     /// `guarded_sleep` round-trip (very short duration).
     #[tokio::test]
     async fn guarded_sleep_roundtrip() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock_recover();
         fresh_registry();
 
         let content = b"async-sensitive-data";
@@ -1086,7 +1101,7 @@ mod tests {
     /// Early wake via watch channel.
     #[tokio::test]
     async fn early_wake() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock_recover();
         fresh_registry();
 
         let content = b"early-wake-data";
@@ -1129,7 +1144,7 @@ mod tests {
     /// 3. A second call (simulating a reconnect) updates the buffer contents.
     #[test]
     fn register_session_key_compiles_and_updates() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock_recover();
         fresh_registry();
 
         let key1 = [0x42u8; 32];
@@ -1153,7 +1168,7 @@ mod tests {
     /// and the new handle must successfully unlock back to the original plaintext.
     #[test]
     fn rotate_key_roundtrip() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock_recover();
         fresh_registry();
 
         let content = b"rotation-test-data";
@@ -1186,7 +1201,7 @@ mod tests {
     /// ciphertext after each sub-interval rotation.
     #[tokio::test]
     async fn guarded_sleep_with_rotation() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock_recover();
         fresh_registry();
 
         let content = b"rotation-during-sleep";
@@ -1209,7 +1224,7 @@ mod tests {
     /// AES-256-GCM round-trip: lock with AES-256-GCM, unlock, verify plaintext.
     #[test]
     fn aes256gcm_roundtrip() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock_recover();
         fresh_registry();
 
         let plaintext_orig = b"aes-256-gcm-protected-data-12345";
@@ -1245,7 +1260,7 @@ mod tests {
     /// ChaCha20 (unauthenticated) round-trip: lock, unlock, verify plaintext.
     #[test]
     fn chacha20_roundtrip() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock_recover();
         fresh_registry();
 
         let plaintext_orig = b"chacha20-stream-no-auth-test!!";
@@ -1282,7 +1297,7 @@ mod tests {
     /// round-trip succeeds.
     #[test]
     fn multi_scheme_rotation() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock_recover();
         fresh_registry();
 
         let content = b"multi-scheme-rotation-test-data!";
@@ -1342,7 +1357,7 @@ mod tests {
     /// be decryptable after rotation to scheme B.
     #[test]
     fn rotate_key_with_scheme_change() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock_recover();
         fresh_registry();
 
         let content = b"rotate-scheme-change-data";
@@ -1387,7 +1402,7 @@ mod tests {
     /// Tag mismatch detection still works for AES-256-GCM.
     #[test]
     fn aes256gcm_tag_mismatch_detected() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock_recover();
         fresh_registry();
 
         let boxed: Box<[u8]> = b"aes-tamper-detect".to_vec().into_boxed_slice();
@@ -1412,7 +1427,7 @@ mod tests {
     /// `init_schemes` with empty vector defaults to XChaCha20-Poly1305 only.
     #[test]
     fn init_schemes_empty_defaults_to_xchacha() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock_recover();
         fresh_registry();
 
         let content = b"empty-schemes-default";

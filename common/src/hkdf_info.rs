@@ -92,6 +92,13 @@ pub const REFLECTIVE_LOADER: &[u8] =
 pub const ENTRA_APP_SECRET: &[u8] =
     b"\x11\x3a\xd7\x4f\x88\xc1\x2e\xb5\x56\x90\x0d\xf3\xe4\x7a\x1c\x5b";
 
+/// HTTP/DoH forward-secrecy session key derivation — domain separation for
+/// ECDH exchanges carried in HTTP headers.  Uses the same X25519 + HKDF
+/// construction as stream-based FS but over a single request/response round
+/// trip.  Distinct from `FS_SESSION` to prevent cross-protocol key reuse.
+pub const FS_HTTP_SESSION: &[u8] =
+    b"\x12\xc9\xe0\x58\x3b\xa7\x6d\xf1\x44\x82\x95\xbe\x0c\x63\xd8\xaf";
+
 /// Collect all info slices into a single array for uniqueness tests.
 #[cfg(test)]
 fn all_infos() -> Vec<&'static [u8]> {
@@ -113,6 +120,7 @@ fn all_infos() -> Vec<&'static [u8]> {
         ADAPTIVE_TIMING,
         REFLECTIVE_LOADER,
         ENTRA_APP_SECRET,
+        FS_HTTP_SESSION,
     ]
 }
 

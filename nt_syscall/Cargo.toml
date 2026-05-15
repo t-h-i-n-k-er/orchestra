@@ -11,9 +11,8 @@ anyhow = { workspace = true }
 log = "0.4"
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = [
-    "memoryapi",
-    "winnt",
-    "ntdef",
-    "basetsd",
+windows-sys = { version = "0.59", features = [
+    "Win32_System_Memory",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_SystemServices",
 ] }

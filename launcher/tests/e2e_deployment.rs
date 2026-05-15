@@ -4,7 +4,7 @@
 //!
 //! 1. A dummy "agent" shell script is written to a temp directory and an
 //!    AES-256-GCM payload is built from it using `common::CryptoSession`.
-//! 2. A local `warp` HTTP server hosts the encrypted payload at
+//! 2. A local `axum` HTTP server hosts the encrypted payload at
 //!    `http://127.0.0.1:<port>/agent.enc`.
 //! 3. The compiled `launcher` binary is invoked via `assert_cmd` with
 //!    `--url` and `--key`.
@@ -17,10 +17,12 @@
 #![cfg(target_os = "linux")]
 
 use assert_cmd::Command;
+use axum::Router;
 use base64::Engine;
 use common::CryptoSession;
 use std::time::Duration;
 use tempfile::tempdir;
+use tower_http::services::ServeDir;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn launcher_downloads_decrypts_and_executes() {
@@ -48,10 +50,13 @@ async fn launcher_downloads_decrypts_and_executes() {
     let serve_dir = dir.path().to_path_buf();
     std::fs::write(serve_dir.join("agent.enc"), &payload).unwrap();
 
-    // Start a local warp server on an ephemeral port.
-    let routes = warp::fs::dir(serve_dir.clone());
-    let (addr, server) = warp::serve(routes).bind_ephemeral(([127, 0, 0, 1], 0));
-    let server_handle = tokio::spawn(server);
+    // Start a local axum static-file server on an ephemeral port.
+    let app = Router::new().fallback_service(ServeDir::new(serve_dir.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
 
     // Give the server a moment to be reachable.
     tokio::time::sleep(Duration::from_millis(100)).await;

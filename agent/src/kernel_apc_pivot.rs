@@ -824,7 +824,7 @@ fn resolve_kthread_for_tid(
                 .context("failed to read thread TID")? as u32;
 
                 if current_tid == tid {
-                    log::info!(
+                    tracing::info!(
                         "kernel_apc_pivot: found KTHREAD at {:#x} for TID {} (PID {})",
                         kthread_addr,
                         tid,
@@ -938,7 +938,7 @@ pub fn pivot_kernel_stack(
     ctx.original_kernel_stack = Some(orig_kernel_stack);
     ctx.original_initial_stack = Some(orig_initial_stack);
 
-    log::debug!(
+    tracing::debug!(
         "kernel_apc_pivot: original KernelStack={:#x}, InitialStack={:#x}",
         orig_kernel_stack,
         orig_initial_stack
@@ -969,7 +969,7 @@ pub fn pivot_kernel_stack(
             match alloc_addr {
                 Some(addr) => {
                     ctx.fake_stack_addr = Some(addr);
-                    log::info!(
+                    tracing::info!(
                         "kernel_apc_pivot: allocated fake stack at {:#x} ({} bytes)",
                         addr,
                         FAKE_STACK_SIZE
@@ -996,7 +996,7 @@ pub fn pivot_kernel_stack(
         bail!("failed to write new KTHREAD.KernelStack value");
     }
 
-    log::info!(
+    tracing::info!(
         "kernel_apc_pivot: pivoted KTHREAD {:#x} kernel stack to {:#x}",
         ctx.kthread_addr,
         target_rsp
@@ -1043,7 +1043,7 @@ pub fn restore_kernel_stack(
         }
     }
 
-    log::info!(
+    tracing::info!(
         "kernel_apc_pivot: restored original kernel stack for KTHREAD {:#x}",
         ctx.kthread_addr
     );
@@ -1122,7 +1122,7 @@ fn allocate_kapc(
     // Inserted = FALSE
     write_field_u8(KAPC_INSERTED_OFFSET, 0);
 
-    log::info!(
+    tracing::info!(
         "kernel_apc_pivot: allocated KAPC at {:#x} for KTHREAD {:#x}",
         kapc_addr,
         kthread_addr
@@ -1229,7 +1229,7 @@ pub fn queue_kernel_apc(
         &[1],
     );
 
-    log::info!(
+    tracing::info!(
         "kernel_apc_pivot: queued kernel APC at {:#x} for KTHREAD {:#x} (handler={:#x})",
         kapc_addr,
         ctx.kthread_addr,
@@ -1277,13 +1277,13 @@ fn allocate_kernel_pool(
             // find unused memory in the kernel's non-paged pool region by
             // scanning for zeroed pages and claiming one.
 
-            log::debug!(
+            tracing::debug!(
                 "kernel_apc_pivot: resolved ExAllocatePool2 at {:#x} (cannot call from usermode)",
                 fn_addr
             );
         }
         Err(_) => {
-            log::debug!("kernel_apc_pivot: ExAllocatePool2 not found, trying ExAllocatePoolWithTag");
+            tracing::debug!("kernel_apc_pivot: ExAllocatePool2 not found, trying ExAllocatePoolWithTag");
         }
     }
 
@@ -1366,7 +1366,7 @@ fn allocate_kernel_pool(
                 }
             }
 
-            log::info!(
+            tracing::info!(
                 "kernel_apc_pivot: allocated {} bytes at {:#x} in non-paged pool",
                 pages_needed * page_size,
                 candidate
@@ -1375,7 +1375,7 @@ fn allocate_kernel_pool(
         }
     }
 
-    log::warn!("kernel_apc_pivot: could not find free kernel memory for allocation");
+    tracing::warn!("kernel_apc_pivot: could not find free kernel memory for allocation");
     None
 }
 
@@ -1392,7 +1392,7 @@ fn free_kernel_pool(
 ) {
     // Best-effort: zero the first 8 bytes to clear our marker.
     // We can't safely call ExFreePool from user mode.
-    log::warn!(
+    tracing::warn!(
         "kernel_apc_pivot: leaking kernel allocation at {:#x} (cannot call ExFreePool from usermode)",
         addr
     );
@@ -1494,7 +1494,7 @@ pub fn init(
 
     // Get the Windows build number.
     let build = get_build_number().context("failed to determine Windows build number")?;
-    log::info!("kernel_apc_pivot: detected Windows build {}", build);
+    tracing::info!("kernel_apc_pivot: detected Windows build {}", build);
 
     // Look up offsets.
     let offsets = offsets_for_build(build)
@@ -1527,7 +1527,7 @@ pub fn init(
 
     let _ = OFFSETS.set(offsets);
 
-    log::info!(
+    tracing::info!(
         "kernel_apc_pivot: initialized for build {} (CR3={:#x})",
         build,
         cr3

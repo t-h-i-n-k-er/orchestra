@@ -475,7 +475,7 @@ pub fn resolve_cr3(
         );
     }
 
-    log::info!(
+    tracing::info!(
         "Resolved CR3 from PsInitialSystemProcess: 0x{:016X} (build={}, DTB offset=0x{:X})",
         cr3,
         build,

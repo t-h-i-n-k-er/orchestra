@@ -359,7 +359,22 @@ pub fn is_uefi_system() -> bool {
         nvram::read_efi_variable("SecureBoot", &EfiGuid::EFI_GLOBAL_VARIABLE).is_ok()
             || nvram::read_efi_variable("Timeout", &EfiGuid::EFI_GLOBAL_VARIABLE).is_ok()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    {
+        // On macOS, Intel Macs use UEFI firmware and expose EFI variables
+        // through /usr/sbin/nvram.  Apple Silicon Macs use iBoot and do not
+        // expose standard EFI variables — UEFI persistence does not apply there.
+        //
+        // Probe strategy: try to read a well-known EFI global variable via
+        // nvram.  If it succeeds, this is an Intel Mac with UEFI.  If it fails
+        // (or nvram is not present), report false.
+        if !std::path::Path::new("/usr/sbin/nvram").exists() {
+            return false;
+        }
+        nvram::read_efi_variable("BootOrder", &EfiGuid::EFI_GLOBAL_VARIABLE).is_ok()
+            || nvram::read_efi_variable("Timeout", &EfiGuid::EFI_GLOBAL_VARIABLE).is_ok()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
         false
     }

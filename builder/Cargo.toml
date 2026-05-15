@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "builder"
+path = "src/lib.rs"
+
 [[bin]]
 name = "orchestra-builder"
 path = "src/main.rs"
@@ -28,8 +32,7 @@ shellcode_packager = { path = "../shellcode_packager" }
 rand = "0.8"
 goblin = "0.8"
 which = "6.0"
-ring = "0.17.14"
-serde_json = "1.0.149"
+serde_json = { workspace = true }
 
 [build-dependencies]
 built = "0.7"

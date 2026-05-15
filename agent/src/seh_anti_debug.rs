@@ -292,6 +292,21 @@ const CHECK_ICEBP: u32 = 4;
 const CHECK_PREFIX_SEG: u32 = 5;
 const CHECK_INSTRUMENTATION: u32 = 6;
 
+/// Check 7: Post-mortem debugger detection via NtQueryInformationProcess.
+///
+/// Queries ProcessDebugPort (class 7) and ProcessDebugObjectHandle (class 30)
+/// to detect debuggers that may not intercept live exceptions (e.g. WinDbg
+/// attached to a crashed process, or a just-in-time debugger).  These checks
+/// complement the VEH-based checks (1-6) which only detect debuggers that
+/// intercept the exception dispatch path.
+const CHECK_POST_MORTEM: u32 = 7;
+
+/// Annotation flag: set when a VEH-based check reported "debugger detected"
+/// but the NtQueryInformationProcess checks show no active debugger port.
+/// This suggests a profiling tool or non-debugger VEH consumer intercepted
+/// the exception, producing a false positive on the VEH checks.
+const CHECK_PROFILER_CONFLICT: u32 = 8;
+
 // ─── VEH Handler: Single-Step Check ───────────────────────────────────────
 //
 // Sets the trap flag (TF, bit 8) in EFLAGS.  If a debugger is single-stepping,
@@ -461,6 +476,130 @@ fn check_instrumentation_callback() -> bool {
         // Query failed — assume no instrumentation.
         false
     }
+}
+
+// ─── Post-Mortem Debugger Detection (L-11) ────────────────────────────────
+//
+// These checks use NtQueryInformationProcess to detect debuggers that may
+// not intercept live VEH exceptions — notably post-mortem (JIT) debuggers
+// and debuggers that attach to an already-running process.  They complement
+// the VEH-based exception checks (1-6) which only detect debuggers that
+// intercept the exception dispatch path.
+//
+// ProcessDebugPort (class 7): returns the debug port handle if the process
+// is being debugged.  Non-zero means a debugger is attached.
+//
+// ProcessDebugObjectHandle (class 30): returns a handle to the debug object
+// associated with the process.  A non-null handle means a debugger is
+// present (this also catches kernel-mode debuggers in some configurations).
+
+/// Query the debug port for the current process.
+///
+/// Returns `true` if a debug port is present (debugger attached).
+fn check_debug_port() -> bool {
+    let nt_query = match resolve_nt_query_information_process() {
+        Some(f) => f,
+        None => return false,
+    };
+
+    // GetCurrentProcess() pseudo-handle = -1 (0xFFFFFFFFFFFFFFFF on x64).
+    let process_handle: isize = -1;
+    let mut debug_port: usize = 0;
+    let mut return_length: u32 = 0;
+
+    // ProcessDebugPort = 7
+    let status = unsafe {
+        nt_query(
+            process_handle,
+            7,
+            &mut debug_port as *mut usize as *mut std::ffi::c_void,
+            std::mem::size_of::<usize>() as u32,
+            &mut return_length,
+        )
+    };
+
+    if status >= 0 {
+        debug_port != 0
+    } else {
+        false
+    }
+}
+
+/// Query the debug object handle for the current process.
+///
+/// Returns `true` if a debug object is associated with the process
+/// (debugger is attached, including kernel debuggers).
+fn check_debug_object_handle() -> bool {
+    let nt_query = match resolve_nt_query_information_process() {
+        Some(f) => f,
+        None => return false,
+    };
+
+    let process_handle: isize = -1;
+    let mut debug_handle: isize = 0;
+    let mut return_length: u32 = 0;
+
+    // ProcessDebugObjectHandle = 30
+    let status = unsafe {
+        nt_query(
+            process_handle,
+            30,
+            &mut debug_handle as *mut isize as *mut std::ffi::c_void,
+            std::mem::size_of::<isize>() as u32,
+            &mut return_length,
+        )
+    };
+
+    // STATUS_SUCCESS (0) and a non-null handle means a debugger is present.
+    // STATUS_PORT_NOT_SET (0xC0000353) means no debugger — not an error.
+    if status >= 0 {
+        debug_handle != 0
+    } else {
+        false
+    }
+}
+
+/// Detect post-mortem and non-intercepting debuggers using
+/// `NtQueryInformationProcess` queries.
+///
+/// Unlike the VEH-based checks (1-6), these detect any attached debugger
+/// regardless of whether it intercepts exceptions.  This catches:
+/// - Post-mortem (JIT) debuggers that attach after a crash
+/// - Debuggers that attach to a running process via `DebugActiveProcess`
+/// - Kernel debuggers that have a debug object for this process
+///
+/// Returns `true` if a debugger is detected via either query.
+fn check_post_mortem_debugger() -> bool {
+    check_debug_port() || check_debug_object_handle()
+}
+
+/// Check for profiler conflict: VEH-based checks can false-positive when
+/// a profiling tool (Intel VTune, Visual Studio Profiler, etc.) registers
+/// its own VEH handler that intercepts exceptions before ours fires.
+///
+/// Returns `true` if any VEH-based check reported "detected" but the
+/// NtQueryInformationProcess queries show no active debugger, suggesting
+/// a non-debugger VEH consumer intercepted the exceptions.
+fn detect_profiler_conflict(veh_results: &[(u32, bool)]) -> bool {
+    // If NtQueryInformationProcess sees a real debugger, there's no conflict.
+    if check_debug_port() || check_debug_object_handle() {
+        return false;
+    }
+
+    // Otherwise, any VEH-based "detected" result is suspicious.
+    // Only consider checks 1-5 (the exception-based ones); check 6
+    // (instrumentation callback) and check 7 (post-mortem) are not
+    // VEH-interception based.
+    let veh_check_ids = [
+        CHECK_SINGLE_STEP,
+        CHECK_CLOSE_HANDLE,
+        CHECK_INT2D,
+        CHECK_ICEBP,
+        CHECK_PREFIX_SEG,
+    ];
+    veh_results
+        .iter()
+        .any(|(id, detected)| veh_check_ids.contains(id) && *detected)
 }
 
 // ─── VEH Handler: Anti-Trace ──────────────────────────────────────────────
@@ -831,6 +970,41 @@ pub unsafe fn run_anti_debug_checks() -> AntiDebugResult {
     }
     checks.push((CHECK_INSTRUMENTATION, has_instrumentation));
 
+    // ── Check 7: Post-mortem / non-intercepting debugger ────────────────
+    //
+    // NtQueryInformationProcess-based checks that detect debuggers which
+    // may not intercept live exceptions (post-mortem JIT debuggers,
+    // debuggers that attached via DebugActiveProcess, etc.).  These
+    // complement the VEH-based checks (1-6) which only detect debuggers
+    // that intercept the exception dispatch path.
+    let has_post_mortem = check_post_mortem_debugger();
+    if has_post_mortem {
+        detected = true;
+    }
+    checks.push((CHECK_POST_MORTEM, has_post_mortem));
+
+    // ── Profiler conflict annotation (L-11) ────────────────────────────
+    //
+    // If any VEH-based check (1-5) reported "detected" but the
+    // NtQueryInformationProcess queries see no active debugger, a
+    // profiling tool or non-debugger VEH consumer likely intercepted
+    // the exception.  Record this as an annotation so the caller can
+    // decide whether to trust the VEH results.
+    //
+    // When a profiler conflict is detected, we clear the `detected` flag
+    // ONLY if the NtQuery-based checks also came back negative — the
+    // post-mortem check above is authoritative for "is a debugger
+    // attached" and the VEH checks alone are not sufficient evidence.
+    let profiler_conflict = detect_profiler_conflict(&checks);
+    if profiler_conflict && !has_post_mortem {
+        // Profiler/tool false positive: VEH checks flagged a debugger,
+        // but NtQueryInformationProcess says no debugger is attached.
+        // Downgrade the detection — the VEH exception was intercepted by
+        // a non-debugger tool (e.g. Intel VTune, Visual Studio Profiler).
+        detected = false;
+    }
+    checks.push((CHECK_PROFILER_CONFLICT, profiler_conflict));
+
     AntiDebugResult {
         debugger_detected: detected,
         checks,
@@ -1116,7 +1290,7 @@ mod tests {
             0x57,                         // push rdi
             0x48, 0x83, 0xEC, 0x20,       // sub rsp, 0x20
             0x48, 0x8B, 0xD9,             // mov rbx, rcx
-            0xE8, 0x10, 0x00, 0x00, 0x00, // call +16
+            0xE8, 0x10, 0x00,             // call +N (truncated to fit 16)
         ];
 
         let mut encoded = original;

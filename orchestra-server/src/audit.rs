@@ -5,7 +5,7 @@
 
 use base64::Engine as _;
 use common::{AuditEvent, Outcome};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -94,7 +94,35 @@ impl AuditLog {
             }
         }
         let b64 = base64::engine::general_purpose::STANDARD.encode(&key);
-        std::fs::write(key_path, format!("{b64}\n"))?;
+
+        // H-7: Write key file with restrictive permissions (owner-only on Unix).
+        {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut f = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .mode(0o600) // owner read/write only
+                    .open(key_path)
+                    .map_err(|e| {
+                        anyhow::anyhow!("failed to create audit key file {}: {e}", key_path.display())
+                    })?;
+                write!(f, "{b64}\n")?;
+            }
+            #[cfg(not(unix))]
+            {
+                let mut f = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(key_path)
+                    .map_err(|e| {
+                        anyhow::anyhow!("failed to create audit key file {}: {e}", key_path.display())
+                    })?;
+                write!(f, "{b64}\n")?;
+            }
+        }
+
         tracing::info!(
             path = %key_path.display(),
             "generated new audit HMAC key and persisted to file"

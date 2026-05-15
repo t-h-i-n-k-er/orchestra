@@ -361,13 +361,13 @@ fn current_thread_handle() -> usize {
 pub unsafe fn scrub_peb_traces() {
     let image_base = get_image_base();
     if image_base == 0 {
-        log::warn!("[memory_hygiene] cannot determine image base");
+        tracing::warn!("[memory_hygiene] cannot determine image base");
         return;
     }
 
     let ldr = get_ldr();
     if ldr.is_null() {
-        log::warn!("[memory_hygiene] PEB->Ldr is null");
+        tracing::warn!("[memory_hygiene] PEB->Ldr is null");
         return;
     }
 
@@ -400,7 +400,7 @@ pub unsafe fn scrub_peb_traces() {
     }
 
     if found_entry == 0 {
-        log::warn!(
+        tracing::warn!(
             "[memory_hygiene] could not find our module in InMemoryOrderModuleList \
              (image_base={:#x})",
             image_base
@@ -430,7 +430,7 @@ pub unsafe fn scrub_peb_traces() {
         *sl.borrow_mut() = saved;
     });
 
-    log::info!(
+    tracing::info!(
         "[memory_hygiene] PEB traces scrubbed for image_base={:#x}",
         image_base
     );
@@ -620,7 +620,7 @@ pub unsafe fn restore_peb_traces() {
         }
     });
 
-    log::info!("[memory_hygiene] PEB traces restored");
+    tracing::info!("[memory_hygiene] PEB traces restored");
 }
 
 // ── Thread start address scrubbing ───────────────────────────────────────────
@@ -652,7 +652,7 @@ pub unsafe fn scrub_thread_start_address() {
     // Resolve a legitimate replacement address.
     let replacement_addr = resolve_legitimate_thread_start();
     if replacement_addr == 0 {
-        log::warn!("[memory_hygiene] could not resolve legitimate thread start address");
+        tracing::warn!("[memory_hygiene] could not resolve legitimate thread start address");
         return;
     }
 
@@ -680,13 +680,13 @@ pub unsafe fn scrub_thread_start_address() {
             );
 
             if set_status == Some(0) {
-                log::info!(
+                tracing::info!(
                     "[memory_hygiene] scrubbed thread start address from {:#x} → {:#x}",
                     start_addr,
                     replacement_addr
                 );
             } else {
-                log::warn!(
+                tracing::warn!(
                     "[memory_hygiene] NtSetInformationThread returned {:?} \
                      when patching start address",
                     set_status
@@ -825,7 +825,7 @@ pub unsafe fn scrub_handle_table() {
                 // STATUS_INFO_LENGTH_MISMATCH or resolution failed — grow buffer.
                 if buf_len > 0x1000000 {
                     // 16 MB safety limit.
-                    log::warn!("[memory_hygiene] handle table buffer exceeded 16 MB, giving up");
+                    tracing::warn!("[memory_hygiene] handle table buffer exceeded 16 MB, giving up");
                     break;
                 }
                 buf_len = if ret_len > buf_len {
@@ -835,7 +835,7 @@ pub unsafe fn scrub_handle_table() {
                 };
             }
             Some(s) => {
-                log::warn!(
+                tracing::warn!(
                     "[memory_hygiene] NtQuerySystemInformation returned {:#010x}",
                     s as u32
                 );
@@ -951,7 +951,7 @@ unsafe fn process_handle_entries(buf: &[u8], image_base: usize) {
     }
 
     if closed_count > 0 || swapped_count > 0 {
-        log::info!(
+        tracing::info!(
             "[memory_hygiene] handle table scrubbed: closed={}, swapped={}",
             closed_count,
             swapped_count
@@ -1119,14 +1119,14 @@ pub unsafe fn periodic_hygiene(config: &HygieneConfig) -> bool {
 
     // ── 1. Verify PEB unlinks ─────────────────────────────────────────────
     if config.scrub_peb && !verify_peb_unlinks() {
-        log::warn!("[memory_hygiene] PEB links were restored — re-scrubbing");
+        tracing::warn!("[memory_hygiene] PEB links were restored — re-scrubbing");
         scrub_peb_traces();
         re_applied = true;
     }
 
     // ── 2. Verify thread start address ────────────────────────────────────
     if config.scrub_thread_start && !verify_thread_start_address() {
-        log::warn!("[memory_hygiene] thread start address was restored — re-scrubbing");
+        tracing::warn!("[memory_hygiene] thread start address was restored — re-scrubbing");
         scrub_thread_start_address();
         re_applied = true;
     }

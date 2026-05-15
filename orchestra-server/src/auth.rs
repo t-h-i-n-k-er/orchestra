@@ -79,9 +79,15 @@ impl RateLimiter {
         let mut start = self.window_start.lock().unwrap();
         if start.elapsed() > self.window_duration {
             *start = Instant::now();
-            self.attempts.store(0, Ordering::Relaxed);
+            // Release ordering ensures the window_start reset is visible to
+            // other threads before they observe the zeroed counter (pairs with
+            // the AcqRel fetch_add below).
+            self.attempts.store(0, Ordering::Release);
         }
-        let count = self.attempts.fetch_add(1, Ordering::Relaxed);
+        // Acquire+Release ordering guarantees we see the latest counter value
+        // (including any concurrent reset) and that our increment is visible to
+        // subsequent readers.  Prevents stale reads under high concurrency.
+        let count = self.attempts.fetch_add(1, Ordering::AcqRel);
         if count >= self.max_attempts {
             Err(StatusCode::TOO_MANY_REQUESTS)
         } else {
@@ -131,13 +137,18 @@ impl PerIpRateLimiter {
 /// Extract the client IP from `axum::extract::ConnectInfo`, falling back
 /// to the `X-Forwarded-For` header (first entry) and finally to
 /// `127.0.0.1` if neither is available.
-pub fn extract_client_ip(req: &Request<axum::body::Body>) -> IpAddr {
+///
+/// Returns `(ip, is_trusted)` where `is_trusted` indicates the IP came from
+/// the kernel socket address (ConnectInfo).  When `is_trusted` is false the
+/// IP is XFF-derived or a fallback and should be rate-limited more
+/// aggressively (see [`rate_limit_key`]).
+pub fn extract_client_ip(req: &Request<axum::body::Body>) -> (IpAddr, bool) {
     // 1. Try ConnectInfo (AXUM direct-connect socket address).
     if let Some(ci) = req
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
     {
-        return ci.0.ip();
+        return (ci.0.ip(), true);
     }
     // 2. Try X-Forwarded-For (reverse-proxy scenario).
     if let Some(xff) = req
@@ -147,12 +158,50 @@ pub fn extract_client_ip(req: &Request<axum::body::Body>) -> IpAddr {
     {
         if let Some(first) = xff.split(',').next() {
             if let Ok(ip) = first.trim().parse::<IpAddr>() {
-                return ip;
+                return (ip, false);
             }
         }
     }
     // 3. Fallback.
-    "127.0.0.1".parse().unwrap()
+    ("127.0.0.1".parse().unwrap(), false)
+}
+
+/// Derive the rate-limit key from a (possibly untrusted) client IP.
+///
+/// When the IP is trusted (ConnectInfo-derived), use it directly — the kernel
+/// guarantees it reflects the actual TCP source and cannot be spoofed.
+///
+/// When the IP is untrusted (XFF-derived or the 127.0.0.1 fallback), widen
+/// the key to a subnet to mitigate two attack vectors:
+///
+/// * **XFF rotation**: an attacker who can set arbitrary `X-Forwarded-For`
+///   headers can cycle through fake IPs, each of which would get its own
+///   rate-limit bucket.  By bucketing on `/24` (IPv4) or `/64` (IPv6) the
+///   attacker's entire subnet shares one bucket.
+/// * **Fallback collapse**: when neither ConnectInfo nor XFF is available,
+///   all clients collapse to `127.0.0.1`.  A single global "unknown" bucket
+///   prevents unrelated clients from each getting a fresh limiter.
+fn rate_limit_key(ip: IpAddr, trusted: bool) -> IpAddr {
+    if trusted {
+        return ip;
+    }
+    match ip {
+        IpAddr::V4(v4) => {
+            // Mask to /24 so all IPs in the same /24 share one bucket.
+            let octets = v4.octets();
+            let masked = std::net::Ipv4Addr::new(octets[0], octets[1], octets[2], 0);
+            IpAddr::from(masked)
+        }
+        IpAddr::V6(v6) => {
+            // Mask to /64 so all IPs in the same /64 share one bucket.
+            let mut segments = v6.segments();
+            segments[4] = 0;
+            segments[5] = 0;
+            segments[6] = 0;
+            segments[7] = 0;
+            IpAddr::from(std::net::Ipv6Addr::from(segments))
+        }
+    }
 }
 
 pub async fn require_bearer(
@@ -160,7 +209,14 @@ pub async fn require_bearer(
     mut req: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let client_ip = extract_client_ip(&req);
+    let (client_ip, ip_trusted) = extract_client_ip(&req);
+    let rl_key = rate_limit_key(client_ip, ip_trusted);
+
+    // Check rate limit *before* attempting auth so that even the first
+    // batch of failures is counted against the budget.  Previously the
+    // check was after the failed auth, meaning the first `max_attempts`
+    // failures always returned 401 instead of 429.
+    state.auth_rate_limiters.check(&rl_key)?;
 
     let header_val = req
         .headers()
@@ -195,8 +251,5 @@ pub async fn require_bearer(
         return Ok(next.run(req).await);
     }
 
-    // Only failed bearer attempts consume the auth limiter. Authenticated
-    // dashboard polling and command requests should not lock out the operator.
-    state.auth_rate_limiters.check(&client_ip)?;
     Err(StatusCode::UNAUTHORIZED)
 }

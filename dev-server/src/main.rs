@@ -6,10 +6,12 @@
 //! no TLS, no auth, no rate limiting.
 
 use anyhow::Result;
+use axum::Router;
 use clap::Parser;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use warp::Filter;
+use tower_http::services::ServeDir;
+use tower_http::trace::TraceLayer;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Serve a directory over HTTP for local QA.")]
@@ -38,19 +40,21 @@ async fn main() -> Result<()> {
 
     tracing::info!(directory = %dir.display(), %addr, "starting dev-server");
 
-    let routes = warp::fs::dir(dir.clone()).with(warp::log::custom(|info| {
-        tracing::info!(
-            method = %info.method(),
-            path = info.path(),
-            status = info.status().as_u16(),
-            "request"
-        );
-    }));
+    let app = Router::new()
+        .fallback_service(ServeDir::new(dir))
+        .layer(TraceLayer::new_for_http());
 
-    let (_addr, server) = warp::serve(routes).bind_with_graceful_shutdown(addr, async {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("shutdown signal received");
-    });
-    server.await;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!("listening on {}", listener.local_addr()?);
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+    tracing::info!("shutdown signal received");
 }

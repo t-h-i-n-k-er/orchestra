@@ -973,6 +973,8 @@ Each error includes a human-readable description and the failing NTSTATUS code w
 | `section-map` | Enables Section Mapping injection technique |
 | `callback-inject` | Enables Callback injection technique (12 APIs) |
 | `transacted-hollowing` | Enables NTFS transaction-based process hollowing with ETW blinding |
+| `delayed-stomp` | Enables delayed module-stomp injection (defeats timing heuristics) |
+| `phantom-dll-hollow` | Enables phantom DLL hollowing via section-backed image mapping |
 | `direct-syscalls` | All techniques use direct syscalls via `nt_syscall` crate |
 
 ---

@@ -15,75 +15,15 @@ use anyhow::{anyhow, Result};
 use enigo::{Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
 #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 use std::cell::RefCell;
-#[cfg(target_os = "macos")]
-use std::ffi::c_void;
 
 #[cfg(target_os = "macos")]
-type CFTypeRef = *const c_void;
-#[cfg(target_os = "macos")]
-type CFDataRef = *const c_void;
-#[cfg(target_os = "macos")]
-type CGImageRef = *mut c_void;
-#[cfg(target_os = "macos")]
-type CGDataProviderRef = *mut c_void;
-
-#[cfg(target_os = "macos")]
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct CGPoint {
-    x: f64,
-    y: f64,
-}
-
-#[cfg(target_os = "macos")]
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct CGSize {
-    width: f64,
-    height: f64,
-}
-
-#[cfg(target_os = "macos")]
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct CGRect {
-    origin: CGPoint,
-    size: CGSize,
-}
-
-#[cfg(target_os = "macos")]
-const KCG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1;
-#[cfg(target_os = "macos")]
-const KCG_NULL_WINDOW_ID: u32 = 0;
-#[cfg(target_os = "macos")]
-const KCG_WINDOW_IMAGE_DEFAULT: u32 = 0;
-
-#[cfg(target_os = "macos")]
-#[link(name = "CoreGraphics", kind = "framework")]
-unsafe extern "C" {
-    fn CGMainDisplayID() -> u32;
-    fn CGDisplayBounds(display: u32) -> CGRect;
-    fn CGWindowListCreateImage(
-        screenBounds: CGRect,
-        listOption: u32,
-        windowID: u32,
-        imageOption: u32,
-    ) -> CGImageRef;
-    fn CGImageGetWidth(image: CGImageRef) -> usize;
-    fn CGImageGetHeight(image: CGImageRef) -> usize;
-    fn CGImageGetBytesPerRow(image: CGImageRef) -> usize;
-    fn CGImageGetBitsPerPixel(image: CGImageRef) -> usize;
-    fn CGImageGetDataProvider(image: CGImageRef) -> CGDataProviderRef;
-    fn CGDataProviderCopyData(provider: CGDataProviderRef) -> CFDataRef;
-}
-
-#[cfg(target_os = "macos")]
-#[link(name = "CoreFoundation", kind = "framework")]
-unsafe extern "C" {
-    fn CFDataGetLength(theData: CFDataRef) -> isize;
-    fn CFDataGetBytePtr(theData: CFDataRef) -> *const u8;
-    fn CFRelease(cf: CFTypeRef);
-}
+use crate::macos_ffi::{
+    CFDataGetBytePtr, CFDataGetLength, CFRelease, CGDataProviderCopyData, CGDisplayBounds,
+    CGImageGetBitsPerPixel, CGImageGetBytesPerRow, CGImageGetDataProvider, CGImageGetHeight,
+    CGImageGetWidth, CGMainDisplayID, CGWindowListCreateImage, CFDataRef, CFTypeRef,
+    CGDataProviderRef, CGImageRef, CGRect, KCG_NULL_WINDOW_ID, KCG_WINDOW_IMAGE_DEFAULT,
+    KCG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY,
+};
 
 // Thread-local `Enigo` instance shared across input-simulation calls.
 // Avoids the overhead of re-initialising the platform input backend on every
@@ -107,7 +47,13 @@ where
                 Enigo::new(&Settings::default()).map_err(|e| anyhow!("enigo init failed: {e}"))?,
             );
         }
-        f(borrow.as_mut().unwrap())
+        // SAFETY: The `is_none` branch above always replaces `None` with
+        // `Some(Enigo)` (or returns early on error).  If we reach this point
+        // the slot is guaranteed to be populated.
+        let enigo = borrow
+            .as_mut()
+            .ok_or_else(|| anyhow!("enigo instance unexpectedly absent after initialisation"))?;
+        f(enigo)
     })
 }
 
@@ -564,7 +510,7 @@ type FnGetDIBits = unsafe extern "system" fn(
     u32,
     u32,
     *mut std::ffi::c_void,
-    *mut winapi::um::wingdi::BITMAPINFO,
+    *mut crate::win_types::BITMAPINFO,
     u32,
 ) -> i32;
 #[cfg(windows)]
@@ -618,7 +564,7 @@ pub fn take_screenshot() -> Result<Vec<u8>> {
         if std::env::var_os("WAYLAND_DISPLAY").is_some() {
             match capture_wayland_portal() {
                 Ok(bytes) => return Ok(bytes),
-                Err(e) => log::warn!(
+                Err(e) => tracing::warn!(
                     "xdg-desktop-portal screenshot failed ({}); falling back to X11/fb0",
                     e
                 ),
@@ -628,7 +574,7 @@ pub fn take_screenshot() -> Result<Vec<u8>> {
         if std::env::var_os("DISPLAY").is_some() {
             match capture_x11() {
                 Ok(bytes) => return Ok(bytes),
-                Err(e) => log::warn!(
+                Err(e) => tracing::warn!(
                     "X11 screen capture failed ({}); falling back to /dev/fb0",
                     e
                 ),
@@ -641,8 +587,10 @@ pub fn take_screenshot() -> Result<Vec<u8>> {
     {
         check_consent()?;
         use std::io::Cursor;
-        use winapi::um::wingdi::{BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY};
-        use winapi::um::winuser::{SM_CXSCREEN, SM_CYSCREEN};
+        use windows_sys::Win32::Graphics::Gdi::{BI_RGB, DIB_RGB_COLORS, SRCCOPY};
+        use crate::win_types::BITMAPINFO;
+        use windows_sys::Win32::Graphics::Gdi::BITMAPINFOHEADER;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SM_CXSCREEN, SM_CYSCREEN};
 
         // SAFETY: All Win32 handles are checked for null before use and are
         // released in reverse-acquisition order even on early returns.

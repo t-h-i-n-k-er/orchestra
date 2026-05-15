@@ -20,7 +20,7 @@ fn make_test_tls_server_config() -> Arc<rustls::ServerConfig> {
     let cert =
         rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
     let cert_pem = cert.cert.pem();
-    let key_pem = cert.key_pair.serialize_pem();
+    let key_pem = cert.signing_key.serialize_pem();
     let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
         .filter_map(|r| r.ok())
         .collect();
@@ -57,6 +57,7 @@ async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
         cfg.admin_token.clone(),
         cfg.command_timeout_secs,
         cfg.clone(),
+        true, // dev_mode for tests
     ));
 
     let agent_listener = tokio::net::TcpListener::bind(cfg.agent_addr).await.unwrap();
@@ -81,7 +82,7 @@ async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
     let http_listener = std::net::TcpListener::bind(cfg.http_addr).unwrap();
     http_listener.set_nonblocking(true).unwrap();
     let http_port = http_listener.local_addr().unwrap().port();
-    let tls_cfg = tls::build(None, None).await.unwrap();
+    let tls_cfg = tls::build(None, None, true).await.unwrap();
     let app = api::router(state.clone(), cfg.static_dir.clone());
     tokio::spawn(async move {
         axum_server::from_tcp_rustls(http_listener, tls_cfg)
@@ -129,7 +130,7 @@ impl FakeAgent {
     }
 
     async fn send(&mut self, m: &Message) {
-        let plain = bincode::serialize(m).unwrap();
+        let plain = bincode::serde::encode_to_vec(m, bincode::config::legacy()).unwrap();
         let enc = self.session.encrypt(&plain);
         self.w.write_u32_le(enc.len() as u32).await.unwrap();
         self.w.write_all(&enc).await.unwrap();
@@ -140,7 +141,7 @@ impl FakeAgent {
         let mut buf = vec![0u8; len as usize];
         self.r.read_exact(&mut buf).await.unwrap();
         let plain = self.session.decrypt(&buf).unwrap();
-        bincode::deserialize(&plain).unwrap()
+        bincode::serde::decode_from_slice(&plain, bincode::config::legacy()).map(|(v, _)| v).unwrap()
     }
 }
 

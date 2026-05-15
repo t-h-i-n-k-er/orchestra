@@ -6,6 +6,9 @@
 //!   or by mounting it to a drive letter.
 //! - **Linux**: ESP is typically `/boot/efi` or needs to be mounted from the
 //!   EFI system partition (typically the first FAT32 partition).
+//! - **macOS**: ESP is accessible via `diskutil mount` to mount the EFI system
+//!   partition (typically disk0s1 on Intel Macs).  On Apple Silicon, the ESP
+//!   may not be directly accessible due to the different boot architecture.
 
 use crate::{BootKitConfig, BootloaderType, EfiGuid};
 use anyhow::{bail, Context, Result};
@@ -70,13 +73,17 @@ pub fn mount_esp() -> Result<EspMountResult> {
     {
         mount_esp_windows()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    {
+        mount_esp_macos()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
         bail!("ESP operations are not supported on this platform");
     }
 }
 
-/// Unmount the ESP (Linux only; no-op on Windows where it's always accessible).
+/// Unmount the ESP (Linux/macOS; no-op on Windows where it's always accessible).
 pub fn unmount_esp(mount_point: &str) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -90,7 +97,21 @@ pub fn unmount_esp(mount_point: &str) -> Result<()> {
         }
         Ok(())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        // On macOS, use diskutil unmount to unmount the ESP partition.
+        let output = std::process::Command::new("diskutil")
+            .arg("unmount")
+            .arg(mount_point)
+            .output()
+            .context("Failed to execute diskutil unmount")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("diskutil unmount failed: {}", stderr);
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = mount_point;
         Ok(())
@@ -582,6 +603,158 @@ fn mount_esp_windows() -> Result<EspMountResult> {
     bail!(
         "Could not locate the EFI System Partition on Windows. \
          Try running 'mountvol S: /S' as Administrator first."
+    )
+}
+
+// ─── macOS ESP mounting ─────────────────────────────────────────────────
+
+#[cfg(target_os = "macos")]
+fn mount_esp_macos() -> Result<EspMountResult> {
+    // On macOS, the ESP is typically a FAT32 partition on the boot disk.
+    // Intel Macs: disk0s1 (EFI System Partition).
+    // Apple Silicon: disk0s1 may be the EFI partition but the boot flow
+    // is different (iBoot).  We still try to mount it.
+
+    // Check if the ESP is already mounted at /Volumes/EFI.
+    let vol_efi = Path::new("/Volumes/EFI");
+    if vol_efi.exists() && vol_efi.join("EFI").exists() {
+        let bootloader = detect_bootloader("/Volumes/EFI");
+        return Ok(EspMountResult {
+            mount_point: "/Volumes/EFI".to_string(),
+            was_already_mounted: true,
+            bootloader_type: bootloader,
+        });
+    }
+
+    // Find the EFI system partition using diskutil list.
+    let esp_device = find_esp_partition_macos()?;
+
+    // Mount the ESP using diskutil.
+    let output = std::process::Command::new("diskutil")
+        .arg("mount")
+        .arg(&esp_device)
+        .output()
+        .context("Failed to execute diskutil mount")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "diskutil mount {} failed: {}",
+            esp_device,
+            stderr.trim()
+        );
+    }
+
+    // After mounting, the ESP should be at /Volumes/EFI.
+    if vol_efi.exists() && vol_efi.join("EFI").exists() {
+        let bootloader = detect_bootloader("/Volumes/EFI");
+        Ok(EspMountResult {
+            mount_point: "/Volumes/EFI".to_string(),
+            was_already_mounted: false,
+            bootloader_type: bootloader,
+        })
+    } else {
+        // diskutil may mount it under a different volume name.  Scan /Volumes.
+        let mount_point = scan_volumes_for_efi()?;
+        let bootloader = detect_bootloader(&mount_point);
+        Ok(EspMountResult {
+            mount_point,
+            was_already_mounted: false,
+            bootloader_type: bootloader,
+        })
+    }
+}
+
+/// Find the EFI System Partition on macOS by parsing `diskutil list`.
+#[cfg(target_os = "macos")]
+fn find_esp_partition_macos() -> Result<String> {
+    let output = std::process::Command::new("diskutil")
+        .arg("list")
+        .output()
+        .context("Failed to execute diskutil list")?;
+
+    if !output.status.success() {
+        bail!("diskutil list failed");
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Parse diskutil list output to find the EFI partition.
+    // Format:
+    //   /dev/disk0 (internal, physical):
+    //      #: TYPE NAME            SIZE       IDENTIFIER
+    //      0: GUID_partition_scheme *500 GB    disk0
+    //      1: EFI                  209.7 MB   disk0s1
+    //
+    // We look for lines containing "EFI" as the partition type/name and
+    // extract the identifier (e.g. "disk0s1").
+    let mut found_device: Option<String> = None;
+    let mut in_physical_disk = false;
+
+    for line in stdout.lines() {
+        // Track which disk we're looking at.
+        if line.contains("/dev/disk") && (line.contains("physical") || line.contains("internal")) {
+            in_physical_disk = true;
+            continue;
+        }
+        if line.contains("/dev/disk") {
+            in_physical_disk = false;
+            continue;
+        }
+        if !in_physical_disk {
+            continue;
+        }
+
+        // Look for EFI partition line.  The identifier is the last field.
+        // Example: "      1: EFI                  209.7 MB   disk0s1"
+        if line.contains("EFI") && !line.contains("TYPE") {
+            if let Some(identifier) = line.split_whitespace().last() {
+                if identifier.starts_with("disk") {
+                    found_device = Some(format!("/dev/{}", identifier));
+                    break;
+                }
+            }
+        }
+    }
+
+    // If diskutil parsing didn't find it, try common defaults.
+    match found_device {
+        Some(dev) => Ok(dev),
+        None => {
+            // Try common ESP partition devices on Intel Macs.
+            for dev in &["/dev/disk0s1", "/dev/disk1s1"] {
+                let check = std::process::Command::new("diskutil")
+                    .arg("info")
+                    .arg(dev)
+                    .output();
+                if let Ok(out) = check {
+                    let info = String::from_utf8_lossy(&out.stdout);
+                    if info.contains("EFI") || info.contains("File System: FAT32") {
+                        return Ok(dev.to_string());
+                    }
+                }
+            }
+            bail!(
+                "Could not find the EFI System Partition on macOS. \
+                 Try 'diskutil mount /dev/disk0s1' manually."
+            )
+        }
+    }
+}
+
+/// Scan /Volumes for a mounted ESP (contains an EFI subdirectory).
+#[cfg(target_os = "macos")]
+fn scan_volumes_for_efi() -> Result<String> {
+    let volumes = std::fs::read_dir("/Volumes").context("Failed to read /Volumes")?;
+    for entry in volumes.flatten() {
+        let path = entry.path();
+        if path.is_dir() && path.join("EFI").is_dir() {
+            return Ok(path.to_string_lossy().to_string());
+        }
+    }
+    bail!(
+        "ESP was mounted but could not find EFI directory under /Volumes. \
+         Mount it manually with 'diskutil mount' and provide the path."
     )
 }
 

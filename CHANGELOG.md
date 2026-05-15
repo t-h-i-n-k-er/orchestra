@@ -6,6 +6,35 @@ All notable changes to Orchestra are documented here.
 
 ## [Unreleased]
 
+### Documentation
+
+- Synchronized documentation with codebase (doc-sync pass):
+  - **ARCHITECTURE.md**: Expanded command dispatch table from ~70 to 120+ commands.
+    Added 8 new categories: COM Hijack, DPAPI Backup, Hardware Persistence, Kerberos
+    Relay, macOS Post-Exploitation, Shadow Credentials, UEFI Persistence, WMI
+    Persistence. Added `DenyDebuggerAttach`, `PageTrackerStatus`,
+    `PageTrackerStatusRedacted`, `ProcessDoppelganging` to existing categories.
+  - **FEATURES.md**: Added 7 missing injection feature flags (`module-stomp`,
+    `thread-hijack`, `threadpool-inject`, `fiber-inject`, `context-only`,
+    `section-map`, `callback-inject`) to the Cargo-only feature table. Added 25
+    missing features to the platform compatibility matrix. Fixed platform matrix
+    for `graph-transport`, `quic-transport`, `entra-ptc`, `entra-app-abuse`
+    (cross-platform, not Windows-only). Clarified `strict-module-key` as a
+    `module_loader` crate feature. Removed duplicate `quic-transport` entry.
+  - **ROADMAP.md**: Added 30+ completed items to the "Completed (continued — late
+    2025)" section covering LSA Whisperer, Kernel Callback BYOVD, EDR Bypass
+    Transform, Evanesco, C4 Bomb, Indirect Dynamic Syscall upgrade, Transacted
+    Hollowing, Delayed Module-Stomp, AMSI Write-Raid, Cronus Sleep Obfuscation,
+    Unwind-Aware Stack Spoofing, COM Hijack, DPAPI Backup, Hardware Persistence,
+    Kerberos Relay, macOS Post-Exploitation, Shadow Credentials, UEFI Persistence,
+    WMI Persistence, Graph/QUIC transports, Software Diversification, AD/Entra ID
+    attack suite, Container escape, VSS pivot, LPE, Recon.
+  - **SECURITY_AUDIT.md**: Corrected `strict-module-key` Cargo.toml attribution
+    from `agent/` to `module_loader/`.
+  - **SECURITY.md**: Clarified `strict-module-key` as a `module_loader` crate feature.
+  - **C_SERVER.md**: Fixed stale file reference `common/src/crypto.rs` → `common/src/lib.rs`.
+  - **DEEP_AUDIT_PROMPT.md**: Fixed stale file reference `nt_syscall/src/syscalls.rs` → `nt_syscall/src/lib.rs`.
+
 ### Fixed
 
 - **Linux direct syscall arity handling** — Direct syscall helpers now return

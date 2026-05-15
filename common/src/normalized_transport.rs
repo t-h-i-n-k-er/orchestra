@@ -258,7 +258,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     async fn send(&mut self, msg: Message) -> Result<()> {
-        let serialized = bincode::serialize(&msg)?;
+        let serialized = bincode::serde::encode_to_vec(&msg, bincode::config::legacy())?;
         let ciphertext = self.session.encrypt(&serialized);
         // Fragment large messages across multiple TLS-shaped records so that
         // the 2-byte record-length field is never exceeded.
@@ -279,7 +279,7 @@ where
     async fn recv(&mut self) -> Result<Message> {
         let ciphertext = self.recv_record().await?;
         let plaintext = self.session.decrypt(&ciphertext)?;
-        let msg: Message = bincode::deserialize(&plaintext)?;
+        let msg: Message = bincode::serde::decode_from_slice(&plaintext, bincode::config::legacy()).map(|(v, _)| v)?;
         Ok(msg)
     }
 }
@@ -846,7 +846,7 @@ mod tests {
         clear.read_exact(&mut ciphertext).await.unwrap();
 
         let plaintext = session_server.decrypt(&ciphertext).unwrap();
-        let msg: Message = bincode::deserialize(&plaintext).unwrap();
+        let msg: Message = bincode::serde::decode_from_slice(&plaintext, bincode::config::legacy()).map(|(v, _)| v).unwrap();
         match msg {
             Message::Heartbeat { timestamp, .. } => assert_eq!(timestamp, 7),
             other => panic!("unexpected inbound message: {other:?}"),
@@ -855,7 +855,7 @@ mod tests {
         // Send a framed encrypted response back through the clear stream;
         // client-side NormalizedTransport should decode it as a normal message.
         let response = Message::Shutdown;
-        let response_plain = bincode::serialize(&response).unwrap();
+        let response_plain = bincode::serde::encode_to_vec(&response, bincode::config::legacy()).unwrap();
         let response_ct = session_server.encrypt(&response_plain);
         clear.write_u32_le(response_ct.len() as u32).await.unwrap();
         clear.write_all(&response_ct).await.unwrap();

@@ -28,7 +28,7 @@
 //! No files are written to disk.
 
 use anyhow::Result;
-use log::info;
+use tracing::info;
 use serde::{Deserialize, Serialize};
 
 use super::ad_enum::AdReconData;

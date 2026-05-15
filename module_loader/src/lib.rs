@@ -547,7 +547,7 @@ pub fn load_plugin(
                     (-1isize) as u64, // current process
                     &mut base as *mut _ as u64,
                     &mut size as *mut _ as u64,
-                    winapi::um::winnt::MEM_RELEASE as u64,
+                    windows_sys::Win32::System::Memory::MEM_RELEASE as u64,
                 );
                 return Err(anyhow!(
                     "DLL mapped successfully but the required '_create_plugin' export is missing"

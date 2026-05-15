@@ -42,6 +42,10 @@ mod tests {
             !IOC_DNS_TASK.is_empty(),
             "DNS task prefix must not be empty"
         );
+        assert!(
+            !IOC_DNS_ECDH.is_empty(),
+            "DNS ECDH prefix must not be empty"
+        );
     }
 
     #[test]
@@ -85,6 +89,14 @@ mod tests {
     }
 
     #[test]
+    fn dns_ecdh_is_not_default() {
+        assert_ne!(
+            IOC_DNS_ECDH, "ecdh",
+            "DNS ECDH prefix must not be the default IoC"
+        );
+    }
+
+    #[test]
     fn pipe_name_is_alphanumeric() {
         assert!(
             IOC_PIPE_NAME.chars().all(|c| c.is_ascii_alphanumeric()),
@@ -113,6 +125,18 @@ mod tests {
         assert!(
             IOC_DNS_BEACON.chars().all(|c| c.is_ascii_alphanumeric()),
             "DNS beacon prefix must be alphanumeric: {IOC_DNS_BEACON}"
+        );
+    }
+
+    #[test]
+    fn dns_ecdh_is_alphanumeric() {
+        assert!(
+            IOC_DNS_ECDH.chars().all(|c| c.is_ascii_alphanumeric()),
+            "DNS ECDH prefix must be alphanumeric: {IOC_DNS_ECDH}"
+        );
+        assert!(
+            !IOC_DNS_ECDH.is_empty(),
+            "DNS ECDH prefix must not be empty"
         );
     }
 

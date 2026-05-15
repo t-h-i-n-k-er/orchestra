@@ -23,9 +23,9 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 
 use crate::state::AppState;
-use subtle::ConstantTimeEq;
 
 // ── Data types ───────────────────────────────────────────────────────────────
 
@@ -223,6 +223,10 @@ pub struct RegisterRequest {
     /// Domain fronting domain for this redirector.
     #[serde(default)]
     pub front_domain: Option<String>,
+    /// Shared secret for authenticating the registration.  Must match
+    /// `redirector_secret` in the server config when that is set.
+    #[serde(default)]
+    pub secret: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -292,6 +296,16 @@ pub async fn handle_register(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<RegisterResponse>), (StatusCode, String)> {
+    // Validate the redirector shared secret when configured.
+    if let Some(ref expected) = state.config.redirector_secret {
+        let presented = req.secret.as_deref().unwrap_or("");
+        if !bool::from(presented.as_bytes().ct_eq(expected.as_bytes())) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "invalid or missing redirector secret".to_string(),
+            ));
+        }
+    }
     // Validate URL.
     if req.url.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "url is required".to_string()));

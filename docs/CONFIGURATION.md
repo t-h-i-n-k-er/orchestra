@@ -21,7 +21,14 @@ feature names used by the builder and server.
 | `smb-pipe-transport` | SMB named-pipe transport, with `tcp_relay` mode for relays | Windows named pipe path; TCP relay mode is cross-platform at the relay edge |
 | `p2p-tcp` | Peer-to-peer TCP mesh networking | — |
 | `forward-secrecy` | X25519 + HKDF session key agreement | `common/forward-secrecy` |
-| `traffic-normalization` | Wire-level traffic shaping profiles | `common::normalized_transport` |
+> **⚠️ Experimental — HTTP/DoH forward secrecy:** The `forward-secrecy`
+> feature provides proven X25519 ECDH for persistent streams (TLS, SSH,
+> SMB).  Forward secrecy over HTTP and DoH transports — where the ECDH
+> handshake is carried via `X-ECDH-Pub` headers (HTTP) or DNS TXT
+> record labels (DoH) — is **experimental** and has not been validated
+> against all malleable-profile transforms.  Use in production at your
+> own risk; the static PSK fallback remains available for these
+> transports.| `traffic-normalization` | Wire-level traffic shaping profiles | `common::normalized_transport` |
 
 ### Stealth and Evasion Features
 

@@ -84,6 +84,13 @@ profile `features = [...]` list. They are not separate fields in the current
 | `uefi-persistence` | UEFI NVRAM/ESP persistence support through the workspace UEFI crate |
 | `ebpf` | Linux eBPF process/file/network hiding; implies `direct-syscalls` |
 | `graph-transport` | Microsoft Graph API covert C2 transport |
+| `module-stomp` | Module stomping (overwriting a loaded DLL's `.text` section with payload) |
+| `thread-hijack` | Thread hijacking (suspend + redirect instruction pointer in existing thread) |
+| `threadpool-inject` | ThreadPool injection via 8 sub-variants (Work, WorkerFactory, Timer, IoCompletion, Wait, Alpc, Direct, AsyncIo) |
+| `fiber-inject` | Fiber injection (ConvertThreadToFiber → CreateFiber → SwitchToFiber) |
+| `context-only` | Context-only injection (minimal instruction-pointer redirect with restore trampoline) |
+| `section-map` | Section mapping injection (NtCreateSection dual-mapped shared sections) |
+| `callback-inject` | Callback injection via 12 Windows API callback-dispatch functions |
 | `hardware-persistence` | Hardware/firmware persistence and DMA-oriented tradecraft modules |
 | `lpe` | Local privilege escalation modules |
 | `macos-postexp` | macOS post-exploitation modules (TCC/SIP/XPC/Keychain workflows) |
@@ -178,11 +185,18 @@ c_server_secret = "<psk>"
 
 ### `forward-secrecy`
 
-**Default: no** | **Recommended for: production**
+**Default: no** | **Maturity: stable (TLS/SSH/SMB), experimental (HTTP/DoH)**
 
 Adds an ephemeral X25519 Diffie-Hellman key exchange after the TLS handshake,
 deriving a unique session key via HKDF-SHA256. Even if the PSK is later
 compromised, recorded sessions cannot be decrypted.
+
+> **⚠️ Experimental — HTTP/DoH:** When combined with `http-transport` or
+> `doh-transport`, the ECDH handshake is carried via `X-ECDH-Pub` headers
+> or DNS TXT record labels rather than a persistent stream.  This mode is
+> **experimental** and has not been validated under all malleable-profile
+> transforms.  Both sides fall back to static PSK if the ECDH exchange
+> fails.  Forward secrecy over TLS, SSH, and SMB transports is stable.
 
 | Attribute | Value |
 |-----------|-------|
@@ -210,6 +224,10 @@ features = ["outbound-c", "forward-secrecy"]
 HTTP-based transport using long-polling for command delivery. Useful for
 environments where raw TCP is blocked but HTTPS is allowed.
 
+> **⚠️ Experimental:** This transport has not been validated under all
+> malleable-profile transforms and network environments. Use in production
+> is not recommended without thorough testing.
+
 | Attribute | Value |
 |-----------|-------|
 | Dependencies | None |
@@ -224,6 +242,10 @@ environments where raw TCP is blocked but HTTPS is allowed.
 
 DNS-over-HTTPS transport for agent sessions. Agents tunnel traffic through
 DNS TXT/A queries to the Control Center's DoH bridge.
+
+> **⚠️ Experimental:** This transport has not been validated under all
+> malleable-profile transforms and DNS resolver environments. Use in
+> production is not recommended without thorough testing.
 
 | Attribute | Value |
 |-----------|-------|
@@ -248,6 +270,10 @@ doh_idle_ip         = "127.0.0.1"
 
 SSH-based transport channel for agent communication.
 
+> **⚠️ Experimental:** This transport has not been validated under all
+> network environments. Use in production is not recommended without
+> thorough testing.
+
 | Attribute | Value |
 |-----------|-------|
 | Dependencies | None |
@@ -258,10 +284,14 @@ SSH-based transport channel for agent communication.
 
 ### `smb-pipe-transport`
 
-**Default: no** | **Windows only**
+**Default: no** | **Windows only** | **Experimental**
 
 Uses Windows named pipes over SMB for agent communication in environments
 where TCP traffic is restricted.
+
+> **⚠️ Experimental:** This transport has not been validated under all
+> network environments. Use in production is not recommended without
+> thorough testing.
 
 | Attribute | Value |
 |-----------|-------|
@@ -506,23 +536,26 @@ imports, applies relocations, and calls the entry point entirely in memory.
 
 **Default: no**
 
-Enforces that the agent binary is running inside an approved execution
-context. Detects debuggers, hypervisors/VMs, and Active Directory domain
-membership. The agent exits if any check fails.
+Detects the agent's execution context — debuggers, hypervisors/VMs, sandbox
+indicators, and Active Directory domain membership — and exposes a structured
+report to the operator.  Enforcement is **policy-gated**: the agent does not
+exit unless the operator has explicitly configured one or more refusal knobs
+(`refuse_when_debugged`, `refuse_in_vm`, `sandbox_score_threshold`) or domain
+validation (`validate_domain`) in the build profile.
 
 | Attribute | Value |
 |-----------|-------|
-| Platform | All |
-| Behaviour | Agent exits on failure |
-| Checks | Debugger, VM/hypervisor, AD domain |
+| Platform | Windows, Linux, macOS |
+| Behaviour | Agent exits **only** when a configured policy knob triggers |
+| Checks | Debugger, VM/hypervisor, sandbox score, AD domain |
 
 **Checks performed:**
 
 | Check | Method | Platform |
 |-------|--------|----------|
-| Debugger | `TracerPid` from `/proc/self/status` (Linux); `IsDebuggerPresent()` (Windows) | All |
-| VM/Hypervisor | CPUID hypervisor bit, DMI strings, `/proc/cpuinfo` | All |
-| AD Domain | `/etc/sssd/sssd.conf` or `/etc/krb5.conf` (Linux); `NetGetJoinInformation` (Windows) | All |
+| Debugger | `TracerPid` from `/proc/self/status` (Linux); `IsDebuggerPresent()` (Windows) | Linux, Windows |
+| VM/Hypervisor | CPUID hypervisor bit, DMI strings, `/proc/cpuinfo` | Linux, Windows |
+| AD Domain | `/etc/resolv.conf` `domain`/`search` directives (Linux, macOS); Registry `Tcpip\Parameters\Domain` + AAD join info (Windows) | Linux, macOS, Windows |
 
 **Adaptive VM detection:**
 - Tier 1 (threshold=2): Default for unknown VMs
@@ -1111,7 +1144,7 @@ before loading.
 |------|-----------|
 | Runtime key provided | Verifies against supplied Ed25519 public key |
 | No runtime key | Falls back to compile-time `MODULE_SIGNING_PUBKEY` |
-| `strict-module-key` feature | Hard error if no runtime key — use for production |
+| `strict-module-key` feature (module_loader crate) | Hard error if no runtime key — use for production |
 
 ---
 
@@ -1138,13 +1171,17 @@ features = ["outbound-c", "module-signatures", "strict-module-key"]
 
 **Default: no**
 
-Enables aggressive performance optimizations including SIMD paths and
-microarchitecture-specific dispatch.
+Enables aggressive performance optimizations including SIMD-accelerated
+memory operations (secure zeroing, bulk XOR), x86-64 microarchitecture
+detection (AVX2 / SSE2 / scalar dispatch), and the optimizer crate's full
+metamorphic diversification pipeline (instruction substitution, dead-code
+insertion, NOP scheduling).
 
 | Attribute | Value |
 |-----------|-------|
-| Platform | x86_64 |
-| Overhead | None at runtime — optimizations applied at compile time |
+| Platform | x86_64 (SIMD); all platforms (diversification) |
+| Overhead | None at runtime — SIMD paths selected once at startup |
+| Extra dependency | `optimizer/diversification` feature |
 
 ---
 
@@ -1179,6 +1216,30 @@ microarchitecture-specific dispatch.
 | `hwbp-amsi` | — | ✅ | — |
 | `hw-bp-hook` | — | ✅ | — |
 | `write-raid-amsi` | — | ✅ | — |
+| `graph-transport` | ✅ | ✅ | ✅ |
+| `quic-transport` | ✅ | ✅ | ✅ |
+| `trampoline-spoof` | — | ✅ | — |
+| `cfg-bypass` | — | ✅ | — |
+| `reflective-loader` | — | ✅ | — |
+| `page-fault-exec` | — | ✅ | — |
+| `coop` | — | ✅ | — |
+| `module-stomp` | — | ✅ | — |
+| `thread-hijack` | — | ✅ | — |
+| `threadpool-inject` | — | ✅ | — |
+| `fiber-inject` | — | ✅ | — |
+| `context-only` | — | ✅ | — |
+| `section-map` | — | ✅ | — |
+| `callback-inject` | — | ✅ | — |
+| `entra-ptc` | ✅ | ✅ | ✅ |
+| `entra-attacks` | — | ✅ | — |
+| `entra-app-abuse` | ✅ | ✅ | ✅ |
+| `adcs-attacks` | — | ✅ | — |
+| `wmi-persistence` | — | ✅ | — |
+| `vss-pivot` | — | ✅ | — |
+| `lpe` | — | ✅ | — |
+| `recon` | ✅ | ✅ | ✅ |
+| `macos-postexp` | — | — | ✅ |
+| `hardware-persistence` | — | ✅ | — |
 
 ### Common feature combinations
 

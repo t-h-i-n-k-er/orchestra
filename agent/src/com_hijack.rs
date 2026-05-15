@@ -41,16 +41,19 @@ use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 
 use anyhow::{anyhow, bail, Context, Result};
-use log::{debug, info, warn};
+use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
-use winapi::shared::guiddef::{GUID, REFIID};
-use winapi::shared::minwindef::{BOOL, DWORD, FALSE, HMODULE, LPVOID, TRUE};
-use winapi::shared::ntdef::{HANDLE, HRESULT, LPCWSTR, LPWSTR, NTSTATUS, PCWSTR, PVOID};
-use winapi::shared::winerror::S_OK;
-use winapi::shared::basetsd::{SIZE_T, ULONG_PTR};
-use winapi::shared::minwindef::LPCVOID;
-use winapi::um::winnt::{ACCESS_MASK, HANDLE as NT_HANDLE, LARGE_INTEGER, SECTION_ALL_ACCESS};
+use crate::win_types::{GUID, REFIID};
+use crate::win_types::{BOOL, DWORD, FALSE, HMODULE, LPVOID, TRUE};
+use crate::win_types::{HANDLE, HRESULT, LPCWSTR, LPWSTR, NTSTATUS, PCWSTR, PVOID};
+use crate::win_types::S_OK;
+use crate::win_types::{SIZE_T, ULONG_PTR};
+use crate::win_types::LPCVOID;
+use windows_sys::Win32::Security::ACCESS_MASK;
+use windows_sys::Win32::System::Memory::SECTION_ALL_ACCESS;
+use crate::win_types::HANDLE as NT_HANDLE;
+use crate::win_types::LARGE_INTEGER;
 
 /// `SECTION_INHERIT` from ntapi — not available in winapi 0.3.
 type SECTION_INHERIT = DWORD;
@@ -230,9 +233,9 @@ type FnCoCreateInstance = unsafe extern "system" fn(
 ) -> HRESULT;
 
 /// Type alias for `LPCVOID` (pointer to const void).
-// LPCVOID imported above from winapi::shared::minwindef
+// LPCVOID imported above from 
 
-// ULONG_PTR imported above from winapi::shared::basetsd
+// ULONG_PTR imported above from 
 
 // ── Data structures ─────────────────────────────────────────────────────────
 
@@ -980,296 +983,327 @@ impl TargetSelector {
 
 // ── Proxy DLL Template Generator ────────────────────────────────────────────
 
-/// Generates a minimal DLL template for COM proxy forwarding.
+/// Generate a COM proxy DLL that forwards all standard COM exports to the
+/// original COM server.
 ///
-/// The generated DLL is a bare-minimum PE that exports `DllGetClassObject`,
-/// which is the entry point COM calls when creating an object.  The proxy
-/// forwards the call to the original COM server while allowing interception.
+/// Uses PE export forwarding — a built-in Windows loader feature — to
+/// transparently delegate `DllGetClassObject`, `DllCanUnloadNow`,
+/// `DllRegisterServer`, and `DllUnregisterServer` to `original_handler`.
+/// No shell-code or runtime patching is required; the loader resolves the
+/// forwarder chain before the first call.
 ///
 /// # PE Structure
 ///
-/// The template creates a minimal x86-64 DLL with:
-/// - DOS header
-/// - PE signature
-/// - COFF header (DLL characteristics)
-/// - Optional header (image base, section alignment, etc.)
-/// - Export directory with `DllGetClassObject`
-/// - A single `.text` section with a stub function
+/// Two sections:
+/// - `.text`  — minimal `DllMain` stub (`mov eax, 1; ret`)
+/// - `.rdata` — export directory with forwarder-RVA entries and all strings
 ///
-/// # Note
+/// # Arguments
 ///
-/// This is a *template* — at runtime, the operator would replace the stub
-/// with actual proxy logic that:
-/// 1. Receives the `IClassFactory` request
-/// 2. Optionally logs the request
-/// 3. Forwards to the original COM server
-/// 4. Returns the result
+/// * `clsid`            — CLSID being hijacked (validated, not embedded)
+/// * `original_handler` — Path or name of the original COM server DLL
+///                        (e.g. `"C:\Windows\System32\shell32.dll"`)
 pub fn generate_proxy_dll_template(clsid: &str, original_handler: &str) -> Result<Vec<u8>> {
     // Validate CLSID format
     if !clsid.starts_with('{') || !clsid.ends_with('}') {
         bail!("CLSID must be in {{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}} format");
     }
 
-    // Minimal x86-64 DLL PE structure — a stub DLL with DllGetClassObject export.
-    // This is a hand-crafted minimal PE that exports a single function.
-    //
-    // The DLL does the following:
-    // - DllGetClassObject(rclsid, riid, ppv) → returns CLASS_E_CLASSNOTAVAILABLE
-    // - DllCanUnloadNow() → returns S_FALSE
-    // - DllRegisterServer() → returns S_OK
-    // - DllUnregisterServer() → returns S_OK
-    //
-    // At 64 bytes minimum, but we need export directory, so ~1024 bytes.
-
     let dll_bytes = build_minimal_proxy_dll(clsid, original_handler)?;
-    info!("Generated proxy DLL template: {} bytes for CLSID {}", dll_bytes.len(), clsid);
+    info!("Generated forwarding proxy DLL: {} bytes for CLSID {}", dll_bytes.len(), clsid);
     Ok(dll_bytes)
 }
 
-/// Build a minimal x86-64 PE DLL with DllGetClassObject export.
+/// Build an x86-64 PE DLL whose exports are all PE forwarder entries pointing
+/// at `original_handler`.
 ///
-/// Creates a position-independent DLL that exports:
-/// - `DllGetClassObject` — returns `CLASS_E_CLASSNOTAVAILABLE` (0x80040154)
-/// - `DllCanUnloadNow` — returns `S_FALSE` (0x00000001)
-///
-/// The export names are encoded so that the DLL can be loaded as a COM server.
-fn build_minimal_proxy_dll(_clsid: &str, _original_handler: &str) -> Result<Vec<u8>> {
-    // ── Machine code stubs (x86-64) ─────────────────────────────────────
+/// PE export forwarding lets us avoid embedding any machine-code proxy logic:
+/// the Windows loader resolves "modulename.FunctionName" forwarder strings
+/// before executing a single instruction in our DLL.  The generated DLL
+/// contains only a trivial `DllMain` stub in `.text` and the full export
+/// directory (with forwarder RVAs) in `.rdata`.
+fn build_minimal_proxy_dll(_clsid: &str, original_handler: &str) -> Result<Vec<u8>> {
+    // ── Derive forwarder module name from original_handler ───────────────
+    // PE export forwarding uses "modulename.ExportName" (no path, no extension).
     //
-    // DllGetClassObject:
-    //   mov eax, 0x80040154   ; CLASS_E_CLASSNOTAVAILABLE
-    //   ret
-    //
-    // DllCanUnloadNow:
-    //   mov eax, 1            ; S_FALSE
-    //   ret
-
-    let fn_get_class_object: &[u8] = &[
-        0xB8, 0x54, 0x01, 0x04, 0x80, // mov eax, 0x80040154
-        0xC3,                          // ret
-    ];
-
-    let fn_can_unload_now: &[u8] = &[
-        0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 (S_FALSE)
-        0xC3,                          // ret
-    ];
-
-    // ── DOS Header (64 bytes) ───────────────────────────────────────────
-    let mut pe = Vec::with_capacity(1024);
-
-    // DOS Header
-    pe.extend_from_slice(b"MZ");           // e_magic
-    pe.extend_from_slice(&[0u8; 58]);      // rest of DOS header
-    pe.extend_from_slice(&0x80u32.to_le_bytes()); // e_lfanew → PE header at offset 0x80
-
-    // DOS stub (padding to 0x80)
-    while pe.len() < 0x80 {
-        pe.push(0);
+    // If the original handler is an absolute path (e.g.
+    //   "C:\\Windows\\System32\\shell32.dll"
+    // ), the Windows loader will NOT discover the DLL via normal search
+    // order when only the bare module stem is used as a forwarder target.
+    // We must ensure the DLL is discoverable.  Strategy:
+    //   1. If the path is within a standard system directory
+    //      (System32, SysWOW64, System), the bare stem is sufficient
+    //      because those directories are always on the DLL search path.
+    //   2. For any other absolute path, we emit a full forwarder string
+    //      that includes the directory so the loader can locate it.
+    //      Unfortunately, PE export forwarding does NOT support paths —
+    //      only a module name.  We fall back to the stem and log a warning
+    //      so the operator knows the forwarded DLL must be on the search
+    //      path or co-located.
+    let (module_name, module_path_prefix) = {
+        let base = original_handler
+            .rsplit(|c: char| c == '/' || c == '\\')
+            .next()
+            .unwrap_or(original_handler);
+        let stem = match base.rsplit_once('.') {
+            Some((s, ext)) if ext.eq_ignore_ascii_case("dll") => s.to_string(),
+            _ => base.to_string(),
+        };
+        // Check if the original handler is an absolute path that is NOT in a
+        // standard system directory.  If so, the forwarder module name alone
+        // may not be discoverable.
+        let is_system_dir = original_handler
+            .to_ascii_lowercase()
+            .contains("\\system32\\")
+            || original_handler
+                .to_ascii_lowercase()
+                .contains("\\syswow64\\")
+            || original_handler
+                .to_ascii_lowercase()
+                .contains("\\system\\");
+        let needs_warning = !is_system_dir
+            && (original_handler.contains('\\') || original_handler.contains('/'));
+        (stem, needs_warning)
+    };
+    if module_name.is_empty() {
+        bail!("Cannot derive forwarder module name from '{}'", original_handler);
+    }
+    if module_path_prefix {
+        tracing::warn!(
+            "com_hijack: original_handler '{}' is a non-system absolute path; \
+             export forwarding uses module stem '{}' which must be discoverable \
+             via DLL search order.  Ensure the target DLL is on the search path \
+             or co-located with the proxy DLL.",
+            original_handler,
+            module_name
+        );
     }
 
-    // ── PE Signature ────────────────────────────────────────────────────
+    // ── Standard COM DLL exports (sorted by name for ENPT) ───────────────
+    // PE spec requires the Export Name Pointer Table to be sorted
+    // lexicographically so the loader can binary-search it.
+    let export_func_names: &[&str] = &[
+        "DllCanUnloadNow",
+        "DllGetClassObject",
+        "DllRegisterServer",
+        "DllUnregisterServer",
+    ];
+    let n = export_func_names.len();
+
+    // Export function name strings ("FunctionName\0")
+    let export_name_strings: Vec<Vec<u8>> = export_func_names
+        .iter()
+        .map(|s| format!("{}\0", s).into_bytes())
+        .collect();
+
+    // Forwarder strings ("modulename.FunctionName\0") – placed inside the
+    // export directory's address range so the loader treats the EAT entries
+    // pointing at them as PE forwarders rather than code RVAs.
+    let forwarder_strings: Vec<Vec<u8>> = export_func_names
+        .iter()
+        .map(|s| format!("{}.{}\0", module_name, s).into_bytes())
+        .collect();
+
+    // ── Fixed PE layout (two sections) ───────────────────────────────────
+    //
+    //  File offsets → Virtual Addresses (SectionAlign=0x1000, FileAlign=0x200):
+    //    0x000–0x1FF  headers (DOS + PE sig + COFF + optional header + 2 section hdrs)
+    //    0x200–0x3FF  .text   raw data (DllMain stub, padded to 0x200)
+    //    0x400–...    .rdata  raw data (export directory + all strings)
+    //
+    //  Virtual layout:
+    //    VA 0x1000  .text   (6-byte DllMain: mov eax,1; ret)
+    //    VA 0x2000  .rdata  (export directory with forwarder-RVA EAT entries)
+
+    const TEXT_VA: u32    = 0x1000;
+    const TEXT_FILE: u32  = 0x200;
+    const TEXT_RAWSIZE: u32 = 0x200;
+    const RDATA_VA: u32   = 0x2000;
+    const RDATA_FILE: u32 = 0x400;
+
+    // ── Compute .rdata offsets ────────────────────────────────────────────
+    //
+    //  Offset 0:            Export Directory (40 bytes)
+    //  eat_off:             EAT (n × 4 bytes)  — forwarder-string RVAs
+    //  enpt_off:            ENPT (n × 4 bytes) — name-string RVAs
+    //  eot_off:             EOT  (n × 2 bytes, padded to next multiple of 4)
+    //  dll_name_off:        "proxy.dll\0"
+    //  export_name_off[i]:  "FunctionName\0" for each export
+    //  fwd_off[i]:          "module.FunctionName\0" forwarder strings
+
+    let eat_off: usize  = 40;
+    let enpt_off: usize = eat_off  + 4 * n;
+    let eot_off: usize  = enpt_off + 4 * n;
+    let eot_end: usize  = eot_off  + 2 * n;
+    let dll_name_off: usize = (eot_end + 3) & !3; // align to 4 bytes
+    let dll_name_bytes = b"proxy.dll\0";
+
+    let mut cur = dll_name_off + dll_name_bytes.len();
+    let export_name_offsets: Vec<usize> = export_name_strings.iter().map(|s| {
+        let off = cur; cur += s.len(); off
+    }).collect();
+    let forwarder_offsets: Vec<usize> = forwarder_strings.iter().map(|s| {
+        let off = cur; cur += s.len(); off
+    }).collect();
+
+    let rdata_content_size = cur;
+    // Round up to FileAlignment
+    let rdata_raw_size: usize = (rdata_content_size + 0x1FF) & !0x1FF;
+
+    // The export data-directory SIZE must cover all forwarder strings; the
+    // loader uses [ExportDirRVA, ExportDirRVA + ExportDirSize) to decide
+    // whether an EAT value is a forwarder or a code-RVA.
+    let export_data_dir_size: u32 = rdata_content_size as u32;
+
+    let rdata_vsize: u32 = rdata_content_size as u32;
+    let rdata_vsize_aligned: u32 = (rdata_vsize + 0xFFF) & !0xFFF;
+    let size_of_image: u32 = RDATA_VA + rdata_vsize_aligned;
+
+    // ── Assemble .rdata content ───────────────────────────────────────────
+    let mut rdata = vec![0u8; rdata_raw_size];
+
+    let rdata_rva = |off: usize| RDATA_VA + off as u32;
+
+    // Export Directory (40 bytes at offset 0)
+    patch_u32(&mut rdata,  0, 0);                         // Characteristics
+    patch_u32(&mut rdata,  4, 0);                         // TimeDateStamp
+    // bytes 8-11: MajorVersion / MinorVersion — already 0
+    patch_u32(&mut rdata, 12, rdata_rva(dll_name_off));   // Name RVA
+    patch_u32(&mut rdata, 16, 1);                         // OrdinalBase
+    patch_u32(&mut rdata, 20, n as u32);                  // NumberOfFunctions
+    patch_u32(&mut rdata, 24, n as u32);                  // NumberOfNames
+    patch_u32(&mut rdata, 28, rdata_rva(eat_off));        // AddressOfFunctions (EAT)
+    patch_u32(&mut rdata, 32, rdata_rva(enpt_off));       // AddressOfNames (ENPT)
+    patch_u32(&mut rdata, 36, rdata_rva(eot_off));        // AddressOfNameOrdinals (EOT)
+
+    // EAT: forwarder-string RVAs (within .rdata, which is within the export
+    // directory's reported range → loader treats them as PE forwarders)
+    for (i, &foff) in forwarder_offsets.iter().enumerate() {
+        patch_u32(&mut rdata, eat_off + 4 * i, rdata_rva(foff));
+    }
+
+    // ENPT: export-name string RVAs
+    for (i, &noff) in export_name_offsets.iter().enumerate() {
+        patch_u32(&mut rdata, enpt_off + 4 * i, rdata_rva(noff));
+    }
+
+    // EOT: 0-based ordinal indices
+    for i in 0..n {
+        rdata[eot_off + 2 * i]     = i as u8;
+        rdata[eot_off + 2 * i + 1] = 0;
+    }
+
+    // DLL name string
+    rdata[dll_name_off..dll_name_off + dll_name_bytes.len()]
+        .copy_from_slice(dll_name_bytes);
+
+    // Export name strings ("FunctionName\0")
+    for (i, s) in export_name_strings.iter().enumerate() {
+        let off = export_name_offsets[i];
+        rdata[off..off + s.len()].copy_from_slice(s);
+    }
+
+    // Forwarder strings ("module.FunctionName\0")
+    for (i, s) in forwarder_strings.iter().enumerate() {
+        let off = forwarder_offsets[i];
+        rdata[off..off + s.len()].copy_from_slice(s);
+    }
+
+    // ── Assemble PE ───────────────────────────────────────────────────────
+    let mut pe: Vec<u8> = Vec::with_capacity(0x400 + rdata_raw_size);
+
+    // DOS Header (64 bytes)
+    pe.extend_from_slice(b"MZ");
+    pe.extend_from_slice(&[0u8; 58]);
+    pe.extend_from_slice(&0x80u32.to_le_bytes()); // e_lfanew
+
+    // Pad to PE offset (0x80)
+    pe.resize(0x80, 0);
+
+    // PE Signature
     pe.extend_from_slice(b"PE\0\0");
 
-    // ── COFF Header (20 bytes) ──────────────────────────────────────────
+    // COFF Header (20 bytes)
     pe.extend_from_slice(&0x8664u16.to_le_bytes()); // Machine: AMD64
-    pe.extend_from_slice(&1u16.to_le_bytes());      // NumberOfSections: 1 (.text)
+    pe.extend_from_slice(&2u16.to_le_bytes());      // NumberOfSections (2)
     pe.extend_from_slice(&0u32.to_le_bytes());      // TimeDateStamp
-    pe.extend_from_slice(&0u32.to_le_bytes());      // PointerToSymbolTable (set later)
-    pe.extend_from_slice(&0u32.to_le_bytes());      // NumberOfSymbols (set later)
+    pe.extend_from_slice(&0u32.to_le_bytes());      // PointerToSymbolTable
+    pe.extend_from_slice(&0u32.to_le_bytes());      // NumberOfSymbols
     pe.extend_from_slice(&0x00F0u16.to_le_bytes()); // SizeOfOptionalHeader
-    pe.extend_from_slice(&0x2102u16.to_le_bytes()); // Characteristics: DLL | EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+    pe.extend_from_slice(&0x2102u16.to_le_bytes()); // DLL | EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
 
-    let coff_header_end = pe.len();
-
-    // ── Optional Header (PE32+, 240 bytes) ──────────────────────────────
-    pe.extend_from_slice(&0x020Bu16.to_le_bytes()); // Magic: PE32+
-    pe.push(0x01); // MajorLinkerVersion
-    pe.push(0x00); // MinorLinkerVersion
-    pe.extend_from_slice(&0x1000u32.to_le_bytes()); // SizeOfCode
-    pe.extend_from_slice(&0u32.to_le_bytes());      // SizeOfInitializedData
+    // Optional Header PE32+ (240 bytes)
+    pe.extend_from_slice(&0x020Bu16.to_le_bytes()); // Magic PE32+
+    pe.push(0x0E); pe.push(0x00);                  // LinkerVersion 14.0
+    pe.extend_from_slice(&TEXT_RAWSIZE.to_le_bytes());         // SizeOfCode
+    pe.extend_from_slice(&(rdata_raw_size as u32).to_le_bytes()); // SizeOfInitializedData
     pe.extend_from_slice(&0u32.to_le_bytes());      // SizeOfUninitializedData
-    pe.extend_from_slice(&0x1000u32.to_le_bytes()); // AddressOfEntryPoint
-    pe.extend_from_slice(&0x1000u32.to_le_bytes()); // BaseOfCode
+    pe.extend_from_slice(&TEXT_VA.to_le_bytes());   // AddressOfEntryPoint (DllMain)
+    pe.extend_from_slice(&TEXT_VA.to_le_bytes());   // BaseOfCode
     pe.extend_from_slice(&0x180000000u64.to_le_bytes()); // ImageBase
     pe.extend_from_slice(&0x1000u32.to_le_bytes()); // SectionAlignment
-    pe.extend_from_slice(&0x200u32.to_le_bytes());  // FileAlignment
-    pe.extend_from_slice(&0x0600u16.to_le_bytes()); // MajorOperatingSystemVersion
-    pe.extend_from_slice(&0u16.to_le_bytes());      // MinorOperatingSystemVersion
+    pe.extend_from_slice(&0x0200u32.to_le_bytes()); // FileAlignment
+    pe.extend_from_slice(&6u16.to_le_bytes());      // MajorOSVersion
+    pe.extend_from_slice(&0u16.to_le_bytes());      // MinorOSVersion
     pe.extend_from_slice(&0u16.to_le_bytes());      // MajorImageVersion
     pe.extend_from_slice(&0u16.to_le_bytes());      // MinorImageVersion
-    pe.extend_from_slice(&0x0600u16.to_le_bytes()); // MajorSubsystemVersion
+    pe.extend_from_slice(&6u16.to_le_bytes());      // MajorSubsystemVersion
     pe.extend_from_slice(&0u16.to_le_bytes());      // MinorSubsystemVersion
     pe.extend_from_slice(&0u32.to_le_bytes());      // Win32VersionValue
-    pe.extend_from_slice(&0x3000u32.to_le_bytes()); // SizeOfImage
-    pe.extend_from_slice(&0x200u32.to_le_bytes());  // SizeOfHeaders
+    pe.extend_from_slice(&size_of_image.to_le_bytes()); // SizeOfImage
+    pe.extend_from_slice(&0x0200u32.to_le_bytes()); // SizeOfHeaders
     pe.extend_from_slice(&0u32.to_le_bytes());      // CheckSum
-    pe.extend_from_slice(&0x0003u16.to_le_bytes()); // Subsystem: WINDOWS_CUI
-    pe.extend_from_slice(&0x8160u16.to_le_bytes()); // DllCharacteristics: DYNAMIC_BASE | NX_COMPAT | TERMINAL_SERVER_AWARE | HIGH_ENTROPY_VA
+    pe.extend_from_slice(&3u16.to_le_bytes());      // Subsystem: WINDOWS_CUI
+    pe.extend_from_slice(&0x8160u16.to_le_bytes()); // DllCharacteristics: DYNAMIC_BASE|NX_COMPAT|TERMINAL_SERVER_AWARE|HIGH_ENTROPY_VA
     pe.extend_from_slice(&0x100000u64.to_le_bytes()); // SizeOfStackReserve
-    pe.extend_from_slice(&0x1000u64.to_le_bytes());   // SizeOfStackCommit
+    pe.extend_from_slice(&0x001000u64.to_le_bytes()); // SizeOfStackCommit
     pe.extend_from_slice(&0x100000u64.to_le_bytes()); // SizeOfHeapReserve
-    pe.extend_from_slice(&0x1000u64.to_le_bytes());   // SizeOfHeapCommit
-    pe.extend_from_slice(&0u32.to_le_bytes());        // LoaderFlags
-    pe.extend_from_slice(&0x10u32.to_le_bytes());     // NumberOfRvaAndSizes
+    pe.extend_from_slice(&0x001000u64.to_le_bytes()); // SizeOfHeapCommit
+    pe.extend_from_slice(&0u32.to_le_bytes());      // LoaderFlags
+    pe.extend_from_slice(&16u32.to_le_bytes());     // NumberOfRvaAndSizes
 
-    // Data directories (16 × 8 bytes = 128 bytes)
-    // All zeroed except Export Table (index 0)
-    let export_dir_rva = 0x2000u32; // Export directory in .text section
-    let export_dir_size = 0x100u32;
-
-    // Directory 0: Export Table
-    pe.extend_from_slice(&export_dir_rva.to_le_bytes());
-    pe.extend_from_slice(&export_dir_size.to_le_bytes());
-    // Directories 1-15: zeroed
-    for _ in 1..16 {
-        pe.extend_from_slice(&0u32.to_le_bytes()); // RVA
-        pe.extend_from_slice(&0u32.to_le_bytes()); // Size
+    // Data directories (16 × 8 bytes).
+    // [0] Export table: spans all of .rdata so forwarder strings are covered.
+    pe.extend_from_slice(&RDATA_VA.to_le_bytes());
+    pe.extend_from_slice(&export_data_dir_size.to_le_bytes());
+    for _ in 1..16usize {
+        pe.extend_from_slice(&0u32.to_le_bytes());
+        pe.extend_from_slice(&0u32.to_le_bytes());
     }
 
-    let section_headers_start = pe.len();
-
-    // ── Section Header: .text ───────────────────────────────────────────
-    pe.extend_from_slice(b".text\0\0\0");          // Name (8 bytes)
-    pe.extend_from_slice(&0x1000u32.to_le_bytes()); // VirtualSize
-    pe.extend_from_slice(&0x1000u32.to_le_bytes()); // VirtualAddress
-    pe.extend_from_slice(&0x400u32.to_le_bytes());  // SizeOfRawData
-    pe.extend_from_slice(&0x200u32.to_le_bytes());  // PointerToRawData
-    pe.extend_from_slice(&0u32.to_le_bytes());      // PointerToRelocations
-    pe.extend_from_slice(&0u32.to_le_bytes());      // PointerToLinenumbers
-    pe.extend_from_slice(&0u16.to_le_bytes());      // NumberOfRelocations
-    pe.extend_from_slice(&0u16.to_le_bytes());      // NumberOfLinenumbers
-    pe.extend_from_slice(&0x60000020u32.to_le_bytes()); // Characteristics: CODE | EXECUTE | READ
-
-    // Pad headers to file alignment (0x200)
-    while pe.len() < 0x200 {
-        pe.push(0);
-    }
-
-    // ── .text Section Content ───────────────────────────────────────────
-    let text_section_start = pe.len(); // 0x200
-
-    // Function code at the start of the section
-    let fn_get_offset = 0; // relative to text section
-    let fn_can_offset = fn_get_class_object.len();
-
-    pe.extend_from_slice(fn_get_class_object);
-    pe.extend_from_slice(fn_can_unload_now);
-
-    // ── Export Directory ────────────────────────────────────────────────
-    // Place export directory at a known offset within .text
-    // Align to 16 bytes for cleanliness
-    while pe.len() - text_section_start < 0x100 {
-        pe.push(0);
-    }
-    let export_dir_file_offset = pe.len() - text_section_start;
-
-    // The export directory is at RVA 0x2000 (text section VA 0x1000 + offset 0x1000)
-    // But we placed code at offset 0, and export dir at offset ~0x100
-    // Let's recalculate: export_dir_rva = 0x1000 + export_dir_file_offset
-    // Since we said export_dir_rva = 0x2000, we need to be at file offset
-    // corresponding to RVA 0x2000 = section VA 0x1000 + offset 0x1000
-    // But our .text section is only 0x1000 bytes, so the export dir at RVA 0x2000
-    // would be at offset 0x1000 in the section. Let's fix this.
-    //
-    // Simpler approach: place export dir right after the code.
-    // RVA of export dir = 0x1000 + (pe.len() - text_section_start)
-    // We need to patch this back into the optional header.
-
-    // Export Directory Table (40 bytes)
-    let export_dir_start = pe.len() - text_section_start;
-    let export_dir_rva_actual = 0x1000u32 + export_dir_start as u32;
-
-    // Characteristics (reserved, 0)
-    pe.extend_from_slice(&0u32.to_le_bytes());
-    // TimeDateStamp
-    pe.extend_from_slice(&0u32.to_le_bytes());
-    // MajorVersion / MinorVersion
+    // Section header: .text (40 bytes)
+    pe.extend_from_slice(b".text\0\0\0");
+    pe.extend_from_slice(&6u32.to_le_bytes());          // VirtualSize (DllMain stub)
+    pe.extend_from_slice(&TEXT_VA.to_le_bytes());
+    pe.extend_from_slice(&TEXT_RAWSIZE.to_le_bytes());
+    pe.extend_from_slice(&TEXT_FILE.to_le_bytes());
+    pe.extend_from_slice(&0u32.to_le_bytes());          // PointerToRelocations
+    pe.extend_from_slice(&0u32.to_le_bytes());          // PointerToLinenumbers
     pe.extend_from_slice(&0u16.to_le_bytes());
     pe.extend_from_slice(&0u16.to_le_bytes());
-    // Name RVA (DLL name) — will be filled after we know its offset
-    let name_rva_patch_offset = pe.len();
-    pe.extend_from_slice(&0u32.to_le_bytes()); // placeholder
-    // OrdinalBase
-    pe.extend_from_slice(&1u32.to_le_bytes());
-    // NumberOfFunctions
-    pe.extend_from_slice(&2u32.to_le_bytes());
-    // NumberOfNames
-    pe.extend_from_slice(&2u32.to_le_bytes());
-    // AddressOfFunctions RVA
-    let addr_funcs_rva_patch = pe.len();
-    pe.extend_from_slice(&0u32.to_le_bytes()); // placeholder
-    // AddressOfNames RVA
-    let addr_names_rva_patch = pe.len();
-    pe.extend_from_slice(&0u32.to_le_bytes()); // placeholder
-    // AddressOfNameOrdinals RVA
-    let addr_ordinals_rva_patch = pe.len();
-    pe.extend_from_slice(&0u32.to_le_bytes()); // placeholder
+    pe.extend_from_slice(&0x60000020u32.to_le_bytes()); // CODE | EXECUTE | READ
 
-    // Export Address Table (2 entries, 4 bytes each)
-    let eat_offset = pe.len() - text_section_start;
-    let eat_rva = 0x1000u32 + eat_offset as u32;
-    // Entry 0: DllGetClassObject (forwarder to code)
-    pe.extend_from_slice(&(0x1000u32 + fn_get_offset as u32).to_le_bytes());
-    // Entry 1: DllCanUnloadNow
-    pe.extend_from_slice(&(0x1000u32 + fn_can_offset as u32).to_le_bytes());
+    // Section header: .rdata (40 bytes)
+    pe.extend_from_slice(b".rdata\0\0");
+    pe.extend_from_slice(&rdata_vsize.to_le_bytes());
+    pe.extend_from_slice(&RDATA_VA.to_le_bytes());
+    pe.extend_from_slice(&(rdata_raw_size as u32).to_le_bytes());
+    pe.extend_from_slice(&RDATA_FILE.to_le_bytes());
+    pe.extend_from_slice(&0u32.to_le_bytes());
+    pe.extend_from_slice(&0u32.to_le_bytes());
+    pe.extend_from_slice(&0u16.to_le_bytes());
+    pe.extend_from_slice(&0u16.to_le_bytes());
+    pe.extend_from_slice(&0x40000040u32.to_le_bytes()); // INITIALIZED_DATA | READ
 
-    // Export Name Pointer Table (2 entries, 4 bytes each)
-    let enpt_offset = pe.len() - text_section_start;
-    let enpt_rva = 0x1000u32 + enpt_offset as u32;
-    // We'll patch these after writing the name strings
-    let enpt_name1_rva_patch = pe.len();
-    pe.extend_from_slice(&0u32.to_le_bytes()); // placeholder for DllGetClassObject name RVA
-    let enpt_name2_rva_patch = pe.len();
-    pe.extend_from_slice(&0u32.to_le_bytes()); // placeholder for DllCanUnloadNow name RVA
+    // Pad to SizeOfHeaders (0x200)
+    pe.resize(0x200, 0);
 
-    // Export Ordinal Table (2 entries, 2 bytes each)
-    let eot_offset = pe.len() - text_section_start;
-    let eot_rva = 0x1000u32 + eot_offset as u32;
-    pe.extend_from_slice(&0u16.to_le_bytes()); // ordinal 0
-    pe.extend_from_slice(&1u16.to_le_bytes()); // ordinal 1
+    // .text raw data: DllMain stub (mov eax, 1; ret), zero-padded to TEXT_RAWSIZE
+    pe.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3]); // mov eax, 1; ret
+    pe.resize(0x200 + TEXT_RAWSIZE as usize, 0);
 
-    // DLL Name string
-    let dll_name_offset = pe.len() - text_section_start;
-    let dll_name_rva = 0x1000u32 + dll_name_offset as u32;
-    pe.extend_from_slice(b"proxy.dll\0");
-
-    // Function name: DllGetClassObject
-    let name1_offset = pe.len() - text_section_start;
-    let name1_rva = 0x1000u32 + name1_offset as u32;
-    pe.extend_from_slice(b"DllGetClassObject\0");
-
-    // Function name: DllCanUnloadNow
-    let name2_offset = pe.len() - text_section_start;
-    let name2_rva = 0x1000u32 + name2_offset as u32;
-    pe.extend_from_slice(b"DllCanUnloadNow\0");
-
-    // ── Patch RVAs ──────────────────────────────────────────────────────
-    // Patch Name RVA in Export Directory
-    patch_u32(&mut pe, name_rva_patch_offset, dll_name_rva);
-    // Patch AddressOfFunctions RVA
-    patch_u32(&mut pe, addr_funcs_rva_patch, eat_rva);
-    // Patch AddressOfNames RVA
-    patch_u32(&mut pe, addr_names_rva_patch, enpt_rva);
-    // Patch AddressOfNameOrdinals RVA
-    patch_u32(&mut pe, addr_ordinals_rva_patch, eot_rva);
-    // Patch Export Name Pointer Table entries
-    patch_u32(&mut pe, enpt_name1_rva_patch, name1_rva);
-    patch_u32(&mut pe, enpt_name2_rva_patch, name2_rva);
-
-    // Patch the Export directory RVA in the optional header
-    // The export directory data directory is at offset 0x78 (in PE32+) from
-    // the start of the optional header, which starts at offset 0x80 + 4 (PE sig) + 20 (COFF) = 0x98
-    // Actually: DOS(0x80) + PE_sig(4) + COFF(20) + optional_header_offset(0) + 112
-    // Optional header starts at 0x80 + 4 + 20 = 0x98
-    // Data directories start at offset 112 from optional header start (PE32+)
-    // So export dir entry is at 0x98 + 112 = 0x108
-    patch_u32(&mut pe, 0x108, export_dir_rva_actual);
-    patch_u32(&mut pe, 0x10C, 0x100u32); // export dir size (generous)
-
-    // Pad .text section to SizeOfRawData (0x400 bytes)
-    while pe.len() < text_section_start + 0x400 {
-        pe.push(0);
-    }
+    // .rdata raw data
+    pe.extend_from_slice(&rdata);
 
     Ok(pe)
 }
@@ -1403,21 +1437,38 @@ pub fn scan_targets() -> Result<TargetScanResult> {
     })
 }
 
-/// Generate a proxy DLL template for COM forwarding.
+/// Generate a forwarding proxy DLL for COM hijacking.
 ///
-/// Creates a minimal PE DLL that exports `DllGetClassObject` and
-/// `DllCanUnloadNow`.  The DLL returns `CLASS_E_CLASSNOTAVAILABLE` from
-/// `DllGetClassObject`, serving as a template that can be patched with
-/// actual proxy logic.
+/// Creates a minimal PE DLL whose standard COM exports (`DllGetClassObject`,
+/// `DllCanUnloadNow`, `DllRegisterServer`, `DllUnregisterServer`) are all
+/// PE export-forwarder entries pointing at the original COM server DLL.
+/// The Windows loader resolves forwarder strings before executing any code
+/// in the proxy, so the DLL contains no proxy logic — only a trivial
+/// `DllMain` stub and the export directory.
+///
+/// # Forwarding mechanism
+///
+/// PE export forwarding uses `"modulename.ExportName"` strings.  The module
+/// name is derived from `original_handler` by stripping the directory path
+/// and `.dll` extension.  For example:
+/// - `"C:\\Windows\\System32\\shell32.dll"` → forwarder module `"shell32"`
+/// - `"propsys.dll"` → forwarder module `"propsys"`
+///
+/// **Important**: If `original_handler` is an absolute path outside the
+/// standard system directories (System32, SysWOW64), the proxy DLL will log
+/// a warning because the Windows loader may not discover the target via
+/// normal DLL search order.  Ensure the target DLL is on the search path or
+/// co-located with the proxy.
 ///
 /// # Arguments
 ///
-/// * `clsid` — Target CLSID (embedded as metadata)
-/// * `original_handler` — Description of the original COM handler
+/// * `clsid` — Target CLSID (validated for format, not embedded in the PE)
+/// * `original_handler` — Path or name of the original COM server DLL
+///   (e.g. `"C:\\Windows\\System32\\shell32.dll"`)
 ///
 /// # Returns
 ///
-/// JSON result with hex-encoded DLL bytes.
+/// JSON result with hex-encoded DLL bytes and metadata.
 pub fn generate_proxy(clsid: &str, original_handler: &str) -> Result<ProxyDllResult> {
     let dll_bytes = generate_proxy_dll_template(clsid, original_handler)
         .context("Failed to generate proxy DLL template")?;
@@ -1540,7 +1591,7 @@ mod tests {
         let target = TargetSelector::get_target_by_clsid(
             "{4991D34B-80A1-4291-83B6-3328366B9097}",
         ).unwrap();
-        assert_eq!(target.progid, Some("SearchFolder".to_string()));
+        assert_eq!(target.prog_id, Some("SearchFolder".to_string()));
     }
 
     #[test]

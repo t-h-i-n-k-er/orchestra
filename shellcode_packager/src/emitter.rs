@@ -25,6 +25,26 @@ use crate::pe::{ImportFunc, PeImage};
 use crate::x86::Emitter;
 use anyhow::Result;
 
+/// Compute a hash for a DLL module name that matches the runtime PEB-walk
+/// resolver emitted by [`build_resolver_function`].
+///
+/// The runtime resolver processes UTF-16 chars from the PEB with one
+/// `ror13(hash) ^ lowered_char` per code unit. This function converts the
+/// ASCII DLL name to UTF-16 and applies the same algorithm so the compile-time
+/// hash matches the runtime hash.
+fn hash_module_name(name: &[u8]) -> u32 {
+    let mut hash: u32 = pe_resolve::SEED;
+    for &b in name {
+        if b == 0 {
+            break;
+        }
+        // Runtime lowercases the char, then does ror13 ^ char
+        let c = b.to_ascii_lowercase() as u16;
+        hash = hash.rotate_right(13) ^ (c as u32);
+    }
+    hash
+}
+
 /// Configuration for shellcode generation.
 #[derive(Debug, Clone)]
 pub struct EmitterConfig {
@@ -113,7 +133,7 @@ pub fn emit_loader(pe: &PeImage, config: &EmitterConfig) -> Result<Vec<u8>> {
     let mut call_patches: Vec<(usize, usize)> = Vec::new();
 
     for dll in &pe.imports {
-        let dll_hash = pe_resolve::hash_str(dll.dll_name.to_uppercase().as_bytes());
+        let dll_hash = hash_module_name(dll.dll_name.as_bytes());
         for func in &dll.functions {
             main.mov_r64_imm32(Emitter::RCX, dll_hash);
             match func {
@@ -209,7 +229,7 @@ fn emit_mov_dword_indirect(e: &mut Emitter, base: u8, src: u8) {
 /// Build the inline PEB-walk resolver function.
 ///
 /// ABI:
-///   - Input: RCX = DLL name hash (ROR-13), RDX = function name hash (ROR-13)
+///   - Input: RCX = DLL name hash (ROR-13 XOR), RDX = function name hash (ROR-13 XOR)
 ///   - If bit 31 of RDX is set: RDX[0:15] = ordinal number
 ///   - Output: RAX = resolved function address (0 on failure)
 ///   - Clobbers: R8-R11, flags. Preserves RBX, RSI, RDI, RBP, R12-R15.
@@ -246,7 +266,7 @@ fn build_resolver_function() -> Vec<u8> {
     emit_load_indirect(&mut e, Emitter::RSI, Emitter::RAX, 0x48); // name byte length
     emit_load_indirect(&mut e, Emitter::RBX, Emitter::RAX, 0x50); // name buffer
 
-    e.xor_r32_r32(Emitter::R8, Emitter::R8); // hash = 0
+    e.mov_r64_imm32(Emitter::R8, pe_resolve::SEED); // hash = SEED
     e.xor_r32_r32(Emitter::R9, Emitter::R9); // i = 0
     e.shr_r64_imm8(Emitter::RSI, 1); // char_count = byte_len / 2
 
@@ -266,8 +286,8 @@ fn build_resolver_function() -> Vec<u8> {
         Emitter::R10,
         Emitter::RCX,
     );
-    emit_uppercase_16(&mut e, Emitter::RCX);
-    emit_ror13_add(
+    emit_lowercase_16(&mut e, Emitter::RCX);
+    emit_ror13_xor(
         &mut e,
         Emitter::R8,
         Emitter::RCX,
@@ -288,19 +308,8 @@ fn build_resolver_function() -> Vec<u8> {
     let skip_hash = e.len();
     e.patch_rel32(je_skip_hash_patch, skip_hash, je_skip_hash_end);
 
-    // Final ROR13 (if not skipped due to empty name, which would have hash=0 anyway)
-    // Only do final ror13 if we actually hashed something
-    // Actually we always need the final ror13 per the algorithm
-    // But if empty name we skip — that's fine, the empty module won't match
-
-    // For non-empty names: apply final ROR13
-    // We need a conditional jump over the final ror13 for the empty case
-    // Let's restructure: emit final ror13 before the skip_hash label
-    // Actually, let me just always emit it — it's harmless for hash=0
-    emit_ror13(&mut e, Emitter::R8, Emitter::R10, Emitter::R11);
-
-    // Move skip_hash to after the final ror13
-    // (We already patched je_skip_hash to skip_hash which is below)
+    // Final ROR13 is NOT applied — pe_resolve::hash_str/hash_wstr do not
+    // perform a trailing ror13 after the last byte.
 
     // Compare hash with dll_hash (r14)
     emit_cmp_reg_reg(&mut e, Emitter::R14, Emitter::R8);
@@ -351,7 +360,7 @@ fn build_resolver_function() -> Vec<u8> {
     e.add_r64_r64(Emitter::RAX, Emitter::RBX); // name string
 
     // Hash export name (ASCII)
-    e.xor_r32_r32(Emitter::RDX, Emitter::RDX); // hash = 0
+    e.mov_r64_imm32(Emitter::RDX, pe_resolve::SEED); // hash = SEED
     e.mov_r64_r64(Emitter::RCX, Emitter::RAX);
 
     let name_hash_loop = e.len();
@@ -365,8 +374,8 @@ fn build_resolver_function() -> Vec<u8> {
     e.cmp_r64_imm32(Emitter::RAX, 0);
     let (name_hash_done_jmp, name_hash_done_jmp_end) = e.forward_je();
 
-    emit_uppercase_8(&mut e, Emitter::RAX);
-    emit_ror13_add(
+    emit_lowercase_8(&mut e, Emitter::RAX);
+    emit_ror13_xor(
         &mut e,
         Emitter::RDX,
         Emitter::RAX,
@@ -380,7 +389,7 @@ fn build_resolver_function() -> Vec<u8> {
 
     let name_hash_done = e.len();
     e.patch_rel32(name_hash_done_jmp, name_hash_done, name_hash_done_jmp_end);
-    emit_ror13(&mut e, Emitter::RDX, Emitter::RSI, Emitter::R12);
+    // No final ror13 — pe_resolve::hash_str does not apply a trailing ror13.
 
     // Compare with func_hash (r15)
     emit_cmp_reg_reg(&mut e, Emitter::R15, Emitter::RDX);
@@ -568,34 +577,34 @@ fn emit_load_u16_at_index(e: &mut Emitter, base: u8, index: u8, tmp: u8, dst: u8
     e.emit_byte(0x00);
 }
 
-/// Uppercase a u16 char in `reg` (if 'a'-'z').
-fn emit_uppercase_16(e: &mut Emitter, reg: u8) {
-    e.cmp_r64_imm32(reg, 0x61);
+/// Lowercase a u16 char in `reg` (if 'A'-'Z').
+fn emit_lowercase_16(e: &mut Emitter, reg: u8) {
+    e.cmp_r64_imm32(reg, 0x41);
     let (jb, jb_end) = e.forward_jb();
-    e.cmp_r64_imm32(reg, 0x7A);
+    e.cmp_r64_imm32(reg, 0x5A);
     let (ja, ja_end) = e.forward_ja();
-    e.sub_r64_imm32(reg, 0x20);
+    e.add_r64_imm32(reg, 0x20);
     let done = e.len();
     e.patch_rel32(jb, done, jb_end);
     e.patch_rel32(ja, done, ja_end);
 }
 
-/// Uppercase a byte in `reg` (if 'a'-'z').
-fn emit_uppercase_8(e: &mut Emitter, reg: u8) {
-    e.cmp_r64_imm32(reg, 0x61);
+/// Lowercase a byte in `reg` (if 'A'-'Z').
+fn emit_lowercase_8(e: &mut Emitter, reg: u8) {
+    e.cmp_r64_imm32(reg, 0x41);
     let (jb, jb_end) = e.forward_jb();
-    e.cmp_r64_imm32(reg, 0x7A);
+    e.cmp_r64_imm32(reg, 0x5A);
     let (ja, ja_end) = e.forward_ja();
-    e.sub_r64_imm32(reg, 0x20);
+    e.add_r64_imm32(reg, 0x20);
     let done = e.len();
     e.patch_rel32(jb, done, jb_end);
     e.patch_rel32(ja, done, ja_end);
 }
 
-/// `hash = ror13(hash) + val`. Clobbers `tmp`, `tmp2`.
-fn emit_ror13_add(e: &mut Emitter, hash: u8, val: u8, tmp: u8, tmp2: u8) {
+/// `hash = ror13(hash) ^ val`. Clobbers `tmp`, `tmp2`.
+fn emit_ror13_xor(e: &mut Emitter, hash: u8, val: u8, tmp: u8, tmp2: u8) {
     emit_ror13(e, hash, tmp, tmp2);
-    e.add_r64_r64(hash, val);
+    e.xor_r32_r32(hash, val);
 }
 
 /// `hash = ror13(hash)`. Clobbers `tmp`, `tmp2`.

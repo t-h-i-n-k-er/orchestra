@@ -21,7 +21,16 @@
 //! [key_len bytes: key]
 //! [4 bytes: ciphertext_len (endianness per bit 0)]
 //! [ciphertext_len bytes: ciphertext]
+//! [32 bytes: HMAC-SHA256 authentication tag]
 //! ```
+//!
+//! The HMAC-SHA256 tag authenticates **all** preceding bytes (magic through
+//! ciphertext).  The HMAC key is derived from the blob's own encryption key
+//! via HKDF-SHA256 with the fixed info string `b"orchestra-poly-mac"` so that
+//! no additional out-of-band secret is required — any tampering with the
+//! scheme, key, or ciphertext is detected before decryption.  The tag is
+//! computed as HMAC-SHA256(hkdf_key, header || key || ciphertext) where
+//! `hkdf_key = HKDF-Expand(salt=b"", info=b"orchestra-poly-mac", 32)`.
 //!
 //! **Backward compatibility**: if the first 4 bytes equal `b"POLY"` the
 //! legacy v1 format is assumed:
@@ -32,6 +41,7 @@
 //! [key_len bytes: key]
 //! [4 bytes BE: ciphertext_len]
 //! [ciphertext_len bytes: ciphertext]
+//! [32 bytes: HMAC-SHA256 authentication tag]
 //! ```
 //!
 //! For scheme 3 (RawStub) the `key` field in the wire format is replaced
@@ -50,8 +60,12 @@
 
 use crate::stub_emitter::{emit_stub, StubKind};
 use hkdf::Hkdf;
+use hmac::{Hmac, KeyInit, Mac};
 use rand::Rng;
 use sha2::Sha256;
+
+/// HMAC-SHA256 type alias used for the poly-blob authentication tag.
+type HmacSha256 = Hmac<Sha256>;
 
 // ── Encryption scheme ─────────────────────────────────────────────────────────
 
@@ -185,6 +199,12 @@ pub fn poly_serialize(blob: &PolyBlob, seed: u64) -> Vec<u8> {
 /// and padding length instead of drawing them from `thread_rng()`.
 ///
 /// Useful for tests that need to assert exact byte offsets.
+///
+/// The output includes a 32-byte HMAC-SHA256 authentication tag appended
+/// after the ciphertext.  The HMAC key is derived from the blob's encryption
+/// key via HKDF-SHA256 with info `b"orchestra-poly-mac"` (empty salt).
+/// This provides Encrypt-then-MAC integrity: any tampering with scheme,
+/// padding, key, or ciphertext is detected before decryption.
 pub fn poly_serialize_with_params(blob: &PolyBlob, seed: u64, use_le: bool, pad_len: u8) -> Vec<u8> {
     let mut rng = rand::thread_rng();
 
@@ -211,7 +231,7 @@ pub fn poly_serialize_with_params(blob: &PolyBlob, seed: u64, use_le: bool, pad_
     };
 
     let mut out = Vec::with_capacity(
-        4 + 1 + 1 + pad_len as usize + 4 + blob.key.len() + 4 + blob.ciphertext.len(),
+        4 + 1 + 1 + pad_len as usize + 4 + blob.key.len() + 4 + blob.ciphertext.len() + 32,
     );
     out.extend_from_slice(&magic);
     out.push(blob.scheme.byte());
@@ -221,7 +241,28 @@ pub fn poly_serialize_with_params(blob: &PolyBlob, seed: u64, use_le: bool, pad_
     out.extend_from_slice(&blob.key);
     out.extend_from_slice(&encode_u32(blob.ciphertext.len() as u32));
     out.extend_from_slice(&blob.ciphertext);
+
+    // Encrypt-then-MAC: derive the HMAC key from the blob's encryption key
+    // via HKDF-SHA256, then compute HMAC-SHA256 over all preceding bytes.
+    let mac_key = derive_poly_mac_key(&blob.key);
+    let mut mac = HmacSha256::new_from_slice(&mac_key)
+        .expect("HMAC-SHA256 accepts any key length");
+    mac.update(&out);
+    let tag = mac.finalize().into_bytes();
+    out.extend_from_slice(&tag);
+
     out
+}
+
+/// Derive a 32-byte HMAC-SHA256 key from the poly blob's encryption key
+/// (or stub bytes) using HKDF-SHA256 with an empty salt and the fixed
+/// info string `b"orchestra-poly-mac"`.
+fn derive_poly_mac_key(blob_key: &[u8]) -> [u8; 32] {
+    let hkdf = Hkdf::<Sha256>::new(None, blob_key);
+    let mut mac_key = [0u8; 32];
+    hkdf.expand(b"orchestra-poly-mac", &mut mac_key)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    mac_key
 }
 
 /// Compute the 4-byte wire magic from `seed` using FNV-1a-32 (little-endian).
@@ -1105,7 +1146,8 @@ mod tests {
         let ct_len_off = key_len_off + 4 + key_len;
         let ct_len = decode_u32(&serialized[ct_len_off..ct_len_off + 4]);
         assert_eq!(ct_len, blob.ciphertext.len());
-        assert_eq!(serialized.len(), ct_len_off + 4 + ct_len);
+        // Total = header + key_len(4) + key + ct_len(4) + ct + 32-byte HMAC-SHA256 tag.
+        assert_eq!(serialized.len(), ct_len_off + 4 + ct_len + 32);
     }
 
     // ── New-format-specific tests ──────────────────────────────────────────────
@@ -1149,8 +1191,9 @@ mod tests {
         assert_eq!(decode_u32(&serialized[54..58]), 32);
         // ciphertext bytes.
         assert_eq!(&serialized[58..90], vec![0xBBu8; 32].as_slice());
-        // Total length.
-        assert_eq!(serialized.len(), 4 + 1 + 1 + 0 + 4 + 44 + 4 + 32);
+        // Total length = magic(4) + scheme(1) + flags(1) + pad(0) + key_len(4) + key(44)
+        //               + ct_len(4) + ct(32) + HMAC-SHA256 tag(32).
+        assert_eq!(serialized.len(), 4 + 1 + 1 + 0 + 4 + 44 + 4 + 32 + 32);
     }
 
     #[test]

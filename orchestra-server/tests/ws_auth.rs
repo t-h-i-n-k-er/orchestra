@@ -35,6 +35,7 @@ async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
         cfg.admin_token.clone(),
         cfg.command_timeout_secs,
         cfg.clone(),
+        true, // dev_mode for tests
     ));
 
     let agent_listener = tokio::net::TcpListener::bind(cfg.agent_addr).await.unwrap();
@@ -50,7 +51,7 @@ async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
                 rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
                     .unwrap();
             let cert_pem = cert.cert.pem();
-            let key_pem = cert.key_pair.serialize_pem();
+            let key_pem = cert.signing_key.serialize_pem();
             let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
                 .filter_map(|r| r.ok())
                 .collect();
@@ -75,7 +76,7 @@ async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
     let http_listener = std::net::TcpListener::bind(cfg.http_addr).unwrap();
     http_listener.set_nonblocking(true).unwrap();
     let http_port = http_listener.local_addr().unwrap().port();
-    let tls_cfg = tls::build(None, None).await.unwrap();
+    let tls_cfg = tls::build(None, None, true).await.unwrap();
     let app = api::router(state.clone(), cfg.static_dir.clone());
     tokio::spawn(async move {
         axum_server::from_tcp_rustls(http_listener, tls_cfg)

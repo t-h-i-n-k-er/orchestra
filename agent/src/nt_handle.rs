@@ -61,7 +61,7 @@ impl Drop for NtHandle {
         if self.is_valid() {
             let status = unsafe { crate::syscalls::syscall_NtClose(self.0 as u64) };
             if status != 0 {
-                log::warn!(
+                tracing::warn!(
                     "NtHandle::drop: NtClose({:#x}) returned status {:#x}",
                     self.0,
                     status

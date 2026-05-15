@@ -27,10 +27,10 @@
 // Windows-only, gated by `forensic-cleanup` feature flag.
 
 use std::mem;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use anyhow::{anyhow, bail, Context, Result};
-use log::{debug, info, warn};
+use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -143,7 +143,8 @@ static DUMP_DETECTED: AtomicBool = AtomicBool::new(false);
 
 /// Global flag to stop the monitoring thread.
 static MONITORING_ACTIVE: AtomicBool = AtomicBool::new(true);
-
+/// Handle returned by `add_veh` so we can remove it on teardown.
+static VEH_HANDLE: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 // ═══════════════════════════════════════════════════════════════════════════
 // Data Types
 // ═══════════════════════════════════════════════════════════════════════════
@@ -560,6 +561,73 @@ pub fn enumerate_threats() -> Result<Vec<DumpThreatInfo>> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// VEH Handler
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// EXCEPTION_ACCESS_VIOLATION code.
+const EXCEPTION_ACCESS_VIOLATION: u32 = 0xC0000005;
+/// EXCEPTION_GUARD_PAGE code (triggered when a PAGE_GUARD page is accessed).
+const EXCEPTION_GUARD_PAGE: u32 = 0x80000001;
+/// EXCEPTION_SINGLE_STEP (anti-debug indicator).
+const EXCEPTION_SINGLE_STEP: u32 = 0x80000004;
+/// EXCEPTION_CONTINUE_EXECUTION — we handled the exception.
+const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
+/// EXCEPTION_CONTINUE_SEARCH — pass to next handler.
+const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+
+/// VEH handler for dump protection.
+///
+/// Intercepts access violations and guard-page faults that may indicate a
+/// memory scanning tool is reading our process memory.  Sets the global
+/// `DUMP_DETECTED` flag on suspicious exceptions and lets guard-page
+/// violations through (they are expected — our own guard pages fire these).
+unsafe extern "system" fn dump_veh_handler(
+    exception_info: *mut ExceptionPointers,
+) -> i32 {
+    if exception_info.is_null() {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    let record = (*exception_info).exception_record;
+    if record.is_null() {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    let code = (*record).exception_code;
+
+    match code {
+        EXCEPTION_ACCESS_VIOLATION => {
+            // Access violation from an external reader.  Flag it.
+            DUMP_DETECTED.store(true, Ordering::SeqCst);
+            debug!(
+                "dump_veh_handler: ACCESS_VIOLATION at {:#x}",
+                (*record).exception_address
+            );
+            // Continue execution — the guard page already raised the fault,
+            // the offending scanner will see the exception propagated.
+            EXCEPTION_CONTINUE_EXECUTION
+        }
+        EXCEPTION_GUARD_PAGE => {
+            // Our own guard pages trigger this.  Flag it so the monitoring
+            // loop can react, but let execution continue.
+            DUMP_DETECTED.store(true, Ordering::SeqCst);
+            debug!(
+                "dump_veh_handler: GUARD_PAGE triggered at {:#x}",
+                (*record).exception_address
+            );
+            EXCEPTION_CONTINUE_EXECUTION
+        }
+        EXCEPTION_SINGLE_STEP => {
+            // Single-step can indicate a debugger is tracing.  Flag it.
+            DUMP_DETECTED.store(true, Ordering::SeqCst);
+            debug!("dump_veh_handler: SINGLE_STEP detected");
+            EXCEPTION_CONTINUE_EXECUTION
+        }
+        _ => EXCEPTION_CONTINUE_SEARCH,
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Public API: Protection Installation
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -609,17 +677,17 @@ pub fn install_dump_protection(config: Option<DumpProtectionConfig>) -> Result<D
 
         // Layer 2: Install VEH handler (if enabled).
         if config.enable_veh {
-            // We provide a stub handler address.  In a real implementation,
-            // this would be a function pointer to a VEH handler that:
-            //   - Checks for EXCEPTION_ACCESS_VIOLATION from suspicious addresses
-            //   - Sets DUMP_DETECTED flag
-            //   - Returns EXCEPTION_CONTINUE_EXECUTION for expected exceptions
-            //   - Returns EXCEPTION_CONTINUE_SEARCH for unexpected ones
-            //
-            // For safety in this implementation, we log but don't install a
-            // real VEH (would require a naked function pointer).
-            debug!("VEH handler installation requested (stub mode)");
-            protection.veh_installed = true;
+            match add_veh(dump_veh_handler as usize) {
+                Ok(handle) => {
+                    VEH_HANDLE.store(handle, Ordering::Release);
+                    protection.veh_installed = true;
+                    debug!("VEH handler installed at {:p}", handle);
+                }
+                Err(e) => {
+                    warn!("Failed to install VEH handler: {}", e);
+                    protection.veh_installed = false;
+                }
+            }
         }
 
         // Layer 3: Set ProcessDebugPort to fool anti-anti-debug techniques.
@@ -681,6 +749,24 @@ unsafe fn install_guard_page() -> Result<*mut std::ffi::c_void> {
 /// Cleans up guard pages, removes VEH handlers, and stops monitoring.
 pub fn remove_dump_protection(protection: &DumpProtection) -> Result<()> {
     MONITORING_ACTIVE.store(false, Ordering::SeqCst);
+
+    // Remove VEH handler if one was installed.
+    if protection.veh_installed {
+        let handle = VEH_HANDLE.load(Ordering::Acquire);
+        if !handle.is_null() {
+            unsafe {
+                match remove_veh(handle) {
+                    Ok(()) => {
+                        VEH_HANDLE.store(std::ptr::null_mut(), Ordering::Release);
+                        info!("VEH handler removed");
+                    }
+                    Err(e) => {
+                        warn!("Failed to remove VEH handler: {}", e);
+                    }
+                }
+            }
+        }
+    }
 
     unsafe {
         // Release guard pages.

@@ -408,7 +408,7 @@ pub unsafe fn capture_and_encrypt_thread_contexts(
                     ) {
                         Ok(tag) => tag,
                         Err(_) => {
-                            log::warn!(
+                            tracing::warn!(
                                 "thread_ctx: encrypt failed for tid {}, skipping",
                                 entry.thread_id
                             );
@@ -446,7 +446,7 @@ pub unsafe fn capture_and_encrypt_thread_contexts(
                         was_suspended: true,
                     });
                 } else {
-                    log::warn!(
+                    tracing::warn!(
                         "thread_ctx: NtGetContextThread failed for tid {} (status {:#x}), skipping",
                         entry.thread_id,
                         ctx_status
@@ -483,7 +483,7 @@ pub unsafe fn capture_and_encrypt_thread_contexts(
         ) {
             Ok(tag) => tag,
             Err(_) => {
-                log::warn!("thread_ctx: TLS encrypt failed for current thread");
+                tracing::warn!("thread_ctx: TLS encrypt failed for current thread");
                 // Zero the derived key and return what we have.
                 let mut key_zero = ctx_key;
                 key_zero.zeroize();
@@ -512,7 +512,7 @@ pub unsafe fn capture_and_encrypt_thread_contexts(
         });
     }
 
-    log::debug!(
+    tracing::debug!(
         "thread_ctx: captured {} thread context snapshots",
         snapshots.len()
     );
@@ -589,7 +589,7 @@ pub unsafe fn decrypt_and_restore_thread_contexts(
                         std::ptr::write_bytes(ctx_mut_ptr, 0, CONTEXT_SIZE);
 
                         if status < 0 {
-                            log::error!(
+                            tracing::error!(
                                 "thread_ctx: NtSetContextThread failed for tid {} (status {:#x})",
                                 snap.tid,
                                 status
@@ -598,7 +598,7 @@ pub unsafe fn decrypt_and_restore_thread_contexts(
                     }
                 }
                 Err(_) => {
-                    log::error!(
+                    tracing::error!(
                         "thread_ctx: AEAD tag mismatch for tid {} — possible tampering!",
                         snap.tid
                     );
@@ -634,7 +634,7 @@ pub unsafe fn decrypt_and_restore_thread_contexts(
                     );
                 }
                 Err(_) => {
-                    log::error!(
+                    tracing::error!(
                         "thread_ctx: TLS AEAD tag mismatch for tid {} — possible tampering!",
                         snap.tid
                     );
@@ -644,7 +644,7 @@ pub unsafe fn decrypt_and_restore_thread_contexts(
         }
     }
 
-    log::debug!(
+    tracing::debug!(
         "thread_ctx: restored {} thread context snapshots",
         snapshots.len()
     );

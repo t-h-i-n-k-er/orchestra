@@ -45,7 +45,7 @@ mod imp {
     use super::*;
     use std::io;
 
-    type PipeHandle = winapi::shared::ntdef::HANDLE;
+    type PipeHandle = windows_sys::Win32::Foundation::HANDLE;
 
     // Maximum frame size (must match agent_link and transport.rs).
     #[allow(dead_code)]
@@ -85,7 +85,7 @@ mod imp {
         while filled < buf.len() {
             let mut bytes_read: u32 = 0;
             let ok = unsafe {
-                winapi::um::fileapi::ReadFile(
+                windows_sys::Win32::Storage::FileSystem::ReadFile(
                     handle,
                     buf[filled..].as_mut_ptr() as *mut _,
                     (buf.len() - filled) as u32,
@@ -113,7 +113,7 @@ mod imp {
         while written < data.len() {
             let mut bytes_written: u32 = 0;
             let ok = unsafe {
-                winapi::um::fileapi::WriteFile(
+                windows_sys::Win32::Storage::FileSystem::WriteFile(
                     handle,
                     data[written..].as_ptr() as *const _,
                     (data.len() - written) as u32,
@@ -144,12 +144,12 @@ mod imp {
         let wide_name: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
 
         let handle = unsafe {
-            winapi::um::namedpipeapi::CreateNamedPipeW(
+            windows_sys::Win32::System::Pipes::CreateNamedPipeW(
                 wide_name.as_ptr() as *const _,
-                winapi::um::winbase::PIPE_ACCESS_DUPLEX,
-                winapi::um::winbase::PIPE_TYPE_BYTE
-                    | winapi::um::winbase::PIPE_READMODE_BYTE
-                    | winapi::um::winbase::PIPE_WAIT,
+                windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX,
+                windows_sys::Win32::System::Pipes::PIPE_TYPE_BYTE
+                    | windows_sys::Win32::System::Pipes::PIPE_READMODE_BYTE
+                    | windows_sys::Win32::System::Pipes::PIPE_WAIT,
                 1, // maxInstances (1 per handle)
                 out_size,
                 in_size,
@@ -158,7 +158,7 @@ mod imp {
             )
         };
 
-        if handle == winapi::um::handleapi::INVALID_HANDLE_VALUE {
+        if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
             return Err(anyhow!(
                 "smb_relay: CreateNamedPipeW failed: {}",
                 io::Error::last_os_error()
@@ -167,13 +167,13 @@ mod imp {
 
         // Wait for a client to connect.
         let ok =
-            unsafe { winapi::um::namedpipeapi::ConnectNamedPipe(handle, std::ptr::null_mut()) };
+            unsafe { windows_sys::Win32::System::Pipes::ConnectNamedPipe(handle, std::ptr::null_mut()) };
         if ok == 0 {
             let err = io::Error::last_os_error();
             // ERROR_PIPE_CONNECTED (535) means a client already connected
             // before we called ConnectNamedPipe — this is fine.
             if err.raw_os_error() != Some(535) {
-                unsafe { winapi::um::handleapi::CloseHandle(handle) };
+                unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
                 return Err(anyhow!("smb_relay: ConnectNamedPipe failed: {err}"));
             }
         }
@@ -184,7 +184,7 @@ mod imp {
     /// Close a named-pipe handle.
     pub(super) fn close_pipe(handle: usize) {
         let handle = handle as PipeHandle;
-        unsafe { winapi::um::handleapi::CloseHandle(handle) };
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
     }
 
     // NOTE: The original bridge_pipe_to_tcp was dead code — the blocking
@@ -299,7 +299,7 @@ async fn bridge_connection(pipe_handle_raw: usize, agent_addr: std::net::SocketA
 
     // Blocking task: read frames from the pipe and send to the channel.
     let pipe_reader = tokio::task::spawn_blocking(move || {
-        let pipe_read_handle = pipe_read_handle_raw as winapi::shared::ntdef::HANDLE;
+        let pipe_read_handle = pipe_read_handle_raw as windows_sys::Win32::Foundation::HANDLE;
         loop {
             let mut len_buf = [0u8; 4];
             if let Err(e) = imp::read_exact_sync(pipe_read_handle, &mut len_buf) {
@@ -359,7 +359,7 @@ async fn bridge_connection(pipe_handle_raw: usize, agent_addr: std::net::SocketA
     // Blocking task: write frames from TCP to the pipe.
     let pipe_write_handle_raw = pipe_handle_raw;
     let pipe_writer = tokio::task::spawn_blocking(move || {
-        let pipe_write_handle = pipe_write_handle_raw as winapi::shared::ntdef::HANDLE;
+        let pipe_write_handle = pipe_write_handle_raw as windows_sys::Win32::Foundation::HANDLE;
         let mut rx = write_rx;
         while let Some(frame) = rx.blocking_recv() {
             if let Err(e) = imp::write_all_sync(pipe_write_handle, &frame) {

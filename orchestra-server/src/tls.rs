@@ -50,7 +50,7 @@ fn cert_fingerprint(pem_bytes: &[u8]) -> Option<String> {
     )
 }
 
-pub async fn build(cert: Option<&Path>, key: Option<&Path>) -> Result<RustlsConfig> {
+pub async fn build(cert: Option<&Path>, key: Option<&Path>, dev_mode: bool) -> Result<RustlsConfig> {
     match (cert, key) {
         (Some(c), Some(k)) => {
             let pem_bytes = std::fs::read(c)
@@ -72,15 +72,31 @@ pub async fn build(cert: Option<&Path>, key: Option<&Path>) -> Result<RustlsConf
             })
         }
         _ => {
+            if !dev_mode {
+                anyhow::bail!(
+                    "FATAL: No TLS certificate configured (tls_cert_path / tls_key_path). \
+                     Self-signed certificate generation is disabled in production.\n\
+                     Either:\n\
+                     1) Set tls_cert_path and tls_key_path in your config to point to a real certificate, or\n\
+                     2) Run with --dev to allow ephemeral self-signed certs (development/testing only).\n\
+                     Tip: Generate a quick local cert with: scripts/generate-certs.sh"
+                );
+            }
             tracing::warn!(
                 "No TLS cert configured; generating an in-memory self-signed certificate. \
                  For production, terminate TLS at a reverse proxy or supply tls_cert_path/tls_key_path."
             );
-            let cert = rcgen::generate_simple_self_signed(vec![
+            let key_pair = rcgen::KeyPair::generate()
+                .map_err(|e| anyhow::anyhow!("rcgen key generation failed: {e}"))?;
+            let mut params = rcgen::CertificateParams::new(vec![
                 "localhost".to_string(),
                 "127.0.0.1".to_string(),
-            ])?;
-            let pem_cert = cert.cert.pem();
+            ])
+            .map_err(|e| anyhow::anyhow!("rcgen params failed: {e}"))?;
+            params.is_ca = rcgen::IsCa::NoCa;
+            let cert = params.self_signed(&key_pair)
+                .map_err(|e| anyhow::anyhow!("rcgen self-signed cert failed: {e}"))?;
+            let pem_cert = cert.pem();
             if let Some(fp) = cert_fingerprint(pem_cert.as_bytes()) {
                 tracing::info!(
                     fingerprint = %fp,
@@ -88,7 +104,7 @@ pub async fn build(cert: Option<&Path>, key: Option<&Path>) -> Result<RustlsConf
                      use this fingerprint as `server_cert_fingerprint` in agent.toml for pinning"
                 );
             }
-            let pem_key = cert.key_pair.serialize_pem();
+            let pem_key = key_pair.serialize_pem();
             RustlsConfig::from_pem(pem_cert.into_bytes(), pem_key.into_bytes())
                 .await
                 .context("self-signed RustlsConfig")
@@ -521,10 +537,11 @@ pub fn build_agent_tls_config(
         // P2-16: Load CRL serials if a CRL path is configured.
         let revoked_serials = match &server_cfg.mtls_crl_path {
                 Some(crl_path) => load_crl_serials(crl_path)
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(path = %crl_path.display(), error = %e, "CRL load failed; proceeding with empty revocation list");
-                        Vec::new()
-                    }),
+                    .with_context(|| format!(
+                        "CRL is configured (mtls_crl_path={}) but could not be loaded; \
+                         refusing to start without revocation data to prevent revoked certs from being accepted",
+                         crl_path.display()
+                    ))?,
                 None => Vec::new(),
             };
         Some(std::sync::Arc::new(CnOuVerifier {

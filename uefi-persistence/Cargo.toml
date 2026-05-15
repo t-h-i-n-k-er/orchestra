@@ -15,14 +15,9 @@ hex = "0.4"
 sha2 = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-winapi = { version = "0.3", features = [
-    "winbase",
-    "winnt",
-    "errhandlingapi",
-    "handleapi",
-    "fileapi",
-    "processthreadsapi",
-    "synchapi",
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_WindowsProgramming",
 ] }
 
 [dev-dependencies]

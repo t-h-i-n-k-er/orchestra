@@ -325,13 +325,13 @@ fn hw_timestamp() -> u64 {
     } {
         Ok(s) => s,
         Err(e) => {
-            log::debug!("hw_timestamp: NtQueryPerformanceCounter failed: {}", e);
+            tracing::debug!("hw_timestamp: NtQueryPerformanceCounter failed: {}", e);
             return 0;
         }
     };
 
     if status != 0 {
-        log::debug!(
+        tracing::debug!(
             "hw_timestamp: NtQueryPerformanceCounter returned {:#010x}, using 0",
             status as u32
         );

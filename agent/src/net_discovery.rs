@@ -447,7 +447,7 @@ mod dns_windows {
                 f(records, 0);
             }
             None => {
-                log::warn!(
+                tracing::warn!(
                     "[net_discovery] could not resolve DnsRecordListFree — leaking DNS records"
                 );
             }

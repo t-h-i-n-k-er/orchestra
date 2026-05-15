@@ -40,6 +40,25 @@
 use anyhow::anyhow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+// ─── NT native types (not exposed by windows-sys) ──────────────────────────
+
+#[repr(C)]
+struct UNICODE_STRING {
+    Length: u16,
+    MaximumLength: u16,
+    Buffer: *mut u16,
+}
+
+#[repr(C)]
+struct OBJECT_ATTRIBUTES {
+    Length: u32,
+    RootDirectory: *mut std::ffi::c_void,
+    ObjectName: *mut UNICODE_STRING,
+    Attributes: u32,
+    SecurityDescriptor: *mut std::ffi::c_void,
+    SecurityQualityOfService: *mut std::ffi::c_void,
+}
 use std::sync::{Mutex, OnceLock, RwLock};
 
 // ─── Syscall target ────────────────────────────────────────────────────────
@@ -310,11 +329,11 @@ unsafe fn read_ntdll_timestamp() -> u32 {
 /// Read the `TimeDateStamp` from the PE header at `base`.
 /// Returns 0 if the header cannot be parsed.
 unsafe fn read_pe_timestamp(base: usize) -> u32 {
-    let dos = &*(base as *const winapi::um::winnt::IMAGE_DOS_HEADER);
+    let dos = &*(base as *const windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER);
     if dos.e_magic != 0x5A4D {
         return 0;
     }
-    let nt = &*((base + dos.e_lfanew as usize) as *const winapi::um::winnt::IMAGE_NT_HEADERS64);
+    let nt = &*((base + dos.e_lfanew as usize) as *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64);
     nt.FileHeader.TimeDateStamp
 }
 
@@ -404,12 +423,12 @@ unsafe fn resolve_via_ssdt(func_name: &str) -> Option<SyscallTarget> {
         gadget_addr: 0,
     });
 
-    let mut h_system: *mut winapi::ctypes::c_void = std::ptr::null_mut();
+    let mut h_system: *mut std::ffi::c_void = std::ptr::null_mut();
     let pid: u32 = 4; // System process
 
     // Minimal OBJECT_ATTRIBUTES.
-    let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-    obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+    let mut obj_attr: OBJECT_ATTRIBUTES = std::mem::zeroed();
+    obj_attr.Length = std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32;
 
     // CLIENT_ID for System process.
     #[repr(C)]
@@ -427,7 +446,11 @@ unsafe fn resolve_via_ssdt(func_name: &str) -> Option<SyscallTarget> {
         sys_open.gadget_addr,
         &[
             &mut h_system as *mut _ as u64,
-            0x001F0003u64, // PROCESS_ALL_ACCESS (simplified)
+            // PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE |
+            // PROCESS_TERMINATE | PROCESS_CREATE_THREAD |
+            // PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION |
+            // SYNCHRONIZE  (HIGH-011: added VM rights for SSDT readback)
+            0x001F0073u64,
             &mut obj_attr as *mut _ as u64,
             &mut client_id as *mut _ as u64,
         ],
@@ -443,7 +466,7 @@ unsafe fn resolve_via_ssdt(func_name: &str) -> Option<SyscallTarget> {
 
     // RAII guard to ensure the System handle is always closed.
     struct SystemHandleGuard {
-        handle: *mut winapi::ctypes::c_void,
+        handle: *mut std::ffi::c_void,
         close: SyscallTarget,
     }
     impl Drop for SystemHandleGuard {
@@ -591,11 +614,11 @@ unsafe fn resolve_via_ssdt(func_name: &str) -> Option<SyscallTarget> {
 unsafe fn resolve_kernel_export_rva(
     kernel_base: usize,
     export_name: &str,
-    h_system: *mut winapi::ctypes::c_void,
+    h_system: *mut std::ffi::c_void,
     sys_read: SyscallTarget,
 ) -> Option<usize> {
     // Read the DOS header.
-    let mut dos_buf = [0u8; std::mem::size_of::<winapi::um::winnt::IMAGE_DOS_HEADER>()];
+    let mut dos_buf = [0u8; std::mem::size_of::<windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER>()];
     let mut bytes_read: usize = 0;
     let status = do_syscall(
         sys_read.ssn,
@@ -828,8 +851,11 @@ fn compare_export_name(remote: &[u8], target: &[u8]) -> i32 {
         }
     }
     // Target exhausted — check if remote also ends here (or has more chars).
+    // CRIT-003 fix: when target is a prefix of remote (e.g. target="NtCreate",
+    // remote="NtCreateThread"), remote is alphabetically GREATER than target,
+    // so we must return 1 (not -1) to guide the binary search correctly.
     if target.len() < remote.len() && remote[target.len()] != 0 {
-        -1 // remote is longer
+        1 // remote is longer (alphabetically greater)
     } else {
         0
     }
@@ -881,16 +907,31 @@ unsafe fn query_kernel_base() -> Option<usize> {
         return None;
     }
 
-    // RTL_PROCESS_MODULE_INFORMATION — matches the kernel's definition on x86_64.
-    // The `Section` field is an expanded IMAGE_INFO structure (16 bytes on x64),
-    // followed by the standard fields.  Using a repr(C) struct ensures the layout
-    // matches the ABI and lets the compiler compute the correct size, eliminating
-    // manual byte-counting errors.
-    #[cfg(target_arch = "x86_64")]
+    // RTL_PROCESS_MODULE_INFORMATION — matches the kernel's definition on all
+    // 64-bit Windows targets (x86_64 and aarch64).  The `Section` field is an
+    // expanded IMAGE_INFO structure (16 bytes: two ULARGE_INTEGER/u64 values),
+    // followed by the standard fields.  Using a repr(C) struct ensures the
+    // layout matches the ABI and lets the compiler compute the correct size,
+    // eliminating manual byte-counting errors.
+    //
+    // Layout (all 64-bit targets):
+    //   +0x00  Section          ULARGE_INTEGER[2]  = 16 bytes
+    //   +0x10  MappedBase       PVOID              =  8 bytes
+    //   +0x18  ImageBase        PVOID              =  8 bytes  ← target
+    //   +0x20  ImageSize        ULONG              =  4 bytes
+    //   +0x24  Flags            ULONG              =  4 bytes
+    //   +0x28  LoadOrderIndex   USHORT             =  2 bytes
+    //   +0x2A  InitOrderIndex   USHORT             =  2 bytes
+    //   +0x2C  LoadCount        USHORT             =  2 bytes
+    //   +0x2E  OffsetToFileName USHORT             =  2 bytes
+    //   +0x30  FullPathName     UCHAR[256]         = 256 bytes
+    //                                                     ────────
+    //                                              Total = 304 bytes
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[repr(C)]
     #[allow(non_camel_case_types)]
     struct RtlProcessModuleInformation {
-        section: [u64; 2],         // +0x00  IMAGE_INFO (16 bytes on x64)
+        section: [u64; 2],         // +0x00  IMAGE_INFO (16 bytes)
         mapped_base: u64,          // +0x10
         image_base: u64,           // +0x18  — what we want
         image_size: u32,           // +0x20
@@ -902,22 +943,21 @@ unsafe fn query_kernel_base() -> Option<usize> {
         full_path_name: [u8; 256], // +0x30
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     const MODULE_INFO_SIZE: usize = std::mem::size_of::<RtlProcessModuleInformation>();
 
-    // Fallback for non-x86_64 targets (e.g. aarch64) where the struct layout
-    // may differ — use the known size for that architecture.
-    #[cfg(not(target_arch = "x86_64"))]
-    const MODULE_INFO_SIZE: usize = 304; // TODO: verify on aarch64
+    // Fallback for other targets (e.g. 32-bit) where the struct layout differs.
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    const MODULE_INFO_SIZE: usize = 304;
 
     // RTL_PROCESS_MODULES layout:
     //   ULONG NumberOfModules           (4 bytes)
-    //   ULONG padding                   (4 bytes on x64)
+    //   ULONG padding                   (4 bytes on 64-bit)
     //   RTL_PROCESS_MODULE_INFORMATION Modules[1]
     let first_module_offset = 8; // After NumberOfModules (4) + padding (4)
 
     // Compile-time sanity check: the struct must match the kernel ABI.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     const _: () = assert!(
         std::mem::size_of::<RtlProcessModuleInformation>() == 304,
         "RtlProcessModuleInformation size mismatch"
@@ -928,11 +968,11 @@ unsafe fn query_kernel_base() -> Option<usize> {
     }
 
     // The first module is typically the kernel (ntoskrnl.exe).
-    // ImageBase is at struct offset 0x18 (24) on x64.
-    #[cfg(target_arch = "x86_64")]
+    // ImageBase is at struct offset 0x18 (24) on all 64-bit targets.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     let image_base_off = first_module_offset + 24;
-    #[cfg(not(target_arch = "x86_64"))]
-    let image_base_off = first_module_offset + 16;
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let image_base_off = first_module_offset + 12; // 32-bit: pointers are 4 bytes
     if image_base_off + 8 > buf.len() {
         return None;
     }
@@ -940,15 +980,15 @@ unsafe fn query_kernel_base() -> Option<usize> {
         usize::from_le_bytes(buf[image_base_off..image_base_off + 8].try_into().ok()?);
 
     // Verify it's the kernel by checking the name.
-    // OffsetToFileName is at struct offset 0x2E (46) on x64.
-    #[cfg(target_arch = "x86_64")]
+    // OffsetToFileName is at struct offset 0x2E (46) on 64-bit targets.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     let name_offset_field_off = first_module_offset + 46;
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let name_offset_field_off = first_module_offset + 38;
-    // FullPathName array starts at struct offset 0x30 (48) on x64.
-    #[cfg(target_arch = "x86_64")]
+    // FullPathName array starts at struct offset 0x30 (48) on 64-bit targets.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     let full_path_name_off = first_module_offset + 48;
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let full_path_name_off = first_module_offset + 40;
 
     if full_path_name_off + 256 > buf.len() {
@@ -1035,8 +1075,8 @@ unsafe fn parse_syscall_stub(func_addr: usize) -> Option<SyscallTarget> {
 ///   2. The gadget does not straddle a 4 KiB page boundary.
 #[cfg(windows)]
 unsafe fn gadget_is_valid(addr: usize, len: usize) -> bool {
-    use winapi::um::memoryapi::VirtualQuery;
-    use winapi::um::winnt::{MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+    use windows_sys::Win32::System::Memory::VirtualQuery;
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEM_COMMIT};
 
     let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
     if VirtualQuery(
@@ -1073,7 +1113,8 @@ unsafe fn gadget_is_valid(addr: usize, len: usize) -> bool {
 /// Collect virtual addresses of all `Nt`-prefixed exports from `module_base`.
 #[cfg(windows)]
 unsafe fn collect_nt_export_vas(module_base: usize) -> Vec<usize> {
-    use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY, IMAGE_NT_HEADERS64};
+    use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64;
+    use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY};
 
     let dos = &*(module_base as *const IMAGE_DOS_HEADER);
     if dos.e_magic != 0x5A4D {
@@ -1138,7 +1179,7 @@ unsafe fn infer_ssn_halo_gate(ntdll_base: usize, target_addr: usize) -> Option<S
 
     let target_idx = vas.iter().position(|&va| va == target_addr)?;
 
-    const MAX_DELTA: usize = 8;
+    const MAX_DELTA: usize = 16;
     for delta in 1..=MAX_DELTA {
         if let Some(&upper_va) = vas.get(target_idx + delta) {
             if let Some(t) = parse_syscall_stub(upper_va) {
@@ -1184,7 +1225,8 @@ unsafe fn infer_ssn_halo_gate(ntdll_base: usize, target_addr: usize) -> Option<S
 /// (x86-64).  Returns the gadget's address, or `None` if none was found.
 #[cfg(all(windows, target_arch = "x86_64"))]
 unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
-    use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
+    use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
+    use windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER;
 
     let dos = &*(ntdll_base as *const IMAGE_DOS_HEADER);
     if dos.e_magic != 0x5A4D {
@@ -1193,7 +1235,7 @@ unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
     let nt = &*((ntdll_base + dos.e_lfanew as usize) as *const IMAGE_NT_HEADERS64);
     let p_sections = (nt as *const _ as usize
         + 4
-        + std::mem::size_of::<winapi::um::winnt::IMAGE_FILE_HEADER>()
+        + std::mem::size_of::<windows_sys::Win32::System::Diagnostics::Debug::IMAGE_FILE_HEADER>()
         + nt.FileHeader.SizeOfOptionalHeader as usize)
         as *const IMAGE_SECTION_HEADER;
 
@@ -1207,7 +1249,7 @@ unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
             && name[4] == b't'
         {
             let start = ntdll_base + section.VirtualAddress as usize;
-            let size = *section.Misc.VirtualSize() as usize;
+            let size = section.Misc.VirtualSize as usize;
             let code = std::slice::from_raw_parts(start as *const u8, size);
             for j in 0..size.saturating_sub(3) {
                 if code[j] == 0x0f && code[j + 1] == 0x05 {
@@ -1229,7 +1271,8 @@ unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
 /// instructions, so the scan walks in 4-byte (u32) steps.
 #[cfg(all(windows, target_arch = "aarch64"))]
 unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
-    use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
+    use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
+    use windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER;
 
     let dos = &*(ntdll_base as *const IMAGE_DOS_HEADER);
     if dos.e_magic != 0x5A4D {
@@ -1238,7 +1281,7 @@ unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
     let nt = &*((ntdll_base + dos.e_lfanew as usize) as *const IMAGE_NT_HEADERS64);
     let p_sections = (nt as *const _ as usize
         + 4
-        + std::mem::size_of::<winapi::um::winnt::IMAGE_FILE_HEADER>()
+        + std::mem::size_of::<windows_sys::Win32::System::Diagnostics::Debug::IMAGE_FILE_HEADER>()
         + nt.FileHeader.SizeOfOptionalHeader as usize)
         as *const IMAGE_SECTION_HEADER;
 
@@ -1252,7 +1295,7 @@ unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
             && name[4] == b't'
         {
             let start = ntdll_base + section.VirtualAddress as usize;
-            let size = *section.Misc.VirtualSize() as usize;
+            let size = section.Misc.VirtualSize as usize;
             let n_words = size / 4;
             let words = std::slice::from_raw_parts(start as *const u32, n_words);
             for j in 0..n_words {
@@ -1459,18 +1502,18 @@ fn map_clean_ntdll() -> anyhow::Result<usize> {
         .collect();
 
     unsafe {
-        let mut obj_name: winapi::shared::ntdef::UNICODE_STRING = std::mem::zeroed();
+        let mut obj_name: UNICODE_STRING = std::mem::zeroed();
         obj_name.Length = ((ntdll_path.len() - 1) * 2) as u16;
         obj_name.MaximumLength = (ntdll_path.len() * 2) as u16;
         obj_name.Buffer = ntdll_path.as_mut_ptr();
 
-        let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-        obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+        let mut obj_attr: OBJECT_ATTRIBUTES = std::mem::zeroed();
+        obj_attr.Length = std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32;
         obj_attr.ObjectName = &mut obj_name;
         obj_attr.Attributes = 0x40; // OBJ_CASE_INSENSITIVE
 
         let mut io_status = [0u64; 2];
-        let mut h_file: *mut winapi::ctypes::c_void = std::ptr::null_mut();
+        let mut h_file: *mut std::ffi::c_void = std::ptr::null_mut();
 
         let s = do_syscall(
             sys_open.ssn,
@@ -1491,7 +1534,7 @@ fn map_clean_ntdll() -> anyhow::Result<usize> {
             ));
         }
 
-        let mut h_section: *mut winapi::ctypes::c_void = std::ptr::null_mut();
+        let mut h_section: *mut std::ffi::c_void = std::ptr::null_mut();
         let s = do_syscall(
             sys_section.ssn,
             gadget,
@@ -1513,7 +1556,7 @@ fn map_clean_ntdll() -> anyhow::Result<usize> {
             ));
         }
 
-        let mut base_addr: *mut winapi::ctypes::c_void = std::ptr::null_mut();
+        let mut base_addr: *mut std::ffi::c_void = std::ptr::null_mut();
         let mut view_size: usize = 0;
         let s = do_syscall(
             sys_map.ssn,
@@ -1731,6 +1774,9 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
     }
     #[cfg(target_arch = "aarch64")]
     {
+        // Windows ARM64 syscall convention: first 8 args in x0-x7, x8 is the
+        // syscall number.  Stack arguments (args[8..]) must be spilled to
+        // [sp+0], [sp+8], … per AAPCS64.
         let a1 = args.get(0).copied().unwrap_or(0);
         let a2 = args.get(1).copied().unwrap_or(0);
         let a3 = args.get(2).copied().unwrap_or(0);
@@ -1739,66 +1785,178 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
         let a6 = args.get(5).copied().unwrap_or(0);
         let a7 = args.get(6).copied().unwrap_or(0);
         let a8 = args.get(7).copied().unwrap_or(0);
+        let stack_args_a64: &[u64] = if args.len() > 8 { &args[8..] } else { &[] };
+        let nstack_a64: usize = stack_args_a64.len();
+        let stack_ptr_a64: *const u64 = stack_args_a64.as_ptr();
 
         if gadget_addr != 0 {
             // Indirect call: branch to a `svc #0; ret` gadget inside ntdll
             // so that no `svc` instruction exists in this crate's code pages.
             // `blr` stores the return address in x30 (LR); the gadget's
             // trailing `ret` uses x30 to return here.
+            //
+            // Stack args beyond x0-x7 are copied to [sp] so the kernel can
+            // read them during the syscall.  SP is saved/restored via x20
+            // (callee-saved, survives the blr, and not reserved by LLVM
+            // unlike x19 on Windows ARM64).
+            //
+            // REGISTER BUDGET: ARM64 has very few free GPRs for inline-asm
+            // operands (x0-x17, x20, x30 are all clobbered; x18/x19 are
+            // reserved).  We therefore pack the 8 register arguments into a
+            // stack array and load them with `ldp` (load-pair) instructions,
+            // reducing the simultaneous in(reg) count from 12 to 5.
+            let regs: [u64; 8] = [a1, a2, a3, a4, a5, a6, a7, a8];
+            let regs_ptr: *const u64 = regs.as_ptr();
             let status: i32;
             core::arch::asm!(
+                // Save SP so we can restore after the call.
+                // NOTE: Use x20 instead of x19.  LLVM reserves x19 for
+                // internal use on Windows ARM64 and rejects it as an
+                // explicit inline-asm operand (E0437 / LLVM error).
+                "mov x20, sp",
+
+                // Allocate stack space for stack-passed args (args[8..]).
+                // Each arg is 8 bytes.  Round up to 16-byte alignment (AAPCS64).
+                "mov x9, {nstack}",
+                "lsl x9, x9, #3",         // x9 = nstack * 8
+                "add x9, x9, #15",
+                "and x9, x9, #-16",        // 16-byte aligned size
+                "sub sp, sp, x9",
+
+                // Copy stack args to [sp .. sp + nstack*8].
+                "mov x10, {nstack}",
+                "cbz x10, 2f",
+                "mov x11, {stack_ptr}",
+                "mov x12, sp",
+                "1:",
+                "ldr x13, [x11], #8",      // load arg, post-increment src
+                "str x13, [x12], #8",      // store arg, post-increment dst
+                "sub x10, x10, #1",
+                "cbnz x10, 1b",
+                "2:",
+
+                // Load register arguments from the packed array using ldp
+                // (load-pair).  Each ldp loads two 64-bit values, so four
+                // instructions cover all 8 arguments (x0-x7).
+                "ldp x0, x1, [{regs_ptr}]",
+                "ldp x2, x3, [{regs_ptr}, #16]",
+                "ldp x4, x5, [{regs_ptr}, #32]",
+                "ldp x6, x7, [{regs_ptr}, #48]",
+
+                // Load syscall number.
                 "mov x8, {ssn}",
-                "mov x0, {a1}",
-                "mov x1, {a2}",
-                "mov x2, {a3}",
-                "mov x3, {a4}",
-                "mov x4, {a5}",
-                "mov x5, {a6}",
-                "mov x6, {a7}",
-                "mov x7, {a8}",
+
+                // Indirect call to the syscall gadget (svc #0; ret in ntdll).
                 "blr {gadget}",
                 // Copy 32-bit NTSTATUS from w0 to output register.
                 "mov {status:w}, w0",
+                // Restore SP.
+                "mov sp, x20",
+
+                regs_ptr = in(reg) regs_ptr,
                 ssn = in(reg) ssn as u64,
-                a1 = in(reg) a1, a2 = in(reg) a2,
-                a3 = in(reg) a3, a4 = in(reg) a4,
-                a5 = in(reg) a5, a6 = in(reg) a6,
-                a7 = in(reg) a7, a8 = in(reg) a8,
+                nstack = in(reg) nstack_a64 as u64,
+                stack_ptr = in(reg) stack_ptr_a64 as u64,
                 gadget = in(reg) gadget_addr as u64,
                 status = out(reg) status,
+                // AAPCS64 caller-saved GPRs: x0-x18, x30 (LR).
+                // x18 is the platform register (reserved) but we declare it
+                // for completeness.  x19 is reserved by LLVM on Windows
+                // ARM64 and cannot appear as an explicit operand.
                 out("x0")  _, out("x1")  _, out("x2")  _, out("x3")  _,
                 out("x4")  _, out("x5")  _, out("x6")  _, out("x7")  _,
                 out("x8")  _,
                 out("x9")  _, out("x10") _, out("x11") _,
                 out("x12") _, out("x13") _, out("x14") _, out("x15") _,
-                out("x16") _, out("x17") _,
+                out("x16") _, out("x17") _, out("x18") _,
+                out("x20") _,
                 out("x30") _,
+                // AAPCS64 caller-saved NEON/FP registers.
+                // The kernel may clobber v0-v7 (argument/return) and
+                // v16-v31 (caller-saved) during a syscall.  v8-v15 are
+                // callee-saved and preserved by the kernel.
+                out("v0")  _, out("v1")  _, out("v2")  _, out("v3")  _,
+                out("v4")  _, out("v5")  _, out("v6")  _, out("v7")  _,
+                out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+                out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+                out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+                out("v28") _, out("v29") _, out("v30") _, out("v31") _,
             );
+            // Keep slices alive until the asm block completes.
+            let _ = &stack_args_a64;
+            let _ = &regs;
             status
         } else {
             // Direct fallback: no gadget available (e.g. bootstrap mode).
             // This leaves a `svc` instruction in the binary — a potential IoC —
-            // but is functionally correct.
+            // but is functionally correct.  Stack args are spilled the same way.
+            //
+            // REGISTER BUDGET: same as the indirect path — pack register
+            // arguments into a stack array and load with ldp to keep the
+            // simultaneous in(reg) count at 4 (regs_ptr, ssn, nstack,
+            // stack_ptr).
+            let regs: [u64; 8] = [a1, a2, a3, a4, a5, a6, a7, a8];
+            let regs_ptr: *const u64 = regs.as_ptr();
             let status: i32;
             core::arch::asm!(
+                // Save SP.
+                "mov x20, sp",
+
+                // Allocate aligned stack space for stack args.
+                "mov x9, {nstack}",
+                "lsl x9, x9, #3",
+                "add x9, x9, #15",
+                "and x9, x9, #-16",
+                "sub sp, sp, x9",
+
+                // Copy stack args.
+                "mov x10, {nstack}",
+                "cbz x10, 2f",
+                "mov x11, {stack_ptr}",
+                "mov x12, sp",
+                "1:",
+                "ldr x13, [x11], #8",
+                "str x13, [x12], #8",
+                "sub x10, x10, #1",
+                "cbnz x10, 1b",
+                "2:",
+
+                // Load register arguments from the packed array using ldp.
+                "ldp x0, x1, [{regs_ptr}]",
+                "ldp x2, x3, [{regs_ptr}, #16]",
+                "ldp x4, x5, [{regs_ptr}, #32]",
+                "ldp x6, x7, [{regs_ptr}, #48]",
+
+                // Load syscall number.
                 "mov x8, {ssn}",
-                "mov x0, {a1}",
-                "mov x1, {a2}",
-                "mov x2, {a3}",
-                "mov x3, {a4}",
-                "mov x4, {a5}",
-                "mov x5, {a6}",
-                "mov x6, {a7}",
-                "mov x7, {a8}",
                 "svc #0",
+                // Restore SP.
+                "mov sp, x20",
+
+                regs_ptr = in(reg) regs_ptr,
                 ssn = in(reg) ssn as u64,
-                a1 = in(reg) a1, a2 = in(reg) a2,
-                a3 = in(reg) a3, a4 = in(reg) a4,
-                a5 = in(reg) a5, a6 = in(reg) a6,
-                a7 = in(reg) a7, a8 = in(reg) a8,
+                nstack = in(reg) nstack_a64 as u64,
+                stack_ptr = in(reg) stack_ptr_a64 as u64,
                 lateout("x0") status,
-                out("x8") _,
+                // AAPCS64 caller-saved GPRs: x1-x18, x30 (LR).
+                out("x1")  _, out("x2")  _, out("x3")  _,
+                out("x4")  _, out("x5")  _, out("x6")  _, out("x7")  _,
+                out("x8")  _,
+                out("x9")  _, out("x10") _, out("x11") _,
+                out("x12") _, out("x13") _, out("x14") _, out("x15") _,
+                out("x16") _, out("x17") _, out("x18") _,
+                out("x20") _,
+                out("x30") _,
+                // AAPCS64 caller-saved NEON/FP registers.
+                out("v0")  _, out("v1")  _, out("v2")  _, out("v3")  _,
+                out("v4")  _, out("v5")  _, out("v6")  _, out("v7")  _,
+                out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+                out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+                out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+                out("v28") _, out("v29") _, out("v30") _, out("v31") _,
             );
+            let _ = &stack_args_a64;
+            let _ = &regs;
             status
         }
     }

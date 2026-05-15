@@ -69,6 +69,7 @@
 
 #![cfg(feature = "adaptive-timing")]
 
+use common::lock::MutexExt;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -360,7 +361,7 @@ impl AdaptiveTimer {
         max_deviation: f64,
     ) -> Self {
         let mut timer = Self::new(base_interval, max_deviation);
-        let mut inner = timer.inner.lock().unwrap();
+        let mut inner = timer.inner.lock_recover();
         inner.min_interval = min_interval;
         inner.max_interval = max_interval;
         drop(inner);
@@ -375,7 +376,7 @@ impl AdaptiveTimer {
     /// Transitions from Learning to Active when enough observations have been
     /// collected.
     pub fn observe(&self, obs: TrafficObservation) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock_recover();
         self.observe_inner(&mut inner, obs);
     }
 
@@ -428,14 +429,14 @@ impl AdaptiveTimer {
                 Ok(profile) => {
                     inner.learned_profile = Some(profile);
                     inner.state = TimerState::Active;
-                    log::debug!(
+                    tracing::debug!(
                         "adaptive_timing: transitioned to Active phase \
                          ({} observations collected)",
                         inner.observation_window.len(),
                     );
                 }
                 Err(e) => {
-                    log::debug!(
+                    tracing::debug!(
                         "adaptive_timing: profile learning failed ({}), \
                          staying in Learning phase",
                         e,
@@ -466,7 +467,7 @@ impl AdaptiveTimer {
 
     /// Record multiple observations at once.
     pub fn observe_batch(&self, observations: Vec<TrafficObservation>) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock_recover();
         for obs in observations {
             self.observe_inner(&mut inner, obs);
         }
@@ -479,7 +480,7 @@ impl AdaptiveTimer {
     /// Requires at least `learning_observations_needed` observations.
     /// Returns the learned `TrafficProfile` on success.
     pub fn learn_profile(&self) -> Result<TrafficProfile, anyhow::Error> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock_recover();
         self.learn_profile_inner(&inner)
     }
 
@@ -660,7 +661,7 @@ impl AdaptiveTimer {
     ///
     /// The returned duration is always clamped to `[min_interval, max_interval]`.
     pub fn next_callback_time(&self) -> Duration {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock_recover();
 
         let duration = match inner.state {
             TimerState::Learning => self.compute_learning_interval(&inner),
@@ -727,7 +728,7 @@ impl AdaptiveTimer {
     ///
     /// During **Evasion**: returns `true` only during peak hours.
     pub fn should_callback_now(&self) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock_recover();
 
         match inner.state {
             TimerState::Learning => true,
@@ -775,7 +776,7 @@ impl AdaptiveTimer {
 
     /// Get the current timer state.
     pub fn state(&self) -> TimerState {
-        self.inner.lock().unwrap().state
+        self.inner.lock_recover().state
     }
 
     /// Transition to evasion mode.
@@ -783,10 +784,10 @@ impl AdaptiveTimer {
     /// Should be called when detection indicators are observed (e.g. EDR
     /// scanning, unusual network responses, etc.).
     pub fn enter_evasion(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock_recover();
         if inner.state != TimerState::Evasion {
             inner.state = TimerState::Evasion;
-            log::debug!("adaptive_timing: entered Evasion phase");
+            tracing::debug!("adaptive_timing: entered Evasion phase");
         }
     }
 
@@ -794,40 +795,40 @@ impl AdaptiveTimer {
     ///
     /// Should be called when the evasion threat has passed.
     pub fn exit_evasion(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock_recover();
         if inner.state == TimerState::Evasion {
             inner.state = if inner.learned_profile.is_some() {
                 TimerState::Active
             } else {
                 TimerState::Learning
             };
-            log::debug!("adaptive_timing: exited Evasion phase, now {:?}", inner.state);
+            tracing::debug!("adaptive_timing: exited Evasion phase, now {:?}", inner.state);
         }
     }
 
     /// Get the number of collected observations.
     pub fn observation_count(&self) -> usize {
-        self.inner.lock().unwrap().observation_window.len()
+        self.inner.lock_recover().observation_window.len()
     }
 
     /// Get the learned profile, if available.
     pub fn profile(&self) -> Option<TrafficProfile> {
-        self.inner.lock().unwrap().learned_profile.clone()
+        self.inner.lock_recover().learned_profile.clone()
     }
 
     /// Get the configured base interval.
     pub fn base_interval(&self) -> Duration {
-        self.inner.lock().unwrap().base_interval
+        self.inner.lock_recover().base_interval
     }
 
     /// Set the base interval (e.g. from a profile update).
     pub fn set_base_interval(&self, interval: Duration) {
-        self.inner.lock().unwrap().base_interval = interval;
+        self.inner.lock_recover().base_interval = interval;
     }
 
     /// Mark the start of a sleep period (for `should_callback_now`).
     pub fn mark_sleep_start(&self) {
-        self.inner.lock().unwrap().sleep_start = Some(Instant::now());
+        self.inner.lock_recover().sleep_start = Some(Instant::now());
     }
 
     /// Compute the recommended payload size for the next callback.
@@ -837,7 +838,7 @@ impl AdaptiveTimer {
     ///
     /// Falls back to a fixed size during the learning phase.
     pub fn recommended_packet_size(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock_recover();
         match &inner.learned_profile {
             Some(profile) => {
                 let size = gaussian_random(
@@ -852,7 +853,7 @@ impl AdaptiveTimer {
 
     /// Force a re-learning of the traffic profile from current observations.
     pub fn relearn(&self) -> Result<(), anyhow::Error> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock_recover();
         let profile = self.learn_profile_inner(&inner)?;
         inner.learned_profile = Some(profile);
         if inner.state == TimerState::Learning {
@@ -863,7 +864,7 @@ impl AdaptiveTimer {
 
     /// Reset the timer to the learning phase, clearing all observations.
     pub fn reset(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock_recover();
         inner.observation_window.clear();
         inner.learned_profile = None;
         inner.state = TimerState::Learning;

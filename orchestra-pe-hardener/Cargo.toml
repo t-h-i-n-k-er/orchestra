@@ -1,0 +1,12 @@
+[package]
+name = "orchestra-pe-hardener"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone PE hardening library — post-processing transformations for Windows PE/PE+ binaries"
+
+[dependencies]
+builder = { path = "../builder" }
+anyhow.workspace = true
+tracing.workspace = true
+serde = { workspace = true, features = ["derive"] }

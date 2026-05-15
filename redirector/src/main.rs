@@ -315,7 +315,15 @@ async fn handle_request(State(state): State<Arc<RedirectorState>>, req: Request<
                     .unwrap_or_else(|_| (StatusCode::BAD_GATEWAY, "upstream error").into_response())
             }
             Err(e) => {
-                tracing::error!("C2 forward failed: {}", e);
+                // H-03: Log a generic message at error level; the full
+                // upstream error may contain internal hostnames/IPs that
+                // should not appear in production logs.
+                tracing::error!(
+                    "C2 forward failed for {} {} — upstream unreachable",
+                    method,
+                    uri
+                );
+                tracing::debug!("C2 forward error detail: {e}");
                 state.log_access(&source_ip, method.as_str(), &uri, true, 502);
                 (StatusCode::BAD_GATEWAY, "upstream error").into_response()
             }
@@ -523,6 +531,10 @@ async fn main() -> Result<()> {
         };
         let (api_url, _token, redirector_id) = conn_clone;
         let heartbeat_cert = cli.c2_cert.clone();
+        // P2-16: capture the server token so we can present it as the
+        // heartbeat shared secret when the server has `redirector_secret`
+        // configured.
+        let heartbeat_secret = cli.server_token.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             // P2-15: log and return on client build failure instead of
@@ -530,16 +542,25 @@ async fn main() -> Result<()> {
             let client = match build_pinned_client(heartbeat_cert.as_ref()) {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::error!("heartbeat client build failed: {e}");
+                    // H-03: Sanitize — don't leak internal details in error log.
+                    tracing::error!("heartbeat client build failed — check TLS cert configuration");
+                    tracing::debug!("heartbeat client build error detail: {e}");
                     return;
                 }
             };
             loop {
                 interval.tick().await;
                 if let Some(ref id) = redirector_id {
+                    // Build the heartbeat body — always include the shared
+                    // secret when we have one so the server can authenticate
+                    // the request against `redirector_secret`.
+                    let mut body = serde_json::json!({ "id": id });
+                    if let Some(ref secret) = heartbeat_secret {
+                        body["secret"] = serde_json::Value::String(secret.clone());
+                    }
                     match client
                         .post(format!("{}/api/redirector/heartbeat", api_url))
-                        .json(&serde_json::json!({ "id": id }))
+                        .json(&body)
                         .send()
                         .await
                     {

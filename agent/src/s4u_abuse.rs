@@ -49,12 +49,12 @@ use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 
 use anyhow::{anyhow, bail, Context, Result};
-use log::{debug, info, warn};
+use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
-use winapi::shared::guiddef::GUID;
-use winapi::shared::minwindef::DWORD;
-use winapi::shared::ntdef::{HRESULT, LPCWSTR, LPWSTR};
+use crate::win_types::GUID;
+use crate::win_types::DWORD;
+use crate::win_types::{HRESULT, LPCWSTR, LPWSTR};
 
 // ── Compile-time API hash constants ─────────────────────────────────────────
 
@@ -1009,6 +1009,7 @@ fn build_pa_for_user(user_name: &str, user_realm: &str) -> Vec<u8> {
         .copied()
         .collect();
     let zero_key = [0u8; 16];
+    use hmac::KeyInit;
     let mut hmac_md5 = hmac::Hmac::<md5::Md5>::new_from_slice(&zero_key)
         .expect("HMAC-MD5 accepts any key length");
     hmac_md5.update(&checksum_data);
@@ -2124,7 +2125,7 @@ mod tests {
             "administrator",
             "CORP.COM",
             &[0u8; 16], // dummy TGT
-        );
+        ).expect("build_s4u2self_tgs_req should produce a valid TGS-REQ");
         // Should start with APPLICATION 12 tag
         assert_eq!(req[0], ASN1_APPLICATION_12);
         // Should be non-trivial in size
@@ -2138,7 +2139,7 @@ mod tests {
             "CORP.COM",
             &[0u8; 32], // dummy S4U2Self ticket
             &[0u8; 64], // dummy S4U2Self TGS-REP
-        );
+        ).expect("build_s4u2proxy_tgs_req should produce a valid TGS-REQ");
         // Should start with APPLICATION 12 tag
         assert_eq!(req[0], ASN1_APPLICATION_12);
         assert!(req.len() > 50);

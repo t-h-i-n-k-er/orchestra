@@ -32,7 +32,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use log::{debug, info, warn};
+use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
 use super::ad_enum::{AdComputer, AdDelegation, AdGroup, AdReconData, AdUser};

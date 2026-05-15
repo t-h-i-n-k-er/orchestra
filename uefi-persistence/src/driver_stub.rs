@@ -121,25 +121,67 @@ pub struct EfiStubResult {
     pub rdata_section_size: u32,
 }
 
+// ─── Architecture-specific patch types ──────────────────────────────────
+//
+// x86-64 uses RIP-relative addressing: a 32-bit displacement is patched
+// into a `lea reg, [rip+disp32]` or `lea reg, [rip+disp32]` instruction.
+// AArch64 uses ADR (form PC-relative address in a register, ±1 MiB range)
+// for the same purpose.
+
+#[cfg(not(target_arch = "aarch64"))]
 #[derive(Debug, Clone, Copy)]
 struct RipRelativePatch {
     displacement_offset: usize,
     rip_after_offset: usize,
 }
 
+#[cfg(not(target_arch = "aarch64"))]
 #[derive(Debug, Clone, Copy)]
 struct PathImageLoaderPatches {
     device_path_patch: RipRelativePatch,
     loaded_image_guid_patch: RipRelativePatch,
 }
 
-struct TextSectionBuild {
-    bytes: Vec<u8>,
-    embedded_payload_patch: Option<RipRelativePatch>,
-    second_stage_patch: Option<PathImageLoaderPatches>,
-    original_bootloader_patch: Option<PathImageLoaderPatches>,
+/// AArch64 ADR-based patch: records the offset of an ADR instruction whose
+/// immediate will be patched to point at the target RVA.
+#[cfg(target_arch = "aarch64")]
+#[derive(Debug, Clone, Copy)]
+struct AdrPatch {
+    /// Byte offset of the ADR instruction within .text.
+    instr_offset: usize,
 }
 
+/// AArch64 path-loader patches: one ADR for the device path, one for the
+/// loaded-image GUID.
+#[cfg(target_arch = "aarch64")]
+#[derive(Debug, Clone, Copy)]
+struct PathLoaderPatchesA64 {
+    device_path_patch: AdrPatch,
+    loaded_image_guid_patch: AdrPatch,
+}
+
+// ─── Type aliases (architecture-polymorphic) ─────────────────────────
+
+#[cfg(not(target_arch = "aarch64"))]
+type PayloadPatch = RipRelativePatch;
+#[cfg(target_arch = "aarch64")]
+type PayloadPatch = AdrPatch;
+
+#[cfg(not(target_arch = "aarch64"))]
+type LoaderPatches = PathImageLoaderPatches;
+#[cfg(target_arch = "aarch64")]
+type LoaderPatches = PathLoaderPatchesA64;
+
+struct TextSectionBuild {
+    bytes: Vec<u8>,
+    embedded_payload_patch: Option<PayloadPatch>,
+    second_stage_patch: Option<LoaderPatches>,
+    original_bootloader_patch: Option<LoaderPatches>,
+}
+
+// ─── x86-64 patch helpers ────────────────────────────────────────────
+
+#[cfg(not(target_arch = "aarch64"))]
 fn patch_rip_relative_i32(
     text: &mut [u8],
     patch: RipRelativePatch,
@@ -167,6 +209,7 @@ fn patch_rip_relative_i32(
     Ok(())
 }
 
+#[cfg(not(target_arch = "aarch64"))]
 fn emit_jnz_rel32_placeholder(text: &mut Vec<u8>) -> usize {
     text.extend_from_slice(&[0x0F, 0x85]);
     let displacement_offset = text.len();
@@ -174,6 +217,7 @@ fn emit_jnz_rel32_placeholder(text: &mut Vec<u8>) -> usize {
     displacement_offset
 }
 
+#[cfg(not(target_arch = "aarch64"))]
 fn emit_jz_rel32_placeholder(text: &mut Vec<u8>) -> usize {
     text.extend_from_slice(&[0x0F, 0x84]);
     let displacement_offset = text.len();
@@ -181,6 +225,7 @@ fn emit_jz_rel32_placeholder(text: &mut Vec<u8>) -> usize {
     displacement_offset
 }
 
+#[cfg(not(target_arch = "aarch64"))]
 fn patch_relative_jump(
     text: &mut [u8],
     displacement_offset: usize,
@@ -202,6 +247,67 @@ fn patch_relative_jump(
     let displacement =
         i32::try_from(displacement).context("relative jump displacement out of i32 range")?;
     text[displacement_offset..end].copy_from_slice(&displacement.to_le_bytes());
+    Ok(())
+}
+
+// ─── AArch64 patch helpers ────────────────────────────────────────────
+
+/// Patch an ADR instruction to point at `target_rva`.
+///
+/// ADR encoding (A64 ISA §C4.1.2):
+///   bits[31]    = op = 0 (ADR) / 1 (ADRP)
+///   bits[30:29] = immlo (2 bits)
+///   bits[28:24] = 10000
+///   bits[23:5]  = immhi (19 bits)
+///   bits[4:0]   = Rd
+///
+/// The signed byte offset = immhi:immlo sign-extended to 21 bits, then
+/// shifted left by 0 (ADR) or 12 (ADRP).  ADR range = ±1 MiB.
+#[cfg(target_arch = "aarch64")]
+fn patch_adr_instruction(
+    text: &mut [u8],
+    patch: AdrPatch,
+    text_rva: u32,
+    target_rva: u32,
+    label: &str,
+) -> Result<()> {
+    let instr_end = patch
+        .instr_offset
+        .checked_add(4)
+        .context("ADR patch offset overflow")?;
+    if instr_end > text.len() {
+        bail!(
+            "{label} ADR instruction offset {} is outside .text size {}",
+            patch.instr_offset,
+            text.len()
+        );
+    }
+
+    let pc = text_rva as i64 + patch.instr_offset as i64;
+    let offset = target_rva as i64 - pc;
+
+    // ADR range check: ±1 MiB (signed 21-bit immediate).
+    if offset < -(1 << 20) || offset >= (1 << 20) {
+        bail!(
+            "{label} ADR offset {offset:#x} out of ±1MiB range (text_rva={text_rva:#x}, target_rva={target_rva:#x})"
+        );
+    }
+
+    let offset = offset as i32;
+    let immhi = (offset >> 3) & 0x7FFFF; // bits [23:5] → 19 bits
+    let immlo = (offset & 0x3) as u32;   // bits [30:29] → 2 bits
+
+    // Read existing instruction to preserve Rd.
+    let existing = u32::from_le_bytes([
+        text[patch.instr_offset],
+        text[patch.instr_offset + 1],
+        text[patch.instr_offset + 2],
+        text[patch.instr_offset + 3],
+    ]);
+    let rd = existing & 0x1F;
+
+    let instr = 0x10000000u32 | (immhi as u32) << 5 | immlo << 29 | rd;
+    text[patch.instr_offset..instr_end].copy_from_slice(&instr.to_le_bytes());
     Ok(())
 }
 
@@ -367,10 +473,19 @@ pub fn build_efi_stub(config: &EfiPayloadConfig) -> Result<EfiStubResult> {
 
     let image_size = reloc_rva + align_up(reloc_size_aligned, SECTION_ALIGNMENT);
 
-    // ─── Patch RIP-relative displacements in .text ──────────────────────
+    // ─── Patch address displacements in .text ────────────────────────────
     if let Some(patch) = text_build.embedded_payload_patch {
         let payload_rva = rdata_rva + rdata_payload_start_offset(config) as u32;
+        #[cfg(not(target_arch = "aarch64"))]
         patch_rip_relative_i32(
+            &mut text_section,
+            patch,
+            text_rva,
+            payload_rva,
+            "embedded payload",
+        )?;
+        #[cfg(target_arch = "aarch64")]
+        patch_adr_instruction(
             &mut text_section,
             patch,
             text_rva,
@@ -381,7 +496,16 @@ pub fn build_efi_stub(config: &EfiPayloadConfig) -> Result<EfiStubResult> {
 
     if let Some(patch) = text_build.second_stage_patch {
         let guid_rva = rdata_rva + rdata_loaded_image_guid_offset(config) as u32;
+        #[cfg(not(target_arch = "aarch64"))]
         patch_rip_relative_i32(
+            &mut text_section,
+            patch.loaded_image_guid_patch,
+            text_rva,
+            guid_rva,
+            "second-stage loaded-image protocol GUID",
+        )?;
+        #[cfg(target_arch = "aarch64")]
+        patch_adr_instruction(
             &mut text_section,
             patch.loaded_image_guid_patch,
             text_rva,
@@ -390,7 +514,16 @@ pub fn build_efi_stub(config: &EfiPayloadConfig) -> Result<EfiStubResult> {
         )?;
 
         let dp_rva = rdata_rva + rdata_second_stage_device_path_offset(config) as u32;
+        #[cfg(not(target_arch = "aarch64"))]
         patch_rip_relative_i32(
+            &mut text_section,
+            patch.device_path_patch,
+            text_rva,
+            dp_rva,
+            "second-stage device path",
+        )?;
+        #[cfg(target_arch = "aarch64")]
+        patch_adr_instruction(
             &mut text_section,
             patch.device_path_patch,
             text_rva,
@@ -401,7 +534,16 @@ pub fn build_efi_stub(config: &EfiPayloadConfig) -> Result<EfiStubResult> {
 
     if let Some(patch) = text_build.original_bootloader_patch {
         let guid_rva = rdata_rva + rdata_loaded_image_guid_offset(config) as u32;
+        #[cfg(not(target_arch = "aarch64"))]
         patch_rip_relative_i32(
+            &mut text_section,
+            patch.loaded_image_guid_patch,
+            text_rva,
+            guid_rva,
+            "original-loader loaded-image protocol GUID",
+        )?;
+        #[cfg(target_arch = "aarch64")]
+        patch_adr_instruction(
             &mut text_section,
             patch.loaded_image_guid_patch,
             text_rva,
@@ -410,7 +552,16 @@ pub fn build_efi_stub(config: &EfiPayloadConfig) -> Result<EfiStubResult> {
         )?;
 
         let dp_rva = rdata_rva + rdata_original_bootloader_device_path_offset(config)? as u32;
+        #[cfg(not(target_arch = "aarch64"))]
         patch_rip_relative_i32(
+            &mut text_section,
+            patch.device_path_patch,
+            text_rva,
+            dp_rva,
+            "original bootloader device path",
+        )?;
+        #[cfg(target_arch = "aarch64")]
+        patch_adr_instruction(
             &mut text_section,
             patch.device_path_patch,
             text_rva,
@@ -798,22 +949,24 @@ fn build_section_header(
     header
 }
 
-/// Build the .text section containing the EFI entry point stub.
-///
-/// The stub:
-/// 1. Saves callee-saved registers.
-/// 2. Sets up the stack frame.
-/// 3. Stores ImageHandle (rcx) and SystemTable (rdx) in registers.
-/// 4. If payload_data is an EFI PE/COFF image: uses BootServices->LoadImage
-///    with SourceBuffer/SourceSize, then StartImage.
-/// 5. If payload_data is raw code: allocates EFI_LOADER_CODE pages, copies the
-///    bytes out of .rdata, and calls entry_point_offset from executable memory.
-/// 6. If second_stage_path is provided: uses BootServices->LoadImage and
-///    StartImage to chain-load the second-stage binary from the ESP.
-/// 7. If chain_to_original is enabled: chain-loads original_bootloader_path.
-/// 8. Returns EFI_SUCCESS (0).
-///
-/// All address calculations use RIP-relative addressing.
+// ─── x86-64 .text section builder ─────────────────────────────────────
+//
+// The stub:
+// 1. Saves callee-saved registers.
+// 2. Sets up the stack frame.
+// 3. Stores ImageHandle (rcx) and SystemTable (rdx) in registers.
+// 4. If payload_data is an EFI PE/COFF image: uses BootServices->LoadImage
+//    with SourceBuffer/SourceSize, then StartImage.
+// 5. If payload_data is raw code: allocates EFI_LOADER_CODE pages, copies the
+//    bytes out of .rdata, and calls entry_point_offset from executable memory.
+// 6. If second_stage_path is provided: uses BootServices->LoadImage and
+//    StartImage to chain-load the second-stage binary from the ESP.
+// 7. If chain_to_original is enabled: chain-loads original_bootloader_path.
+// 8. Returns EFI_SUCCESS (0).
+//
+// All address calculations use RIP-relative addressing.
+
+#[cfg(not(target_arch = "aarch64"))]
 fn build_text_section(config: &EfiPayloadConfig) -> Result<TextSectionBuild> {
     let mut text = Vec::new();
     let mut embedded_payload_patch = None;
@@ -891,6 +1044,7 @@ fn build_text_section(config: &EfiPayloadConfig) -> Result<TextSectionBuild> {
     })
 }
 
+#[cfg(not(target_arch = "aarch64"))]
 fn emit_embedded_efi_image_loader(
     text: &mut Vec<u8>,
     payload_len: usize,
@@ -926,6 +1080,7 @@ fn emit_embedded_efi_image_loader(
     Ok(payload_patch)
 }
 
+#[cfg(not(target_arch = "aarch64"))]
 fn emit_raw_payload_loader(
     text: &mut Vec<u8>,
     config: &EfiPayloadConfig,
@@ -972,14 +1127,17 @@ fn emit_raw_payload_loader(
     Ok(payload_patch)
 }
 
+#[cfg(not(target_arch = "aarch64"))]
 fn emit_second_stage_loader(text: &mut Vec<u8>) -> Result<PathImageLoaderPatches> {
     emit_path_image_loader(text)
 }
 
+#[cfg(not(target_arch = "aarch64"))]
 fn emit_original_bootloader_loader(text: &mut Vec<u8>) -> Result<PathImageLoaderPatches> {
     emit_path_image_loader(text)
 }
 
+#[cfg(not(target_arch = "aarch64"))]
 fn emit_path_image_loader(text: &mut Vec<u8>) -> Result<PathImageLoaderPatches> {
     // Robust chain-loader path:
     // 1) Resolve EFI_LOADED_IMAGE_PROTOCOL via OpenProtocol(ImageHandle,...)
@@ -1049,6 +1207,642 @@ fn emit_path_image_loader(text: &mut Vec<u8>) -> Result<PathImageLoaderPatches> 
     Ok(PathImageLoaderPatches {
         device_path_patch,
         loaded_image_guid_patch,
+    })
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// AArch64 EFI entry-point stub
+// ══════════════════════════════════════════════════════════════════════════
+//
+// AAPCS64 calling convention used by UEFI on AArch64:
+//   x0  = 1st arg / return value
+//   x1  = 2nd arg
+//   x2  = 3rd arg
+//   x3  = 4th arg
+//   x4-x7 = additional args
+//   x19-x28 = callee-saved
+//   x29 = FP (frame pointer)
+//   x30 = LR (link register)
+//   SP must be 16-byte aligned on any public interface.
+//
+// EFI entry point: ImageHandle in x0, SystemTable* in x1.
+//
+// Register allocation in the stub:
+//   x19 = ImageHandle (callee-saved)
+//   x20 = SystemTable* (callee-saved)
+//   x21 = BootServices* (callee-saved, cached from SystemTable+0x60)
+//   x0-x7 = scratch / function call arguments / return values
+//
+// Stack frame layout (96 bytes total):
+//   [sp+0]   = saved x29 (FP)
+//   [sp+8]   = saved x30 (LR)
+//   [sp+16]  = saved x19
+//   [sp+24]  = saved x20
+//   [sp+32]  = saved x21
+//   [sp+40]  = saved x22
+//   [sp+48]  = local: new_handle (8 bytes)
+//   [sp+56]  = padding / local storage
+//   [sp+64]  = local: loaded_image_iface (8 bytes)
+//   [sp+80]  = padding
+//   [sp+88]  = padding
+
+#[cfg(target_arch = "aarch64")]
+mod a64 {
+    //! AArch64 instruction emission helpers.
+    //!
+    //! Each helper appends a single 4-byte A64 instruction to a `Vec<u8>`.
+
+    // ─── Instruction encoding constants ─────────────────────────────────
+
+    // STP pre-indexed (64-bit): 10 101 0 011 0 imm7 Rt2 Rn Rt
+    const STP_PRE_INDEXED: u32 = 0xA9800000;
+    // LDP post-indexed (64-bit): 10 100 0 011 1 imm7 Rt2 Rn Rt
+    const LDP_POST_INDEXED: u32 = 0xA8C00000;
+    // LDR unsigned offset (64-bit): 11 111 0 01 01 imm12 Rn Rt
+    const LDR_UNSIGNED: u32 = 0xF9400000;
+    // STR unsigned offset (64-bit): 11 111 0 01 00 imm12 Rn Rt
+    const STR_UNSIGNED: u32 = 0xF9000000;
+    // MOV (register) = ADD Xd, Xn, #0
+    const MOV_ADD_ZERO: u32 = 0x91000000;
+    // MOVZ 64-bit: 1 10 100101 hw imm16 Rd
+    pub const MOVZ_64: u32 = 0xD2800000;
+    // MOVK 64-bit: 1 11 100101 hw imm16 Rd
+    const MOVK_64: u32 = 0xF2800000;
+    // BLR Xn: 1101 0110 0011 1111 0000 00 Rn 00000
+    const BLR: u32 = 0xD63F0000;
+    // RET: 1101 0110 0101 1111 0000 00 11111 00000
+    const RET: u32 = 0xD65F03C0;
+    // NOP: 1101 0101 0000 0011 0010 0000 0001 1111
+    const NOP: u32 = 0xD503201F;
+    // B.cond: 0101 0100 imm19 0 cond
+    const B_COND_BASE: u32 = 0x54000000;
+    // CBNZ 64-bit: 1 0110101 imm19 Rt
+    const CBNZ_64: u32 = 0xB5000000;
+    // CBZ 64-bit: 1 0110100 imm19 Rt
+    const CBZ_64: u32 = 0xB4000000;
+    // ADD immediate (64-bit): 1 00 100010 sh imm12 Rn Rd
+    const ADD_IMM: u32 = 0x91000000;
+    // SUB immediate (64-bit): 1 10 100010 sh imm12 Rn Rd
+    const SUB_IMM: u32 = 0xD1000000;
+    // ADD register (64-bit): 1 00 01011 shift 0 Rm imm6 Rn Rd
+    const ADD_REG: u32 = 0x8B000000;
+    // ADR: 0 immlo 10000 immhi Rd
+    const ADR: u32 = 0x10000000;
+    // LDRB unsigned offset: 00 111 0 01 01 imm12 Rn Rt (not scaled)
+    const LDRB_UNSIGNED: u32 = 0x39400000;
+    // STRB unsigned offset: 00 111 0 01 00 imm12 Rn Rt (not scaled)
+    const STRB_UNSIGNED: u32 = 0x39000000;
+
+    // Condition codes
+    pub const COND_NE: u32 = 0x1;
+    pub const COND_EQ: u32 = 0x0;
+
+    // Register numbers
+    pub const SP: u32 = 31; // treated as SP in load/store, but encoded as 31
+    pub const X0: u32 = 0;
+    pub const X1: u32 = 1;
+    pub const X2: u32 = 2;
+    pub const X3: u32 = 3;
+    pub const X4: u32 = 4;
+    pub const X5: u32 = 5;
+    pub const X8: u32 = 8;
+    pub const X9: u32 = 9;
+    pub const X19: u32 = 19;
+    pub const X20: u32 = 20;
+    pub const X21: u32 = 21;
+    pub const X22: u32 = 22;
+    pub const X23: u32 = 23;
+    pub const X24: u32 = 24;
+    pub const X25: u32 = 25;
+    pub const FP: u32 = 29;
+    pub const LR: u32 = 30;
+
+    /// Emit a single 32-bit instruction in little-endian.
+    #[inline]
+    pub fn emit(text: &mut Vec<u8>, instr: u32) {
+        text.extend_from_slice(&instr.to_le_bytes());
+    }
+
+    /// STP Xt1, Xt2, [Xn, #imm]!  (pre-indexed, 64-bit)
+    /// imm is in units of 8 bytes (0..×512 → 0..4096 bytes).
+    #[inline]
+    pub fn stp_pre(text: &mut Vec<u8>, rt1: u32, rt2: u32, rn: u32, imm8: i32) {
+        let imm7 = (imm8 >> 3) & 0x7F;
+        emit(text, STP_PRE_INDEXED | ((imm7 as u32) << 15) | (rt2 << 10) | (rn << 5) | rt1);
+    }
+
+    /// LDP Xt1, Xt2, [Xn], #imm  (post-indexed, 64-bit)
+    /// imm is in units of 8 bytes.
+    #[inline]
+    pub fn ldp_post(text: &mut Vec<u8>, rt1: u32, rt2: u32, rn: u32, imm8: i32) {
+        let imm7 = (imm8 >> 3) & 0x7F;
+        emit(text, LDP_POST_INDEXED | ((imm7 as u32) << 15) | (rt2 << 10) | (rn << 5) | rt1);
+    }
+
+    /// LDR Xt, [Xn, #imm]  (unsigned offset, 64-bit)
+    /// imm is in bytes, must be a multiple of 8, range 0..32760.
+    #[inline]
+    pub fn ldr_unsigned(text: &mut Vec<u8>, rt: u32, rn: u32, imm_bytes: u32) {
+        debug_assert_eq!(imm_bytes % 8, 0);
+        let imm12 = imm_bytes / 8;
+        emit(text, LDR_UNSIGNED | (imm12 << 10) | (rn << 5) | rt);
+    }
+
+    /// STR Xt, [Xn, #imm]  (unsigned offset, 64-bit)
+    /// imm is in bytes, must be a multiple of 8, range 0..32760.
+    #[inline]
+    pub fn str_unsigned(text: &mut Vec<u8>, rt: u32, rn: u32, imm_bytes: u32) {
+        debug_assert_eq!(imm_bytes % 8, 0);
+        let imm12 = imm_bytes / 8;
+        emit(text, STR_UNSIGNED | (imm12 << 10) | (rn << 5) | rt);
+    }
+
+    /// MOV Xd, Xn  (encoded as ADD Xd, Xn, #0)
+    #[inline]
+    pub fn mov_reg(text: &mut Vec<u8>, rd: u32, rn: u32) {
+        emit(text, MOV_ADD_ZERO | (rn << 5) | rd);
+    }
+
+    /// MOVZ Xd, #imm16, LSL #shift  (shift = 0, 16, 32, or 48)
+    #[inline]
+    pub fn movz(text: &mut Vec<u8>, rd: u32, imm16: u16, shift: u32) {
+        let hw = shift / 16;
+        emit(text, MOVZ_64 | (hw << 21) | ((imm16 as u32) << 5) | rd);
+    }
+
+    /// MOVK Xd, #imm16, LSL #shift  (shift = 0, 16, 32, or 48)
+    #[inline]
+    pub fn movk(text: &mut Vec<u8>, rd: u32, imm16: u16, shift: u32) {
+        let hw = shift / 16;
+        emit(text, MOVK_64 | (hw << 21) | ((imm16 as u32) << 5) | rd);
+    }
+
+    /// Load a 64-bit immediate into Xd using MOVZ + up to 3 MOVK.
+    pub fn mov_imm64(text: &mut Vec<u8>, rd: u32, val: u64) {
+        let parts = [
+            (val & 0xFFFF) as u16,
+            ((val >> 16) & 0xFFFF) as u16,
+            ((val >> 32) & 0xFFFF) as u16,
+            ((val >> 48) & 0xFFFF) as u16,
+        ];
+        // Find the first non-zero part for MOVZ.
+        let first = parts.iter().position(|&p| p != 0).unwrap_or(0);
+        movz(text, rd, parts[first], first as u32 * 16);
+        for i in (first + 1)..4 {
+            if parts[i] != 0 {
+                movk(text, rd, parts[i], i as u32 * 16);
+            }
+        }
+    }
+
+    /// BLR Xn  (branch with link to register)
+    #[inline]
+    pub fn blr(text: &mut Vec<u8>, rn: u32) {
+        emit(text, BLR | (rn << 5));
+    }
+
+    /// RET
+    #[inline]
+    pub fn ret(text: &mut Vec<u8>) {
+        emit(text, RET);
+    }
+
+    /// NOP
+    #[inline]
+    pub fn nop(text: &mut Vec<u8>) {
+        emit(text, NOP);
+    }
+
+    /// ADD Xd, Xn, #imm12
+    #[inline]
+    pub fn add_imm(text: &mut Vec<u8>, rd: u32, rn: u32, imm12: u32) {
+        emit(text, ADD_IMM | (imm12 << 10) | (rn << 5) | rd);
+    }
+
+    /// SUB Xd, Xn, #imm12
+    #[inline]
+    pub fn sub_imm(text: &mut Vec<u8>, rd: u32, rn: u32, imm12: u32) {
+        emit(text, SUB_IMM | (imm12 << 10) | (rn << 5) | rd);
+    }
+
+    /// ADD Xd, Xn, Xm
+    #[inline]
+    pub fn add_reg(text: &mut Vec<u8>, rd: u32, rn: u32, rm: u32) {
+        emit(text, ADD_REG | (rm << 16) | (rn << 5) | rd);
+    }
+
+    /// ADR Xd, label  (emit placeholder, return instruction offset)
+    /// The immediate will be patched later by patch_adr_instruction.
+    #[inline]
+    pub fn adr_placeholder(text: &mut Vec<u8>, rd: u32) -> usize {
+        let offset = text.len();
+        emit(text, ADR | rd); // immhi/immlo = 0 → offset 0 (placeholder)
+        offset
+    }
+
+    /// B.cond label  (emit placeholder with cond, return instruction offset)
+    /// The immediate will be patched later by patch_bcond.
+    #[inline]
+    pub fn bcond_placeholder(text: &mut Vec<u8>, cond: u32) -> usize {
+        let offset = text.len();
+        emit(text, B_COND_BASE | cond);
+        offset
+    }
+
+    /// CBNZ Xn, label  (emit placeholder, return instruction offset)
+    #[inline]
+    pub fn cbnz_placeholder(text: &mut Vec<u8>, rn: u32) -> usize {
+        let offset = text.len();
+        emit(text, CBNZ_64 | (rn << 5));
+        offset
+    }
+
+    /// CBZ Xn, label  (emit placeholder, return instruction offset)
+    #[inline]
+    pub fn cbz_placeholder(text: &mut Vec<u8>, rn: u32) -> usize {
+        let offset = text.len();
+        emit(text, CBZ_64 | (rn << 5));
+        offset
+    }
+
+    /// Patch a B.cond / CBNZ / CBZ conditional branch instruction.
+    /// `instr_offset` is the byte offset of the 4-byte instruction.
+    /// `target_offset` is the byte offset of the target instruction.
+    pub fn patch_cond_branch(
+        text: &mut [u8],
+        instr_offset: usize,
+        target_offset: usize,
+        label: &str,
+    ) -> anyhow::Result<()> {
+        let instr_end = instr_offset + 4;
+        if instr_end > text.len() || target_offset > text.len() {
+            anyhow::bail!(
+                "{label} branch patch out of range (instr={}, target={}, len={})",
+                instr_offset, target_offset, text.len()
+            );
+        }
+        let offset = (target_offset as isize - instr_offset as isize) >> 2;
+        if offset < -(1 << 19) as isize || offset >= (1 << 19) as isize {
+            anyhow::bail!(
+                "{label} conditional branch offset {offset:#x} out of ±1MiB range"
+            );
+        }
+        let existing = u32::from_le_bytes([
+            text[instr_offset],
+            text[instr_offset + 1],
+            text[instr_offset + 2],
+            text[instr_offset + 3],
+        ]);
+        // Clear imm19 (bits 23:5) and write new offset.
+        let imm19 = (offset as u32) & 0x7FFFF;
+        let patched = (existing & !(0x7FFFF << 5)) | (imm19 << 5);
+        text[instr_offset..instr_end].copy_from_slice(&patched.to_le_bytes());
+        Ok(())
+    }
+
+    /// LDRB Wt, [Xn, #imm]  (unsigned offset, 32-bit register, byte load)
+    /// imm is in bytes, NOT scaled, range 0..4095.
+    #[inline]
+    pub fn ldrb(text: &mut Vec<u8>, rt: u32, rn: u32, imm: u32) {
+        emit(text, LDRB_UNSIGNED | (imm << 10) | (rn << 5) | rt);
+    }
+
+    /// STRB Wt, [Xn, #imm]  (unsigned offset, byte store)
+    /// imm is in bytes, NOT scaled, range 0..4095.
+    #[inline]
+    pub fn strb(text: &mut Vec<u8>, rt: u32, rn: u32, imm: u32) {
+        emit(text, STRB_UNSIGNED | (imm << 10) | (rn << 5) | rt);
+    }
+}
+
+// ─── AArch64 build_text_section ──────────────────────────────────────
+
+#[cfg(target_arch = "aarch64")]
+fn build_text_section(config: &EfiPayloadConfig) -> Result<TextSectionBuild> {
+    use a64::*;
+
+    let mut text = Vec::new();
+    let mut embedded_payload_patch = None;
+    let mut second_stage_patch = None;
+    let mut original_bootloader_patch = None;
+
+    // ─── Prologue ───────────────────────────────────────────────────────
+    // x0 = ImageHandle, x1 = EFI_SYSTEM_TABLE*
+
+    // Save FP, LR, and callee-saved registers.
+    // STP x29, x30, [SP, #-96]!   (pre-decrement SP by 96)
+    stp_pre(&mut text, FP, LR, SP, -96);
+    // STP x19, x20, [SP, #16]     (signed offset)
+    a64_store_pair_signed(&mut text, X19, X20, SP, 16);
+    // STP x21, x22, [SP, #32]
+    a64_store_pair_signed(&mut text, X21, X22, SP, 32);
+
+    // Save ImageHandle → x19, SystemTable → x20
+    mov_reg(&mut text, X19, X0);
+    mov_reg(&mut text, X20, X1);
+
+    // Cache BootServices*: ldr x21, [x20, #0x60]
+    ldr_unsigned(&mut text, X21, X20, 0x60);
+
+    if !config.payload_data.is_empty() {
+        embedded_payload_patch = Some(if looks_like_pe_coff_image(&config.payload_data) {
+            emit_embedded_efi_image_loader_a64(&mut text, config.payload_data.len())?
+        } else {
+            emit_raw_payload_loader_a64(&mut text, config)?
+        });
+    }
+
+    if !config.second_stage_path.is_empty() {
+        second_stage_patch = Some(emit_second_stage_loader_a64(&mut text)?);
+    }
+
+    if config.chain_to_original {
+        original_bootloader_patch = Some(emit_original_bootloader_loader_a64(&mut text)?);
+    }
+
+    // ─── Return EFI_SUCCESS ─────────────────────────────────────────────
+    // mov x0, #0  (EFI_SUCCESS)
+    emit(&mut text, MOVZ_64 | (0u32 << 5) | X0);
+    // Restore callee-saved registers.
+    // LDP x21, x22, [SP, #32]
+    a64_load_pair_signed(&mut text, X21, X22, SP, 32);
+    // LDP x19, x20, [SP, #16]
+    a64_load_pair_signed(&mut text, X19, X20, SP, 16);
+    // LDP x29, x30, [SP], #96  (post-increment, restore SP)
+    ldp_post(&mut text, FP, LR, SP, 96);
+    ret(&mut text);
+
+    // Pad to 16-byte alignment (AArch64 instructions are 4 bytes, so
+    // pad with NOPs which are safe in the instruction stream).
+    while text.len() % 16 != 0 {
+        nop(&mut text);
+    }
+
+    Ok(TextSectionBuild {
+        bytes: text,
+        embedded_payload_patch,
+        second_stage_patch,
+        original_bootloader_patch,
+    })
+}
+
+/// Helper: STP Xt1, Xt2, [Xn, #imm]  (signed offset, 64-bit)
+/// Unlike the pre-indexed form, this does NOT write back to Rn.
+#[cfg(target_arch = "aarch64")]
+fn a64_store_pair_signed(text: &mut Vec<u8>, rt1: u32, rt2: u32, rn: u32, imm_bytes: i32) {
+    use a64::*;
+    // STP signed offset: 10 101 0 010 0 imm7 Rt2 Rn Rt
+    let base: u32 = 0xA9000000;
+    let imm7 = (imm_bytes >> 3) & 0x7F;
+    emit(text, base | ((imm7 as u32) << 15) | (rt2 << 10) | (rn << 5) | rt1);
+}
+
+/// Helper: LDP Xt1, Xt2, [Xn, #imm]  (signed offset, 64-bit)
+#[cfg(target_arch = "aarch64")]
+fn a64_load_pair_signed(text: &mut Vec<u8>, rt1: u32, rt2: u32, rn: u32, imm_bytes: i32) {
+    use a64::*;
+    // LDP signed offset: 10 101 0 010 1 imm7 Rt2 Rn Rt
+    let base: u32 = 0xA9400000;
+    let imm7 = (imm_bytes >> 3) & 0x7F;
+    emit(text, base | ((imm7 as u32) << 15) | (rt2 << 10) | (rn << 5) | rt1);
+}
+
+/// AArch64 embedded EFI PE/COFF image loader.
+///
+/// BootServices->LoadImage(0, ImageHandle, NULL, SourceBuffer, SourceSize, &new_handle)
+/// BootServices->StartImage(new_handle, NULL, NULL)
+#[cfg(target_arch = "aarch64")]
+fn emit_embedded_efi_image_loader_a64(
+    mut text: &mut Vec<u8>,
+    payload_len: usize,
+) -> Result<AdrPatch> {
+    use a64::*;
+
+    // Subroutine prologue: save scratch regs we'll use.
+    // STP x22, x23, [SP, #-16]!  (save temporaries)
+    stp_pre(&mut text, X22, X23, SP, -16);
+
+    // ADR x3, payload_data  (will be patched to point into .rdata)
+    let payload_instr = adr_placeholder(&mut text, X3);
+
+    // x0 = 0 (ParentImageHandle = NULL for from-buffer load)
+    //   Actually UEFI spec says BootServices->LoadImage first arg is
+    //   BOOLEAN ParentImageHandle... but on AArch64 it's passed as UINTN.
+    //   UEFI LoadImage: arg0=BootPolicy, arg1=ParentImageHandle, arg2=DevicePath,
+    //                   arg3=SourceBuffer, arg4=SourceSize, arg5=&ImageHandle
+    movz(&mut text, X0, 0, 0);             // BootPolicy = FALSE
+    mov_reg(&mut text, X1, X19);            // ParentImageHandle = ImageHandle
+    movz(&mut text, X2, 0, 0);             // DevicePath = NULL
+    // x3 already = SourceBuffer (from ADR above)
+    mov_imm64(&mut text, X4, payload_len as u64); // SourceSize
+    add_imm(&mut text, X5, SP, 16);         // &new_handle on stack (above saved regs)
+
+    // ldr x8, [x21, #0xC8]  (BootServices->LoadImage)
+    ldr_unsigned(&mut text, X8, X21, 0xC8);
+    blr(&mut text, X8);
+
+    // cbnz x0, load_failed
+    let load_failed = cbnz_placeholder(&mut text, X0);
+
+    // Load new_handle from stack and call StartImage.
+    ldr_unsigned(&mut text, X0, SP, 16);    // x0 = new_handle
+    movz(&mut text, X1, 0, 0);              // ExitDataSize = NULL
+    movz(&mut text, X2, 0, 0);              // ExitData = NULL
+    ldr_unsigned(&mut text, X8, X21, 0xD0); // BootServices->StartImage
+    blr(&mut text, X8);
+
+    let done = text.len();
+
+    // load_failed:
+    a64::patch_cond_branch(text, load_failed, done, "LoadImage failed")?;
+
+    // Restore temporaries.
+    ldp_post(&mut text, X22, X23, SP, 16);
+
+    Ok(AdrPatch {
+        instr_offset: payload_instr,
+    })
+}
+
+/// AArch64 raw payload loader.
+///
+/// BootServices->AllocatePages(AllocateAnyPages, EfiLoaderCode, pages, &entry_buf)
+/// memcpy from .rdata to allocated pages
+/// call entry_buf + entry_point_offset(ImageHandle, SystemTable)
+#[cfg(target_arch = "aarch64")]
+fn emit_raw_payload_loader_a64(
+    mut text: &mut Vec<u8>,
+    config: &EfiPayloadConfig,
+) -> Result<AdrPatch> {
+    use a64::*;
+
+    let pages = payload_pages(config.payload_data.len())?;
+
+    // Save temporaries.
+    stp_pre(&mut text, X22, X23, SP, -16);
+
+    // AllocatePages(AllocateAnyPages=0, EfiLoaderCode=2, pages, &entry_buf)
+    movz(&mut text, X0, 0, 0);                 // AllocateAnyPages
+    movz(&mut text, X1, 2, 0);                 // EfiLoaderCode
+    mov_imm64(&mut text, X2, pages as u64);      // NumberOfPages
+    add_imm(&mut text, X3, SP, 16);             // &entry_buf on stack
+    ldr_unsigned(&mut text, X8, X21, 0x28);     // BootServices->AllocatePages
+    blr(&mut text, X8);
+    let alloc_failed = cbnz_placeholder(&mut text, X0);
+
+    // Load entry_buf from stack.
+    ldr_unsigned(&mut text, X22, SP, 16);       // x22 = entry_buf
+
+    // ADR x2, payload_data  (source = .rdata, will be patched)
+    let payload_instr = adr_placeholder(&mut text, X2);
+
+    // x0 = entry_buf (destination)
+    mov_reg(&mut text, X0, X22);
+
+    // x1 = payload_len
+    mov_imm64(&mut text, X1, config.payload_data.len() as u64);
+
+    // Manual memcpy loop: copy bytes from x2 to x0, length in x1.
+    // Use a simple byte-copy loop to avoid alignment issues.
+    // Save loop registers.
+    emit(&mut text, 0xD503201F); // NOP (alignment padding)
+    // loop:
+    let loop_start = text.len();
+    // cbz x1, done_copy
+    let copy_done = cbz_placeholder(&mut text, X1);
+    // ldrb w3, [x2], #1  (post-indexed load byte)
+    // LDRB w3, [x2, #0] then ADD x2, x2, #1
+    ldrb(&mut text, X3, X2, 0);
+    add_imm(&mut text, X2, X2, 1);
+    // strb w3, [x0], #1  (post-indexed store byte)
+    strb(&mut text, X3, X0, 0);
+    add_imm(&mut text, X0, X0, 1);
+    // sub x1, x1, #1
+    sub_imm(&mut text, X1, X1, 1);
+    // b loop_start
+    let loop_branch = text.len();
+    emit(&mut text, 0x14000000u32); // B (unconditional) placeholder
+    // Patch the B instruction.
+    {
+        let offset = (loop_start as isize - loop_branch as isize) >> 2;
+        let imm26 = (offset as u32) & 0x3FFFFFF;
+        let instr = 0x14000000u32 | imm26;
+        text[loop_branch..loop_branch + 4].copy_from_slice(&instr.to_le_bytes());
+    }
+
+    // done_copy:
+    let done_copy_offset = text.len();
+    a64::patch_cond_branch(text, copy_done, done_copy_offset, "copy_done")?;
+
+    // Compute entry point: entry_buf + entry_point_offset
+    mov_reg(&mut text, X0, X22);              // x0 = entry_buf
+    if config.entry_point_offset != 0 {
+        add_imm(&mut text, X0, X0, config.entry_point_offset);
+    }
+
+    // Call entry_buf(ImageHandle, SystemTable)
+    mov_reg(&mut text, X8, X0);               // x8 = entry point address
+    mov_reg(&mut text, X0, X19);              // x0 = ImageHandle
+    mov_reg(&mut text, X1, X20);              // x1 = SystemTable
+    blr(&mut text, X8);
+
+    let done = text.len();
+    a64::patch_cond_branch(text, alloc_failed, done, "AllocatePages failed")?;
+
+    // Restore temporaries.
+    ldp_post(&mut text, X22, X23, SP, 16);
+
+    Ok(AdrPatch {
+        instr_offset: payload_instr,
+    })
+}
+
+/// AArch64 second-stage loader (same as path image loader).
+#[cfg(target_arch = "aarch64")]
+fn emit_second_stage_loader_a64(text: &mut Vec<u8>) -> Result<PathLoaderPatchesA64> {
+    emit_path_image_loader_a64(text)
+}
+
+/// AArch64 original bootloader loader (same as path image loader).
+#[cfg(target_arch = "aarch64")]
+fn emit_original_bootloader_loader_a64(text: &mut Vec<u8>) -> Result<PathLoaderPatchesA64> {
+    emit_path_image_loader_a64(text)
+}
+
+/// AArch64 path image loader.
+///
+/// 1) OpenProtocol(ImageHandle, &EFI_LOADED_IMAGE_PROTOCOL_GUID,
+///                 &iface, ImageHandle, NULL, BY_HANDLE_PROTOCOL)
+/// 2) LoadedImage->DeviceHandle (offset 0x18)
+/// 3) LoadImage(FALSE, ImageHandle, DevicePath, DeviceHandle, NULL, &new_handle)
+/// 4) StartImage(new_handle, NULL, NULL)
+#[cfg(target_arch = "aarch64")]
+fn emit_path_image_loader_a64(mut text: &mut Vec<u8>) -> Result<PathLoaderPatchesA64> {
+    use a64::*;
+
+    // Save temporaries: x22-x25
+    stp_pre(&mut text, X22, X23, SP, -32);
+    a64_store_pair_signed(&mut text, X24, X25, SP, 16);
+
+    // OpenProtocol(ImageHandle, &GUID, &iface, ImageHandle, NULL, BY_HANDLE_PROTOCOL)
+    // x0 = ImageHandle
+    mov_reg(&mut text, X0, X19);
+    // x1 = &EFI_LOADED_IMAGE_PROTOCOL_GUID  (ADR, to be patched)
+    let guid_instr = adr_placeholder(&mut text, X1);
+    // x2 = &iface (on stack)
+    add_imm(&mut text, X2, SP, 48);            // above saved regs
+    // x3 = ImageHandle (AgentHandle)
+    mov_reg(&mut text, X3, X19);
+    // x4 = NULL (ControllerHandle)
+    movz(&mut text, X4, 0, 0);
+    // x5 = EFI_OPEN_PROTOCOL_BY_HANDLE_PROTOCOL (0x20)
+    movz(&mut text, X5, EFI_OPEN_PROTOCOL_BY_HANDLE_PROTOCOL as u16, 0);
+    ldr_unsigned(&mut text, X8, X21, 0x118);   // BootServices->OpenProtocol
+    blr(&mut text, X8);
+    let open_failed = cbnz_placeholder(&mut text, X0);
+
+    // Check iface is non-null.
+    ldr_unsigned(&mut text, X22, SP, 48);       // x22 = loaded_image_iface
+    let null_iface = cbz_placeholder(&mut text, X22);
+
+    // x9 = LoadedImage->DeviceHandle (offset 0x18)
+    ldr_unsigned(&mut text, X9, X22, 0x18);
+    let null_device = cbz_placeholder(&mut text, X9);
+
+    // LoadImage(FALSE, ImageHandle, DevicePath, DeviceHandle, NULL, &new_handle)
+    movz(&mut text, X0, 0, 0);                 // BootPolicy = FALSE
+    mov_reg(&mut text, X1, X19);               // ParentImageHandle
+    // x2 = DevicePath (ADR, to be patched)
+    let dp_instr = adr_placeholder(&mut text, X2);
+    mov_reg(&mut text, X3, X9);                // DeviceHandle
+    movz(&mut text, X4, 0, 0);                 // SourceSize = 0 (from device)
+    add_imm(&mut text, X5, SP, 56);            // &new_handle
+    ldr_unsigned(&mut text, X8, X21, 0xC8);    // BootServices->LoadImage
+    blr(&mut text, X8);
+    let load_failed = cbnz_placeholder(&mut text, X0);
+
+    // StartImage(new_handle, NULL, NULL)
+    ldr_unsigned(&mut text, X0, SP, 56);       // x0 = new_handle
+    movz(&mut text, X1, 0, 0);                 // ExitDataSize = NULL
+    movz(&mut text, X2, 0, 0);                 // ExitData = NULL
+    ldr_unsigned(&mut text, X8, X21, 0xD0);    // BootServices->StartImage
+    blr(&mut text, X8);
+
+    let done = text.len();
+
+    // Patch all error branches to jump to 'done'.
+    a64::patch_cond_branch(text, open_failed, done, "OpenProtocol failed")?;
+    a64::patch_cond_branch(text, null_iface, done, "null loaded_image_iface")?;
+    a64::patch_cond_branch(text, null_device, done, "null DeviceHandle")?;
+    a64::patch_cond_branch(text, load_failed, done, "LoadImage failed")?;
+
+    // Restore temporaries.
+    a64_load_pair_signed(&mut text, X24, X25, SP, 16);
+    ldp_post(&mut text, X22, X23, SP, 32);
+
+    Ok(PathLoaderPatchesA64 {
+        device_path_patch: AdrPatch { instr_offset: dp_instr },
+        loaded_image_guid_patch: AdrPatch { instr_offset: guid_instr },
     })
 }
 
@@ -1264,14 +2058,28 @@ mod tests {
             "Payload INT3 sled not found in binary"
         );
 
-        assert!(
-            find_subsequence(&result.binary, &[0x41, 0xFF, 0x96, 0x28, 0, 0, 0]),
-            "Raw payload path should allocate EFI_LOADER_CODE pages via BootServices->AllocatePages"
-        );
-        assert!(
-            !find_subsequence(&result.binary, &[0x48, 0x8D, 0x3D]),
-            "Raw payload path must not jump directly into .rdata"
-        );
+        // Architecture-specific: verify raw payload loader calls AllocatePages.
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            assert!(
+                find_subsequence(&result.binary, &[0x41, 0xFF, 0x96, 0x28, 0, 0, 0]),
+                "Raw payload path should allocate EFI_LOADER_CODE pages via BootServices->AllocatePages"
+            );
+            assert!(
+                !find_subsequence(&result.binary, &[0x48, 0x8D, 0x3D]),
+                "Raw payload path must not jump directly into .rdata"
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // AArch64: BootServices->AllocatePages is at offset 0x28, loaded via
+            // LDR X8, [X21, #0x28].  The unsigned-offset encoding of LDR X8, [X21, #0x28]
+            // is 0xF940D168 (imm12=5, Rn=21, Rt=8).
+            assert!(
+                find_subsequence(&result.binary, &0xF940D168u32.to_le_bytes()),
+                "Raw payload path should load BootServices->AllocatePages on AArch64"
+            );
+        }
     }
 
     #[test]
@@ -1285,14 +2093,26 @@ mod tests {
         };
         let result = build_efi_stub(&config).unwrap();
 
-        assert!(
-            find_subsequence(&result.binary, &[0x4C, 0x8D, 0x0D]),
-            "Embedded PE path should pass SourceBuffer via r9"
-        );
-        assert!(
-            find_subsequence(&result.binary, &[0x41, 0xFF, 0x96, 0xC8, 0, 0, 0]),
-            "Embedded PE path should call BootServices->LoadImage"
-        );
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            assert!(
+                find_subsequence(&result.binary, &[0x4C, 0x8D, 0x0D]),
+                "Embedded PE path should pass SourceBuffer via r9"
+            );
+            assert!(
+                find_subsequence(&result.binary, &[0x41, 0xFF, 0x96, 0xC8, 0, 0, 0]),
+                "Embedded PE path should call BootServices->LoadImage"
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // AArch64: BootServices->LoadImage is at offset 0xC8, loaded via
+            // LDR X8, [X21, #0xC8].  Encoding: imm12=25, Rn=21, Rt=8 → 0xF9419468.
+            assert!(
+                find_subsequence(&result.binary, &0xF9419468u32.to_le_bytes()),
+                "Embedded PE path should load BootServices->LoadImage on AArch64"
+            );
+        }
     }
 
     #[test]
@@ -1381,9 +2201,15 @@ mod tests {
             find_subsequence(&result.binary, &utf16_path_bytes(original_path)),
             "Original bootloader path should be embedded as an EFI FILE_PATH device path"
         );
+        #[cfg(not(target_arch = "aarch64"))]
         assert!(
             find_subsequence(&result.binary, &[0x41, 0xFF, 0x96, 0xC8, 0, 0, 0]),
             "Original bootloader path should be loaded through BootServices->LoadImage"
+        );
+        #[cfg(target_arch = "aarch64")]
+        assert!(
+            find_subsequence(&result.binary, &0xF9419468u32.to_le_bytes()),
+            "Original bootloader path should be loaded through BootServices->LoadImage on AArch64"
         );
     }
 

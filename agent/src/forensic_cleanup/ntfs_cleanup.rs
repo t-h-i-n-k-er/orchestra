@@ -39,7 +39,7 @@
 use std::mem;
 
 use anyhow::{anyhow, bail, Context, Result};
-use log::{debug, info, warn};
+use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
 macro_rules! defer {
@@ -85,6 +85,12 @@ const OBJ_CASE_INSENSITIVE: u32 = 0x00000040;
 const FSCTL_ENUM_USN_DATA: u32 = 0x000900B8;
 const FSCTL_READ_USN_JOURNAL: u32 = 0x000900BB;
 const FSCTL_WRITE_USN_CLOSE: u32 = 0x000900EF;
+/// `FSCTL_IS_VOLUME_DIRTY` — returns a u32 whose bit 0 is set when the
+/// volume has pending NTFS transactions (i.e. the log is "in use").
+const FSCTL_IS_VOLUME_DIRTY: u32 = 0x00090078;
+/// Bit mask for the "volume is dirty" flag in the output of
+/// `FSCTL_IS_VOLUME_DIRTY`.
+const VOLUME_IS_DIRTY: u32 = 0x00000001;
 const FSCTL_QUERY_USN_JOURNAL: u32 = 0x000900F4;
 const FSCTL_GET_RETRIEVAL_POINTERS: u32 = 0x00090073;
 
@@ -451,6 +457,35 @@ unsafe fn nt_open_volume(volume: &str) -> Result<*mut std::ffi::c_void> {
     }
 
     Ok(handle)
+}
+
+/// Send an FSCTL via `NtFsControlFile` (indirect syscall).
+unsafe fn nt_fs_control_file(
+    file_handle: *mut std::ffi::c_void,
+    fs_control_code: u32,
+    input_buffer: *mut std::ffi::c_void,
+    input_buffer_length: u32,
+    output_buffer: *mut std::ffi::c_void,
+    output_buffer_length: u32,
+) -> Result<i32> {
+    let mut iosb = IoStatusBlock::default();
+
+    let status = crate::syscall!(
+        "NtFsControlFile",
+        file_handle as u64,
+        0u64, // Event
+        0u64, // ApcRoutine
+        0u64, // ApcContext
+        &mut iosb as *mut _ as u64,
+        fs_control_code as u64,
+        input_buffer as u64,
+        input_buffer_length as u64,
+        output_buffer as u64,
+        output_buffer_length as u64,
+    )
+    .map_err(|e| anyhow!("NtFsControlFile resolution: {e}"))?;
+
+    Ok(status)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -949,6 +984,41 @@ pub fn clean_logfile(volume: &str) -> Result<LogFileResult> {
         if data_runs_start == 0 || logfile_size == 0 {
             nt_close(vol_handle);
             bail!("Could not find $LogFile data runs");
+        }
+
+        // ── Pending-transaction safety check (M-6) ──────────────────────
+        // Before zeroing $LogFile data runs, verify the volume has no
+        // pending NTFS transactions.  If the volume is "dirty" (bit 0 of
+        // the FSCTL_IS_VOLUME_DIRTY output), aborting here avoids
+        // filesystem corruption from truncating an active log.
+        {
+            let mut dirty_flags: u32 = 0;
+            let status = nt_fs_control_file(
+                vol_handle,
+                FSCTL_IS_VOLUME_DIRTY,
+                std::ptr::null_mut(),
+                0,
+                &mut dirty_flags as *mut u32 as *mut std::ffi::c_void,
+                std::mem::size_of::<u32>() as u32,
+            )?;
+
+            if status != STATUS_SUCCESS {
+                nt_close(vol_handle);
+                bail!(
+                    "FSCTL_IS_VOLUME_DIRTY returned 0x{:08X} — aborting $LogFile cleanup",
+                    status as u32
+                );
+            }
+
+            if dirty_flags & VOLUME_IS_DIRTY != 0 {
+                nt_close(vol_handle);
+                bail!(
+                    "Volume '{}' is dirty (pending NTFS transactions, flags=0x{:08X}) — \
+                     aborting $LogFile cleanup to avoid filesystem corruption",
+                    volume,
+                    dirty_flags
+                );
+            }
         }
 
         // Parse data runs and zero them.

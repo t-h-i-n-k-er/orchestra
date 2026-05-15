@@ -80,6 +80,7 @@
 
 #![cfg(all(windows, feature = "stack-spoof", target_arch = "x86_64"))]
 
+use common::lock::MutexExt;
 use std::sync::{Mutex, OnceLock};
 
 // ── Transit gadget definitions ──────────────────────────────────────────────
@@ -367,7 +368,7 @@ fn populate_gadget_cache() -> Vec<TransitGadget> {
         all_gadgets.extend(gadgets);
     }
 
-    log::debug!(
+    tracing::debug!(
         "stack_spoof: found {} transit gadgets across {} DLLs",
         all_gadgets.len(),
         SCAN_DLLS.len(),
@@ -486,7 +487,7 @@ fn populate_return_addr_db() -> std::collections::HashMap<String, Vec<usize>> {
         }
     }
 
-    log::debug!(
+    tracing::debug!(
         "stack_spoof: return address DB has {} entries across {} modules",
         db.values().map(|v| v.len()).sum::<usize>(),
         db.len(),
@@ -580,13 +581,13 @@ const WIN32_CHAIN_TEMPLATES: &[Win32ChainTemplate] = &[
 /// - The return address database is empty
 /// - No template resolves successfully
 pub fn build_spoofed_stack() -> Option<SyntheticCallChain> {
-    let gadgets = ensure_gadgets().lock().unwrap();
+    let gadgets = ensure_gadgets().lock_recover();
     if gadgets.is_empty() {
-        log::warn!("stack_spoof: no transit gadgets available");
+        tracing::warn!("stack_spoof: no transit gadgets available");
         return None;
     }
 
-    let addr_db = ensure_return_addr_db().lock().unwrap();
+    let addr_db = ensure_return_addr_db().lock_recover();
 
     // Try templates in random order
     let template_order: Vec<usize> = {
@@ -751,7 +752,7 @@ fn build_fallback_chain(
 /// obtain transit gadgets for stack spoofing.
 pub fn find_transit_gadgets() -> Vec<TransitGadget> {
     let cache = ensure_gadgets();
-    cache.lock().unwrap().clone()
+    cache.lock_recover().clone()
 }
 
 /// Return whether the stack-spoofing infrastructure is available.
@@ -760,14 +761,14 @@ pub fn find_transit_gadgets() -> Vec<TransitGadget> {
 /// - Transit gadgets have been found in at least one DLL
 /// - The return address database has at least one module with addresses
 pub fn is_available() -> bool {
-    let gadgets = ensure_gadgets().lock().unwrap();
-    let addr_db = ensure_return_addr_db().lock().unwrap();
+    let gadgets = ensure_gadgets().lock_recover();
+    let addr_db = ensure_return_addr_db().lock_recover();
     !gadgets.is_empty() && !addr_db.is_empty()
 }
 
 /// Return the number of transit gadgets in the cache.
 pub fn gadget_count() -> usize {
-    ensure_gadgets().lock().unwrap().len()
+    ensure_gadgets().lock_recover().len()
 }
 
 /// Return the total number of return addresses in the database.
@@ -787,12 +788,12 @@ pub fn return_addr_count() -> usize {
 pub fn revalidate() {
     // Re-scan for gadgets
     {
-        let mut gadgets = ensure_gadgets().lock().unwrap();
+        let mut gadgets = ensure_gadgets().lock_recover();
         *gadgets = populate_gadget_cache();
     }
     // Re-scan for return addresses
     {
-        let mut db = ensure_return_addr_db().lock().unwrap();
+        let mut db = ensure_return_addr_db().lock_recover();
         *db = populate_return_addr_db();
     }
 }

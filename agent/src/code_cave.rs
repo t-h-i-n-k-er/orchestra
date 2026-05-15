@@ -39,7 +39,7 @@
 //! All functions are `unsafe` because they dereference raw pointers into
 //! remote process memory and manipulate memory protections.
 
-#![cfg(all(windows, target_arch = "x86_64"))]
+#![cfg(windows)]
 
 use std::sync::OnceLock;
 
@@ -315,11 +315,27 @@ unsafe fn enumerate_modules() -> Vec<ModuleInfo> {
 
     // Get PEB via TEB.
     let peb: *const u8;
-    std::arch::asm!(
-        "mov {}, gs:[0x60]",
-        out(reg) peb,
-        options(nostack, nomem, preserves_flags)
-    );
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::asm!(
+            "mov {}, gs:[0x60]",
+            out(reg) peb,
+            options(nostack, nomem, preserves_flags)
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        let teb: *const u8;
+        std::arch::asm!(
+            "mrs {}, tpidr_el0",
+            out(reg) teb,
+            options(nostack, nomem, preserves_flags)
+        );
+        // PEB pointer is at TEB+0x60 on aarch64 Windows.
+        peb = *(teb.add(0x60) as *const *const u8);
+    }
 
     if peb.is_null() {
         return result;

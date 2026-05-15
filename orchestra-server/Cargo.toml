@@ -14,7 +14,7 @@ common = { path = "../common" }
 builder = { path = "../builder" }
 tokio = { workspace = true }
 serde = { workspace = true }
-serde_json = "1.0"
+serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -23,22 +23,19 @@ clap = { workspace = true }
 axum = { version = "0.7", features = ["ws", "macros"] }
 axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
 tower-http = { version = "0.5", features = ["fs", "trace", "cors"] }
-rustls = { version = "0.23.38", default-features = false, features = ["ring", "std", "logging", "tls12"] }
-rcgen = "0.13"
+rustls = { workspace = true }
+rcgen = "0.14"
 dashmap = "6"
 uuid = { version = "1", features = ["v4"] }
-toml = "0.8"
-async-trait = "0.1"
+toml = { workspace = true }
 futures-util = "0.3"
 subtle = "2.5"
-time = { version = "0.3", features = ["formatting"] }
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
-bincode = "1.3.3"
+tokio-rustls = { workspace = true }
+bincode = { version = "2", features = ["serde"] }
 tempfile = "3"
-libc = "0.2.185"
 chrono = { version = "0.4.44", features = ["serde"] }
 sha2 = { workspace = true }
-hmac = "0.12"
+hmac = "0.13"
 hex = "0.4"
 base64 = { workspace = true }
 zeroize = "1"
@@ -54,11 +51,15 @@ rustls-pemfile = "2"
 # Enable dangerous-tls so tests can use NoCertificateVerification.
 common = { path = "../common", features = ["dangerous-tls"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.185"
+
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["winbase", "namedpipeapi", "fileapi", "handleapi"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_System_IO", "Win32_Security"] }
 
 [features]
 default = []
-# Application-layer forward secrecy via X25519 ECDH. Must also be enabled on
-# the agent side for the exchange to succeed.
-forward-secrecy = ["common/forward-secrecy"]
+# NOTE: Application-layer forward secrecy (X25519 ECDH) is now always
+# enabled.  The `common::forward_secrecy` module is compiled
+# unconditionally.  The old feature flag has been removed because it was
+# a no-op stub that gated nothing.

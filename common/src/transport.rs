@@ -21,7 +21,7 @@ pub const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 #[async_trait]
 impl Transport for TcpTransport {
     async fn send(&mut self, msg: Message) -> Result<()> {
-        let serialized = bincode::serialize(&msg)?;
+        let serialized = bincode::serde::encode_to_vec(&msg, bincode::config::legacy())?;
         let encrypted = self.session.encrypt(&serialized);
         let len = encrypted.len() as u32;
         self.stream.write_u32_le(len).await?;
@@ -31,6 +31,9 @@ impl Transport for TcpTransport {
 
     async fn recv(&mut self) -> Result<Message> {
         let len = self.stream.read_u32_le().await?;
+        if len == 0 {
+            anyhow::bail!("zero-length frame rejected");
+        }
         if len > MAX_FRAME_BYTES {
             anyhow::bail!(
                 "Frame length {} exceeds maximum allowed {}",
@@ -41,7 +44,7 @@ impl Transport for TcpTransport {
         let mut buffer = vec![0; len as usize];
         self.stream.read_exact(&mut buffer).await?;
         let decrypted = self.session.decrypt(&buffer)?;
-        let msg: Message = bincode::deserialize(&decrypted)?;
+        let msg: Message = bincode::serde::decode_from_slice(&decrypted, bincode::config::legacy()).map(|(v, _)| v)?;
         Ok(msg)
     }
 }

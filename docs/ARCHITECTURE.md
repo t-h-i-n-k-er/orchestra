@@ -190,7 +190,7 @@ pub fn handle_command(
 ) -> Result<String, String>
 ```
 
-Each command handler is a separate function in `handlers.rs` or a dedicated module. The 70+ commands include:
+Each command handler is a separate function in `handlers.rs` or a dedicated module. The 120+ commands include:
 
 | Category | Commands |
 |----------|----------|
@@ -203,9 +203,9 @@ Each command handler is a separate function in `handlers.rs` or a dedicated modu
 | **HCI Research** | `StartHciLogging`, `StopHciLogging`, `GetHciLogBuffer` |
 | **Persistence** | `EnablePersistence`, `DisablePersistence` |
 | **Injection — Unified** | `UnifiedInject { target_process, payload, technique, evade }` — unified 15-variant engine with string-based selection for the parser-exposed techniques (`"auto"`, `"ProcessHollow"`, `"ThreadPool"`, `"ThreadPool:Work"`, etc.) |
-| **Injection — Legacy** | `TransactedHollow { target_process, payload, etw_blinding }`, `DelayedStomp { target_pid, payload, delay_secs }`, `InjectSideLoad { pid, payload, export_config }` |
+| **Injection — Legacy** | `TransactedHollow { target_process, payload, etw_blinding }`, `DelayedStomp { target_pid, payload, delay_secs }`, `InjectSideLoad { pid, payload, export_config }`, `ProcessDoppelganging` (NTFS transaction-backed process hollowing — `transacted-hollowing` feature) |
 | **Code Morphing** | `SetReencodeSeed`, `MorphNow` |
-| **Evasion** | `SyscallEmulationToggle`, `CetStatus`, `UnhookNtdll` (KnownDlls re-fetch + disk fallback), `AmsiBypassMode { mode }` (Hwbp / MemoryPatch / WriteRaid / Auto) |
+| **Evasion** | `SyscallEmulationToggle`, `CetStatus`, `UnhookNtdll` (KnownDlls re-fetch + disk fallback), `AmsiBypassMode { mode }` (Hwbp / MemoryPatch / WriteRaid / Auto), `DenyDebuggerAttach` 🆕 — permanently deny debugger attachment via `NtSetInformationProcess(ProcessDebugFlags)` |
 | **EDR Bypass Transform** | `EvasionTransformScan`, `EvasionTransformRun`, `EdrBypassStatus` |
 | **Token Manipulation** | `MakeToken`, `StealToken`, `Rev2Self`, `GetSystem` |
 | **Token Impersonation** | `ImpersonatePipe`, `RevertToken`, `ListTokens` |
@@ -220,8 +220,16 @@ Each command handler is a separate function in `handlers.rs` or a dedicated modu
 | **Credential Access** | `HarvestLSASS` (incremental memory reading — no dump file), `HarvestLSA { method }` (Untrusted/SspInject/Auto), `LSAWhispererStatus`, `LSAWhispererStop` |
 | **Kernel Callback** | `KernelCallbackScan`, `KernelCallbackNuke { drivers }`, `KernelCallbackRestore` |
 | **Sleep** | `SetSleepVariant { variant }` ("cronus" / "ekko") |
-| **Evanesco** | `EvanescoStatus`, `EvanescoSetThreshold { idle_ms }` |
+| **Evanesco** | `EvanescoStatus`, `EvanescoSetThreshold { idle_ms }`, `PageTrackerStatus` 🆕, `PageTrackerStatusRedacted` 🆕 (live page-tracker statistics with optional credential redaction) |
 | **Sandbox** | `SandboxCheck` — weighted indicator breakdown with total score and threshold |
+| **COM Hijack** 🆕 | `ComHijackScanTargets`, `ComHijackManifest`, `ComHijackProxyDll`, `ComHijackActivateFile`, `ComHijackActivateMemory` — registry-free COM hijack through activation contexts (`com-hijack` feature) |
+| **DPAPI Backup** 🆕 | `DpapiBackupKeyRetrieve`, `DpapiBackupKeyHarvest`, `DpapiBackupKeyDecrypt` — domain backup-key retrieval and blob decryption (`dpapi-backup` feature) |
+| **Hardware Persistence** 🆕 | `HwDetectThunderbolt`, `HwCheckDmaVulnerability`, `HwPrepareDmaPayload`, `HwDmaReadPhysical`, `HwBootMode`, `HwInstallVbrPersistence`, `HwInstallUefiBootPersistence`, `HwDetectPersistence`, `HwRemovePersistence` — Thunderbolt/DMA-based hardware persistence (`hardware-persistence` feature) |
+| **Kerberos Relay** 🆕 | `KerberosRelay`, `KerberosRelayListClsids` — Kerberos relay through COM cross-session activation (`kerberos-relay` feature) |
+| **macOS Post-Exploitation** 🆕 | `MacTccCheck`, `MacTccBypass`, `MacSipStatus`, `MacSipBypassMount`, `MacXpcEnumerate`, `MacXpcExploit`, `MacKeychainDump` — TCC/SIP/XPC/Keychain operations on macOS (`macos-postexp` feature) |
+| **Shadow Credentials** 🆕 | `ShadowCredentialsCheckAccess`, `ShadowCredentialsCertGen`, `ShadowCredentialsAttack` — AD Shadow Credentials via `msDS-KeyCredentialLink` and PKINIT (`shadow-credentials` feature) |
+| **UEFI Persistence** 🆕 | `UefiMountEsp`, `UefiEnumerateBootEntries`, `UefiBuildStub`, `UefiCheckCapsuleSupport`, `UefiDetectPersistence`, `UefiWriteDriver`, `UefiWriteVariable`, `UefiReadVariable`, `UefiModifyBootEntry`, `UefiInstallRuntimeDriver`, `UefiRemovePersistence` — UEFI NVRAM/ESP persistence (`uefi-persistence` feature) |
+| **WMI Persistence** 🆕 | `WmiScanSubscriptions`, `WmiInstallSubscription`, `WmiRemoveSubscription`, `WmiGenerateStager`, `WmiCloudUpload` — COM-based WMI permanent event subscriptions (`wmi-persistence` feature) |
 
 ---
 
@@ -1517,9 +1525,9 @@ The `persistence` module implements platform-specific persistence mechanisms:
 | Windows | Registry Run | Writes to `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` with configurable key name |
 | Windows | COM Hijack | Replaces InProcServer32 for a GUID with agent path |
 | Windows | WMI Subscription | Creates `__EventFilter` + `CommandLineEventConsumer` binding via COM |
-| Linux | LaunchAgent (macOS) | Writes `.plist` to `~/Library/LaunchAgents/` |
+| macOS | LaunchAgent | Writes `.plist` to `~/Library/LaunchAgents/` and loads via `launchctl bootstrap gui/$(uid)` |
 | Linux | cron | Adds `@reboot` entry to user crontab |
-| Linux | systemd | Creates user service unit in `~/.config/systemd/user/` |
+| Linux | systemd | Creates user service unit in `~/.config/systemd/user/` (user) or `/etc/systemd/system/` (root) |
 | Linux | shell profile | Appends execution to `.bashrc` / `.zshrc` |
 
 All persistence methods are gated behind the `persistence` feature flag and require an explicit `EnablePersistence` command.

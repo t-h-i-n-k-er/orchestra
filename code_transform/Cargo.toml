@@ -8,7 +8,7 @@ edition = "2021"
 virtualize = []
 
 [dependencies]
-iced-x86 = { version = "1", features = [
+iced-x86 = { version = "1.20", features = [
     "decoder",
     "encoder",
     "block_encoder",

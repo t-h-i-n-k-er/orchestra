@@ -1096,8 +1096,6 @@ fn emit_handler(
             //   6. Store rdx → [rbx+rcx]
             // This works uniformly for all ops.
 
-            let op = *self; // capture which VmOp we are
-
             // Load dst register index
             load_reg_idx!(out); // eax = dst reg index
 
@@ -1184,18 +1182,18 @@ fn emit_handler(
                 VmOp::Shl => {
                     // Shift dst by cl (low byte of src). Use rcx for shift count.
                     // rax already has src value; move low byte to cl.
-                    let mut mov_cl = Instruction::with2(Code::Mov_cl_r8, Register::CL, Register::AL).unwrap();
+                    let mut mov_cl = Instruction::with2(Code::Mov_rm8_r8, Register::CL, Register::AL).unwrap();
                     mov_cl.set_ip(next_ip());
                     out.push(mov_cl);
-                    let mut alu = Instruction::with1(Code::Shl_r64_cl, Register::RDX).unwrap();
+                    let mut alu = Instruction::with2(Code::Shl_rm64_CL, Register::RDX, Register::CL).unwrap();
                     alu.set_ip(next_ip());
                     out.push(alu);
                 }
                 VmOp::Shr => {
-                    let mut mov_cl = Instruction::with2(Code::Mov_cl_r8, Register::CL, Register::AL).unwrap();
+                    let mut mov_cl = Instruction::with2(Code::Mov_rm8_r8, Register::CL, Register::AL).unwrap();
                     mov_cl.set_ip(next_ip());
                     out.push(mov_cl);
-                    let mut alu = Instruction::with1(Code::Shr_r64_cl, Register::RDX).unwrap();
+                    let mut alu = Instruction::with2(Code::Shr_rm64_CL, Register::RDX, Register::CL).unwrap();
                     alu.set_ip(next_ip());
                     out.push(alu);
                 }

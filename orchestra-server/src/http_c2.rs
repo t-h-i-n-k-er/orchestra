@@ -42,6 +42,11 @@ struct HttpSession {
     connection_id: String,
     outbound_rx: mpsc::Receiver<Message>,
     outbound_queue: VecDeque<Message>,
+    /// ECDH-derived crypto session (replaces static PSK once established).
+    ecdh_session: Option<std::sync::Arc<common::CryptoSession>>,
+    /// Server-side ECDH state used to produce the response header
+    /// on the *first* reply after receiving the client's ECDH init.
+    ecdh_handshake_pending: Option<String>,
 }
 
 /// Shared state for the HTTP C2 handler.
@@ -49,6 +54,8 @@ struct HttpSession {
 pub struct HttpC2State {
     pub profile_manager: Arc<MultiProfileManager>,
     pub app_state: Arc<AppState>,
+    /// Static PSK-derived crypto session (fallback when ECDH not established).
+    crypto: Arc<common::CryptoSession>,
     /// Per-session HTTP transport state keyed by extracted session ID.
     sessions: Arc<DashMap<String, Arc<Mutex<HttpSession>>>>,
     /// Per-IP rate limiter for C2 requests.  More permissive than the auth
@@ -62,9 +69,13 @@ impl HttpC2State {
         app_state: Arc<AppState>,
         c2_rate_limiter: Arc<auth::PerIpRateLimiter>,
     ) -> Self {
+        let crypto = Arc::new(common::CryptoSession::from_shared_secret(
+            app_state.agent_shared_secret.as_bytes(),
+        ));
         Self {
             profile_manager,
             app_state,
+            crypto,
             sessions: Arc::new(DashMap::new()),
             c2_rate_limiter,
         }
@@ -152,13 +163,25 @@ async fn handle_get(
     };
 
     // Step 3: Touch the session.
-    ensure_http_session(state, &session_id);
+    let http_session = ensure_http_session(state, &session_id);
+
+    // Process ECDH header (if present) and obtain response header value.
+    let ecdh_response_header = {
+        let mut guard = http_session.lock().unwrap_or_else(|p| p.into_inner());
+        process_ecdh_header(state, &session_id, &mut guard, headers)
+    };
+
+    // Determine the crypto session (ECDH-derived or PSK fallback).
+    let crypto = {
+        let guard = http_session.lock().unwrap_or_else(|p| p.into_inner());
+        session_crypto(state, &guard)
+    };
 
     state.profile_manager.touch_session(&session_id).await;
 
     if !body.is_empty() {
         match transformer.transform_inbound(body) {
-            Ok(decoded) => match make_transport_crypto(state).decrypt(&decoded) {
+            Ok(decoded) => match crypto.decrypt(&decoded) {
                 Ok(plaintext) => {
                     process_task_output(&state, &session_id, &plaintext).await;
                 }
@@ -198,17 +221,26 @@ async fn handle_get(
             let content_type = transformer
                 .content_type()
                 .unwrap_or("application/octet-stream");
-            return (
+            let mut resp = (
                 StatusCode::OK,
                 [(axum::http::header::CONTENT_TYPE, content_type)],
                 Bytes::new(),
             )
                 .into_response();
+            if let Some(ref hdr) = ecdh_response_header {
+                resp.headers_mut().insert(
+                    axum::http::HeaderName::from_static(
+                        common::forward_secrecy::ECDH_HEADER_NAME,
+                    ),
+                    axum::http::HeaderValue::from_str(hdr).unwrap(),
+                );
+            }
+            return resp;
         }
     };
 
     // Step 5: Transform the tasking data through the server pipeline.
-    let encrypted_task_data = make_transport_crypto(state).encrypt(&task_data);
+    let encrypted_task_data = crypto.encrypt(&task_data);
     let response_body = transformer.transform_outbound(&encrypted_task_data, &session_id);
 
     // Step 6: Build the response with profile headers.
@@ -226,6 +258,11 @@ async fn handle_get(
         if key.to_lowercase() != "content-type" {
             builder = builder.header(key.as_str(), value.as_str());
         }
+    }
+
+    // Add ECDH response header if handshake just completed.
+    if let Some(ref hdr) = ecdh_response_header {
+        builder = builder.header(common::forward_secrecy::ECDH_HEADER_NAME, hdr.as_str());
     }
 
     builder
@@ -266,7 +303,19 @@ async fn handle_post(
     };
 
     // Step 3: Transform and decrypt the inbound data.
-    ensure_http_session(state, &session_id);
+    let http_session = ensure_http_session(state, &session_id);
+
+    // Process ECDH header (if present) and obtain response header value.
+    let ecdh_response_header = {
+        let mut guard = http_session.lock().unwrap_or_else(|p| p.into_inner());
+        process_ecdh_header(state, &session_id, &mut guard, headers)
+    };
+
+    // Determine the crypto session (ECDH-derived or PSK fallback).
+    let crypto = {
+        let guard = http_session.lock().unwrap_or_else(|p| p.into_inner());
+        session_crypto(state, &guard)
+    };
 
     let decoded = match transformer.transform_inbound(body) {
         Ok(data) => data,
@@ -281,7 +330,7 @@ async fn handle_post(
         }
     };
 
-    let plaintext = match make_transport_crypto(state).decrypt(&decoded) {
+    let plaintext = match crypto.decrypt(&decoded) {
         Ok(data) => data,
         Err(e) => {
             tracing::warn!(
@@ -314,12 +363,24 @@ async fn handle_post(
         .content_type()
         .unwrap_or("application/octet-stream");
 
-    (
+    let mut resp = (
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, content_type)],
         Bytes::from(ack),
     )
-        .into_response()
+        .into_response();
+
+    // Add ECDH response header if handshake just completed.
+    if let Some(ref hdr) = ecdh_response_header {
+        resp.headers_mut().insert(
+            axum::http::HeaderName::from_static(
+                common::forward_secrecy::ECDH_HEADER_NAME,
+            ),
+            axum::http::HeaderValue::from_str(hdr).unwrap(),
+        );
+    }
+
+    resp
 }
 
 // ── Helper Functions ─────────────────────────────────────────────────────────
@@ -339,8 +400,10 @@ fn extract_headers(headers: &HeaderMap) -> HashMap<String, String> {
 ///
 /// Delegates to `auth::extract_client_ip` which checks `ConnectInfo`,
 /// then `X-Forwarded-For`, then falls back to `127.0.0.1`.
+/// Returns only the IP (discards the trust flag — the C2 path does not
+/// use per-IP rate limiting).
 fn extract_client_ip_from_request(req: &axum::extract::Request) -> IpAddr {
-    auth::extract_client_ip(req)
+    auth::extract_client_ip(req).0
 }
 
 fn now_secs() -> u64 {
@@ -350,8 +413,59 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-fn make_transport_crypto(state: &HttpC2State) -> common::CryptoSession {
-    common::CryptoSession::from_shared_secret(state.app_state.agent_shared_secret.as_bytes())
+/// Return the appropriate crypto session for a given HTTP session:
+/// - If ECDH has completed, use the derived session (forward secrecy).
+/// - Otherwise fall back to the static PSK session.
+fn session_crypto(
+    state: &HttpC2State,
+    http_session: &HttpSession,
+) -> std::sync::Arc<common::CryptoSession> {
+    http_session
+        .ecdh_session
+        .clone()
+        .unwrap_or_else(|| state.crypto.clone())
+}
+
+/// Process the `X-ECDH-Pub` header from an agent request.
+///
+/// If present and valid, derives an ECDH session key and stores it on the
+/// `HttpSession` for all subsequent encrypt/decrypt operations.  Returns
+/// the response header value that the server must echo back so the agent
+/// can complete its side of the handshake.
+fn process_ecdh_header(
+    state: &HttpC2State,
+    session_id: &str,
+    http_session: &mut HttpSession,
+    headers: &HashMap<String, String>,
+) -> Option<String> {
+    let header_val = headers.get(common::forward_secrecy::ECDH_HEADER_NAME)?;
+
+    // Skip if this session already completed ECDH.
+    if http_session.ecdh_session.is_some() {
+        return None;
+    }
+
+    let psk = state.app_state.agent_shared_secret.as_bytes();
+    match common::forward_secrecy::HttpEcdhServerSession::new(psk, header_val) {
+        Ok(server_ecdh) => {
+            let response_header = server_ecdh.response_header_value();
+            http_session.ecdh_session = Some(Arc::new(server_ecdh.into_session()));
+            http_session.ecdh_handshake_pending = None; // cleared — session is ready
+            tracing::info!(
+                "ECDH session established for HTTP agent '{}'",
+                session_id
+            );
+            Some(response_header)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "ECDH handshake failed for session '{}': {}",
+                session_id,
+                e
+            );
+            None
+        }
+    }
 }
 
 fn ensure_http_session(state: &HttpC2State, session_id: &str) -> Arc<Mutex<HttpSession>> {
@@ -386,6 +500,8 @@ fn ensure_http_session(state: &HttpC2State, session_id: &str) -> Arc<Mutex<HttpS
                 connection_id,
                 outbound_rx: rx,
                 outbound_queue: VecDeque::new(),
+                ecdh_session: None,
+                ecdh_handshake_pending: None,
             }));
             v.insert(session.clone());
             session
@@ -464,7 +580,7 @@ async fn get_pending_task(state: &HttpC2State, session_id: &str) -> Option<Vec<u
     };
 
     let msg = maybe_msg?;
-    match bincode::serialize(&msg) {
+    match bincode::serde::encode_to_vec(&msg, bincode::config::legacy()) {
         Ok(v) => Some(v),
         Err(e) => {
             tracing::warn!(
@@ -485,7 +601,7 @@ async fn process_task_output(state: &HttpC2State, session_id: &str, output: &[u8
         session_id
     );
 
-    let msg: Message = match bincode::deserialize(output) {
+    let msg: Message = match bincode::serde::decode_from_slice(output, bincode::config::legacy()).map(|(v, _)| v) {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(

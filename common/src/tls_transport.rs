@@ -132,7 +132,7 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
 /// Performs a minimal DER parse to extract SAN dNSName entries and compares
 /// them against `server_name`.  Falls back to CN matching if no SAN extension
 /// is present.  Returns `true` if the name matches, `false` otherwise.
-fn verify_cert_hostname(der: &[u8], server_name: &rustls::pki_types::ServerName<'_>) -> bool {
+pub fn verify_cert_hostname(der: &[u8], server_name: &rustls::pki_types::ServerName<'_>) -> bool {
     let expected = match server_name {
         rustls::pki_types::ServerName::DnsName(dns) => dns.as_ref().to_ascii_lowercase(),
         _ => return true, // IP address or other types — skip hostname check
@@ -393,7 +393,7 @@ fn enter_seq(buf: &[u8], pos: usize) -> Option<usize> {
 /// `None` when the structure cannot be navigated.
 ///
 /// Handles both `UTCTime` (2-digit year) and `GeneralizedTime` (4-digit year).
-fn cert_validity_period(der: &[u8]) -> Option<(i64, i64)> {
+pub fn cert_validity_period(der: &[u8]) -> Option<(i64, i64)> {
     // Minimal DER TLV decoder.
     fn read_len(buf: &[u8], pos: usize) -> Option<(usize, usize)> {
         let first = *buf.get(pos)?;
@@ -571,10 +571,293 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsTransport<S> {
 
 pub const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CryptoSession, Message};
+    use tokio::io::duplex;
+
+    // ── hex_nibble ─────────────────────────────────────────────────────
+
+    #[test]
+    fn hex_nibble_digits() {
+        assert_eq!(hex_nibble(b'0').unwrap(), 0);
+        assert_eq!(hex_nibble(b'9').unwrap(), 9);
+    }
+
+    #[test]
+    fn hex_nibble_lowercase() {
+        assert_eq!(hex_nibble(b'a').unwrap(), 10);
+        assert_eq!(hex_nibble(b'f').unwrap(), 15);
+    }
+
+    #[test]
+    fn hex_nibble_uppercase() {
+        assert_eq!(hex_nibble(b'A').unwrap(), 10);
+        assert_eq!(hex_nibble(b'F').unwrap(), 15);
+    }
+
+    #[test]
+    fn hex_nibble_invalid() {
+        assert!(hex_nibble(b'g').is_err());
+        assert!(hex_nibble(b'z').is_err());
+        assert!(hex_nibble(b'G').is_err());
+        assert!(hex_nibble(b' ').is_err());
+    }
+
+    // ── PinnedCertVerifier ─────────────────────────────────────────────
+
+    #[test]
+    fn verifier_from_hex_roundtrip() {
+        let expected: [u8; 32] = [
+            0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45,
+            0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01,
+            0x23, 0x45, 0x67, 0x89,
+        ];
+        let hex = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let verifier = PinnedCertVerifier::from_hex(hex).unwrap();
+        assert_eq!(verifier.expected, expected);
+    }
+
+    #[test]
+    fn verifier_from_hex_rejects_short() {
+        assert!(PinnedCertVerifier::from_hex("abcd").is_err());
+    }
+
+    #[test]
+    fn verifier_from_hex_rejects_long() {
+        let long = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789ff";
+        assert!(PinnedCertVerifier::from_hex(long).is_err());
+    }
+
+    #[test]
+    fn verifier_from_hex_rejects_invalid_chars() {
+        let bad = "ghijklmnopqrstuvghijklmnopqrstuvghijklmnopqrstuvghijklmnopqrstuvghij";
+        assert!(PinnedCertVerifier::from_hex(bad).is_err());
+    }
+
+    #[test]
+    fn verifier_new_matches_from_hex() {
+        let bytes = [0x42u8; 32];
+        let v1 = PinnedCertVerifier::new(bytes);
+        let hex: String = "42".repeat(32);
+        let v2 = PinnedCertVerifier::from_hex(&hex).unwrap();
+        assert_eq!(v1.expected, v2.expected);
+    }
+
+    // ── match_wildcard ─────────────────────────────────────────────────
+
+    #[test]
+    fn wildcard_matches_subdomain() {
+        assert!(match_wildcard("*.example.com", "sub.example.com"));
+        assert!(match_wildcard("*.example.com", "www.example.com"));
+    }
+
+    #[test]
+    fn wildcard_no_match_bare_domain() {
+        assert!(!match_wildcard("*.example.com", "example.com"));
+    }
+
+    #[test]
+    fn wildcard_no_match_multi_level() {
+        // *.example.com should not match deep.sub.example.com by strict rules
+        // but our impl allows it since we only check the suffix after first dot.
+        // This test documents current behavior.
+        let result = match_wildcard("*.example.com", "deep.sub.example.com");
+        // ".sub.example.com" != ".example.com" → false
+        assert!(!result);
+    }
+
+    #[test]
+    fn wildcard_no_match_wrong_suffix() {
+        assert!(!match_wildcard("*.example.com", "sub.other.com"));
+    }
+
+    #[test]
+    fn non_wildcard_returns_false() {
+        assert!(!match_wildcard("example.com", "example.com"));
+    }
+
+    #[test]
+    fn wildcard_name_no_dot_returns_false() {
+        assert!(!match_wildcard("*.example.com", "nodot"));
+    }
+
+    // ── read_der_len ───────────────────────────────────────────────────
+
+    #[test]
+    fn read_der_len_short() {
+        let buf = [0x05, 0x01, 0x02];
+        let (pos, len) = read_der_len(&buf, 0).unwrap();
+        assert_eq!(pos, 1);
+        assert_eq!(len, 5);
+    }
+
+    #[test]
+    fn read_der_len_two_byte() {
+        let buf = [0x81, 0x80, 0x00]; // length = 128
+        let (pos, len) = read_der_len(&buf, 0).unwrap();
+        assert_eq!(pos, 2);
+        assert_eq!(len, 128);
+    }
+
+    #[test]
+    fn read_der_len_zero() {
+        let buf = [0x00];
+        let (pos, len) = read_der_len(&buf, 0).unwrap();
+        assert_eq!(pos, 1);
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn read_der_len_out_of_bounds() {
+        let buf = [0x81]; // says 1-byte length follows, but no byte present
+        assert!(read_der_len(&buf, 0).is_none());
+    }
+
+    // ── skip_tlv ───────────────────────────────────────────────────────
+
+    #[test]
+    fn skip_tlv_basic() {
+        // SEQUENCE of length 2 followed by data
+        let buf = [0x30, 0x02, 0x01, 0x02, 0xFF];
+        let next = skip_tlv(&buf, 0).unwrap();
+        assert_eq!(next, 4); // past tag(1) + len(1) + value(2)
+    }
+
+    // ── enter_seq ──────────────────────────────────────────────────────
+
+    #[test]
+    fn enter_seq_valid() {
+        let buf = [0x30, 0x02, 0x01, 0x02];
+        let pos = enter_seq(&buf, 0).unwrap();
+        assert_eq!(pos, 2); // points to first byte inside the SEQUENCE
+    }
+
+    #[test]
+    fn enter_seq_wrong_tag() {
+        let buf = [0x02, 0x01, 0x01]; // INTEGER, not SEQUENCE
+        assert!(enter_seq(&buf, 0).is_none());
+    }
+
+    // ── TlsTransport send/recv roundtrip ───────────────────────────────
+
+    #[tokio::test]
+    async fn tls_transport_roundtrip() {
+        let key = [0x77u8; 32];
+        let (client_io, server_io) = duplex(4096);
+        let mut client_transport: TlsTransport<_> =
+            TlsTransport::new(client_io, CryptoSession::from_key(key));
+        let mut server_transport: TlsTransport<_> =
+            TlsTransport::new(server_io, CryptoSession::from_key(key));
+
+        let msg = Message::VersionHandshake { version: 42 };
+        client_transport.send(msg.clone()).await.unwrap();
+        let received = server_transport.recv().await.unwrap();
+        match received {
+            Message::VersionHandshake { version } => assert_eq!(version, 42),
+            other => panic!("expected VersionHandshake, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_transport_heartbeat_roundtrip() {
+        let key = [0xAAu8; 32];
+        let (client_io, server_io) = duplex(4096);
+        let mut client_transport: TlsTransport<_> =
+            TlsTransport::new(client_io, CryptoSession::from_key(key));
+        let mut server_transport: TlsTransport<_> =
+            TlsTransport::new(server_io, CryptoSession::from_key(key));
+
+        let msg = Message::Heartbeat {
+            timestamp: 1234567890,
+            agent_id: "test-agent".to_string(),
+            status: "ok".to_string(),
+            mesh_public_key: None,
+        };
+        client_transport.send(msg.clone()).await.unwrap();
+        let received = server_transport.recv().await.unwrap();
+        match received {
+            Message::Heartbeat {
+                timestamp,
+                agent_id,
+                status,
+                mesh_public_key,
+            } => {
+                assert_eq!(timestamp, 1234567890);
+                assert_eq!(agent_id, "test-agent");
+                assert_eq!(status, "ok");
+                assert!(mesh_public_key.is_none());
+            }
+            other => panic!("expected Heartbeat, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_transport_shutdown_roundtrip() {
+        let key = [0xBBu8; 32];
+        let (client_io, server_io) = duplex(4096);
+        let mut client_transport: TlsTransport<_> =
+            TlsTransport::new(client_io, CryptoSession::from_key(key));
+        let mut server_transport: TlsTransport<_> =
+            TlsTransport::new(server_io, CryptoSession::from_key(key));
+
+        client_transport.send(Message::Shutdown).await.unwrap();
+        let received = server_transport.recv().await.unwrap();
+        match received {
+            Message::Shutdown => {}
+            other => panic!("expected Shutdown, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_transport_wrong_key_fails() {
+        let client_key = [0x11u8; 32];
+        let server_key = [0x22u8; 32];
+        let (client_io, server_io) = duplex(4096);
+        let mut client_transport: TlsTransport<_> =
+            TlsTransport::new(client_io, CryptoSession::from_key(client_key));
+        let mut server_transport: TlsTransport<_> =
+            TlsTransport::new(server_io, CryptoSession::from_key(server_key));
+
+        client_transport
+            .send(Message::Shutdown)
+            .await
+            .unwrap();
+        // Decryption should fail because keys don't match.
+        let result = server_transport.recv().await;
+        assert!(result.is_err(), "recv with wrong key should fail");
+    }
+
+    #[tokio::test]
+    async fn tls_transport_oversized_frame_rejected() {
+        let key = [0xCCu8; 32];
+        let (client_io, server_io) = duplex(8192);
+        let mut client_transport: TlsTransport<_> =
+            TlsTransport::new(client_io, CryptoSession::from_key(key));
+        let mut server_transport: TlsTransport<_> =
+            TlsTransport::new(server_io, CryptoSession::from_key(key));
+
+        // Write a frame length that exceeds MAX_FRAME_BYTES directly.
+        use tokio::io::AsyncWriteExt;
+        client_transport.stream.write_u32_le(MAX_FRAME_BYTES + 1).await.unwrap();
+        let result = server_transport.recv().await;
+        assert!(result.is_err(), "oversized frame should be rejected");
+    }
+
+    // ── cert_validity_period (self-signed cert parse) ──────────────────
+
+    #[test]
+    fn cert_validity_period_rejects_garbage() {
+        assert!(cert_validity_period(&[]).is_none());
+        assert!(cert_validity_period(&[0xFF]).is_none());
+    }
+}
+
 #[async_trait]
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport for TlsTransport<S> {
     async fn send(&mut self, msg: Message) -> Result<()> {
-        let serialized = bincode::serialize(&msg)?;
+        let serialized = bincode::serde::encode_to_vec(&msg, bincode::config::legacy())?;
         let encrypted = self.session.encrypt(&serialized);
         let len = encrypted.len() as u32;
         self.stream.write_u32_le(len).await?;
@@ -594,6 +877,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport for TlsTransport<S> {
         let mut buffer = vec![0u8; len as usize];
         self.stream.read_exact(&mut buffer).await?;
         let decrypted = self.session.decrypt(&buffer)?;
-        Ok(bincode::deserialize(&decrypted)?)
+        Ok(bincode::serde::decode_from_slice(&decrypted, bincode::config::legacy()).map(|(v, _)| v)?)
     }
 }

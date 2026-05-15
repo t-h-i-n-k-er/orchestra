@@ -1146,7 +1146,13 @@ fn align_up(val: usize, align: usize) -> usize {
 // ── Public high-level injection functions ─────────────────────────────────────
 
 /// Inject or replace the VS_VERSIONINFO resource (RT_VERSION = 16) in the PE.
-pub fn inject_version_info(buf: &mut Vec<u8>, cfg: &VersionInfoConfig) -> Result<()> {
+/// Build the VS_VERSIONINFO blob (RT_VERSION = 16) from config and add it to
+/// the resource builder.
+///
+/// This is the internal helper used by [`apply_all`] to coalesce resources.
+/// The public [`inject_version_info`] wrapper calls this and then writes the
+/// section immediately.
+fn add_version_info_to_builder(rsrc: &mut ResourceSectionBuilder, cfg: &VersionInfoConfig) -> Result<()> {
     // If clone_from is set, try to extract version info from the reference PE.
     // On the build host (likely Linux) the reference PE probably doesn't exist;
     // fall back to config-based generation silently.
@@ -1175,22 +1181,33 @@ pub fn inject_version_info(buf: &mut Vec<u8>, cfg: &VersionInfoConfig) -> Result
         build_vs_versioninfo(cfg)
     };
 
-    let mut rsrc = ResourceSectionBuilder::default();
     // RT_VERSION = 16, name ID = 1, language ID = 0 (neutral).
     rsrc.add(16, 1, 0, vi_data);
+    Ok(())
+}
+
+/// Inject or replace the VS_VERSIONINFO resource (RT_VERSION = 16) in the PE.
+///
+/// When called standalone, this creates a new `.rsrc` section containing only
+/// the version info. When multiple resource types are needed, prefer using
+/// [`apply_all`] which coalesces all resources into a single section.
+pub fn inject_version_info(buf: &mut Vec<u8>, cfg: &VersionInfoConfig) -> Result<()> {
+    let mut rsrc = ResourceSectionBuilder::default();
+    add_version_info_to_builder(&mut rsrc, cfg)?;
     inject_rsrc_section(buf, &rsrc)
 }
 
-/// Inject RT_ICON (3) and RT_GROUP_ICON (14) resources from a .ico file.
-pub fn inject_icon(buf: &mut Vec<u8>, ico_path: &str) -> Result<()> {
+/// Add RT_ICON (3) and RT_GROUP_ICON (14) resources from a .ico file to the
+/// resource builder.
+///
+/// This is the internal helper used by [`apply_all`] to coalesce resources.
+fn add_icon_to_builder(rsrc: &mut ResourceSectionBuilder, ico_path: &str) -> Result<()> {
     let ico_bytes =
         std::fs::read(ico_path).with_context(|| format!("Failed to read icon file: {ico_path}"))?;
     let images = parse_ico(&ico_bytes).context("Failed to parse ICO file")?;
     if images.is_empty() {
         return Err(anyhow!("ICO file contains no images"));
     }
-
-    let mut rsrc = ResourceSectionBuilder::default();
 
     // Build RT_ICON entries (type 3) and the GRPICONDIR for RT_GROUP_ICON (14).
     // GRPICONDIR layout: WORD reserved, WORD type, WORD count, then GRPICONDIRENTRY[]
@@ -1218,20 +1235,41 @@ pub fn inject_icon(buf: &mut Vec<u8>, ico_path: &str) -> Result<()> {
 
     // RT_GROUP_ICON entry (type 14, name 1, lang 0).
     rsrc.add(14, 1, 0, grp_dir);
+    Ok(())
+}
+
+/// Inject RT_ICON (3) and RT_GROUP_ICON (14) resources from a .ico file.
+///
+/// When called standalone, this creates a new `.rsrc` section containing only
+/// the icon resources. When multiple resource types are needed, prefer using
+/// [`apply_all`] which coalesces all resources into a single section.
+pub fn inject_icon(buf: &mut Vec<u8>, ico_path: &str) -> Result<()> {
+    let mut rsrc = ResourceSectionBuilder::default();
+    add_icon_to_builder(&mut rsrc, ico_path)?;
     inject_rsrc_section(buf, &rsrc)
+}
+
+/// Add the RT_MANIFEST resource (type 24) to the resource builder.
+///
+/// This is the internal helper used by [`apply_all`] to coalesce resources.
+fn add_manifest_to_builder(rsrc: &mut ResourceSectionBuilder, manifest: &str) {
+    let xml = manifest_xml(manifest);
+    let xml_bytes = xml.into_bytes(); // UTF-8
+    // RT_MANIFEST = 24, name = 1 (executable), lang = 0.
+    rsrc.add(24, 1, 0, xml_bytes);
 }
 
 /// Inject or replace the RT_MANIFEST resource (type 24) in the PE.
 ///
 /// `manifest` can be `"asInvoker"`, `"requireAdministrator"`, `"highestAvailable"`,
 /// or a literal XML string.
+///
+/// When called standalone, this creates a new `.rsrc` section containing only
+/// the manifest. When multiple resource types are needed, prefer using
+/// [`apply_all`] which coalesces all resources into a single section.
 pub fn inject_manifest(buf: &mut Vec<u8>, manifest: &str) -> Result<()> {
-    let xml = manifest_xml(manifest);
-    let xml_bytes = xml.into_bytes(); // UTF-8
-
     let mut rsrc = ResourceSectionBuilder::default();
-    // RT_MANIFEST = 24, name = 1 (executable), lang = 0.
-    rsrc.add(24, 1, 0, xml_bytes);
+    add_manifest_to_builder(&mut rsrc, manifest);
     inject_rsrc_section(buf, &rsrc)
 }
 
@@ -1412,26 +1450,43 @@ pub fn apply_all(buf: &mut Vec<u8>, cfg: &PayloadConfig) -> Result<()> {
         info!("artifact kit: debug directory stripped");
     }
 
-    // 9. Inject version info.
-    if let Some(ref vi) = cfg.version_info {
-        inject_version_info(buf, vi).context("artifact kit: version info injection failed")?;
-        info!("artifact kit: version info injected");
-    }
+    // 9–11. Coalesce version info, icon, and manifest resources into a single
+    // .rsrc section to avoid orphaning prior resources. Each inject_* function
+    // called individually would append its own section, overwriting the data
+    // directory entry and losing earlier resources. By collecting all entries
+    // into one ResourceSectionBuilder and injecting once, the PE gets a single
+    // .rsrc section containing all resource types.
+    let has_resources = cfg.version_info.is_some()
+        || cfg.icon_path.is_some()
+        || cfg.custom_manifest.is_some()
+        || cfg.manifest_preset.is_some();
+    if has_resources {
+        let mut rsrc = ResourceSectionBuilder::default();
 
-    // 10. Inject icon.
-    if let Some(ref icon) = cfg.icon_path {
-        inject_icon(buf, icon).context("artifact kit: icon injection failed")?;
-        info!("artifact kit: icon injected");
-    }
+        if let Some(ref vi) = cfg.version_info {
+            add_version_info_to_builder(&mut rsrc, vi)
+                .context("artifact kit: version info build failed")?;
+            info!("artifact kit: version info prepared");
+        }
 
-    // 11. Inject manifest.
-    let manifest = cfg
-        .custom_manifest
-        .as_deref()
-        .or(cfg.manifest_preset.as_deref());
-    if let Some(m) = manifest {
-        inject_manifest(buf, m).context("artifact kit: manifest injection failed")?;
-        info!("artifact kit: manifest injected");
+        if let Some(ref icon) = cfg.icon_path {
+            add_icon_to_builder(&mut rsrc, icon)
+                .context("artifact kit: icon build failed")?;
+            info!("artifact kit: icon prepared");
+        }
+
+        let manifest = cfg
+            .custom_manifest
+            .as_deref()
+            .or(cfg.manifest_preset.as_deref());
+        if let Some(m) = manifest {
+            add_manifest_to_builder(&mut rsrc, m);
+            info!("artifact kit: manifest prepared");
+        }
+
+        inject_rsrc_section(buf, &rsrc)
+            .context("artifact kit: coalesced resource injection failed")?;
+        info!("artifact kit: coalesced resources injected (single .rsrc section)");
     }
 
     // 12. Recalculate PE checksum.
@@ -1587,7 +1642,6 @@ mod tests {
             target_arch: "x86_64".to_string(),
             c2_address: "127.0.0.1:8444".to_string(),
             encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
-            hmac_key: None,
             c_server_secret: None,
             server_cert_fingerprint: None,
             features: vec![],
@@ -1607,6 +1661,7 @@ mod tests {
             strip_signature: false,
             strip_debug: false,
             module_aes_key: None,
+            module_verify_key: None,
             driver_path: None,
         };
         let mut buf = b"ELF binary data here".to_vec();

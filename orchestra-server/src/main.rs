@@ -1,6 +1,7 @@
 //! Orchestra Control Center entry point.
 
 use anyhow::Result;
+use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use orchestra_server::auth::PerIpRateLimiter;
 use orchestra_server::{
@@ -49,6 +50,87 @@ fn check_credential_strength(token: &str, label: &str) {
     }
 }
 
+/// Sentinel values that must not appear in production configurations.
+/// These are the defaults from `ServerConfig::default()` — deploying with
+/// any of them allows anyone with repo access to authenticate.
+const SENTINEL_ADMIN_TOKEN: &str = "change-me-admin-token";
+const SENTINEL_AGENT_SECRET: &str = "change-me-pre-shared-secret";
+const SENTINEL_MODULE_AES_KEY: &str = "dGhpcyBpcyBhIDMyLWJ5dGUgYWVzIGtleSE=";
+
+/// Reject configurations that contain well-known sentinel values.
+/// Returns `Ok(())` if all credentials are custom, or an error listing
+/// the sentinels found.
+fn reject_sentinel_credentials(cfg: &ServerConfig, dev_mode: bool) -> Result<()> {
+    if dev_mode {
+        tracing::warn!(
+            "⚡ Development mode enabled — sentinel credential checks SKIPPED. \
+             Never use --dev in production."
+        );
+        return Ok(());
+    }
+
+    let mut violations = Vec::new();
+
+    if cfg.admin_token == SENTINEL_ADMIN_TOKEN {
+        violations.push("admin_token is the default sentinel value");
+    }
+    if cfg.agent_shared_secret == SENTINEL_AGENT_SECRET {
+        violations.push("agent_shared_secret is the default sentinel value");
+    }
+    if cfg.module_aes_key.as_deref() == Some(SENTINEL_MODULE_AES_KEY) {
+        violations.push("module_aes_key is the well-known base64 sentinel (\"this is a 32-byte aes key!\")");
+    }
+
+    // Check for well-known weak base64 patterns in module_aes_key.
+    if let Some(ref key) = cfg.module_aes_key {
+        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(key) {
+            let decoded_str = String::from_utf8_lossy(&decoded);
+            if decoded_str.contains("change-me")
+                || decoded_str.contains("secret")
+                || decoded_str.contains("password")
+                || decoded_str.contains("aes key")
+            {
+                violations.push(
+                    "module_aes_key decodes to a plaintext sentinel phrase — \
+                     generate a real 32-byte key with: openssl rand -base64 32",
+                );
+            }
+        }
+    }
+
+    if cfg.allow_local_builds {
+        violations.push(
+            "allow_local_builds is true — this permits SSRF via builder requests \
+             to private/loopback IPs. Disable in production."
+        );
+    }
+
+    if cfg.redirector_secret.is_none() {
+        violations.push(
+            "redirector_secret is not set — anyone can register arbitrary redirectors \
+             and inject entries into the C2 mesh. Set redirector_secret to a strong \
+             random value (e.g., openssl rand -base64 32)."
+        );
+    }
+
+    if violations.is_empty() {
+        return Ok(());
+    }
+
+    let msg = violations
+        .iter()
+        .map(|v| format!("  • {v}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    anyhow::bail!(
+        "FATAL: Insecure configuration detected — refusing to start.\n\
+         {msg}\n\n\
+         Fix these issues in your config file, or run with --dev to override \
+         (development/testing only)."
+    );
+}
+
 #[derive(Parser, Debug)]
 #[command(
     version,
@@ -64,6 +146,13 @@ struct Cli {
     /// Override the agent shared secret.
     #[arg(long)]
     agent_secret: Option<String>,
+    /// Development mode: relaxes production security checks (sentinel
+    /// credential rejection, TLS cert requirements, redirector auth).
+    ///
+    /// **NEVER use in production.** This flag is intended for local
+    /// development and automated testing only.
+    #[arg(long, default_value_t = false)]
+    dev: bool,
     /// Path to a directory of malleable C2 profile TOML files.
     ///
     /// All `.toml` files in this directory are loaded as named profiles.
@@ -192,13 +281,17 @@ async fn main() -> Result<()> {
 
             match action {
                 RedirectorAction::Add { url, profile_name } => {
+                    let mut body = serde_json::json!({
+                        "url": url,
+                        "profile_name": profile_name,
+                    });
+                    if let Some(ref secret) = cfg.redirector_secret {
+                        body["secret"] = serde_json::Value::String(secret.clone());
+                    }
                     let resp = client
                         .post(format!("{}/redirector/register", base_url))
                         .header("Authorization", format!("Bearer {}", cfg.admin_token))
-                        .json(&serde_json::json!({
-                            "url": url,
-                            "profile_name": profile_name,
-                        }))
+                        .json(&body)
                         .send()
                         .await?;
                     if resp.status().is_success() {
@@ -265,15 +358,8 @@ async fn main() -> Result<()> {
         cfg.agent_shared_secret = s;
     }
 
-    if cfg.admin_token == "change-me-admin-token"
-        || cfg.agent_shared_secret == "change-me-pre-shared-secret"
-    {
-        eprintln!(
-            "FATAL: Default credentials detected. Change admin_token and \
-             pre_shared_secret in configuration before running."
-        );
-        std::process::exit(1);
-    }
+    // Reject sentinel/weak credentials unless --dev mode is enabled.
+    reject_sentinel_credentials(&cfg, cli.dev)?;
 
     check_credential_strength(&cfg.admin_token, "admin_token");
     check_credential_strength(&cfg.agent_shared_secret, "agent_shared_secret");
@@ -301,6 +387,7 @@ async fn main() -> Result<()> {
         cfg.admin_token.clone(),
         cfg.command_timeout_secs,
         cfg.clone(),
+        cli.dev,
     ));
 
     orchestra_server::build_handler::init_build_queue(
@@ -309,7 +396,7 @@ async fn main() -> Result<()> {
         cfg.build_retention_days,
     );
 
-    let tls_cfg = tls::build(cfg.tls_cert_path.as_deref(), cfg.tls_key_path.as_deref()).await?;
+    let tls_cfg = tls::build(cfg.tls_cert_path.as_deref(), cfg.tls_key_path.as_deref(), cli.dev).await?;
 
     // Agent listener (TLS-encrypted TCP).
     {

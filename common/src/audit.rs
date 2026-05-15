@@ -40,3 +40,82 @@ pub enum Outcome {
     Success,
     Failure,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_populates_fields() {
+        let evt = AuditEvent::new("agent-1", "admin", "login", "via ssh", Outcome::Success);
+        assert_eq!(evt.agent_id, "agent-1");
+        assert_eq!(evt.user, "admin");
+        assert_eq!(evt.action, "login");
+        assert_eq!(evt.details, "via ssh");
+        assert!(matches!(evt.outcome, Outcome::Success));
+        assert!(!evt.tampered);
+        // Timestamp should be a reasonable Unix epoch value (> year 2020).
+        assert!(evt.timestamp > 1577836800);
+    }
+
+    #[test]
+    fn outcome_failure() {
+        let evt = AuditEvent::new("a", "u", "act", "det", Outcome::Failure);
+        assert!(matches!(evt.outcome, Outcome::Failure));
+    }
+
+    #[test]
+    fn tampered_default_is_false() {
+        let evt = AuditEvent::new("a", "u", "act", "det", Outcome::Success);
+        assert!(!evt.tampered);
+    }
+
+    #[test]
+    fn serialize_deserialize_roundtrip() {
+        let evt = AuditEvent::new("agent-42", "root", "exec", "ls -la", Outcome::Success);
+        let json = serde_json::to_string(&evt).unwrap();
+        let parsed: AuditEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.agent_id, evt.agent_id);
+        assert_eq!(parsed.user, evt.user);
+        assert_eq!(parsed.action, evt.action);
+        assert_eq!(parsed.details, evt.details);
+        assert_eq!(parsed.timestamp, evt.timestamp);
+        assert!(!parsed.tampered);
+    }
+
+    #[test]
+    fn deserialize_missing_tampered_defaults_false() {
+        // JSON without the `tampered` field should deserialize with tampered = false.
+        let json = r#"{
+            "timestamp": 1700000000,
+            "agent_id": "a",
+            "user": "u",
+            "action": "act",
+            "details": "d",
+            "outcome": "Success"
+        }"#;
+        let parsed: AuditEvent = serde_json::from_str(json).unwrap();
+        assert!(!parsed.tampered);
+    }
+
+    #[test]
+    fn outcome_serialization() {
+        assert_eq!(
+            serde_json::to_string(&Outcome::Success).unwrap(),
+            "\"Success\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Outcome::Failure).unwrap(),
+            "\"Failure\""
+        );
+    }
+
+    #[test]
+    fn timestamp_is_reasonable() {
+        let evt1 = AuditEvent::new("a", "u", "act", "det", Outcome::Success);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let evt2 = AuditEvent::new("a", "u", "act", "det", Outcome::Success);
+        // Second event should have a >= timestamp.
+        assert!(evt2.timestamp >= evt1.timestamp);
+    }
+}

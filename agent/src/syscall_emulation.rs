@@ -57,13 +57,14 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
-use log::{debug, warn};
+use tracing::{debug, warn};
 // Type-only imports — no function imports to avoid IAT entries.
 // All win32 API calls are resolved dynamically via pe_resolve.
-use winapi::shared::basetsd::SIZE_T;
-use winapi::shared::minwindef::{BOOL, DWORD, LPVOID};
-use winapi::shared::ntdef::ULONG;
-use winapi::um::winnt::{HANDLE, MEMORY_BASIC_INFORMATION};
+use crate::win_types::SIZE_T;
+use crate::win_types::{BOOL, DWORD, LPVOID};
+use crate::win_types::ULONG;
+use windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION;
+use crate::win_types::HANDLE;
 
 // ── NTSTATUS helpers ─────────────────────────────────────────────────────────
 
@@ -1318,13 +1319,13 @@ macro_rules! emulated_syscall {
         {
             match $crate::syscall_emulation::dispatch(__name, __args) {
                 Ok(status) if status >= 0 => {
-                    log::trace!("emulated_syscall: {} → emulation success (status={:#x})", __name, status);
+                    tracing::trace!("emulated_syscall: {} → emulation success (status={:#x})", __name, status);
                     Ok(status)
                 }
                 Ok(status) => {
                     // Emulation returned a failure NTSTATUS.  Fall back
                     // to indirect syscall if configured to do so.
-                    log::debug!(
+                    tracing::debug!(
                         "emulated_syscall: {} → emulation returned failure status {:#x}, trying indirect fallback",
                         __name, status
                     );
@@ -1333,7 +1334,7 @@ macro_rules! emulated_syscall {
                     })
                 }
                 Err(e) => {
-                    log::debug!(
+                    tracing::debug!(
                         "emulated_syscall: {} → emulation error: {}, trying indirect fallback",
                         __name, e
                     );

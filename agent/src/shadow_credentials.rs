@@ -38,14 +38,14 @@ use std::ptr;
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::Engine;
-use log::{debug, info, warn};
+use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use winapi::shared::guiddef::GUID;
-use winapi::shared::minwindef::DWORD;
-use winapi::shared::ntdef::{HRESULT, LPCWSTR, LPWSTR};
-use winapi::shared::winerror::S_OK;
+use crate::win_types::GUID;
+use crate::win_types::DWORD;
+use crate::win_types::{HRESULT, LPCWSTR, LPWSTR};
+use crate::win_types::S_OK;
 
 // ── Compile-time API hash constants ─────────────────────────────────────────
 

@@ -49,12 +49,12 @@ use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 
 use anyhow::{anyhow, bail, Context, Result};
-use log::{debug, info, warn};
+use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
-use winapi::shared::minwindef::{BOOL, DWORD, FALSE, LPVOID, TRUE};
-use winapi::shared::ntdef::HANDLE;
-use winapi::um::winnt::LARGE_INTEGER;
+use crate::win_types::{BOOL, DWORD, FALSE, LPVOID, TRUE};
+use crate::win_types::HANDLE;
+use crate::win_types::LARGE_INTEGER;
 
 use crate::pe_resolve_macros::hash_str_const;
 use crate::win_types::{PROCESS_INFORMATION, STARTUPINFOW};
@@ -150,7 +150,7 @@ type FnCreateProcessW = unsafe extern "system" fn(
 type FnCreatePipe = unsafe extern "system" fn(
     *mut HANDLE,                                       // hReadPipe
     *mut HANDLE,                                       // hWritePipe
-    *mut winapi::um::minwinbase::SECURITY_ATTRIBUTES,  // lpPipeAttributes
+    *mut crate::win_types::SECURITY_ATTRIBUTES,  // lpPipeAttributes
     DWORD,                                             // nSize
 ) -> i32; // BOOL
 
@@ -377,7 +377,7 @@ impl Wsl2Detector {
                 FILE_ATTRIBUTE_NORMAL,
                 ptr::null_mut(),
             );
-            if h == winapi::um::handleapi::INVALID_HANDLE_VALUE {
+            if h == crate::win_types::INVALID_HANDLE_VALUE {
                 return false;
             }
             let _ = crate::syscall!("NtClose", h as u64);
@@ -409,7 +409,7 @@ impl Wsl2Detector {
                 FILE_ATTRIBUTE_NORMAL,
                 ptr::null_mut(),
             );
-            if h == winapi::um::handleapi::INVALID_HANDLE_VALUE {
+            if h == crate::win_types::INVALID_HANDLE_VALUE {
                 return false;
             }
             let _ = crate::syscall!("NtClose", h as u64);
@@ -665,8 +665,8 @@ impl Wsl2Executor {
         let mut stdin_read: HANDLE = ptr::null_mut();
         let mut stdin_write: HANDLE = ptr::null_mut();
 
-        let mut sa: winapi::um::minwinbase::SECURITY_ATTRIBUTES = unsafe { mem::zeroed() };
-        sa.nLength = mem::size_of::<winapi::um::minwinbase::SECURITY_ATTRIBUTES>() as DWORD;
+        let mut sa: crate::win_types::SECURITY_ATTRIBUTES = unsafe { mem::zeroed() };
+        sa.nLength = mem::size_of::<crate::win_types::SECURITY_ATTRIBUTES>() as DWORD;
         sa.bInheritHandle = TRUE;
         sa.lpSecurityDescriptor = ptr::null_mut();
 
@@ -916,7 +916,7 @@ impl Wsl2Executor {
             )
         };
 
-        if handle == winapi::um::handleapi::INVALID_HANDLE_VALUE {
+        if handle == crate::win_types::INVALID_HANDLE_VALUE {
             bail!("CreateFileW({}) failed", path);
         }
 

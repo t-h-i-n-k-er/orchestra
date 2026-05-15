@@ -66,6 +66,7 @@
 //! The shared memory region is allocated in kernel pool with `ExAllocatePool`
 //! via BYOVD, never from user-mode VirtualAlloc.
 
+use common::lock::MutexExt;
 use super::deploy::{self, DeployedDriver};
 use super::discover;
 use super::driver_db::VulnerableDriver;
@@ -887,11 +888,11 @@ pub fn init(session_key: &[u8]) -> Result<()> {
 
     // Step 5: Store global state.
     {
-        let mut addr = PROXY_REGION_ADDR.lock().unwrap();
+        let mut addr = PROXY_REGION_ADDR.lock_recover();
         *addr = region_addr;
     }
     {
-        let mut c = PROXY_CR3.lock().unwrap();
+        let mut c = PROXY_CR3.lock_recover();
         *c = cr3;
     }
 
@@ -1008,11 +1009,11 @@ pub fn init(session_key: &[u8]) -> Result<()> {
 
     // Store stub address and callback index.
     {
-        let mut s = CALLBACK_STUB_ADDR.lock().unwrap();
+        let mut s = CALLBACK_STUB_ADDR.lock_recover();
         *s = stub_addr;
     }
     {
-        let mut i = CALLBACK_INDEX.lock().unwrap();
+        let mut i = CALLBACK_INDEX.lock_recover();
         *i = slot_index;
     }
 
@@ -1053,7 +1054,7 @@ pub fn proxy_batch(batch: &ProxyBatch) -> Result<Vec<ProxyResult>> {
         );
     }
 
-    let region_addr = *PROXY_REGION_ADDR.lock().unwrap();
+    let region_addr = *PROXY_REGION_ADDR.lock_recover();
     if region_addr == 0 {
         bail!("proxy not initialized — call init() first");
     }
@@ -1175,7 +1176,7 @@ pub fn proxy_single(opcode: SyscallType, args: [u64; 6]) -> Result<ProxyResult> 
 /// `true` if the proxy has been initialized (shared region allocated
 /// and callback registered).
 pub fn is_initialized() -> bool {
-    let region_addr = *PROXY_REGION_ADDR.lock().unwrap();
+    let region_addr = *PROXY_REGION_ADDR.lock_recover();
     region_addr != 0
 }
 
@@ -1189,7 +1190,7 @@ pub fn is_initialized() -> bool {
 /// # Safety
 /// Must be called before agent exit to avoid leaving stale kernel callbacks.
 pub fn shutdown(session_key: &[u8]) -> Result<()> {
-    let region_addr = *PROXY_REGION_ADDR.lock().unwrap();
+    let region_addr = *PROXY_REGION_ADDR.lock_recover();
     if region_addr == 0 {
         return Ok(()); // Not initialized, nothing to do.
     }
@@ -1201,7 +1202,7 @@ pub fn shutdown(session_key: &[u8]) -> Result<()> {
     let driver = deployed.driver;
     let device_handle = deployed.device_handle.context("no device handle")?;
 
-    let cr3 = *PROXY_CR3.lock().unwrap();
+    let cr3 = *PROXY_CR3.lock_recover();
     let kernel_base = discover::get_kernel_base()
         .context("shutdown: failed to resolve kernel base")?;
 
@@ -1214,7 +1215,7 @@ pub fn shutdown(session_key: &[u8]) -> Result<()> {
         }
     }
 
-    let slot_index = *CALLBACK_INDEX.lock().unwrap();
+    let slot_index = *CALLBACK_INDEX.lock_recover();
     if slot_index != usize::MAX {
         // Resolve the callback array and clear our slot.
         let psp_array = discover::resolve_kernel_symbol(
@@ -1255,15 +1256,15 @@ pub fn shutdown(session_key: &[u8]) -> Result<()> {
 
     // Clear global state.
     {
-        let mut addr = PROXY_REGION_ADDR.lock().unwrap();
+        let mut addr = PROXY_REGION_ADDR.lock_recover();
         *addr = 0;
     }
     {
-        let mut s = CALLBACK_STUB_ADDR.lock().unwrap();
+        let mut s = CALLBACK_STUB_ADDR.lock_recover();
         *s = 0;
     }
     {
-        let mut i = CALLBACK_INDEX.lock().unwrap();
+        let mut i = CALLBACK_INDEX.lock_recover();
         *i = usize::MAX;
     }
 
@@ -1435,7 +1436,7 @@ mod tests {
     #[test]
     fn test_is_initialized_when_not_initialized() {
         // In test mode, PROXY_REGION_ADDR should be 0.
-        let region_addr = *PROXY_REGION_ADDR.lock().unwrap();
+        let region_addr = *PROXY_REGION_ADDR.lock_recover();
         assert_eq!(region_addr, 0);
         assert!(!is_initialized());
     }

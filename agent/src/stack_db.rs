@@ -35,6 +35,7 @@
 
 #![cfg(all(windows, feature = "stack-spoof"))]
 
+use common::lock::MutexExt;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -241,7 +242,8 @@ unsafe fn has_valid_unwind_info(addr: usize) -> bool {
 ///
 /// Must be called with a valid process state (modules loaded, PEB walkable).
 unsafe fn build_address_db() -> HashMap<String, Vec<usize>> {
-    use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY, IMAGE_NT_HEADERS64};
+    use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_NT_HEADERS64};
+    use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY};
 
     let mut db = HashMap::new();
 
@@ -302,7 +304,7 @@ unsafe fn build_address_db() -> HashMap<String, Vec<usize>> {
         entry_points.dedup();
 
         let key = module_name.trim_end_matches('\0').to_string();
-        log::debug!(
+        tracing::debug!(
             "stack_db: collected {} entry points from {}",
             entry_points.len(),
             key
@@ -310,7 +312,7 @@ unsafe fn build_address_db() -> HashMap<String, Vec<usize>> {
         db.insert(key, entry_points);
     }
 
-    log::info!(
+    tracing::info!(
         "stack_db: address database built with {} modules, {} total entry points",
         db.len(),
         db.values().map(|v| v.len()).sum::<usize>()
@@ -409,7 +411,7 @@ unsafe fn resolve_all_templates() -> Vec<ResolvedChain> {
             match resolve_ret_gadget(module_name, function_name) {
                 Some(addr) => frames.push(ChainFrame { return_addr: addr }),
                 None => {
-                    log::debug!(
+                    tracing::debug!(
                         "stack_db: template {} — could not resolve {}!{}",
                         idx,
                         module_name.trim_end_matches('\0'),
@@ -422,7 +424,7 @@ unsafe fn resolve_all_templates() -> Vec<ResolvedChain> {
         }
 
         if all_ok && !frames.is_empty() {
-            log::debug!(
+            tracing::debug!(
                 "stack_db: template {} resolved with {} frames",
                 idx,
                 frames.len()
@@ -431,7 +433,7 @@ unsafe fn resolve_all_templates() -> Vec<ResolvedChain> {
         }
     }
 
-    log::info!(
+    tracing::info!(
         "stack_db: resolved {}/{} chain templates",
         chains.len(),
         CHAIN_TEMPLATES.len()
@@ -482,15 +484,15 @@ pub fn build_chain() -> Option<ResolvedChain> {
     ensure_initialised();
 
     let cache = CHAIN_CACHE.get().unwrap();
-    let guard = cache.lock().unwrap();
+    let guard = cache.lock_recover();
     if guard.is_empty() {
-        log::debug!("stack_db: no resolved chains available");
+        tracing::debug!("stack_db: no resolved chains available");
         return None;
     }
 
     let idx = next_chain_index(guard.len());
     let chain = guard[idx].clone();
-    log::trace!(
+    tracing::trace!(
         "stack_db: selected cached chain {} ({} frames)",
         idx,
         chain.frames.len()
@@ -698,7 +700,7 @@ pub fn populate_frame_buffer(buf: &mut [u64], chain: &ResolvedChain, stack_args:
 
 /// Check whether `addr` points into committed executable memory.
 fn is_executable_address(addr: usize) -> bool {
-    use winapi::um::winnt::{MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEM_COMMIT};
 
     unsafe {
         let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
@@ -744,7 +746,7 @@ pub fn revalidate_db() {
 
     // Spot-check the cached chains.
     let cache = CHAIN_CACHE.get().unwrap();
-    let guard = cache.lock().unwrap();
+    let guard = cache.lock_recover();
     let mut any_invalid = false;
 
     for (ci, chain) in guard.iter().enumerate() {
@@ -752,7 +754,7 @@ pub fn revalidate_db() {
         // which is the most likely to be affected by unhooking).
         if let Some(first) = chain.frames.first() {
             if !is_executable_address(first.return_addr) {
-                log::warn!(
+                tracing::warn!(
                     "stack_db: chain {} frame 0 addr {:#x} invalid — triggering rebuild",
                     ci,
                     first.return_addr
@@ -771,30 +773,30 @@ pub fn revalidate_db() {
 
 /// Force-rebuild the address database and chain cache.
 pub fn rebuild_db() {
-    log::info!("stack_db: rebuilding address database and chain cache");
+    tracing::info!("stack_db: rebuilding address database and chain cache");
 
     // Rebuild address database.
     if let Some(db) = ADDR_DB.get() {
         let new_db = unsafe { build_address_db() };
-        let mut guard = db.lock().unwrap();
+        let mut guard = db.lock_recover();
         *guard = new_db;
     }
 
     // Rebuild chain cache.
     if let Some(cache) = CHAIN_CACHE.get() {
         let new_chains = unsafe { resolve_all_templates() };
-        let mut guard = cache.lock().unwrap();
+        let mut guard = cache.lock_recover();
         *guard = new_chains;
     }
 
-    log::info!("stack_db: rebuild complete");
+    tracing::info!("stack_db: rebuild complete");
 }
 
 /// Return the total number of entry points across all modules.
 pub fn entry_count() -> usize {
     ensure_initialised();
     let db = ADDR_DB.get().unwrap();
-    let guard = db.lock().unwrap();
+    let guard = db.lock_recover();
     guard.values().map(|v| v.len()).sum()
 }
 
@@ -802,6 +804,6 @@ pub fn entry_count() -> usize {
 pub fn is_available() -> bool {
     ensure_initialised();
     let cache = CHAIN_CACHE.get().unwrap();
-    let guard = cache.lock().unwrap();
+    let guard = cache.lock_recover();
     !guard.is_empty()
 }

@@ -90,9 +90,9 @@ pub enum SleepScheme {
     XChaCha20Poly1305,
     /// AES-256-GCM AEAD (12-byte nonce, 16-byte tag).
     Aes256Gcm,
-    /// ChaCha20 stream cipher (12-byte nonce, no authentication tag).
-    /// Offers the highest throughput but provides **no integrity check** —
-    /// tampered regions will silently decrypt to garbage rather than fail.
+    /// ChaCha20-Poly1305 AEAD (12-byte nonce, 16-byte tag).
+    /// Same ChaCha20 stream cipher internally but with Poly1305 authentication.
+    /// Uses the IETF ChaCha20-Poly1305 construction (96-bit nonce).
     ChaCha20,
 }
 
@@ -124,7 +124,7 @@ impl SleepScheme {
         match self {
             Self::XChaCha20Poly1305 => 16,
             Self::Aes256Gcm => 16,
-            Self::ChaCha20 => 0,
+            Self::ChaCha20 => 16,
         }
     }
 
@@ -136,11 +136,29 @@ impl SleepScheme {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 #[serde(rename_all = "kebab-case")]
+/// Sleep timing configuration.
+///
+/// # Field precedence
+///
+/// **Prefer `base_interval_ms`** for new configurations — it provides
+/// sub-second granularity and is the canonical field used at runtime.
+/// `base_interval_secs` is retained for backward compatibility with existing
+/// TOML profiles.  When both are set, `base_interval_ms` takes precedence;
+/// otherwise the agent falls back to `base_interval_secs * 1000`.  Use
+/// [`effective_base_interval_ms()`](Self::effective_base_interval_ms) to
+/// resolve the interval without repeating the precedence logic.
+///
+/// Call [`validate()`](Self::validate) after deserialization or programmatic
+/// construction to catch inconsistent values (e.g. `secs = 5, ms = 30_000`).
 pub struct SleepConfig {
     #[serde(default)]
     pub method: SleepMethod,
+    /// Base sleep interval in seconds.  Retained for backward compatibility;
+    /// prefer `base_interval_ms` for new profiles.
     #[serde(default = "default_base_interval")]
     pub base_interval_secs: u64,
+    /// Base sleep interval in milliseconds (preferred).  When `Some`, this
+    /// value takes precedence over `base_interval_secs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_interval_ms: Option<u64>,
     #[serde(default = "default_jitter_percent")]
@@ -184,6 +202,49 @@ pub struct SleepConfig {
 }
 
 impl SleepConfig {
+    /// Validate the config for internal consistency.
+    ///
+    /// Checks that `base_interval_secs` and `base_interval_ms` (when both
+    /// present) agree to within 1 second of rounding.  When the values
+    /// diverge by more than 1 second the method returns a descriptive error,
+    /// preventing silent misconfiguration (e.g. `secs = 5, ms = 30_000`).
+    ///
+    /// The precedence rule is: `base_interval_ms` wins when set; `secs` is a
+    /// fallback.  This is documented on [`SleepConfig::effective_base_interval_ms`].
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(ms) = self.base_interval_ms {
+            if ms == 0 {
+                return Err(
+                    "sleep.base-interval-ms must be greater than zero when present".to_string()
+                );
+            }
+            let secs_from_ms = ms.saturating_add(999) / 1000; // ceiling division
+            let diff = secs_from_ms.abs_diff(self.base_interval_secs);
+            if diff > 1 {
+                return Err(format!(
+                    "sleep.base-interval-secs ({}) and sleep.base-interval-ms ({}) \
+                     are inconsistent (differ by {diff}s).  When both are specified, \
+                     base-interval-ms takes precedence and secs should be a close \
+                     approximation (within 1s of ceiling division).",
+                    self.base_interval_secs, ms
+                ));
+            }
+        }
+        if self.base_interval_secs == 0 {
+            return Err("sleep.base-interval-secs must be greater than zero".to_string());
+        }
+        Ok(())
+    }
+
+    /// Return the effective base sleep interval in **milliseconds**.
+    ///
+    /// `base_interval_ms` takes precedence when present; otherwise
+    /// `base_interval_secs * 1000` is used.
+    pub fn effective_base_interval_ms(&self) -> u64 {
+        self.base_interval_ms
+            .unwrap_or_else(|| self.base_interval_secs.saturating_mul(1000))
+    }
+
     /// Resolve `mask_rotation_schemes` into a `Vec<SleepScheme>`.
     ///
     /// - If the list is empty, returns `[XChaCha20Poly1305]` (backward compat).
@@ -1212,6 +1273,10 @@ pub struct GraphC2Profile {
     /// Use Azure Government cloud instead of commercial.
     #[serde(default)]
     pub government_cloud: bool,
+    /// Pre-shared key for ECDH forward-secrecy authentication.
+    /// If empty, the transport uses only the static `CryptoSession`.
+    #[serde(default)]
+    pub psk: String,
 }
 
 /// Configuration for the QUIC (HTTP/3) covert C2 transport.
@@ -1316,6 +1381,10 @@ pub struct QuicC2Profile {
     /// execution. Default: 8.
     #[serde(default = "default_quic_max_streams")]
     pub max_concurrent_streams: u32,
+    /// Pre-shared key for ECDH forward-secrecy authentication.
+    /// If empty, the transport uses only the static `CryptoSession`.
+    #[serde(default)]
+    pub psk: String,
 }
 
 fn default_quic_port() -> u16 {
@@ -1356,6 +1425,7 @@ impl Default for QuicC2Profile {
             h3_path: default_quic_h3_path(),
             h3_headers: std::collections::HashMap::new(),
             max_concurrent_streams: default_quic_max_streams(),
+            psk: String::new(),
         }
     }
 }
@@ -1385,6 +1455,7 @@ impl Default for GraphC2Profile {
             sharepoint_site_id: None,
             sharepoint_list_id: None,
             government_cloud: false,
+            psk: String::new(),
         }
     }
 }

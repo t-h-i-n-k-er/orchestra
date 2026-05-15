@@ -36,7 +36,7 @@ use std::mem;
 use std::ptr;
 
 use anyhow::{anyhow, bail, Context, Result};
-use log::{debug, info, warn};
+use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
 use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};

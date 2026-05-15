@@ -26,11 +26,16 @@
 
 #![cfg(not(feature = "memory-guard"))]
 
+use common::lock::MutexExt;
 use anyhow::Result;
 use std::ptr;
 use std::sync::Mutex;
 
 // ── Statics ──────────────────────────────────────────────────────────────────
+
+/// Reentrancy guard: prevents concurrent `lock()` calls from corrupting
+/// global state (HIGH-009).  Only one thread may hold the "lock" at a time.
+static LOCK_GUARD: Mutex<bool> = Mutex::new(false);
 
 /// Registered regions: (pointer, length, label).
 ///
@@ -78,7 +83,7 @@ pub unsafe fn register(buf: &'static mut [u8], label: &'static str) {
         .lock()
         .unwrap()
         .push((buf.as_mut_ptr() as usize, buf.len(), label));
-    log::debug!(
+    tracing::debug!(
         "memory_guard_stub: registered region '{}' ({} bytes)",
         label,
         buf.len()
@@ -96,18 +101,32 @@ pub unsafe fn register(buf: &'static mut [u8], label: &'static str) {
 /// Returns an error if random key generation fails.
 #[inline]
 pub fn lock() -> Result<KeyHandle> {
-    log::debug!(
+    tracing::debug!(
         "memory-guard: feature disabled; using XOR-based stub encryption \
          (NOT as strong as XChaCha20-Poly1305; enable memory-guard feature for full protection)"
     );
+
+    // HIGH-009: Claim the reentrancy guard atomically.
+    let mut guard = LOCK_GUARD.lock_recover();
+    if *guard {
+        anyhow::bail!(
+            "memory_guard_stub::lock: another lock() is already active — \
+             concurrent encryption would corrupt global key state"
+        );
+    }
+    *guard = true;
+    drop(guard); // release LOCK_GUARD so unlock() can acquire it
+
     let mut key = [0u8; 32];
     use rand::RngCore;
     rand::rngs::OsRng.fill_bytes(&mut key);
     if key.iter().all(|&b| b == 0) {
+        // Release guard before returning error (HIGH-009).
+        *LOCK_GUARD.lock_recover() = false;
         anyhow::bail!("memory_guard_stub::lock: key generation produced all-zeros key");
     }
 
-    let regions = REGISTERED_REGIONS.lock().unwrap();
+    let regions = REGISTERED_REGIONS.lock_recover();
 
     // Compute integrity hashes of plaintext before encryption.
     let mut hashes = Vec::with_capacity(regions.len());
@@ -123,8 +142,8 @@ pub fn lock() -> Result<KeyHandle> {
     xor_regions(&regions, &key);
 
     // Store the key globally for guarded_sleep() compatibility.
-    *CURRENT_KEY.lock().unwrap() = key;
-    *INTEGRITY_HASHES.lock().unwrap() = hashes.clone();
+    *CURRENT_KEY.lock_recover() = key;
+    *INTEGRITY_HASHES.lock_recover() = hashes.clone();
 
     Ok(KeyHandle { key, hashes })
 }
@@ -141,7 +160,7 @@ pub fn lock() -> Result<KeyHandle> {
 /// while encrypted) or if the handle is invalid.
 #[inline]
 pub fn unlock(handle: KeyHandle) -> Result<()> {
-    let regions = REGISTERED_REGIONS.lock().unwrap();
+    let regions = REGISTERED_REGIONS.lock_recover();
     xor_regions(&regions, &handle.key);
 
     // Verify integrity: compare post-decryption hashes with pre-encryption hashes.
@@ -155,7 +174,10 @@ pub fn unlock(handle: KeyHandle) -> Result<()> {
         }
         let actual = unsafe { simple_hash(ptr_addr as *mut u8, len) };
         if actual != expected {
-            log::error!(
+            // HIGH-009: Release guard even on integrity failure to avoid
+            // permanently locking out future lock() calls.
+            *LOCK_GUARD.lock_recover() = false;
+            tracing::error!(
                 "memory_guard_stub: INTEGRITY CHECK FAILED for region '{}' — \
                  data was modified while encrypted! Expected hash {:02x?}, got {:02x?}",
                 label,
@@ -170,8 +192,11 @@ pub fn unlock(handle: KeyHandle) -> Result<()> {
     }
 
     // Clear the per-cycle key from global state.
-    *CURRENT_KEY.lock().unwrap() = [0u8; 32];
-    INTEGRITY_HASHES.lock().unwrap().clear();
+    *CURRENT_KEY.lock_recover() = [0u8; 32];
+    INTEGRITY_HASHES.lock_recover().clear();
+
+    // HIGH-009: Release the reentrancy guard so subsequent lock() calls can proceed.
+    *LOCK_GUARD.lock_recover() = false;
 
     Ok(())
 }
@@ -265,39 +290,26 @@ pub fn init_schemes(_schemes: Vec<common::config::SleepScheme>, _rotation_interv
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
-/// Simple hash for integrity verification.
+/// SHA-256 integrity hash for tamper detection.
 ///
-/// Uses a FNV-1a-inspired hash stretched to 32 bytes.  This is NOT
-/// cryptographically strong but is sufficient to detect accidental or
-/// naive tampering with encrypted memory during sleep cycles.
+/// Uses SHA-256 (via the `sha2` crate) to produce a cryptographically
+/// strong digest of a memory region.  Unlike FNV-1a, an attacker who
+/// can modify memory cannot maintain the hash without knowing the
+/// plaintext — preimage and second-preimage resistance make forgery
+/// computationally infeasible.
 ///
 /// # Safety
 ///
 /// `ptr` must point to at least `len` readable bytes.
 unsafe fn simple_hash(ptr: *mut u8, len: usize) -> [u8; 32] {
-    // FNV-1a offset basis and prime for 64-bit.
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x00000100000001B3;
-
-    let mut state: [u64; 4] = [
-        FNV_OFFSET.wrapping_add(1),
-        FNV_OFFSET.wrapping_add(2),
-        FNV_OFFSET.wrapping_add(3),
-        FNV_OFFSET.wrapping_add(4),
-    ];
-
+    use sha2::{Sha256, Digest};
     let slice = std::slice::from_raw_parts(ptr, len);
-    for (i, &byte) in slice.iter().enumerate() {
-        let lane = &mut state[i % 4];
-        *lane ^= byte as u64;
-        *lane = lane.wrapping_mul(FNV_PRIME);
-    }
-
-    let mut result = [0u8; 32];
-    for (i, &s) in state.iter().enumerate() {
-        result[i * 8..(i + 1) * 8].copy_from_slice(&s.to_le_bytes());
-    }
-    result
+    let mut hasher = Sha256::new();
+    hasher.update(slice);
+    let result = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
 }
 
 /// Apply the XOR cipher to every registered region.
@@ -316,7 +328,7 @@ fn xor_regions(regions: &[(usize, usize, &'static str)], key: &[u8; 32]) {
                 *byte ^= key[i % 32];
             }
         }
-        log::debug!(
+        tracing::debug!(
             "memory_guard_stub: XOR-locked region '{}' ({} bytes)",
             label,
             len

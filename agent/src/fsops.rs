@@ -149,13 +149,13 @@ fn is_reparse_point(path: &Path) -> Result<bool> {
     // ── Step 1: Open the file (NtCreateFile, no IAT) ────────────────────
     // Opening with FILE_OPEN_REPARSE_POINT prevents following the reparse
     // point, and FILE_OPEN_FOR_BACKUP_INTENT covers the directory case.
-    let mut obj_name = winapi::shared::ntdef::UNICODE_STRING {
+    let mut obj_name = crate::win_types::UNICODE_STRING {
         Length: ((wide.len() - 1) * 2) as u16,
         MaximumLength: (wide.len() * 2) as u16,
         Buffer: wide.as_mut_ptr(),
     };
-    let mut obj_attr = winapi::shared::ntdef::OBJECT_ATTRIBUTES {
-        Length: std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32,
+    let mut obj_attr = crate::win_types::OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32,
         RootDirectory: std::ptr::null_mut(),
         ObjectName: &mut obj_name,
         Attributes: OBJ_CASE_INSENSITIVE,
@@ -296,7 +296,7 @@ pub async fn write_file(path: &str, data: &[u8], config: &Config) -> Result<()> 
                 let target = std::fs::read_link(&path)
                     .map(|t| t.display().to_string())
                     .unwrap_or_else(|_| "<unresolvable reparse point>".to_owned());
-                log::warn!(
+                tracing::warn!(
                     "write_file: {} is a reparse point pointing to {}; \
                      removing reparse point and writing a regular file",
                     path.display(),

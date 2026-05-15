@@ -76,7 +76,7 @@ macro_rules! resolve_api {
             let base = match pe_resolve::get_module_handle_by_hash($dll_hash) {
                 Some(b) => b,
                 None => {
-                    log::error!("resolve_api: module hash {:#x} not found", $dll_hash);
+                    tracing::error!("resolve_api: module hash {:#x} not found", $dll_hash);
                     return None;
                 }
             };
@@ -86,7 +86,7 @@ macro_rules! resolve_api {
             ) {
                 Some(a) => a,
                 None => {
-                    log::error!("resolve_api: {} not found", $fn_name);
+                    tracing::error!("resolve_api: {} not found", $fn_name);
                     return None;
                 }
             };

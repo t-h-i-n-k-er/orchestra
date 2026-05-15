@@ -15,14 +15,14 @@ rand = { workspace = true }
 anyhow = { workspace = true }
 async-trait = "0.1"
 tokio = { workspace = true, features = ["net", "io-util"] }
-serde_json = "1.0"
-toml = "1.1.2"
+serde_json = { workspace = true }
+toml = { workspace = true }
 base64 = { workspace = true }
-rustls = { version = "0.23.38", default-features = false, features = ["ring", "std", "logging", "tls12"] }
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
 rustls-pemfile = "2.2.0"
-hkdf = { version = "0.12" }
-hmac = { version = "0.12" }
+hkdf = { version = "0.13" }
+hmac = { version = "0.13" }
 zeroize = "1"
 
 # Optional: Ed25519 signatures for module verification.
@@ -31,22 +31,24 @@ ed25519-dalek = { version = "2", optional = true }
 # X25519 ephemeral DH for application-layer forward secrecy.
 # Always enabled — each session performs ECDH to derive a per-session key.
 x25519-dalek = { version = "2" }
-bincode = "1.3.3"
+bincode = { version = "2", features = ["serde"] }
 
 # Memory locking for PSK protection (mlock on Unix, VirtualLock on Windows).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["winnt"] }
 pe_resolve = { path = "../pe_resolve" }
 
 [features]
+default = ["module-signatures"]
 module-signatures = ["dep:ed25519-dalek"]
 dangerous-tls = []
-# Legacy no-op feature kept for backward compat with CI/build scripts.
-# Forward secrecy (X25519 ECDH) is now always enabled.
-forward-secrecy = []
+# NOTE: Forward secrecy (X25519 ECDH) is always enabled — the
+# `common::forward_secrecy` module is compiled unconditionally.
+# The old `forward-secrecy` feature flag has been removed because
+# it was a misleading no-op that gated nothing.
 
 [dev-dependencies]
-serde_json = "1.0"
+serde_json = { workspace = true }
+proptest = "1.4"

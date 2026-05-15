@@ -18,7 +18,7 @@
 //! - **Non-Windows**: Stub implementations that return `None`
 
 #![allow(dead_code)]
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 include!(concat!(env!("OUT_DIR"), "/api_hashes.rs"));
 
@@ -47,9 +47,13 @@ pub fn hash_str(bytes: &[u8]) -> u32 {
 
 /// Compute a case-insensitive rotational hash of a UTF-16 wide string.
 ///
-/// Used for hashing DLL module names from the PEB loader data. Both the
-/// low and high bytes of each UTF-16 code unit are folded into the hash
-/// to correctly handle non-ASCII module names.
+/// Used for hashing DLL module names from the PEB loader data. For ASCII
+/// code units (high byte = 0) the hash is **identical** to [`hash_str`] on the
+/// same bytes, ensuring that wide-string PEB entries match the build-time
+/// hash constants generated from ASCII DLL names.
+///
+/// Non-ASCII code units (e.g. CJK) are folded in a single rotation+XOR step
+/// using the raw u16 value, preserving all 16 bits rather than truncating to u8.
 ///
 /// # Example
 ///
@@ -63,12 +67,20 @@ pub fn hash_wstr(bytes: &[u16]) -> u32 {
         if c == 0 {
             break;
         }
-        // Fold each UTF-16 code unit to lowercase and mix both bytes into the
-        // hash.  Truncating to u8 breaks for non-ASCII module names (CJK, etc.).
-        let lo = (c as u8).to_ascii_lowercase();
-        let hi = ((c >> 8) as u8).to_ascii_lowercase();
-        hash = hash.rotate_right(13) ^ (lo as u32);
-        hash = hash.rotate_right(13) ^ (hi as u32);
+        if c < 0x0100 {
+            // ASCII-range: case-fold and hash as a single u32 to match hash_str.
+            let folded = (c as u8).to_ascii_lowercase() as u32;
+            hash = hash.rotate_right(13) ^ folded;
+        } else {
+            // Non-ASCII: hash the full u16 in two steps (lo, hi) so that all
+            // 16 bits participate in the hash.  We do *not* case-fold non-ASCII
+            // code units because Windows PEB BaseDllName entries preserve the
+            // original case for non-ASCII characters.
+            let lo = (c & 0xFF) as u32;
+            let hi = ((c >> 8) & 0xFF) as u32;
+            hash = hash.rotate_right(13) ^ lo;
+            hash = hash.rotate_right(13) ^ hi;
+        }
     }
     hash
 }
@@ -367,6 +379,11 @@ pub unsafe fn get_proc_address_by_hash(dll_base: usize, target_hash: u32) -> Opt
     // Parse the dynamic section for DT_SYMTAB (6), DT_STRTAB (5),
     // DT_HASH (4), and DT_SYMENT (11).
     // Elf64_Dyn: { i64 d_tag; u64 d_val/d_ptr } — 16 bytes each.
+    //
+    // IMPORTANT: For shared libraries and PIE executables, the d_ptr values
+    // in DT_SYMTAB, DT_STRTAB, and DT_HASH are virtual addresses relative
+    // to ELF base (load address 0 in the ELF file).  The actual in-memory
+    // address = dll_base (l_addr / load bias) + d_ptr.
     let mut symtab: usize = 0;
     let mut strtab: usize = 0;
     let mut hash_addr: usize = 0;
@@ -375,15 +392,16 @@ pub unsafe fn get_proc_address_by_hash(dll_base: usize, target_hash: u32) -> Opt
         let mut dyn_ptr = dyn_start as *const i64;
         loop {
             let tag = *dyn_ptr;
-            let val = *(dyn_ptr.add(1)) as usize; // interpret u64 as usize
+            let val = *(dyn_ptr.add(1)) as usize; // raw d_ptr (VMA in ELF address space)
             if tag == 0 {
                 break; // DT_NULL
             }
             match tag {
-                5 => strtab = val,
-                6 => symtab = val,
-                4 => hash_addr = val,
-                11 => syment = val,
+                // d_ptr values are VMAs; add dll_base to get actual memory address.
+                5 => strtab = dll_base + val,
+                6 => symtab = dll_base + val,
+                4 => hash_addr = dll_base + val,
+                11 => syment = val, // DT_SYMENT is a scalar, not an address
                 _ => {}
             }
             dyn_ptr = dyn_ptr.add(2); // advance 16 bytes
@@ -847,4 +865,272 @@ pub unsafe fn close_handle(handle: *mut core::ffi::c_void) {
 )))]
 pub unsafe fn close_handle(_handle: *mut core::ffi::c_void) {
     // No-op on non-Windows targets; CloseHandle is a Windows-only concept.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── hash_str ────────────────────────────────────────────────────────
+
+    #[test]
+    fn hash_str_deterministic() {
+        let h1 = hash_str(b"NtCreateThreadEx");
+        let h2 = hash_str(b"NtCreateThreadEx");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn hash_str_case_insensitive() {
+        let upper = hash_str(b"NTDLL.DLL");
+        let lower = hash_str(b"ntdll.dll");
+        let mixed = hash_str(b"Ntdll.Dll");
+        assert_eq!(upper, lower);
+        assert_eq!(upper, mixed);
+    }
+
+    #[test]
+    fn hash_str_different_names() {
+        let h1 = hash_str(b"NtCreateThreadEx");
+        let h2 = hash_str(b"NtClose");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn hash_str_null_terminator_stops() {
+        let h1 = hash_str(b"NtClose\x00extra");
+        let h2 = hash_str(b"NtClose");
+        assert_eq!(h1, h2, "null byte should terminate hashing");
+    }
+
+    #[test]
+    fn hash_str_empty() {
+        // Hash of empty string should just be the seed.
+        let h = hash_str(b"");
+        assert_eq!(h, SEED);
+    }
+
+    #[test]
+    fn hash_str_single_byte() {
+        let h = hash_str(b"A");
+        let expected = SEED.rotate_right(13) ^ (b'a' as u32);
+        assert_eq!(h, expected);
+    }
+
+    #[test]
+    fn hash_str_matches_build_time_hashes() {
+        // Verify runtime hash_str matches the build-time generated constants.
+        assert_eq!(hash_str(b"NtCreateThreadEx"), HASH_NTCREATETHREADEX);
+        assert_eq!(hash_str(b"NtClose"), HASH_NTCLOSE);
+        assert_eq!(hash_str(b"ntdll.dll"), HASH_NTDLL_DLL);
+        assert_eq!(hash_str(b"amsi.dll"), HASH_AMSI_DLL);
+        assert_eq!(hash_str(b"kernel32.dll"), HASH_KERNEL32_DLL);
+    }
+
+    // ── hash_wstr ───────────────────────────────────────────────────────
+
+    #[test]
+    fn hash_wstr_matches_hash_str_for_ascii() {
+        let ascii = b"ntdll.dll";
+        let wide: Vec<u16> = ascii.iter().map(|&b| b as u16).collect();
+        let h_str = hash_str(ascii);
+        let h_wstr = hash_wstr(&wide);
+        assert_eq!(
+            h_str, h_wstr,
+            "ASCII strings must produce the same hash in narrow and wide encoding"
+        );
+    }
+
+    #[test]
+    fn hash_wstr_case_insensitive() {
+        let upper: Vec<u16> = "NTDLL.DLL".encode_utf16().collect();
+        let lower: Vec<u16> = "ntdll.dll".encode_utf16().collect();
+        assert_eq!(hash_wstr(&upper), hash_wstr(&lower));
+    }
+
+    #[test]
+    fn hash_wstr_null_terminator() {
+        let with_null: Vec<u16> = "ntdll\0extra".encode_utf16().collect();
+        let without: Vec<u16> = "ntdll".encode_utf16().collect();
+        assert_eq!(hash_wstr(&with_null), hash_wstr(&without));
+    }
+
+    #[test]
+    fn hash_wstr_empty() {
+        let h = hash_wstr(&[]);
+        assert_eq!(h, SEED);
+    }
+
+    #[test]
+    fn hash_wstr_non_ascii_preserves_all_bits() {
+        // Non-ASCII u16 values should hash differently from just the low byte.
+        let wide: Vec<u16> = vec![0x0100]; // Ā (Latin A with macron)
+        // Non-ASCII should produce a different hash than ASCII low byte only.
+        // hash_wstr processes non-ASCII as two separate steps (lo, hi).
+        let ascii_lo_only: Vec<u16> = vec![0x00]; // just byte 0x00
+        let h_non_ascii = hash_wstr(&wide);
+        let h_ascii_lo = hash_wstr(&ascii_lo_only);
+        assert_ne!(h_non_ascii, h_ascii_lo);
+    }
+
+    // ── is_forwarder ────────────────────────────────────────────────────
+
+    #[test]
+    fn is_forwarder_inside_export_dir() {
+        assert!(is_forwarder(0x5000, 0x4000, 0x2000));
+        // 0x4000 <= 0x5000 < 0x4000 + 0x2000 = 0x6000
+    }
+
+    #[test]
+    fn is_forwarder_at_start() {
+        assert!(is_forwarder(0x4000, 0x4000, 0x2000));
+    }
+
+    #[test]
+    fn is_forwarder_at_end_minus_one() {
+        assert!(is_forwarder(0x5FFF, 0x4000, 0x2000));
+    }
+
+    #[test]
+    fn is_not_forwarder_at_exact_end() {
+        assert!(!is_forwarder(0x6000, 0x4000, 0x2000));
+    }
+
+    #[test]
+    fn is_not_forwarder_before_dir() {
+        assert!(!is_forwarder(0x3FFF, 0x4000, 0x2000));
+    }
+
+    #[test]
+    fn is_not_forwarder_well_past_dir() {
+        assert!(!is_forwarder(0x10000, 0x4000, 0x2000));
+    }
+
+    #[test]
+    fn is_forwarder_zero_size_dir() {
+        // Zero-size export directory — nothing is inside.
+        assert!(!is_forwarder(0x4000, 0x4000, 0));
+    }
+
+    #[test]
+    fn is_forwarder_overflow_protection() {
+        // saturating_add prevents overflow: 0xFFFFFFFE + 3 would overflow
+        // but saturating_add clamps to usize::MAX, so the check still works.
+        // 0xFFFFFFFF is >= 0xFFFFFFFE and < usize::MAX, so it IS a forwarder.
+        assert!(is_forwarder(0xFFFFFFFF, 0xFFFFFFFE, 2));
+        // An address at exactly the saturated end should NOT be a forwarder.
+        assert!(!is_forwarder(usize::MAX, 0xFFFFFFFE, 2));
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // ── hash_str properties ──────────────────────────────────────────
+
+        #[test]
+        fn hash_str_deterministic(bytes: Vec<u8>) {
+            let a = hash_str(&bytes);
+            let b = hash_str(&bytes);
+            prop_assert_eq!(a, b);
+        }
+
+        #[test]
+        fn hash_str_case_insensitive_any_ascii(a in any::<u8>()) {
+            // Generate the case partner and verify they hash identically.
+            let b: u8 = if a.is_ascii_alphabetic() {
+                if a.is_ascii_lowercase() { a.to_ascii_uppercase() } else { a.to_ascii_lowercase() }
+            } else {
+                a // non-alpha: identical
+            };
+            prop_assert_eq!(hash_str(&[a]), hash_str(&[b]));
+        }
+
+        #[test]
+        fn hash_str_null_terminator_stops_rest_ignored(prefix: Vec<u8>, suffix: Vec<u8>) {
+            // No null in prefix, null at the junction.
+            let mut input = prefix.clone();
+            input.push(0);
+            input.extend_from_slice(&suffix);
+            prop_assert_eq!(hash_str(&input), hash_str(&prefix));
+        }
+
+        #[test]
+        fn hash_str_extension_invariant(extra in 1u8..) {
+            // Use a single non-null byte as prefix to verify the extension formula.
+            // hash_str("[a]") = SEED.rotate_right(13) ^ lower(a)
+            // hash_str("[a, extra]") = hash_str("[a]").rotate_right(13) ^ lower(extra)
+            let a: u8 = 0x41; // 'A' — known non-null
+            let prefix = &[a][..];
+            let extended = vec![a, extra];
+            let h_prefix = hash_str(prefix);
+            let h_extended = hash_str(&extended);
+            let expected = h_prefix.rotate_right(13) ^ (extra.to_ascii_lowercase() as u32);
+            prop_assert_eq!(h_extended, expected);
+        }
+
+        // ── hash_wstr properties ─────────────────────────────────────────
+
+        #[test]
+        fn hash_wstr_deterministic(bytes: Vec<u16>) {
+            let a = hash_wstr(&bytes);
+            let b = hash_wstr(&bytes);
+            prop_assert_eq!(a, b);
+        }
+
+        #[test]
+        fn hash_wstr_matches_hash_str_for_ascii_wide(lo: Vec<u8>) {
+            // For ASCII-range code units, hash_wstr on the wide version
+            // must equal hash_str on the narrow version.
+            let wide: Vec<u16> = lo.iter().map(|&b| b as u16).collect();
+            prop_assert_eq!(hash_wstr(&wide), hash_str(&lo));
+        }
+
+        #[test]
+        fn hash_wstr_null_terminator_stops_rest_ignored(prefix: Vec<u16>, suffix: Vec<u16>) {
+            let mut input = prefix.clone();
+            input.push(0);
+            input.extend_from_slice(&suffix);
+            prop_assert_eq!(hash_wstr(&input), hash_wstr(&prefix));
+        }
+
+        #[test]
+        fn hash_wstr_ascii_case_insensitive(a in 1u16..0x100u16) {
+            // For ASCII range (< 0x100), case folding should produce same hash.
+            let a8 = a as u8;
+            let b: u16 = if a8.is_ascii_alphabetic() {
+                if a8.is_ascii_lowercase() { a8.to_ascii_uppercase() as u16 }
+                else { a8.to_ascii_lowercase() as u16 }
+            } else {
+                a // non-alpha ASCII: same byte
+            };
+            prop_assert_eq!(hash_wstr(&[a]), hash_wstr(&[b]));
+        }
+
+        // ── is_forwarder properties ──────────────────────────────────────
+
+        #[test]
+        fn is_forwarder_inside_range(rva: usize, dir_rva: usize, size: usize) {
+            // When rva is strictly inside [dir_rva, dir_rva+size), it's a forwarder.
+            prop_assume!(size > 0);
+            prop_assume!(rva >= dir_rva);
+            prop_assume!(rva < dir_rva.saturating_add(size));
+            prop_assert!(is_forwarder(rva, dir_rva, size));
+        }
+
+        #[test]
+        fn is_forwarder_outside_below(rva: usize, dir_rva: usize, size: usize) {
+            prop_assume!(size > 0);
+            prop_assume!(rva < dir_rva);
+            prop_assert!(!is_forwarder(rva, dir_rva, size));
+        }
+
+        #[test]
+        fn is_forwarder_zero_size_means_none(rva: usize, dir_rva: usize) {
+            prop_assert!(!is_forwarder(rva, dir_rva, 0));
+        }
+    }
 }

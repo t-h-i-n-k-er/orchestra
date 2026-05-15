@@ -21,6 +21,9 @@ This document describes where the project is going next.
   macOS LaunchAgent/CronJob paths, Windows scheduled-task/autorun mechanisms.
 - ✅ **HTTP and DNS-over-HTTPS C2 transports** (`http-transport`,
   `doh-transport`) available as explicit opt-in channels.
+  ⚠️ *Forward secrecy over HTTP/DoH (ECDH key exchange via headers/DNS
+  labels) is **experimental** — not yet tested end-to-end under all
+  malleable-profile transforms.*
 - ✅ **Polymorphic payload packaging** with multi-cipher layout variation in
   `payload-packager`.
 - ✅ **SSH transport compile path** (`ssh-transport`) available as an
@@ -54,7 +57,8 @@ This document describes where the project is going next.
 - ✅ **Forward secrecy (X25519 + HKDF)**: the `forward-secrecy` feature
   performs an ephemeral X25519 key exchange to derive a unique session
   key, ensuring recorded sessions cannot be decrypted if the PSK is
-  later compromised.
+  later compromised.  ⚠️ *Forward secrecy over HTTP/DoH transports
+  (ECDH via `X-ECDH-Pub` headers and DNS TXT labels) is **experimental**.*
 - ✅ **Interactive PTY shell sessions**: `StartShell`, `ShellInput`,
   `ShellOutput`, `CloseShell` commands with non-blocking reader thread
   architecture.
@@ -122,6 +126,75 @@ This document describes where the project is going next.
   breakpoint VEH), `write-raid-amsi` (Windows, data-only race condition,
   preferred AMSI bypass).
 
+### Completed (continued — late 2025)
+
+- ✅ **LSA Whisperer** (`lsa-whisperer` feature) — SSP interface credential
+  extraction from MSV1_0/Kerberos/WDigest, bypasses Credential Guard and
+  RunAsPPL without reading LSASS memory.
+- ✅ **Kernel Callback BYOVD** (`kernel-callback` feature) — Surgical EDR
+  callback overwrite via 8 vulnerable signed drivers; `ret` pointer defeats
+  EDR self-integrity checks; anti-forensic driver unlinking.
+- ✅ **Automated EDR Bypass Transform Engine** (`evasion-transform` feature) —
+  Runtime `.text` signature scanning with 5 semantic-preserving transformations
+  (instruction substitution, register reassignment, NOP sled insertion, constant
+  splitting, jump obfuscation).
+- ✅ **Evanesco continuous memory hiding** (`evanesco` feature) — Per-page RC4
+  encryption at rest, VEH-based auto-decryption, background re-encryption thread,
+  sleep obfuscation integration.
+- ✅ **C4 Bomb — DPAPI Padding Oracle** (`browser-data` feature) — CBC padding-oracle
+  attack against DPAPI `CryptUnprotectData` to recover Chrome v20+ App-Bound
+  encryption key without elevation.
+- ✅ **Indirect Dynamic Syscall upgrade** — Runtime SSN validation (cross-reference +
+  probe methods), build-aware caching from `KUSER_SHARED_DATA`, SSDT nuclear fallback,
+  versioned SSN range table for Windows 10/11 builds.
+- ✅ **NTFS Transaction-Based Process Hollowing** (`transacted-hollowing` feature) —
+  Fileless process hollowing via NTFS transactions with ETW blinding and spoofed
+  provider GUIDs.
+- ✅ **Delayed Module-Stomp Injection** (`delayed-stomp` feature) — EDR timing-heuristic
+  bypass with configurable randomized delay between DLL load and stomping.
+- ✅ **AMSI Write-Raid Bypass** (`write-raid-amsi` feature) — Data-only race condition
+  overwriting `AmsiInitFailed` flag; zero code/permission/breakpoint modifications.
+- ✅ **Cronus Sleep Obfuscation** — Waitable-timer variant (`NtCreateTimer` +
+  `NtSetTimer` + `NtWaitForSingleObject`) as alternative to Ekko `NtDelayExecution`.
+- ✅ **Unwind-Aware Call Stack Spoofing upgrade** (`stack-spoof` feature) — Multi-frame
+  plausible call graph chains, unwind metadata validation, post-sleep revalidation.
+- ✅ **COM Hijack** (`com-hijack` feature) — Registry-free COM hijack through activation
+  contexts with scan, manifest generation, proxy DLL creation, and activation commands.
+- ✅ **DPAPI Backup Key** (`dpapi-backup` feature) — Domain backup-key retrieval, harvesting,
+  and blob decryption for offline credential recovery.
+- ✅ **Hardware Persistence** (`hardware-persistence` feature) — Thunderbolt/DMA-based
+  persistence with VBR and UEFI boot persistence, physical memory read, vulnerability
+  detection.
+- ✅ **Kerberos Relay** (`kerberos-relay` feature) — Kerberos relay through COM
+  cross-session activation with CLSID enumeration.
+- ✅ **macOS Post-Exploitation** (`macos-postexp` feature) — TCC check/bypass, SIP
+  status/bypass mount, XPC enumeration/exploit, Keychain dump.
+- ✅ **Shadow Credentials** (`shadow-credentials` feature) — AD Shadow Credentials
+  attack via `msDS-KeyCredentialLink` and PKINIT with access check, cert generation,
+  and attack execution.
+- ✅ **UEFI Persistence** (`uefi-persistence` feature) — UEFI NVRAM/ESP persistence
+  with boot entry enumeration, stub building, driver writing, variable manipulation,
+  and runtime driver installation.
+- ✅ **WMI Persistence** (`wmi-persistence` feature) — COM-based WMI permanent event
+  subscription management with stager generation and cloud upload.
+- ✅ **Graph transport** (`graph-transport` feature) — Microsoft Graph API covert C2
+  transport channel.
+- ✅ **QUIC transport** (`quic-transport` feature) — QUIC/HTTP3 C2 transport with
+  certificate verification.
+- ✅ **Software Diversification** (`optimizer` crate) — Build-time code diversification
+  via instruction substitution, opaque dead-code insertion, and scheduling passes;
+  invoked via `--diversify` flag in builder CLI.
+- ✅ **Active Directory / Entra ID attack suite** — `adcs-attacks` (ESC1–ESC8),
+  `entra-ptc` (Primary Refresh Token theft), `entra-attacks` (credential attacks,
+  PRT theft, token abuse), `entra-app-abuse` (OAuth application abuse), `s4u-abuse`
+  (S4U2Self/S4U2Proxy delegation abuse), `shadow-credentials` (KeyCredentialLink).
+- ✅ **Container escape** (`container-escape` feature) — Linux container escape,
+  cloud metadata credential theft, cloud IAM pivoting.
+- ✅ **VSS pivot** (`vss-pivot` feature) — Volume Shadow Copy access for locked files
+  (SAM, SYSTEM, NTDS.dit).
+- ✅ **LPE** (`lpe` feature) — Local privilege escalation modules.
+- ✅ **Recon** (`recon` feature) — Automated reconnaissance and situational awareness.
+
 ---
 
 ## Short term (next 0–3 months)
@@ -140,6 +213,56 @@ This document describes where the project is going next.
 - **Remote manual-map import resolution under mismatched ASLR bases.** Expand
   regression coverage and failure diagnostics for cross-process module-layout
   divergence.
+- **Polymorphic stub emitter variants.** The `payload-packager` stub emitter
+  currently ships one x86-64 decoder layout. Planned variants include
+  register-shuffled AES-CTR, RC4-stream, and position-independent
+  Chacha20-Poly1305 stubs. Register constants (`RDX`, `R8–R11`) and
+  encoding helpers (`xor_rr_zero`, `add_r64_imm8`, `jge_rel8`, `jb_rel8`,
+  `jmp_rel8`, `movzx_r64_mem8_base_idx`, `mov_mem8_base_idx_r8`,
+  `xor_r8_mem8_base_idx`, `mov_r64_imm64`) are retained under
+  `#[allow(dead_code)]` in `stub_emitter.rs` for these upcoming variants.
+
+## Code hygiene policies
+
+### `#[allow(dead_code)]` items
+
+The codebase contains ~60 `#[allow(dead_code)]` annotations.  Each one
+includes a justification comment.  The categories are:
+
+1. **Windows API constants** kept for completeness and future use
+   (e.g., `com_hijack.rs`, `adcs_attacks.rs`, `lsa_whisperer.rs`).
+2. **Planned emitter variants** in `payload-packager/src/stub_emitter.rs`
+   — register constants and encoding helpers for upcoming polymorphic
+   decoder layouts.
+3. **Backward-compatible utility functions** (e.g., `c2_http.rs`,
+   `poly.rs`, `pe_artifact_kit.rs`) that are not yet wired into every
+   code path.
+4. **Feature-gated code paths** that become dead when their feature is
+   disabled (e.g., `module_loader.rs`, `c2_ssh.rs`).
+5. **Platform-specific functions** only reachable on their target OS
+   (e.g., `env_check.rs`).
+6. **Internal helpers** kept for completeness and testing flexibility
+   (e.g., `virtualize.rs`, `optimizer.rs`).
+
+Policy: do not remove these annotations without first confirming that
+the symbol is truly unreachable in all feature/OS configurations *and*
+not listed on this roadmap for an upcoming capability.  When a new
+dead-code annotation is added, it must include a comment explaining why.
+
+### `#[ignore]` tests
+
+Three integration tests are marked `#[ignore]`:
+
+- `launcher/tests/hollowing_test.rs` — requires a writable build
+  directory and is invasive; opt-in only.
+- `hollowing/src/windows_impl.rs` — manual Windows test requiring an
+  explicit 32-bit payload path.
+- `agent/src/process_manager.rs` — invasive hollowing test gated behind
+  `#[cfg(windows)]`.
+
+These tests cannot run in CI (they require a live Windows environment
+with specific filesystem layouts).  Each has a comment explaining the
+prerequisite.  Run locally with `cargo test -- --ignored` when needed.
 
 ## Medium term (3–9 months)
 

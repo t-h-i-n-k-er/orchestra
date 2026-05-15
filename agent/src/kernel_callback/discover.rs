@@ -520,7 +520,7 @@ fn walk_callback_array(
                 });
             }
             Err(e) => {
-                log::warn!(
+                tracing::warn!(
                     "Failed to read callback block at 0x{:016X}: {}",
                     block_addr,
                     e
@@ -574,7 +574,7 @@ fn walk_bugcheck_callback_list(
 
         // Cycle detection for corrupted lists.
         if !visited.insert(current) {
-            log::warn!(
+            tracing::warn!(
                 "BugCheck callback list cycle detected at 0x{:016X}, stopping",
                 current
             );
@@ -603,7 +603,7 @@ fn walk_bugcheck_callback_list(
                 }
             }
             Err(e) => {
-                log::warn!(
+                tracing::warn!(
                     "Failed to read BugCheck callback record at 0x{:016X}: {}",
                     current,
                     e
@@ -638,7 +638,7 @@ pub fn scan_callbacks(deployed: &DeployedDriver) -> Result<ScanResult> {
 
     // Step 1: Get the kernel base address.
     let kernel_base = get_kernel_base().context("failed to get kernel base address")?;
-    log::info!("Kernel base address: 0x{:016X}", kernel_base);
+    tracing::info!("Kernel base address: 0x{:016X}", kernel_base);
 
     // Step 2: Resolve the callback list symbols.
     // These are the primary callback routine arrays in ntoskrnl.
@@ -659,20 +659,20 @@ pub fn scan_callbacks(deployed: &DeployedDriver) -> Result<ScanResult> {
     for (symbol, list_type) in &symbols {
         match resolve_kernel_symbol(driver, device_handle, kernel_base, symbol) {
             Ok(addr) => {
-                log::info!("Resolved {} at 0x{:016X}", symbol, addr);
+                tracing::info!("Resolved {} at 0x{:016X}", symbol, addr);
 
                 match walk_callback_array(driver, device_handle, addr, *list_type) {
                     Ok(cbs) => {
-                        log::info!("Found {} callbacks in {}", cbs.len(), symbol);
+                        tracing::info!("Found {} callbacks in {}", cbs.len(), symbol);
                         all_callbacks.extend(cbs);
                     }
                     Err(e) => {
-                        log::warn!("Failed to walk callback array at {}: {}", symbol, e);
+                        tracing::warn!("Failed to walk callback array at {}: {}", symbol, e);
                     }
                 }
             }
             Err(e) => {
-                log::warn!("Failed to resolve {}: {}", symbol, e);
+                tracing::warn!("Failed to resolve {}: {}", symbol, e);
             }
         }
     }
@@ -686,22 +686,22 @@ pub fn scan_callbacks(deployed: &DeployedDriver) -> Result<ScanResult> {
         "KeBugCheckCallbackListHead",
     ) {
         Ok(list_head) => {
-            log::info!(
+            tracing::info!(
                 "Resolved KeBugCheckCallbackListHead at 0x{:016X}",
                 list_head
             );
             match walk_bugcheck_callback_list(driver, device_handle, list_head) {
                 Ok(cbs) => {
-                    log::info!("Found {} BugCheck callbacks", cbs.len());
+                    tracing::info!("Found {} BugCheck callbacks", cbs.len());
                     all_callbacks.extend(cbs);
                 }
                 Err(e) => {
-                    log::warn!("Failed to walk KeBugCheckCallbackListHead: {}", e);
+                    tracing::warn!("Failed to walk KeBugCheckCallbackListHead: {}", e);
                 }
             }
         }
         Err(e) => {
-            log::warn!("Failed to resolve KeBugCheckCallbackListHead: {}", e);
+            tracing::warn!("Failed to resolve KeBugCheckCallbackListHead: {}", e);
         }
     }
 
@@ -709,19 +709,19 @@ pub fn scan_callbacks(deployed: &DeployedDriver) -> Result<ScanResult> {
     // This is a linked list of CALLBACK_ENTRY_ITEM, not a flat array.
     match resolve_kernel_symbol(driver, device_handle, kernel_base, "CallbackListHead") {
         Ok(list_head) => {
-            log::info!("Resolved CallbackListHead at 0x{:016X}", list_head);
+            tracing::info!("Resolved CallbackListHead at 0x{:016X}", list_head);
             match walk_linked_callback_list(driver, device_handle, list_head) {
                 Ok(cbs) => {
-                    log::info!("Found {} object manager callbacks", cbs.len());
+                    tracing::info!("Found {} object manager callbacks", cbs.len());
                     all_callbacks.extend(cbs);
                 }
                 Err(e) => {
-                    log::warn!("Failed to walk CallbackListHead: {}", e);
+                    tracing::warn!("Failed to walk CallbackListHead: {}", e);
                 }
             }
         }
         Err(e) => {
-            log::warn!("Failed to resolve CallbackListHead: {}", e);
+            tracing::warn!("Failed to resolve CallbackListHead: {}", e);
         }
     }
 
@@ -793,7 +793,7 @@ fn walk_linked_callback_list(
                 }
             }
             Err(e) => {
-                log::warn!("Failed to read callback entry at 0x{:016X}: {}", current, e);
+                tracing::warn!("Failed to read callback entry at 0x{:016X}: {}", current, e);
                 break;
             }
         }

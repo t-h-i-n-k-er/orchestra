@@ -65,6 +65,10 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
+// CRIT-004: poison-recovering lock helpers — always encrypt/decrypt even
+// after a previous panic, so pages are never left in an inconsistent state.
+use common::lock::RwLockExt;
+
 // ── Windows constants ────────────────────────────────────────────────────────
 
 /// PAGE_NOACCESS protection constant.
@@ -144,15 +148,15 @@ fn query_page_size() -> usize {
             unsafe { get_system_info(&mut info as *mut SystemInfo as *mut u8) };
             let sz = info.dw_page_size as usize;
             if sz > 0 && sz.is_power_of_two() {
-                log::info!("evanesco: system page size = {} bytes", sz);
+                tracing::info!("evanesco: system page size = {} bytes", sz);
                 sz
             } else {
-                log::warn!("evanesco: GetSystemInfo returned invalid page size {}, defaulting to 4096", sz);
+                tracing::warn!("evanesco: GetSystemInfo returned invalid page size {}, defaulting to 4096", sz);
                 4096
             }
         }
         None => {
-            log::warn!("evanesco: cannot resolve GetSystemInfo, defaulting to 4096 byte pages");
+            tracing::warn!("evanesco: cannot resolve GetSystemInfo, defaulting to 4096 byte pages");
             4096
         }
     }
@@ -282,7 +286,7 @@ impl PageInfo {
             if result != 0 {
                 self.key_locked = true;
             } else {
-                log::warn!(
+                tracing::warn!(
                     "evanesco: VirtualLock({} bytes) failed for {:?} at {:#x}",
                     len,
                     self.label,
@@ -290,7 +294,7 @@ impl PageInfo {
                 );
             }
         } else {
-            log::warn!("evanesco: cannot resolve VirtualLock — AEAD key not locked");
+            tracing::warn!("evanesco: cannot resolve VirtualLock — AEAD key not locked");
         }
     }
 
@@ -378,14 +382,10 @@ impl PageGuard {
             Some(t) => t,
             None => return,
         };
-        let mut pages = match tracker.pages.write() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        let mut crypto_sidecar = match tracker.crypto_sidecar.write() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
+        // CRIT-004: recover from poison — always re-encrypt even if a
+        // previous encrypt/decrypt cycle panicked.
+        let mut pages = tracker.pages.write_recover();
+        let mut crypto_sidecar = tracker.crypto_sidecar.write_recover();
         for &(base, size) in &self.ranges {
             encrypt_page_unlocked(&mut pages, &mut crypto_sidecar, base, size);
         }
@@ -425,7 +425,7 @@ fn encrypt_page_unlocked(
         let cipher = match XChaCha20Poly1305::new_from_slice(&info.aead_key) {
             Ok(c) => c,
             Err(_) => {
-                log::error!(
+                tracing::error!(
                     "evanesco: XChaCha20-Poly1305 key init failed for {:?}",
                     info.label
                 );
@@ -441,7 +441,7 @@ fn encrypt_page_unlocked(
             match cipher.encrypt(xnonce, plaintext as &[u8]) {
                 Ok(ct) => ct,
                 Err(_) => {
-                    log::error!(
+                    tracing::error!(
                         "evanesco: XChaCha20-Poly1305 encryption failed for {:?}",
                         info.label
                     );
@@ -486,7 +486,7 @@ fn encrypt_page_unlocked(
             )
         };
         if status < 0 {
-            log::error!(
+            tracing::error!(
                 "evanesco: NtProtectVirtualMemory(PAGE_NOACCESS) failed for {:?} status={:#x}",
                 info.label,
                 status as u32
@@ -522,7 +522,7 @@ fn decrypt_page_unlocked(
         let crypto = match crypto_sidecar.get(&base) {
             Some(c) => c.clone(),
             None => {
-                log::error!(
+                tracing::error!(
                     "evanesco: no sidecar crypto for {:?} at {:#x} — zeroing page",
                     info.label,
                     base
@@ -564,7 +564,7 @@ fn decrypt_page_unlocked(
             )
         };
         if status < 0 {
-            log::error!(
+            tracing::error!(
                 "evanesco: NtProtectVirtualMemory({:?}) failed for {:?} status={:#x}",
                 access,
                 info.label,
@@ -579,7 +579,7 @@ fn decrypt_page_unlocked(
         let cipher = match XChaCha20Poly1305::new_from_slice(&info.aead_key) {
             Ok(c) => c,
             Err(_) => {
-                log::error!(
+                tracing::error!(
                     "evanesco: XChaCha20-Poly1305 key init failed for {:?}",
                     info.label
                 );
@@ -601,7 +601,7 @@ fn decrypt_page_unlocked(
                 std::ptr::copy_nonoverlapping(pt.as_ptr(), base as *mut u8, pt.len());
             },
             Err(_) => {
-                log::error!(
+                tracing::error!(
                     "evanesco: AEAD tag mismatch for {:?} at {:#x} — page may have been tampered with, zeroing",
                     info.label, base
                 );
@@ -686,7 +686,7 @@ pub fn init(idle_threshold_ms: u64, scan_interval_ms: u64) -> Result<()> {
         .set(inner)
         .map_err(|_| anyhow!("evanesco: init called more than once"))?;
 
-    log::info!(
+    tracing::info!(
         "evanesco: initialised (idle_threshold={}ms, scan_interval={}ms)",
         idle_threshold_ms,
         scan_interval_ms
@@ -718,14 +718,10 @@ pub fn shutdown() {
 
     // Decrypt all pages back to their original state.
     {
-        let mut pages = match inner.pages.write() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        let mut crypto_sidecar = match inner.crypto_sidecar.write() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
+        // CRIT-004: recover from poison — always decrypt all pages during
+        // shutdown even if a previous encrypt/decrypt cycle panicked.
+        let mut pages = inner.pages.write_recover();
+        let mut crypto_sidecar = inner.crypto_sidecar.write_recover();
         for (&base, info) in pages.iter_mut() {
             if info.state == PageState::Encrypted {
                 // Restore original protection first.
@@ -796,7 +792,7 @@ pub fn shutdown() {
         }
     }
 
-    log::info!("evanesco: shutdown complete");
+    tracing::info!("evanesco: shutdown complete");
 }
 
 // ── VEH handler ──────────────────────────────────────────────────────────────
@@ -811,7 +807,7 @@ fn register_veh(inner: &Arc<PageTrackerInner>) -> Result<()> {
     // Dynamic resolution — no IAT entry for AddVectoredExceptionHandler.
     type FnAddVEH = unsafe extern "system" fn(
         u32,
-        Option<unsafe extern "system" fn(*mut winapi::um::winnt::EXCEPTION_POINTERS) -> i32>,
+        Option<unsafe extern "system" fn(*mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) -> i32>,
     ) -> *mut std::ffi::c_void;
 
     let add_veh: FnAddVEH = (|| unsafe {
@@ -829,7 +825,7 @@ fn register_veh(inner: &Arc<PageTrackerInner>) -> Result<()> {
     if let Ok(mut guard) = inner.veh_handle.lock() {
         *guard = Some(handle as usize);
     }
-    log::debug!("evanesco: VEH registered at {:?}", handle);
+    tracing::debug!("evanesco: VEH registered at {:?}", handle);
     Ok(())
 }
 
@@ -840,7 +836,7 @@ unsafe fn remove_veh(handle: usize) {
     let k32 = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) {
         Some(base) => base,
         None => {
-            log::error!("evanesco: cannot resolve kernel32 for RemoveVectoredExceptionHandler");
+            tracing::error!("evanesco: cannot resolve kernel32 for RemoveVectoredExceptionHandler");
             return;
         }
     };
@@ -852,7 +848,7 @@ unsafe fn remove_veh(handle: usize) {
     if let Some(fn_ptr) = remove_veh {
         fn_ptr(handle as *mut std::ffi::c_void);
     } else {
-        log::error!("evanesco: cannot resolve RemoveVectoredExceptionHandler");
+        tracing::error!("evanesco: cannot resolve RemoveVectoredExceptionHandler");
     }
 }
 
@@ -921,7 +917,7 @@ static VEH_TRACKER_PTR: AtomicPtr<PageTrackerInner> = AtomicPtr::new(std::ptr::n
 /// but this is irrelevant because we never touch it.  The exception
 /// dispatcher handles saving/restoring CONTEXT for us.
 unsafe extern "system" fn veh_handler(
-    exception_info: *mut winapi::um::winnt::EXCEPTION_POINTERS,
+    exception_info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
 ) -> i32 {
     let ei = match (exception_info).as_ref() {
         Some(ei) => ei,
@@ -965,29 +961,41 @@ unsafe extern "system" fn veh_handler(
 
     // Quick check: page-align the fault address and see if it's tracked.
     let page_base = fault_addr & page_mask();
+
+    // L-2: Remember whether the page was present under the read lock so we
+    // can distinguish "never tracked" from "disappeared between locks" in
+    // the write-lock path below.  If another thread (background re-key or
+    // concurrent VEH handler) removed the entry between our read and write
+    // locks, the page is already being handled and we should retry the
+    // faulting instruction rather than propagating the exception.
+    let mut was_tracked = false;
     {
-        let pages = match inner.pages.read() {
-            Ok(g) => g,
-            Err(_) => return EXCEPTION_CONTINUE_SEARCH,
-        };
-        if !pages.contains_key(&page_base) {
+        // CRIT-004: recover from poison — the VEH handler must still
+        // function after a previous panic to decrypt pages on access.
+        let pages = inner.pages.read_recover();
+        was_tracked = pages.contains_key(&page_base);
+        if !was_tracked {
             return EXCEPTION_CONTINUE_SEARCH;
         }
     } // release read lock before write
 
     // Decrypt the page.
-    let mut pages = match inner.pages.write() {
-        Ok(g) => g,
-        Err(_) => return EXCEPTION_CONTINUE_SEARCH,
-    };
-    let mut crypto_sidecar = match inner.crypto_sidecar.write() {
-        Ok(g) => g,
-        Err(_) => return EXCEPTION_CONTINUE_SEARCH,
-    };
+    let mut pages = inner.pages.write_recover();
+    let mut crypto_sidecar = inner.crypto_sidecar.write_recover();
 
     let size = match pages.get(&page_base) {
         Some(i) => i.size,
-        None => return EXCEPTION_CONTINUE_SEARCH,
+        None => {
+            // Page was present under the read lock but disappeared before we
+            // acquired the write lock.  Another thread (e.g. background
+            // re-keying or a concurrent VEH handler on the same page) already
+            // took care of it.  Retry the faulting instruction — the page is
+            // either decrypted or will re-fault at its new address.
+            if was_tracked {
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
     };
 
     if decrypt_page_unlocked(&mut pages, &mut crypto_sidecar, page_base, size, access) {
@@ -1037,11 +1045,10 @@ fn background_loop(inner: &Arc<PageTrackerInner>) {
         let now = Instant::now();
 
         // Collect pages to re-encrypt under read lock.
+        // CRIT-004: recover from poison — always re-encrypt idle pages
+        // even after a previous panic in the encryption path.
         let to_encrypt: Vec<(usize, usize)> = {
-            let pages = match inner.pages.read() {
-                Ok(g) => g,
-                Err(_) => continue,
-            };
+            let pages = inner.pages.read_recover();
             pages
                 .iter()
                 .filter(|(_, info)| {
@@ -1054,14 +1061,8 @@ fn background_loop(inner: &Arc<PageTrackerInner>) {
 
         // Re-encrypt each page under write lock.
         if !to_encrypt.is_empty() {
-            let mut pages = match inner.pages.write() {
-                Ok(g) => g,
-                Err(_) => continue,
-            };
-            let mut crypto_sidecar = match inner.crypto_sidecar.write() {
-                Ok(g) => g,
-                Err(_) => continue,
-            };
+            let mut pages = inner.pages.write_recover();
+            let mut crypto_sidecar = inner.crypto_sidecar.write_recover();
             for (base, size) in to_encrypt {
                 encrypt_page_unlocked(&mut pages, &mut crypto_sidecar, base, size);
                 inner.encrypt_count.fetch_add(1, Ordering::Relaxed);
@@ -1109,24 +1110,17 @@ pub fn enroll(base: *mut u8, size: usize, orig_protect: u32, label: &str) -> Res
     // P1-22: Lock the AEAD key in RAM immediately after generation.
     info.lock_aead_key();
 
+    // CRIT-004: recover from poison — enrollment must proceed even if a
+    // previous operation panicked.
     {
-        let mut pages = inner
-            .pages
-            .write()
-            .map_err(|e| anyhow!("evanesco: failed to acquire pages lock: {}", e))?;
+        let mut pages = inner.pages.write_recover();
         pages.insert(aligned_base, info);
     }
 
     // Now encrypt the page.
     {
-        let mut pages = inner
-            .pages
-            .write()
-            .map_err(|e| anyhow!("evanesco: failed to acquire pages lock: {}", e))?;
-        let mut crypto_sidecar = inner
-            .crypto_sidecar
-            .write()
-            .map_err(|e| anyhow!("evanesco: failed to acquire crypto_sidecar lock: {}", e))?;
+        let mut pages = inner.pages.write_recover();
+        let mut crypto_sidecar = inner.crypto_sidecar.write_recover();
         // The page starts decrypted (caller just gave us the memory), so we
         // need to set up the initial state properly.  First, set it to
         // DecryptedRW so encrypt_page_unlocked will actually encrypt it.
@@ -1137,7 +1131,7 @@ pub fn enroll(base: *mut u8, size: usize, orig_protect: u32, label: &str) -> Res
         inner.encrypt_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    log::debug!(
+    tracing::debug!(
         "evanesco: enrolled region base={:#x} size={} label={:?}",
         aligned_base,
         aligned_size,
@@ -1159,14 +1153,10 @@ pub fn acquire_pages(ranges: &[(usize, usize)], access: AccessType) -> Result<Pa
         .get()
         .ok_or_else(|| anyhow!("evanesco: not initialised"))?;
 
-    let mut pages = inner
-        .pages
-        .write()
-        .map_err(|e| anyhow!("evanesco: failed to acquire pages lock: {}", e))?;
-    let mut crypto_sidecar = inner
-        .crypto_sidecar
-        .write()
-        .map_err(|e| anyhow!("evanesco: failed to acquire crypto_sidecar lock: {}", e))?;
+    // CRIT-004: recover from poison — page access must succeed even if
+    // a previous operation panicked.
+    let mut pages = inner.pages.write_recover();
+    let mut crypto_sidecar = inner.crypto_sidecar.write_recover();
 
     for &(base, size) in ranges {
         decrypt_page_unlocked(&mut pages, &mut crypto_sidecar, base, size, access);
@@ -1213,11 +1203,10 @@ pub fn encrypt_all() {
     // Collect current page info first — we cannot iterate the HashMap while
     // mutating keys.  NtProtectVirtualMemory may adjust the base address
     // (kernel rounds to page boundary), which changes the HashMap key.
+    // CRIT-004: recover from poison — encrypt_all MUST always proceed
+    // even after a previous panic, otherwise pages remain decrypted.
     let page_info: Vec<(usize, usize)> = {
-        let pages = match inner.pages.read() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
+        let pages = inner.pages.read_recover();
         pages
             .iter()
             .filter(|(_, info)| info.state != PageState::Encrypted)
@@ -1225,14 +1214,8 @@ pub fn encrypt_all() {
             .collect()
     };
 
-    let mut pages = match inner.pages.write() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-    let mut crypto_sidecar = match inner.crypto_sidecar.write() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
+    let mut pages = inner.pages.write_recover();
+    let mut crypto_sidecar = inner.crypto_sidecar.write_recover();
 
     for (base, size) in page_info {
         // TOCTOU mitigation: re-validate that the page is still not encrypted
@@ -1255,7 +1238,7 @@ pub fn encrypt_all() {
         let new_base = pages.get(&base).map(|info| info.base).unwrap_or(base);
         if new_base != base {
             if let Some(mut entry) = pages.remove(&base) {
-                log::debug!(
+                tracing::debug!(
                     "evanesco: re-keying page {:#x} → {:#x} after kernel adjustment",
                     base,
                     entry.base
@@ -1286,7 +1269,7 @@ pub fn decrypt_minimum() {
 pub fn set_idle_threshold(ms: u64) {
     if let Some(inner) = GLOBAL_TRACKER.get() {
         inner.idle_threshold_ms.store(ms, Ordering::Relaxed);
-        log::info!("evanesco: idle threshold updated to {}ms", ms);
+        tracing::info!("evanesco: idle threshold updated to {}ms", ms);
     }
 }
 
@@ -1310,10 +1293,8 @@ pub(crate) fn status_json() -> String {
         None => return r#"{"error":"not initialised"}"#.to_string(),
     };
 
-    let pages = match inner.pages.read() {
-        Ok(g) => g,
-        Err(_) => return r#"{"error":"lock poisoned"}"#.to_string(),
-    };
+    // CRIT-004: recover from poison — telemetry should always report real data.
+    let pages = inner.pages.read_recover();
 
     let total = pages.len();
     let mut encrypted = 0usize;
@@ -1352,10 +1333,8 @@ pub(crate) fn status_redacted() -> String {
         None => return r#"{"error":"not initialised"}"#.to_string(),
     };
 
-    let pages = match inner.pages.read() {
-        Ok(g) => g,
-        Err(_) => return r#"{"error":"lock poisoned"}"#.to_string(),
-    };
+    // CRIT-004: recover from poison — telemetry should always report real data.
+    let pages = inner.pages.read_recover();
 
     let total = pages.len();
     let mut encrypted = 0usize;
@@ -1402,7 +1381,7 @@ mod tests {
         let nonce_bytes = [0xBBu8; AEAD_NONCE_LEN];
         let cipher = XChaCha20Poly1305::new_from_slice(&key).unwrap();
         let nonce = chacha20poly1305::XNonce::from_slice(&nonce_bytes);
-        let ciphertext = cipher.encrypt(nonce, b"").unwrap();
+        let ciphertext = cipher.encrypt(nonce, &[][..]).unwrap();
         // Ciphertext is just the 16-byte tag for empty plaintext.
         assert_eq!(ciphertext.len(), AEAD_TAG_LEN);
         let plaintext = cipher.decrypt(nonce, ciphertext.as_slice()).unwrap();

@@ -219,7 +219,7 @@ A `strict-module-key` Cargo feature has been added that converts the `None`
 fallback into a hard `Err`:
 
 ```toml
-# agent/Cargo.toml
+# module_loader/Cargo.toml
 [features]
 strict-module-key = ["module-signatures"]
 ```

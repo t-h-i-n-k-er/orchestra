@@ -8,21 +8,29 @@ license.workspace = true
 [dependencies]
 common = { path = "../common" }
 libloading = "0.8"
-reqwest = { workspace = true }
 sha2 = { workspace = true }
 aes-gcm = { workspace = true }
 base64 = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
-serde_json = "1.0"
+serde_json = { workspace = true }
 libc = "0.2"
 tracing = { workspace = true }
 tempfile = "3.3"
 ed25519-dalek = { version = "2.1.0", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-goblin = { version = "0.7" }
-winapi = { version = "0.3", features = ["winnt", "psapi", "minwinbase"] }
+goblin = { version = "0.8" }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemServices",
+] }
 pe_resolve = { path = "../pe_resolve" }
 nt_syscall = { path = "../nt_syscall" }
 
@@ -35,7 +43,7 @@ module-signatures = ["dep:ed25519-dalek"]
 # supplied by the operator rather than one baked into the binary.
 strict-module-key = ["module-signatures"]
 # Enable reflective PE loading on Windows (no temp file written to disk).
-# Requires the Windows-only `goblin` + `winapi` dependencies declared above.
+# Requires the Windows-only `goblin` + `windows-sys` dependencies declared above.
 manual-map = []
 
 [dev-dependencies]

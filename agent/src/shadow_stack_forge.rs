@@ -297,9 +297,9 @@ pub fn init_shadow_forge() -> bool {
     let supported = cpuid_cet_ss_supported();
 
     if supported {
-        log::info!("shadow_stack_forge: CPU supports CET shadow stacks (CPUID.07H:ECX[7])");
+        tracing::info!("shadow_stack_forge: CPU supports CET shadow stacks (CPUID.07H:ECX[7])");
     } else {
-        log::info!("shadow_stack_forge: CPU does NOT support CET shadow stacks");
+        tracing::info!("shadow_stack_forge: CPU does NOT support CET shadow stacks");
     }
 
     CET_SS_AVAILABLE.store(supported, Ordering::Release);
@@ -537,7 +537,7 @@ pub unsafe fn forge_shadow_return_entry(return_addr: usize) -> ShadowResult<()> 
     // This is the entry that the API's RET will verify.
     wrssq(current_ssp, return_addr as u64)?;
 
-    log::trace!(
+    tracing::trace!(
         "shadow_stack_forge: forged return entry {:#x} at SSP {:#x}",
         return_addr,
         current_ssp,
@@ -588,7 +588,7 @@ pub unsafe fn forge_shadow_frame(return_addr: usize, rbp: usize) -> ShadowResult
     // stored for potential future use (e.g., frame chain verification).
     let _ = rbp; // Suppress unused warning.
 
-    log::trace!(
+    tracing::trace!(
         "shadow_stack_forge: forged frame ret={:#x} at SSP {:#x}",
         return_addr,
         current_ssp,
@@ -789,7 +789,7 @@ pub unsafe fn restore_shadow_state(state: &ShadowState) -> ShadowResult<()> {
         // SSP has advanced past (or equals) the saved position.
         // The forged entry was consumed by a RET.  The shadow stack
         // is now consistent with the regular stack.
-        log::trace!(
+        tracing::trace!(
             "shadow_stack_forge: SSP advanced from {:#x} to {:#x} — no restoration needed",
             state.saved_ssp,
             current_ssp,
@@ -800,7 +800,7 @@ pub unsafe fn restore_shadow_state(state: &ShadowState) -> ShadowResult<()> {
     // SSP is below the saved position — this shouldn't happen in normal
     // operation (it would mean the shadow stack grew without a RET).
     // This could indicate a nested CALL happened.  Log a warning.
-    log::warn!(
+    tracing::warn!(
         "shadow_stack_forge: SSP {:#x} is below saved {:#x} — unexpected state, skipping restore",
         current_ssp,
         state.saved_ssp,
@@ -840,7 +840,7 @@ pub unsafe fn set_ssp(new_ssp: u64) -> ShadowResult<()> {
         options(nostack, preserves_flags)
     );
 
-    log::trace!("shadow_stack_forge: SSP switched to {:#x}", new_ssp);
+    tracing::trace!("shadow_stack_forge: SSP switched to {:#x}", new_ssp);
 
     Ok(())
 }
@@ -881,7 +881,7 @@ pub unsafe fn prepare_spoofed_return(
 ) -> ShadowStackCookie {
     // Check if shadow stack forging is available.
     if !is_shadow_forge_available() {
-        log::trace!(
+        tracing::trace!(
             "shadow_stack_forge: CET-SS not available — skipping shadow stack preparation"
         );
         return ShadowStackCookie {
@@ -899,7 +899,7 @@ pub unsafe fn prepare_spoofed_return(
     let state = match save_shadow_state() {
         Ok(s) => s,
         Err(e) => {
-            log::warn!(
+            tracing::warn!(
                 "shadow_stack_forge: failed to save shadow state: {} — forging disabled",
                 e
             );
@@ -918,7 +918,7 @@ pub unsafe fn prepare_spoofed_return(
     // Forge the spoofed return address onto the shadow stack.
     match forge_shadow_return_entry(spoofed_ret) {
         Ok(()) => {
-            log::debug!(
+            tracing::debug!(
                 "shadow_stack_forge: forged spoofed return {:#x} onto shadow stack (actual_ret={:#x})",
                 spoofed_ret,
                 actual_ret,
@@ -930,7 +930,7 @@ pub unsafe fn prepare_spoofed_return(
             }
         }
         Err(e) => {
-            log::warn!(
+            tracing::warn!(
                 "shadow_stack_forge: WRSS forging failed: {} — proceeding without forged shadow entry",
                 e
             );
@@ -962,13 +962,13 @@ pub unsafe fn restore_from_cookie(cookie: ShadowStackCookie) {
 
     match restore_shadow_state(&cookie.state) {
         Ok(()) => {
-            log::trace!(
+            tracing::trace!(
                 "shadow_stack_forge: shadow stack restored after forged return {:#x}",
                 cookie.forged_ret,
             );
         }
         Err(e) => {
-            log::warn!(
+            tracing::warn!(
                 "shadow_stack_forge: shadow stack restoration failed: {} — shadow stack may be inconsistent",
                 e,
             );

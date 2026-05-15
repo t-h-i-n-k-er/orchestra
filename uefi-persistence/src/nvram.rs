@@ -5,6 +5,9 @@
 //! - **Windows**: Uses `GetFirmwareEnvironmentVariableA` / `SetFirmwareEnvironmentVariableA`
 //!   (requires `SeSystemEnvironmentPrivilege`).
 //! - **Linux**: Reads from / writes to `/sys/firmware/efi/efivars/<name>-<guid>`.
+//! - **macOS**: Uses the `nvram` command-line tool (`/usr/sbin/nvram`) to read/write
+//!   EFI variables.  Requires root privileges (SIP-protected on Apple Silicon, but
+//!   accessible via `nvram` on Intel Macs with UEFI firmware).
 //!
 //! # Safety
 //!
@@ -70,7 +73,11 @@ pub fn read_efi_variable(name: &str, guid: &EfiGuid) -> Result<Vec<u8>> {
     {
         read_efi_variable_windows(name, guid)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    {
+        read_efi_variable_macos(name, guid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
         let _ = (name, guid);
         bail!("EFI variable operations are not supported on this platform");
@@ -100,7 +107,11 @@ pub fn write_efi_variable(
     {
         write_efi_variable_windows(name, guid, data, attrs)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    {
+        write_efi_variable_macos(name, guid, data, attrs)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
         let _ = (name, guid, data, attrs);
         bail!("EFI variable operations are not supported on this platform");
@@ -123,25 +134,23 @@ pub fn delete_efi_variable(name: &str, guid: &EfiGuid) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        // On Windows, set the variable with zero length to delete it.
-        // This requires SetFirmwareEnvironmentVariableA with NULL lpValue and 0 size.
-        // Since winapi doesn't expose that directly, we use the raw API.
-        let var_name = format!("{}-{}", name, guid.to_string());
-        let wide_name: Vec<u16> = var_name.encode_utf16().chain(std::iter::once(0)).collect();
-        let wide_guid: Vec<u16> = guid
-            .to_string()
+        // GetFirmwareEnvironmentVariableW / SetFirmwareEnvironmentVariableW:
+        //   lpName = variable name only (e.g. "BootOrder")
+        //   lpGuid = GUID string (e.g. "{8be4df61-93ca-11d2-aa0d-00e098032b8c}")
+        let wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let wide_guid: Vec<u16> = format!("{{{}}}", guid.to_string())
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
         unsafe {
-            let result = winapi::um::winbase::SetFirmwareEnvironmentVariableW(
+            let result = windows_sys::Win32::System::WindowsProgramming::SetFirmwareEnvironmentVariableW(
                 wide_name.as_ptr(),
                 wide_guid.as_ptr(),
                 std::ptr::null_mut(),
                 0,
             );
             if result == 0 {
-                let err = winapi::um::errhandlingapi::GetLastError();
+                let err = windows_sys::Win32::Foundation::GetLastError();
                 bail!(
                     "SetFirmwareEnvironmentVariableW failed for {}: error {}",
                     name,
@@ -151,7 +160,27 @@ pub fn delete_efi_variable(name: &str, guid: &EfiGuid) -> Result<()> {
         }
         Ok(())
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    {
+        // macOS nvram -d deletes a variable by name.
+        // Use the GUID-qualified name to be precise.
+        let nvram_name = format!("{}:{}", guid.to_string(), name);
+        let output = std::process::Command::new("/usr/sbin/nvram")
+            .arg("-d")
+            .arg(&nvram_name)
+            .output()
+            .context("Failed to execute nvram")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // nvram returns error if variable doesn't exist; that's fine for delete.
+            if stderr.contains("not found") || stderr.contains("No such") {
+                return Ok(());
+            }
+            bail!("nvram -d failed for {}: {}", name, stderr);
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
         let _ = (name, guid);
         bail!("EFI variable operations are not supported on this platform");
@@ -235,25 +264,26 @@ fn write_efi_variable_linux(
 
 #[cfg(target_os = "windows")]
 fn read_efi_variable_windows(name: &str, guid: &EfiGuid) -> Result<Vec<u8>> {
-    // GetFirmwareEnvironmentVariableA expects "Name-Guid" format.
-    let var_name = format!("{}-{}", name, guid.to_string());
-    let wide_name: Vec<u16> = var_name.encode_utf16().chain(std::iter::once(0)).collect();
-    let wide_guid: Vec<u16> = guid
-        .to_string()
+    // GetFirmwareEnvironmentVariableW expects the variable name and GUID
+    // as separate parameters:
+    //   lpName = variable name only (e.g. "BootOrder")
+    //   lpGuid = GUID string (e.g. "{8be4df61-93ca-11d2-aa0d-00e098032b8c}")
+    let wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide_guid: Vec<u16> = format!("{{{}}}", guid.to_string())
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
 
     unsafe {
         // First call to get the required buffer size.
-        let size = winapi::um::winbase::GetFirmwareEnvironmentVariableW(
+        let size = windows_sys::Win32::System::WindowsProgramming::GetFirmwareEnvironmentVariableW(
             wide_name.as_ptr(),
             wide_guid.as_ptr(),
             std::ptr::null_mut(),
             0,
         );
         if size == 0 {
-            let err = winapi::um::errhandlingapi::GetLastError();
+            let err = windows_sys::Win32::Foundation::GetLastError();
             bail!(
                 "GetFirmwareEnvironmentVariableW failed for {}: error {}",
                 name,
@@ -262,14 +292,14 @@ fn read_efi_variable_windows(name: &str, guid: &EfiGuid) -> Result<Vec<u8>> {
         }
 
         let mut buf = vec![0u8; size as usize];
-        let read = winapi::um::winbase::GetFirmwareEnvironmentVariableW(
+        let read = windows_sys::Win32::System::WindowsProgramming::GetFirmwareEnvironmentVariableW(
             wide_name.as_ptr(),
             wide_guid.as_ptr(),
             buf.as_mut_ptr() as *mut _,
             size,
         );
         if read == 0 {
-            let err = winapi::um::errhandlingapi::GetLastError();
+            let err = windows_sys::Win32::Foundation::GetLastError();
             bail!(
                 "GetFirmwareEnvironmentVariableW read failed for {}: error {}",
                 name,
@@ -288,29 +318,164 @@ fn write_efi_variable_windows(
     data: &[u8],
     _attrs: EfiVarAttributes,
 ) -> Result<()> {
-    let var_name = format!("{}-{}", name, guid.to_string());
-    let wide_name: Vec<u16> = var_name.encode_utf16().chain(std::iter::once(0)).collect();
-    let wide_guid: Vec<u16> = guid
-        .to_string()
+    let wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide_guid: Vec<u16> = format!("{{{}}}", guid.to_string())
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
 
     unsafe {
-        let result = winapi::um::winbase::SetFirmwareEnvironmentVariableW(
+        let result = windows_sys::Win32::System::WindowsProgramming::SetFirmwareEnvironmentVariableW(
             wide_name.as_ptr(),
             wide_guid.as_ptr(),
             data.as_ptr() as *mut _,
             data.len() as u32,
         );
         if result == 0 {
-            let err = winapi::um::errhandlingapi::GetLastError();
+            let err = windows_sys::Win32::Foundation::GetLastError();
             bail!(
                 "SetFirmwareEnvironmentVariableW failed for {}: error {}",
                 name,
                 err
             );
         }
+    }
+    Ok(())
+}
+
+// ─── macOS implementation ───────────────────────────────────────────────
+//
+// macOS does not expose EFI variables through a filesystem like Linux or
+// through a Win32 API like Windows.  Instead, the `nvram` command-line tool
+// (`/usr/sbin/nvram`) provides read/write access to firmware (NVRAM) variables.
+//
+// On Intel Macs with UEFI firmware, all standard EFI variables (BootOrder,
+// BootXXXX, etc.) are accessible via `nvram`.  On Apple Silicon Macs, the
+// firmware NVRAM namespace is more restricted; only Apple-defined variables
+// are typically accessible.  For UEFI boot kit purposes, Intel Macs are the
+// primary target — Apple Silicon Macs use an entirely different boot flow
+// (iBoot + Secure Enclave) where UEFI persistence does not apply.
+//
+// Variable naming convention for nvram:
+//   - Standard UEFI variables use the GUID-qualified form: `<GUID>:<Name>`
+//     e.g. `8BE4DF61-93CA-11D2-AA0D-00E098032B8C:BootOrder`
+//   - The `nvram -p` output lists variables as `<Name>  <hex data>`, where
+//     `<Name>` already includes the GUID prefix for firmware variables.
+//   - For read: `nvram <name>` prints `<name>\t<hex bytes>`
+//   - For write: `nvram <name>=<hex value>` (no spaces around =)
+//   - For delete: `nvram -d <name>`
+
+#[cfg(target_os = "macos")]
+fn nvram_var_name(name: &str, guid: &EfiGuid) -> String {
+    format!("{}:{}", guid.to_string().to_uppercase(), name)
+}
+
+#[cfg(target_os = "macos")]
+fn read_efi_variable_macos(name: &str, guid: &EfiGuid) -> Result<Vec<u8>> {
+    let var_name = nvram_var_name(name, guid);
+    let output = std::process::Command::new("/usr/sbin/nvram")
+        .arg(&var_name)
+        .output()
+        .context("Failed to execute /usr/sbin/nvram")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("nvram read failed for {}: {}", name, stderr.trim());
+    }
+
+    // nvram output format: "<name>\t<value>\n"
+    // The value is typically hex-encoded ASCII bytes, e.g.:
+    //   %01%00%00%00%00%00
+    // or plain hex like:
+    //   01000000 0000
+    // Parse the tab-separated output.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value_part = stdout
+        .find('\t')
+        .map(|i| &stdout[i + 1..])
+        .or_else(|| stdout.find(' ').map(|i| &stdout[i + 1..]))
+        .unwrap_or("")
+        .trim();
+
+    if value_part.is_empty() {
+        bail!("nvram returned empty value for {}", name);
+    }
+
+    // Try parsing as %-encoded hex first (%XX format used by macOS nvram).
+    let data = if value_part.contains('%') {
+        parse_nvram_percent_encoded(value_part)?
+    } else {
+        // Try plain hex (space-separated hex bytes).
+        parse_nvram_hex(value_part)?
+    };
+
+    Ok(data)
+}
+
+/// Parse macOS nvram %-encoded value (e.g. "%01%00%00%00").
+#[cfg(target_os = "macos")]
+fn parse_nvram_percent_encoded(s: &str) -> Result<Vec<u8>> {
+    let mut result = Vec::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let hex: String = chars.by_ref().take(2).collect();
+            let byte = u8::from_str_radix(&hex, 16)
+                .with_context(|| format!("Invalid %-encoded hex: %{}", hex))?;
+            result.push(byte);
+        } else if c.is_ascii_whitespace() {
+            continue;
+        } else {
+            // Plain ASCII character (not %-encoded) — treat as literal byte.
+            result.push(c as u8);
+        }
+    }
+    Ok(result)
+}
+
+/// Parse space-separated hex value (e.g. "0100 0000 0000").
+#[cfg(target_os = "macos")]
+fn parse_nvram_hex(s: &str) -> Result<Vec<u8>> {
+    let mut result = Vec::new();
+    for token in s.split_whitespace() {
+        // Each token may be a multi-byte hex string.
+        if token.len() % 2 != 0 {
+            bail!("Invalid hex token (odd length): {}", token);
+        }
+        for i in (0..token.len()).step_by(2) {
+            let byte = u8::from_str_radix(&token[i..i + 2], 16)
+                .with_context(|| format!("Invalid hex byte in token: {}", token))?;
+            result.push(byte);
+        }
+    }
+    Ok(result)
+}
+
+#[cfg(target_os = "macos")]
+fn write_efi_variable_macos(
+    name: &str,
+    guid: &EfiGuid,
+    data: &[u8],
+    _attrs: EfiVarAttributes,
+) -> Result<()> {
+    let var_name = nvram_var_name(name, guid);
+
+    // Encode data as %-escaped hex for nvram.
+    let mut hex_value = String::with_capacity(data.len() * 3);
+    for &byte in data {
+        hex_value.push_str(&format!("%{:02x}", byte));
+    }
+
+    let assignment = format!("{}={}", var_name, hex_value);
+
+    let output = std::process::Command::new("/usr/sbin/nvram")
+        .arg(&assignment)
+        .output()
+        .context("Failed to execute /usr/sbin/nvram")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("nvram write failed for {}: {}", name, stderr.trim());
     }
     Ok(())
 }
@@ -580,14 +745,15 @@ pub fn modify_boot_entry(entry_num: u16, new_path: &str) -> Result<BootEntryBack
     new_entry.extend_from_slice(&[0x7F, 0xFF, 0x04, 0x00]);
     // No optional data.
 
-    // Rebuild with Linux attribute header if needed.
-    let final_data = rebuild_with_attr_header(&original_data, &new_entry);
-
     // Write the modified entry.
+    // NOTE: `new_entry` contains only the EFI_LOAD_OPTION payload (no Linux
+    // efivars 4-byte attribute header).  `write_efi_variable` will prepend
+    // the attribute header on Linux, so we must NOT call
+    // `rebuild_with_attr_header` here — that would cause a double-prepend.
     write_efi_variable(
         &var_name,
         &EfiGuid::EFI_GLOBAL_VARIABLE,
-        &final_data,
+        &new_entry,
         EfiVarAttributes::STANDARD_BOOT,
     )?;
 
@@ -658,13 +824,16 @@ pub fn add_boot_entry(
 /// Restore a boot entry from a backup.
 pub fn restore_boot_entry(backup: &BootEntryBackup) -> Result<()> {
     let var_name = format!("Boot{:04X}", backup.entry_number);
+    // Strip the Linux efivars 4-byte attribute header (if present) to get
+    // the raw EFI_LOAD_OPTION payload.  `write_efi_variable` will re-add
+    // the attribute header on Linux, so we must NOT use
+    // `rebuild_with_attr_header` here — that would cause a double-prepend.
     let payload = strip_linux_attr_header(&backup.original_data);
-    let final_data = rebuild_with_attr_header(&backup.original_data, payload);
 
     write_efi_variable(
         &var_name,
         &EfiGuid::EFI_GLOBAL_VARIABLE,
-        &final_data,
+        payload,
         EfiVarAttributes::STANDARD_BOOT,
     )
 }

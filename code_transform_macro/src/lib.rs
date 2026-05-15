@@ -66,7 +66,12 @@ fn unsupported_signature_reason(func: &ItemFn) -> Option<String> {
 fn parse_seed() -> u64 {
     static FALLBACK: OnceLock<u64> = OnceLock::new();
     if let Ok(seed_txt) = std::env::var("CODE_TRANSFORM_SEED") {
-        if let Ok(seed) = seed_txt.trim().parse::<u64>() {
+        let trimmed = seed_txt.trim();
+        // Try hex first (matching OPTIMIZER_STUB_SEED format), then decimal.
+        if let Ok(seed) = u64::from_str_radix(trimmed, 16) {
+            return seed;
+        }
+        if let Ok(seed) = trimmed.parse::<u64>() {
             return seed;
         }
     }
@@ -168,9 +173,70 @@ fn compile_helper_obj(func: &ItemFn) -> Result<std::path::PathBuf, String> {
     Ok(obj_path)
 }
 
+/// Resolve the best available `objdump` binary for the current host/target
+/// combination.
+///
+/// On Linux hosts, plain `objdump` (GNU binutils) works for all targets.
+/// On macOS, the system `objdump` is LLVM-based and may produce subtly
+/// different output; we prefer `llvm-objdump` or `gobjdump` (Homebrew).
+/// When cross-compiling for Windows, we also try the target-prefixed
+/// toolchain (e.g. `x86_64-w64-mingw32-objdump`).
+fn resolve_objdump_command(target: &str) -> Command {
+    let host = std::env::var("HOST").unwrap_or_default();
+
+    // If host == target (native build), use the standard tool.
+    if host == target {
+        return Command::new("objdump");
+    }
+
+    // Cross-compilation scenarios — try target-prefixed objdump first.
+    let cross_candidates: Vec<String> = if target.contains("windows") {
+        // Windows targets: try MinGW cross-compilation prefixes.
+        let arch_prefix = if target.starts_with("x86_64") {
+            "x86_64-w64-mingw32"
+        } else if target.starts_with("aarch64") {
+            "aarch64-w64-mingw32"
+        } else {
+            ""
+        };
+        if arch_prefix.is_empty() {
+            vec![]
+        } else {
+            vec![format!("{}-objdump", arch_prefix)]
+        }
+    } else {
+        vec![]
+    };
+
+    for candidate in &cross_candidates {
+        if Command::new(candidate)
+            .arg("--version")
+            .output()
+            .is_ok()
+        {
+            return Command::new(candidate);
+        }
+    }
+
+    // macOS host: prefer GNU objdump via Homebrew, then llvm-objdump.
+    if cfg!(target_os = "macos") {
+        for cmd in &["gobjdump", "llvm-objdump"] {
+            if Command::new(cmd).arg("--version").output().is_ok() {
+                return Command::new(cmd);
+            }
+        }
+    }
+
+    // Fallback: plain objdump.
+    Command::new("objdump")
+}
+
 fn parse_objdump_bytes(obj: &std::path::Path) -> Result<Vec<u8>, String> {
-    let out = Command::new("objdump")
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let mut cmd = resolve_objdump_command(&target);
+    let out = cmd
         .arg("-d")
+        .arg("--section=.text")
         .arg(obj)
         .output()
         .map_err(|e| format!("failed to run objdump: {}", e))?;
@@ -225,7 +291,13 @@ fn parse_objdump_bytes(obj: &std::path::Path) -> Result<Vec<u8>, String> {
         );
     }
 
-    if let Some(ret_pos) = bytes.iter().position(|&b| b == 0xC3) {
+    // M-2: Strip trailing alignment padding (INT3 = 0xCC, NOP = 0x90), then
+    // find the LAST 0xC3 (RET) byte.  Scanning from the end avoids matching
+    // a 0xC3 that is a sub-byte of a multi-byte instruction (e.g. VEX-encoded).
+    while bytes.last() == Some(&0xCC) || bytes.last() == Some(&0x90) {
+        bytes.pop();
+    }
+    if let Some(ret_pos) = bytes.iter().rposition(|&b| b == 0xC3) {
         bytes.truncate(ret_pos + 1);
     }
     if bytes.is_empty() {
@@ -284,6 +356,25 @@ pub fn transform(attrs: TokenStream, item: TokenStream) -> TokenStream {
 
     let func = parse_macro_input!(item as ItemFn);
 
+    // The code transformation engine emits x86_64 machine code via
+    // global_asm! and is only supported on linux+x86_64.  Check the
+    // compilation target up front and produce a clear compile_error!
+    // on all other platforms so the operator knows immediately that
+    // the #[transform] attribute cannot be used.
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let is_linux_x86_64 = target.starts_with("x86_64") && target.contains("linux");
+    if !is_linux_x86_64 {
+        let msg = format!(
+            "#[code_transform::transform]: code transformation is only supported \
+             on linux+x86_64 targets (current target: '{}'). \
+             Remove the #[transform] attribute from function '{}' or compile \
+             for a supported target.",
+            target,
+            func.sig.ident
+        );
+        return compile_error(&msg);
+    }
+
     if contains_asm(&func) {
         let msg = format!(
             "#[code_transform::transform]: function '{}' contains inline assembly and cannot be transformed",
@@ -304,8 +395,22 @@ pub fn transform(attrs: TokenStream, item: TokenStream) -> TokenStream {
     let transformed = match extract_and_transform(&func, seed) {
         Ok(b) => b,
         Err(e) => {
+            // Extraction failed — likely a non-Linux host, missing objdump,
+            // or cross-compilation without target-prefixed objdump.
+            //
+            // CRITICAL: We MUST NOT silently fall back to the original
+            // function body.  Doing so would cause the binary to compile and
+            // run without the intended code virtualization, defeating the
+            // purpose of the #[transform] attribute and giving a false sense
+            // of obfuscation.  Instead, emit a compile_error! so the build
+            // fails and the operator is forced to either:
+            //   1. Install the appropriate objdump for the target, or
+            //   2. Remove the #[transform] attribute from this function.
             let msg = format!(
-                "#[code_transform::transform]: compile-time byte extraction failed for '{}': {}",
+                "#[code_transform::transform]: byte extraction failed for '{}': {}. \
+                 Ensure objdump (or a target-prefixed variant) is installed and \
+                 can disassemble the target architecture, or remove the \
+                 #[transform] attribute from this function.",
                 func.sig.ident, e
             );
             return compile_error(&msg);

@@ -19,7 +19,7 @@
 
 use anyhow::{Context as _, Result};
 use common::config::{Config, SshAuthConfig};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,6 +55,12 @@ const BAKED_SMB_PIPE_HOST: Option<&str> = option_env!("SYS_SMB_PIPE_HOST");
 const BAKED_SMB_PIPE_NAME: Option<&str> = option_env!("SYS_SMB_PIPE_NAME");
 const BAKED_SMB_PIPE_MODE: Option<&str> = option_env!("SYS_SMB_PIPE_MODE");
 const BAKED_SMB_TCP_RELAY_PORT: Option<&str> = option_env!("SYS_SMB_TCP_RELAY_PORT");
+/// Module verification key baked from the server-side build via
+/// ORCHESTRA_MODULE_VERIFY_KEY → SYS_MODULE_VERIFY_KEY.  When present,
+/// overrides the config file value so the agent verifies signed modules
+/// against the server's Ed25519 signing key instead of falling back to the
+/// compile-time MODULE_SIGNING_PUBKEY constant in the module_loader crate.
+const BAKED_MODULE_VERIFY_KEY: Option<&str> = option_env!("SYS_MODULE_VERIFY_KEY");
 const BAKED_QUIC_ENDPOINT: Option<&str> = option_env!("SYS_QUIC_ENDPOINT");
 const BAKED_QUIC_PORT: Option<&str> = option_env!("SYS_QUIC_PORT");
 const BAKED_QUIC_ALPN: Option<&str> = option_env!("SYS_QUIC_ALPN");
@@ -184,7 +190,7 @@ struct BuildOverrideValues<'a> {
 }
 
 fn apply_baked_build_overrides(config: Config) -> Result<Config> {
-    apply_build_overrides(
+    let mut config = apply_build_overrides(
         config,
         BuildOverrideValues {
             sleep_ms: BAKED_SLEEP_MS,
@@ -210,7 +216,17 @@ fn apply_baked_build_overrides(config: Config) -> Result<Config> {
             quic_alpn: BAKED_QUIC_ALPN,
             quic_sni: BAKED_QUIC_SNI,
         },
-    )
+    )?;
+
+    // Bake in the module verification key when provided by the server-side
+    // build. This ensures the agent verifies signed modules against the
+    // server's Ed25519 signing key instead of falling back to the hardcoded
+    // MODULE_SIGNING_PUBKEY constant.
+    if let Some(verify_key) = nonempty(BAKED_MODULE_VERIFY_KEY) {
+        config.module_verify_key = Some(verify_key.to_string());
+    }
+
+    Ok(config)
 }
 
 fn apply_build_overrides_from_values(
@@ -624,7 +640,7 @@ pub fn load_config() -> Result<Config> {
         let expected = std::fs::read_to_string(&sha_path)
             .map(|s| s.trim().to_ascii_lowercase())
             .unwrap_or_default();
-        let actual = format!("{:x}", Sha256::digest(content.as_bytes()));
+        let actual = hex::encode(Sha256::digest(content.as_bytes()));
         if actual != expected {
             anyhow::bail!(
                 "Config integrity check failed: SHA-256 mismatch for {}",
@@ -659,6 +675,10 @@ pub fn load_config() -> Result<Config> {
     }
 
     let config = apply_baked_build_overrides(config)?;
+
+    if let Err(e) = config.sleep.validate() {
+        tracing::warn!("sleep config validation warning: {e}");
+    }
 
     update_cache(&config, mtime_token);
     Ok(config)

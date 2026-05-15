@@ -66,7 +66,7 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 
 use anyhow::{anyhow, bail, Context, Result};
-use log::{debug, info, warn};
+use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
 use pe_resolve;

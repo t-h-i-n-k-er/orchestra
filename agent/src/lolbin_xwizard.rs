@@ -45,13 +45,15 @@ use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 
 use anyhow::{anyhow, bail, Context, Result};
-use log::{debug, info, warn};
+use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
-use winapi::shared::minwindef::{BOOL, DWORD, FALSE, LPVOID, TRUE};
-use winapi::shared::ntdef::{HANDLE, LPCWSTR, NTSTATUS, PCWSTR};
-use winapi::shared::basetsd::{SIZE_T, ULONG_PTR};
-use winapi::um::winnt::{ACCESS_MASK, HANDLE as NT_HANDLE, LARGE_INTEGER};
+use crate::win_types::{BOOL, DWORD, FALSE, LPVOID, TRUE};
+use crate::win_types::{HANDLE, LPCWSTR, NTSTATUS, PCWSTR};
+use crate::win_types::{SIZE_T, ULONG_PTR};
+use windows_sys::Win32::Security::ACCESS_MASK;
+use crate::win_types::HANDLE as NT_HANDLE;
+use crate::win_types::LARGE_INTEGER;
 
 use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
 use crate::win_types::{PROCESS_INFORMATION, STARTUPINFOW};

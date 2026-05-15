@@ -55,7 +55,7 @@ fn harvest_entropy() -> [u8; 64] {
         }
     }
 
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("rdrand") {
             unsafe {

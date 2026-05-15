@@ -204,6 +204,12 @@ pub fn apply_passes_to_binary(binary: &[u8]) -> Result<Vec<u8>, String> {
                     .into(),
             );
         }
+        _ => {
+            return Err(
+                "unsupported binary format; only PE and ELF are supported for diversification"
+                    .into(),
+            );
+        }
     };
 
     if sections.is_empty() {
@@ -344,8 +350,20 @@ impl Pass for InstructionSchedulingPass {
         let mut prev_end = 0usize;
         for &end in &block_boundaries {
             let start = prev_end;
+            // The last instruction in [start..end) is the terminator (branch,
+            // call, return, etc.).  We must NOT let the scheduler move it.
+            // Schedule only the interior instructions [start..end-1) and leave
+            // the terminator pinned at its original position.
             if end > start + 2 {
-                schedule_block(&mut instrs[start..end]);
+                let terminator_idx = end - 1;
+                let fc = instrs[terminator_idx].flow_control();
+                if fc != FlowControl::Next {
+                    // Pin the terminator: only schedule [start..terminator_idx).
+                    schedule_block(&mut instrs[start..terminator_idx]);
+                } else {
+                    // No terminator (trailing block) — safe to schedule all.
+                    schedule_block(&mut instrs[start..end]);
+                }
             }
             prev_end = end;
         }
@@ -537,6 +555,14 @@ fn build_resource_set(ins: &Instruction) -> ResourceSet {
             | Code::Rdrand_r64
             | Code::Rdseed_r64
     );
+
+    // Flow-control terminators (branches, calls, returns, interrupts) must
+    // never be reordered.  Mark them as having side effects so the dependency
+    // checker pins them in place.  This is a safety net: the scheduling pass
+    // should already exclude terminators from the scheduling window.
+    if ins.flow_control() != FlowControl::Next {
+        rs.has_side_effects = true;
+    }
 
     // ── Latency-based priority ──────────────────────────────────────────
     // Memory operations get higher priority (latency ~4) so they are

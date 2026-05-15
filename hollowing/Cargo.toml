@@ -14,17 +14,12 @@ rand.workspace = true
 tracing = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = [
-    "processthreadsapi",
-    "memoryapi",
-    "winbase",
-    "winnt",
-    "libloaderapi",
-    "wow64apiset",
-    "handleapi",
-    "synchapi",
-    "errhandlingapi",
-    "tlhelp32",
-    "minwinbase",
-    "basetsd",
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
 ] }

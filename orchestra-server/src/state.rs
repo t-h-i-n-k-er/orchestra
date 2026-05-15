@@ -180,6 +180,9 @@ pub struct AppState {
     /// protection).  Each IP gets its own sliding window of ~10 attempts
     /// per 5 minutes.
     pub auth_rate_limiters: crate::auth::PerIpRateLimiter,
+    /// Development mode: relaxes certain production security checks (e.g.,
+    /// WebSocket localhost origin bypass).  Set via `--dev` CLI flag.
+    pub dev_mode: bool,
     /// One-time session IDs for WebSocket authentication.  Maps a random
     /// session UUID to the authenticated operator ID.  Prevents the real
     /// bearer token from being echoed in the `Sec-WebSocket-Protocol`
@@ -197,6 +200,7 @@ impl AppState {
         admin_token: String,
         command_timeout_secs: u64,
         config: ServerConfig,
+        dev_mode: bool,
     ) -> Self {
         // Build the operator store from config.
         let operators: HashMap<String, OperatorRecord> = config
@@ -238,6 +242,7 @@ impl AppState {
                 10,                                     // max attempts per IP
                 std::time::Duration::from_secs(60 * 5), // per 5-minute window
             ),
+            dev_mode,
             ws_sessions: DashMap::new(),
             shell_output_buffers: DashMap::new(),
         }

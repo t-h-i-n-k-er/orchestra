@@ -239,14 +239,16 @@ table stays in sync with the crate manifest.
 |---------|---------|
 | `adaptive-timing` | Adaptive C2 timing — Gaussian-distributed callback scheduling modelled on observed network traffic patterns |
 | `browser-data` | Browser stored-data recovery — Chrome (including App-Bound Encryption v127+), Edge, and Firefox |
+| `callback-inject` | Injection via kernel callback vectors — APC, window message, and timer callback dispatch |
 | `cet-bypass` | CET / Shadow Stack bypass for Windows 11 24H2+ hardware-enforced shadow stacks |
 | `cfg-bypass` | Control Flow Guard bypass — bitset manipulation, CFG-valid trampolines, dispatch override |
 | `com-hijack` | Registry-free COM object hijacking via SxS manifest activation contexts |
+| `context-only` | Context-only injection — `SetThreadContext` IP/SP rewrite with restore trampoline; no new remote thread |
 | `coop` | Counterfeit Object-Oriented Programming — C++ vtable dispatch chains that pass CFI/CFG checks |
 | `delayed-stomp` | Delayed module-stomp injection — waits for EDR initial-scan heuristics to pass before stomping |
 | `dev` | Development / debug mode |
 | `direct-syscalls` | Direct syscall dispatch via hand-crafted stubs (bypasses ntdll hooks) |
-| `doh-transport` | DNS-over-HTTPS covert transport (C2 through DNS TXT queries via DoH resolver) |
+| `doh-transport` | DNS-over-HTTPS covert transport (C2 through DNS TXT queries via DoH resolver); ⚠️ experimental |
 | `dpapi-backup` | DPAPI domain backup key retrieval and secret decryption via MS-BKRP |
 | `ebpf` | eBPF-based Linux evasion — hides process, files, and network connections from user-space monitoring |
 | `embedded_driver` | Embedded encrypted vulnerable-driver payload packaging via `ORCHESTRA_DRIVER_PATH` |
@@ -254,12 +256,13 @@ table stays in sync with the crate manifest.
 | `env-validation` | Environment validation before agent execution |
 | `etw-check` | Pre-injection ETW auto-logger enumeration via registry |
 | `evanesco` | Continuous memory hiding — per-page RC4 encryption with background re-encryption thread |
+| `fiber-inject` | Fiber-based injection — creates remote fiber and schedules it for execution |
 | `evasion-transform` | Automated EDR bypass transformation engine — pattern avoidance via instruction substitution |
 | `forensic-cleanup` | Forensic cleanup — Windows Prefetch evidence removal and USN journal cleaning |
-| `forward-secrecy` | Application-layer perfect forward secrecy via X25519 ECDH + HKDF |
+| `forward-secrecy` | Application-layer perfect forward secrecy via X25519 ECDH + HKDF; ⚠️ HTTP/DoH ECDH is experimental |
 | `hci-research` | Human-computer-interaction telemetry — key/mouse events and timing capture |
 | `hot-reload` | Hot-reload support — file watcher for dynamic module updates |
-| `http-transport` | HTTP malleable-profile transport (C2 over HTTP/S with customizable headers/URIs) |
+| `http-transport` | HTTP malleable-profile transport (C2 over HTTP/S with customizable headers/URIs); ⚠️ experimental |
 | `hwbp-amsi` | Hardware-breakpoint AMSI/ETW bypass using DR0/DR1 + VEH |
 | `hw-bp-hook` | General-purpose hardware-breakpoint hooking framework (DR0–DR3 + VEH) |
 | `kerberos-relay` | Kerberos relay attack via COM cross-session activation — captures service tickets without NTLM |
@@ -267,6 +270,7 @@ table stays in sync with the crate manifest.
 | `lolbin-xwizard` | COM Scriptlet execution via xwizard.exe and alternative LOLBIN dispatchers |
 | `lsa-whisperer` | LSA Whisperer — LSA package-interface extraction with Untrusted, SSP inject, and Auto methods |
 | `manual-map` | Manual PE mapping injection (implies `module_loader/manual-map`) |
+| `module-stomp` | Module stomping — overwrites legitimate DLL in memory with payload |
 | `memory-guard` | Encrypt sensitive memory regions while agent is idle (XChaCha20-Poly1305, key in XMM registers) |
 | `module-signatures` | Cryptographic module signature verification (implies `common/module-signatures`) |
 | `network-discovery` | Network discovery and reconnaissance capabilities |
@@ -281,16 +285,19 @@ table stays in sync with the crate manifest.
 | `reflective-loader` | Reflective DLL loading via NtCreateSection + NtMapViewOfSection (no VirtualAlloc) |
 | `remote-assist` | Remote assistance — screenshot capture, mouse/keyboard control |
 | `s4u-abuse` | S4U2Self/S4U2Proxy Kerberos delegation abuse — forges service tickets for arbitrary users |
+| `section-map` | Section mapping injection — maps payload via NtCreateSection/NtMapViewOfSection into target |
 | `seh-anti-debug` | SEH-based anti-debugging — deeply nested VEH handler chains that crash analysis tools |
 | `self-reencode` | Self-re-encoding (Metamorphic Lite) — periodically re-encode .text section at runtime |
 | `shadow-credentials` | Shadow Credentials attack — Kerberos authentication via certificate added to target's msDS-KeyCredentialLink |
-| `smb-pipe-transport` | SMB/TCP named-pipe covert transport (direct named-pipe or TCP relay mode) |
-| `ssh-transport` | SSH covert transport — tunnels C2 traffic through an SSH session channel |
+| `smb-pipe-transport` | SMB/TCP named-pipe covert transport (direct named-pipe or TCP relay mode); ⚠️ experimental |
+| `ssh-transport` | SSH covert transport — tunnels C2 traffic through an SSH session channel; ⚠️ experimental |
 | `stack-spoof` | Stack spoofing during indirect syscall dispatch (implies `direct-syscalls`) |
 | `stealth` | Stealth bundle — enables `direct-syscalls`, `unsafe-runtime-rewrite`, `memory-guard`, `ppid-spoofing` |
 | `surveillance` | Surveillance — screenshot capture, keylogger, clipboard monitoring |
 | `syscall-emulation` | Routes Nt* syscalls through kernel32/advapi32 equivalents (implies `direct-syscalls`) |
 | `thread-ctx-encrypt` | Thread context encryption — encrypts CONTEXT structs, stack pointers, and TLS during sleep |
+| `thread-hijack` | Thread hijacking — suspends existing thread and redirects execution to payload |
+| `threadpool-inject` | Threadpool injection — queues payload via TP_WORK/TP_TIMER/TP_WAIT to hijack system threadpool |
 | `token-impersonation` | Token-only impersonation via NtImpersonateThread / SetThreadToken (implies `direct-syscalls`) |
 | `traffic-normalization` | Traffic normalization — shapes C2 traffic to blend with legitimate patterns |
 | `trampoline-spoof` | Trampoline-based multi-frame stack spoofing through legitimate DLL gadgets (implies `direct-syscalls`) |

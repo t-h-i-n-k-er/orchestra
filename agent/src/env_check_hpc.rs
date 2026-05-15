@@ -882,10 +882,19 @@ fn mean_stddev(values: &[f64]) -> (f64, f64) {
 /// Run all four HPC measurements multiple times and compute statistical
 /// fingerprint.
 ///
-/// Returns `None` if `RDPMC` is not available on this system.
+/// Returns `None` if neither `RDPMC` nor `perf_event_open` is available.
 pub fn analyze_hpc_fingerprint() -> Option<HpcFingerprint> {
-    if !rdpmc_available() {
-        return None;
+    // On Linux, perf_event_open provides a user-mode path to hardware PMCs
+    // that works even when the kernel disallows direct RDPMC (CR4.PCE=0).
+    // Many Linux hosts expose perf reads while disallowing user-mode RDPMC,
+    // so we must not gate on rdpmc_available() alone.  Instead we open the
+    // perf counters first and only bail out if both RDPMC *and* perf are
+    // unavailable.
+    #[cfg(not(target_os = "linux"))]
+    {
+        if !rdpmc_available() {
+            return None;
+        }
     }
 
     // On Linux: open perf_event_open file descriptors to configure the four
@@ -897,6 +906,11 @@ pub fn analyze_hpc_fingerprint() -> Option<HpcFingerprint> {
     let _perf_guard = {
         let vendor = detect_cpu_vendor();
         let fds = open_performance_counters(vendor).unwrap_or([-1i32; 4]);
+        // If RDPMC is unavailable AND no perf fds opened, there is no way
+        // to read hardware counters on this host — bail out early.
+        if !rdpmc_available() && fds.iter().all(|&f| f < 0) {
+            return None;
+        }
         ACTIVE_PERF_FDS.with(|c| c.set(Some(fds)));
         // RAII guard: close fds and clear thread-local when this scope exits.
         struct PerfGuard([i32; 4]);

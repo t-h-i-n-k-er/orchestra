@@ -1338,7 +1338,7 @@ async fn send_command_by_agent_id(
     };
 
     // Serialize the innermost C2 message.
-    let mut payload = bincode::serialize(&inner_msg)
+    let mut payload = bincode::serde::encode_to_vec(&inner_msg, bincode::config::legacy())
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("serialize: {e}")))?;
 
     // Wrap in P2P routing blobs from the innermost hop to the outermost.
@@ -1688,16 +1688,23 @@ async fn ws_handler(
             .get(axum::http::header::HOST)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        // Accept if the origin's host matches the request host, or if
-        // the origin is localhost (development).  Strip scheme prefix.
+        // Accept if the origin's host matches the request host.
+        // In production, localhost/127.0.0.1 origins are NOT accepted —
+        // containerized environments may share localhost across tenants.
+        // Use --dev to relax this check for local development.
         let origin_host = origin
             .strip_prefix("https://")
             .or_else(|| origin.strip_prefix("http://"))
             .unwrap_or(origin);
         let origin_host = origin_host.split(':').next().unwrap_or(origin_host);
         let request_host = host.split(':').next().unwrap_or(host);
-        let allowed =
-            origin_host == request_host || origin_host == "localhost" || origin_host == "127.0.0.1";
+        let allowed = if state.dev_mode {
+            origin_host == request_host
+                || origin_host == "localhost"
+                || origin_host == "127.0.0.1"
+        } else {
+            origin_host == request_host
+        };
         if !allowed {
             tracing::warn!(%origin, "WebSocket rejected: disallowed Origin header");
             return (StatusCode::FORBIDDEN, "disallowed origin").into_response();
