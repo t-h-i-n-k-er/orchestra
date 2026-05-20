@@ -1124,6 +1124,10 @@ pub unsafe fn disable_evasion() {
 
 /// No-op on non-Windows.
 #[cfg(not(windows))]
+///
+/// # Safety
+///
+/// This non-Windows implementation is a no-op.
 pub unsafe fn disable_evasion() {}
 
 // ── Debug register scrubbing ───────────────────────────────────────────────

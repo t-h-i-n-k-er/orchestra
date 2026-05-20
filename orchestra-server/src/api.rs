@@ -1,7 +1,7 @@
 //! REST + WebSocket API for the operator dashboard.
 
 use crate::auth::{require_bearer, AuthenticatedUser};
-use crate::state::{now_secs, AgentView, AppState};
+use crate::state::{now_secs, AgentId, AgentView, AppState};
 use axum::{
     extract::{
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
@@ -119,8 +119,8 @@ pub struct PushModuleRequest {
 
 #[derive(Deserialize)]
 pub struct LinkAgentsRequest {
-    pub parent_agent_id: String,
-    pub child_agent_id: String,
+    pub parent_agent_id: AgentId,
+    pub child_agent_id: AgentId,
     /// Transport to use: `"smb"` or `"tcp"`.
     pub transport: String,
     /// Target address for TCP links (host:port).  Ignored for SMB.
@@ -130,7 +130,7 @@ pub struct LinkAgentsRequest {
 
 #[derive(Deserialize)]
 pub struct UnlinkAgentRequest {
-    pub agent_id: String,
+    pub agent_id: AgentId,
 }
 
 #[derive(Serialize)]
@@ -140,9 +140,9 @@ pub struct TopologyReply {
 
 #[derive(Serialize)]
 pub struct TopologyNodeView {
-    pub agent_id: String,
-    pub parent: Option<String>,
-    pub children: Vec<String>,
+    pub agent_id: AgentId,
+    pub parent: Option<AgentId>,
+    pub children: Vec<AgentId>,
     pub depth: u32,
 }
 
@@ -670,10 +670,14 @@ async fn link_agents(
     Json(req): Json<LinkAgentsRequest>,
 ) -> Result<Json<CommandReply>, (StatusCode, String)> {
     // Validate that the parent agent exists (directly connected or via P2P).
-    let parent_entry = state.find_by_agent_id(&req.parent_agent_id);
+    let parent_entry = state.find_by_agent_id(req.parent_agent_id.as_ref());
     if parent_entry.is_none() {
         // Check if the parent is reachable via P2P relay.
-        if state.route_to_agent(&req.parent_agent_id).await.is_none() {
+        if state
+            .route_to_agent(req.parent_agent_id.as_ref())
+            .await
+            .is_none()
+        {
             return Err((
                 StatusCode::NOT_FOUND,
                 format!(
@@ -687,14 +691,14 @@ async fn link_agents(
     // Send the LinkAgents command to the child agent.
     let cmd_req = CommandRequest {
         command: Command::LinkAgents {
-            parent_agent_id: req.parent_agent_id.clone(),
-            child_agent_id: req.child_agent_id.clone(),
+            parent_agent_id: req.parent_agent_id.0.clone(),
+            child_agent_id: req.child_agent_id.0.clone(),
             transport: req.transport.clone(),
             target_addr: req.target_addr.clone(),
         },
     };
 
-    let entry = state.find_by_agent_id(&req.child_agent_id).ok_or((
+    let entry = state.find_by_agent_id(req.child_agent_id.as_ref()).ok_or((
         StatusCode::NOT_FOUND,
         format!(
             "child agent '{}' must be directly connected to issue LinkAgents",
@@ -703,7 +707,7 @@ async fn link_agents(
     ))?;
 
     state.audit.record_simple(
-        &req.child_agent_id,
+        req.child_agent_id.as_ref(),
         &user.id,
         "LinkAgents",
         &format!(
@@ -726,11 +730,11 @@ async fn unlink_agent(
 ) -> Result<Json<CommandReply>, (StatusCode, String)> {
     let cmd_req = CommandRequest {
         command: Command::UnlinkAgent {
-            agent_id: req.agent_id.clone(),
+            agent_id: req.agent_id.0.clone(),
         },
     };
 
-    let entry = state.find_by_agent_id(&req.agent_id).ok_or((
+    let entry = state.find_by_agent_id(req.agent_id.as_ref()).ok_or((
         StatusCode::NOT_FOUND,
         format!(
             "agent '{}' not found or not directly connected",
@@ -739,7 +743,7 @@ async fn unlink_agent(
     ))?;
 
     state.audit.record_simple(
-        &req.agent_id,
+        req.agent_id.as_ref(),
         &user.id,
         "UnlinkAgent",
         &format!("unlink agent_id={}", req.agent_id),
@@ -758,9 +762,13 @@ async fn list_topology(State(state): State<Arc<AppState>>) -> Json<TopologyReply
         .nodes
         .iter()
         .map(|(agent_id, node)| TopologyNodeView {
-            agent_id: agent_id.clone(),
-            parent: node.parent.clone(),
-            children: node.children.clone(),
+            agent_id: AgentId::from(agent_id.clone()),
+            parent: node.parent.as_ref().map(|s| AgentId::from(s.as_str())),
+            children: node
+                .children
+                .iter()
+                .map(|s| AgentId::from(s.as_str()))
+                .collect(),
             depth: node.depth,
         })
         .collect();
@@ -1709,20 +1717,26 @@ async fn ws_handler(
         }
     }
 
-    // Browsers can't attach `Authorization` to a WebSocket handshake, so the
-    // dashboard includes a `bearer.<token>` subprotocol for authentication and
-    // also offers `DASHBOARD_WS_PROTOCOL` as the actual negotiated protocol.
-    // Validate the token in constant time before accepting the upgrade, then
-    // select only the stable dashboard protocol so the bearer token is never
-    // echoed in the response header.
-    let presented = headers
+    // MED-021: Prefer the standard `Authorization: Bearer token>` header for
+    // non-browser clients.  Browsers cannot attach custom headers during the
+    // WebSocket handshake, so fall back to the `Sec-WebSocket-Protocol` bearer
+    // subprotocol for dashboard (browser) clients.
+    //
+    // Check Authorization header first, then Sec-WebSocket-Protocol.
+    let token = if let Some(auth_header) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    {
+        auth_header.to_string()
+    } else if let Some(t) = headers
         .get(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
         .and_then(|v| v.to_str().ok())
-        .and_then(extract_bearer_subprotocol);
-
-    let token = match presented {
-        Some(t) => t,
-        None => return (StatusCode::UNAUTHORIZED, "missing bearer subprotocol").into_response(),
+        .and_then(extract_bearer_subprotocol)
+    {
+        t
+    } else {
+        return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
     };
 
     use subtle::ConstantTimeEq;

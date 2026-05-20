@@ -17,3 +17,7 @@ pub mod deps;
 /// PE artifact manipulation: section renaming, timestamp randomization,
 /// Rich header removal, and other post-link diversification.
 pub mod pe_artifact_kit;
+
+/// Mobile platform build pipeline extension: Android APK/AAR and iOS
+/// IPA/.a artifact generation with platform-specific configuration types.
+pub mod mobile;

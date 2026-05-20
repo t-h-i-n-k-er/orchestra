@@ -18,7 +18,7 @@ mod exec_tests {
     unsafe fn alloc_exec_page(code: &[u8]) -> *mut u8 {
         use libc::{mmap, mprotect, MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
         let page_size: usize = 4096;
-        let len = ((code.len() + page_size - 1) / page_size) * page_size;
+        let len = code.len().div_ceil(page_size) * page_size;
 
         let ptr = mmap(
             std::ptr::null_mut(),

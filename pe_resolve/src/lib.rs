@@ -322,7 +322,7 @@ pub unsafe fn get_module_handle_by_hash(target_hash: u32) -> Option<usize> {
             // Use the basename (last path component) for hashing.
             let basename = name_bytes
                 .split(|&b| b == b'/')
-                .last()
+                .next_back()
                 .unwrap_or(name_bytes);
             if !basename.is_empty() && hash_str(basename) == target_hash {
                 return Some(entry.l_addr);

@@ -10,6 +10,15 @@ pe_resolve = { path = "../pe_resolve" }
 anyhow = { workspace = true }
 log = "0.4"
 
+[features]
+default = ["win32-impl", "full-api", "aarch64-support"]
+# Compatibility/validation feature surface referenced by audit and build tooling.
+# The crate continues to expose the full Windows implementation by default.
+win32-impl = []
+full-api = ["win32-impl"]
+aarch64-support = ["win32-impl"]
+x86_64-only = ["win32-impl"]
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_System_Memory",

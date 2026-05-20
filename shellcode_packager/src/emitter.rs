@@ -479,39 +479,39 @@ fn emit_return_zero(e: &mut Emitter, ret_label: usize) {
 }
 
 /// Emit ordinal-based export resolution.
-fn emit_ordinal_resolver(mut e: &mut Emitter, ret_label: usize) {
+fn emit_ordinal_resolver(e: &mut Emitter, ret_label: usize) {
     // Parse export directory from RBX (DllBase)
-    emit_load_indirect(&mut e, Emitter::RAX, Emitter::RBX, 0x3C);
+    emit_load_indirect(e, Emitter::RAX, Emitter::RBX, 0x3C);
     e.add_r64_r64(Emitter::RAX, Emitter::RBX);
     e.add_r64_imm32(Emitter::RAX, 24 + 112);
-    emit_load_indirect(&mut e, Emitter::RAX, Emitter::RAX, 0);
+    emit_load_indirect(e, Emitter::RAX, Emitter::RAX, 0);
     e.cmp_r64_imm32(Emitter::RAX, 0);
     let (no_export_jmp, no_export_jmp_end) = e.forward_je();
 
     e.add_r64_r64(Emitter::RAX, Emitter::RBX);
     // Base = [export_dir + 16]
-    emit_load_indirect(&mut e, Emitter::RSI, Emitter::RAX, 16);
+    emit_load_indirect(e, Emitter::RSI, Emitter::RAX, 16);
     // NumberOfFunctions = [export_dir + 20]
-    emit_load_indirect(&mut e, Emitter::R11, Emitter::RAX, 20);
+    emit_load_indirect(e, Emitter::R11, Emitter::RAX, 20);
     // AddressOfFunctions = [export_dir + 28]
-    emit_load_indirect(&mut e, Emitter::RDI, Emitter::RAX, 28);
+    emit_load_indirect(e, Emitter::RDI, Emitter::RAX, 28);
     e.add_r64_r64(Emitter::RDI, Emitter::RBX);
 
     // ordinal = r15 & 0xFFFF
     e.mov_r64_r64(Emitter::RAX, Emitter::R15);
     e.and_r64_imm32(Emitter::RAX, 0xFFFF);
     // index = ordinal - base
-    emit_sub_reg_reg(&mut e, Emitter::RAX, Emitter::RSI);
+    emit_sub_reg_reg(e, Emitter::RAX, Emitter::RSI);
 
     // Bounds check
-    emit_cmp_reg_reg(&mut e, Emitter::R11, Emitter::RAX);
+    emit_cmp_reg_reg(e, Emitter::R11, Emitter::RAX);
     let (oob_jmp, oob_jmp_end) = e.forward_jbe();
 
     // functions[index]
     e.add_r64_r64(Emitter::RAX, Emitter::RAX);
     e.add_r64_r64(Emitter::RAX, Emitter::RAX);
     e.add_r64_r64(Emitter::RAX, Emitter::RDI);
-    emit_load_indirect(&mut e, Emitter::RAX, Emitter::RAX, 0);
+    emit_load_indirect(e, Emitter::RAX, Emitter::RAX, 0);
     e.add_r64_r64(Emitter::RAX, Emitter::RBX);
     let p = e.jmp_rel32_placeholder();
     e.patch_rel32(p, ret_label, e.len());
@@ -531,8 +531,8 @@ fn emit_ordinal_resolver(mut e: &mut Emitter, ret_label: usize) {
 
 /// `mov r64, gs:[offset]`
 ///
-/// Encoded as: GS prefix + REX.W + 0x8B (MOV r64, r/m64) + ModRM(mod=00, rm=SIB)
-/// + SIB(scale=0, index=none, base=disp32) + disp32.
+/// Encoded as: `GS prefix + REX.W + 0x8B (MOV r64, r/m64) +
+/// ModRM(mod=00, rm=SIB) + SIB(scale=0, index=none, base=disp32) + disp32`.
 /// This produces `mov r64, gs:[abs32]` using SIB-based absolute addressing
 /// (mod=00, rm=100b, SIB base=101b) which is the only way to encode a flat
 /// 32-bit absolute offset with a segment override in 64-bit long mode.

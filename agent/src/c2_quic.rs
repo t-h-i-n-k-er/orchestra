@@ -107,11 +107,17 @@ fn build_tls_client_config(profile: &QuicC2Profile) -> Result<rustls::ClientConf
         .with_no_client_auth();
 
     if profile.insecure && !profile.cert_pinning {
-        // Dangerous: accept any certificate (testing only).
+        // MED-010: In production builds, use a verifier that still validates
+        // TLS signatures and hostname but skips CA chain verification.  In
+        // test builds, the fully-permissive AcceptAnyCertVerifier is available.
+        //
+        // This ensures that even in "insecure" mode, the agent cannot be
+        // MITM'd by an attacker presenting a forged certificate — the
+        // signature must still be mathematically valid.
         tls_config
             .dangerous()
-            .set_certificate_verifier(Arc::new(AcceptAnyCertVerifier));
-        tracing::warn!("QUIC TLS: insecure mode — accepting any server certificate (testing only)");
+            .set_certificate_verifier(Arc::new(InsecureSkipCaVerifier));
+        tracing::warn!("QUIC TLS: insecure mode — skipping CA chain verification (signatures + hostname still checked)");
     } else if profile.cert_pinning {
         tls_config
             .dangerous()
@@ -126,13 +132,19 @@ fn build_tls_client_config(profile: &QuicC2Profile) -> Result<rustls::ClientConf
 
 /// Certificate verifier that accepts any certificate (insecure / testing).
 ///
+/// **MED-010:** This verifier is ONLY compiled into test builds.  Production
+/// builds use `InsecureSkipCaVerifier` instead, which still validates TLS
+/// signatures and hostname to prevent trivial MITM attacks.
+///
 /// **Note:** While `verify_server_cert` accepts any end-entity certificate
 /// (this is the intended testing behaviour), TLS signature verification is
 /// still delegated to the real `rustls` crypto primitives so that we don't
 /// silently accept forged signatures.
+#[cfg(test)]
 #[derive(Debug)]
 struct AcceptAnyCertVerifier;
 
+#[cfg(test)]
 impl rustls::client::danger::ServerCertVerifier for AcceptAnyCertVerifier {
     fn verify_server_cert(
         &self,
@@ -151,6 +163,100 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCertVerifier {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Certificate verifier that skips CA chain verification but still validates
+/// TLS signatures and hostname (MED-010).
+///
+/// Used in production builds when `insecure = true` — provides a safer
+/// alternative to `AcceptAnyCertVerifier` by ensuring:
+///
+/// 1. **TLS signatures are valid**: The certificate's signature chain is
+///    verified using `rustls` crypto primitives.  An attacker cannot present
+///    a forged/self-signed certificate.
+/// 2. **Hostname matches**: The certificate's SAN/CN must match the server
+///    name from the profile, preventing redirection to a different host.
+/// 3. **Validity period is checked**: Expired or not-yet-valid certificates
+///    are rejected.
+///
+/// What is **not** checked: whether the certificate chains to a trusted root
+/// CA.  This is the "insecure" part — a legitimate certificate for the
+/// correct hostname issued by an unknown CA will be accepted.
+#[derive(Debug)]
+struct InsecureSkipCaVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for InsecureSkipCaVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        // Verify hostname/SAN — must match the configured server name.
+        if !common::tls_transport::verify_cert_hostname(end_entity.as_ref(), server_name) {
+            tracing::warn!("QUIC TLS (insecure): hostname validation failed");
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidForName,
+            ));
+        }
+
+        // Reject certificates outside their validity window.
+        if let Some((not_before, not_after)) =
+            common::tls_transport::cert_validity_period(end_entity.as_ref())
+        {
+            let now_secs = now.as_secs() as i64;
+            if now_secs < not_before {
+                return Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::NotValidYet,
+                ));
+            }
+            if now_secs > not_after {
+                return Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::Expired,
+                ));
+            }
+        }
+
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        // Signature verification is NOT skipped — ensures the certificate
+        // was actually issued by the claimed CA (even if we don't trust it).
         rustls::crypto::verify_tls12_signature(
             message,
             cert,

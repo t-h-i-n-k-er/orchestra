@@ -215,9 +215,10 @@ async fn agent_registers_and_ping_round_trips() {
         // for the Ping command.
         let req = agent.recv().await;
         match req {
-            Message::TaskRequest { command, .. }
-                if matches!(command, Command::SetReencodeSeed { .. }) =>
-            {
+            Message::TaskRequest {
+                command: Command::SetReencodeSeed { .. },
+                ..
+            } => {
                 // Acknowledge and wait for the real command.
             }
             Message::TaskRequest {

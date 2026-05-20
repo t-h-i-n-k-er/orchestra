@@ -551,12 +551,55 @@ pub fn clean_usn_journal(volume: &str, remove_references: &[String]) -> Result<U
         let mut output_buffer = vec![0u8; MAX_USN_BUFFER_SIZE];
         let mut iosb = IoStatusBlock::default();
 
-        // Start USN = 0 to read from the beginning.
-        let mut start_usn: i64 = 0;
+        // Query the USN journal metadata to discover the valid USN range.
+        // Using start_usn=0 would force the driver to scan from the very
+        // beginning of the journal (which may be outside the current valid
+        // range) and on large journals this is both slow and may return
+        // unexpected data.  Instead, call FSCTL_QUERY_USN_JOURNAL first to
+        // obtain FirstUsn and start from there.
+        let mut journal_data_buf = [0u8; 56]; // USN_JOURNAL_DATA is 56 bytes
+        let qstatus = crate::syscall!(
+            "NtFsControlFile",
+            handle as u64,
+            0u64,
+            0u64,
+            0u64,
+            &mut iosb as *mut _ as u64,
+            journal_data_buf.as_mut_ptr() as u64,
+            journal_data_buf.len() as u64,
+            FSCTL_QUERY_USN_JOURNAL as u64,
+            0u64, // no input buffer
+            0u64, // input length = 0
+        );
+
+        let start_usn: i64 = if qstatus == STATUS_SUCCESS && iosb.information >= 24 {
+            // USN_JOURNAL_DATA layout: UsnJournalID(8) + FirstUsn(8) + NextUsn(8) + ...
+            let first_usn = read_u64_le(&journal_data_buf, 8) as i64;
+            let next_usn = read_u64_le(&journal_data_buf, 16) as i64;
+            let lowest_valid = if iosb.information >= 32 {
+                read_u64_le(&journal_data_buf, 24) as i64
+            } else {
+                0i64
+            };
+            tracing::debug!(
+                "USN journal range: first_usn={}, next_usn={}, lowest_valid={}",
+                first_usn,
+                next_usn,
+                lowest_valid
+            );
+            // Use the maximum of first_usn and lowest_valid to be safe.
+            first_usn.max(lowest_valid)
+        } else {
+            tracing::warn!(
+                "FSCTL_QUERY_USN_JOURNAL failed (status=0x{:08X}), falling back to start_usn=0",
+                qstatus as u32
+            );
+            0i64
+        };
 
         // Input buffer: USN_JOURNAL_DATA_V0 — start_usn (8 bytes) + reason_mask (4 bytes).
         let mut input_buf = [0u8; 12];
-        write_u64_le(&mut input_buf, 0, 0); // Start USN = 0
+        write_u64_le(&mut input_buf, 0, start_usn as u64); // Start USN from valid range
         write_u32_le(&mut input_buf, 8, 0xFFFFFFFF); // All reasons
 
         let status = crate::syscall!(
@@ -618,12 +661,15 @@ pub fn clean_usn_journal(volume: &str, remove_references: &[String]) -> Result<U
                     .any(|r| name_lower.contains(&r.to_lowercase()));
 
                 if matches {
-                    // Zero out the filename in the journal entry.
-                    // Note: this modifies the in-memory buffer; writing back
-                    // to the actual journal requires raw volume access to the
-                    // $UsnJrnl data.  For now, we note the match count.
-                    result.entries_cleaned += 1;
-                    debug!("Cleaned USN entry referencing: {}", name_str);
+                    // WARNING: actual USN journal writes require direct raw
+                    // volume access to \\.\C: bypassing the filesystem (opening
+                    // with FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
+                    // seeking to the journal data attribute offset, and writing
+                    // the zeroed record).  In-memory-only matching is logged
+                    // below so operators know which records *would* be cleaned,
+                    // but entries_cleaned is NOT incremented because no disk
+                    // write occurs.
+                    debug!("USN journal: matched record referencing \"{}\" (raw volume write required to actually clean)", name_str);
                 }
             }
 
@@ -634,8 +680,8 @@ pub fn clean_usn_journal(volume: &str, remove_references: &[String]) -> Result<U
         }
 
         info!(
-            "USN journal cleanup on {}: {} entries processed, {} cleaned",
-            volume, result.entries_processed, result.entries_cleaned
+            "USN journal scan on {}: {} entries processed (raw volume write required for actual cleanup; entries_cleaned always 0 in current mode)",
+            volume, result.entries_processed
         );
     }
 
@@ -1036,6 +1082,45 @@ pub fn clean_logfile(volume: &str) -> Result<LogFileResult> {
                     volume,
                     dirty_flags
                 );
+            }
+        }
+
+        // ── Flush USN journal (M-7) ──────────────────────────────────────
+        // Issue FSCTL_WRITE_USN_CLOSE to flush any pending USN journal
+        // entries for this volume handle.  This ensures the USN close record
+        // is written *before* we zero the $LogFile data runs, so NTFS does
+        // not have outstanding USN entries that would require the log after
+        // we zero it.
+        {
+            let usn_status = nt_fs_control_file(
+                vol_handle,
+                FSCTL_WRITE_USN_CLOSE,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                0,
+            );
+            match usn_status {
+                Ok(st) if st >= 0 => {
+                    debug!(
+                        "FSCTL_WRITE_USN_CLOSE succeeded on '{}' (status={:#010x})",
+                        volume, st as u32
+                    );
+                }
+                Ok(st) => {
+                    warn!(
+                        "FSCTL_WRITE_USN_CLOSE returned NTSTATUS {:#010x} on '{}' — \
+                         continuing with $LogFile zeroing (log may still have pending data)",
+                        st as u32, volume
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "FSCTL_WRITE_USN_CLOSE failed on '{}': {} — \
+                         continuing with $LogFile zeroing",
+                        volume, e
+                    );
+                }
             }
         }
 

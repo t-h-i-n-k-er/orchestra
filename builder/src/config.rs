@@ -855,7 +855,7 @@ package        = "launcher"
             "127.0.0.1:8444".to_string(), // debug
         ];
         for addr in profiles {
-            let port: u16 = addr.split(':').last().unwrap().parse().unwrap();
+            let port: u16 = addr.split(':').next_back().unwrap().parse().unwrap();
             assert_eq!(
                 port, server_agent_port,
                 "c2_address '{}' must use port {} (agent listener), not 8443 (dashboard)",

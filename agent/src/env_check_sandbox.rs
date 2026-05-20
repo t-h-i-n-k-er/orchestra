@@ -24,14 +24,13 @@ pub fn check_mouse_movement() -> u8 {
         ).expect("GetCursorPos not found")
     };
 
-    // Take 4 samples over ~1 second total.  Previously this was 20 × 500 ms = 10 s,
+    // Take 8 samples over ~2 seconds total.  Previously this was 20 × 500 ms = 10 s,
     // which stalled startup long enough to be trivially detected by timing analysis.
-    // 4 × 250 ms = 1 s is still sufficient to detect a static/automated cursor
-    // while keeping the window short enough to avoid timing-based sandbox flags.
-    let mut positions = Vec::with_capacity(4);
+    // 8 × 250 ms = 2 s catches intermittent user activity while avoiding timing flags.
+    let mut positions = Vec::with_capacity(8);
     let mut total_distance = 0.0f64;
 
-    for _ in 0..4 {
+    for _ in 0..8 {
         let mut pt = POINT { x: 0, y: 0 };
         unsafe {
             if get_cursor_pos(&mut pt) != 0 {
@@ -155,16 +154,22 @@ pub fn check_mouse_movement() -> u8 {
     score
 }
 
-/// Shared sampling loop: calls `probe` 4 times with 250 ms intervals and
-/// scores based on number of distinct positions seen and total travel distance.
+/// Shared sampling loop: calls `probe` 8 times with 250 ms intervals (2 s
+/// total) and scores based on number of distinct positions seen and total
+/// travel distance.
+///
+/// The 8-sample / 2-second window is long enough to catch intermittent user
+/// activity (short pauses between mouse movements) while remaining fast
+/// enough for the initial environment check.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn _sample_mouse_positions<F>(mut probe: F) -> u8
 where
     F: FnMut(usize) -> Option<(i32, i32)>,
 {
-    let mut positions = Vec::with_capacity(4);
+    let sample_count = 8usize;
+    let mut positions = Vec::with_capacity(sample_count);
     let mut total_distance = 0.0f64;
-    for i in 0..4 {
+    for i in 0..sample_count {
         if let Some(pos) = probe(i) {
             positions.push(pos);
         }
@@ -179,6 +184,10 @@ where
         let dy = (w[1].1 - w[0].1) as f64;
         total_distance += (dx * dx + dy * dy).sqrt();
     }
+    // Scoring thresholds scaled for the larger sample count:
+    // - All positions identical or negligible movement → likely sandbox.
+    // - Some movement but not enough distinct positions → suspicious.
+    // - Significant movement with many distinct positions → real user.
     if unique.len() < 2 || total_distance < 5.0 {
         20
     } else if unique.len() < 4 && total_distance < 50.0 {
@@ -475,21 +484,45 @@ pub fn check_system_uptime_artifacts() -> u8 {
 
 /// Linux implementation: reads `/proc/uptime` for system uptime and counts
 /// entries in `/tmp` as a proxy for usage history.
+///
+/// Uses multiple heuristics because automated `/tmp` cleanup (systemd-tmpfiles,
+/// cron) may keep `/tmp` nearly empty on long-running systems:
+/// 1. File count in `/tmp` (primary).
+/// 2. Presence of long-lived daemon sockets/pipes in `/run` and `/var/run`.
+/// 3. Log file count in `/var/log` as a secondary usage indicator.
 #[cfg(target_os = "linux")]
 pub fn check_system_uptime_artifacts() -> u8 {
     let mut temp_files_count = 0;
     if let Ok(temp_dir) = std::fs::read_dir("/tmp") {
         temp_files_count = temp_dir.count();
     }
-    
+
+    // Secondary heuristic: count entries in /run (daemon sockets, PID files).
+    // A system that has been running for hours will typically have dozens of
+    // entries here even if /tmp is aggressively cleaned.
+    let run_files_count = std::fs::read_dir("/run")
+        .or_else(|_| std::fs::read_dir("/var/run"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+
+    // Tertiary heuristic: log files in /var/log.  Even a minimally-used
+    // system accumulates rotated log files over 24 hours.
+    let log_files_count = std::fs::read_dir("/var/log")
+        .map(|d| d.count())
+        .unwrap_or(0);
+
+    // Combined "system activity" score.  If /tmp is empty but /run has
+    // entries and /var/log has files, the system is likely not a sandbox.
+    let system_activity = temp_files_count + (run_files_count / 4) + (log_files_count / 2);
+
     let uptime_str = std::fs::read_to_string("/proc/uptime").unwrap_or_default();
     let uptime_secs: f64 = uptime_str.split_whitespace().next().unwrap_or("0").parse().unwrap_or(0.0);
     let uptime_mins = uptime_secs / 60.0;
     let uptime_hours = uptime_mins / 60.0;
-    
-    if uptime_mins < 10.0 && temp_files_count < 5 {
+
+    if uptime_mins < 10.0 && system_activity < 10 {
         20
-    } else if uptime_hours < 24.0 && temp_files_count < 20 {
+    } else if uptime_hours < 24.0 && system_activity < 30 {
         10
     } else {
         0
@@ -1020,15 +1053,31 @@ pub fn sandbox_probability_score(metrics: &SandboxMetrics) -> u32 {
     // Freshly booted but otherwise plausible hosts can have little temp/file
     // history immediately after provisioning. Keep uptime as a supporting
     // signal unless corroborated by additional suspicious hardware evidence.
-    if hw_contrib == 0 && uptime_contrib > 0 {
-        if mouse_contrib == 0 && desktop_contrib == 0 {
-            uptime_contrib = uptime_contrib.min(10);
-        } else if mouse_contrib > 0 && desktop_contrib > 0 {
-            uptime_contrib = uptime_contrib.min(10);
-        }
+    if hw_contrib == 0
+        && uptime_contrib > 0
+        && ((mouse_contrib == 0 && desktop_contrib == 0)
+            || (mouse_contrib > 0 && desktop_contrib > 0))
+    {
+        uptime_contrib = uptime_contrib.min(10);
     }
 
     let score = mouse_contrib + desktop_contrib + uptime_contrib + hw_contrib;
+
+    // Headless-server dampening: when all three behavioural signals (mouse,
+    // desktop, uptime) are elevated but there is NO hardware corroboration,
+    // the pattern is consistent with a legitimate headless/cloud server rather
+    // than a sandbox.  A real sandbox would typically exhibit VM or emulator
+    // hardware artifacts that push hw_contrib > 0.  Cap at the moderate
+    // threshold boundary to prevent false-positive warnings.
+    if hw_contrib == 0
+        && mouse_contrib > 0
+        && desktop_contrib > 0
+        && uptime_contrib > 0
+        && score > 30
+    {
+        return 30;
+    }
+
     std::cmp::min(score, 100)
 }
 
@@ -1135,5 +1184,33 @@ mod tests {
     #[test]
     fn all_zero_scores_produces_zero() {
         assert_eq!(sandbox_probability_score(&metrics(0, 0, 0, 0)), 0);
+    }
+
+    /// A headless cloud VM (no mouse, no desktop, fresh boot, no hardware
+    /// corroboration) should not exceed 30.  Without hw_contrib the three
+    /// behavioural signals (mouse, desktop, uptime) are consistent with a
+    /// legitimate freshly-provisioned headless server, not a sandbox.
+    #[test]
+    fn headless_cloud_vm_capped_at_moderate() {
+        // mouse=20, desktop=20, uptime=20, hw=0
+        // Before fix: coupled cap brings mouse+desktop to 30, uptime dampened
+        // to 10 → total 40.  After fix: total capped at 30.
+        let score = sandbox_probability_score(&metrics(20, 20, 20, 0));
+        assert!(
+            score <= 30,
+            "headless cloud VM (no hw corroboration) must not exceed moderate threshold: got {score}"
+        );
+    }
+
+    /// Hardware corroboration overrides the headless-server dampening:
+    /// if VM hardware is detected, the full score should be reachable.
+    #[test]
+    fn hardware_corroboration_overrides_headless_dampening() {
+        // Same as headless_cloud_vm but with hw=20 → full scoring applies.
+        let score = sandbox_probability_score(&metrics(20, 20, 20, 20));
+        assert!(
+            score > 30,
+            "with hardware corroboration the score should exceed moderate: got {score}"
+        );
     }
 }

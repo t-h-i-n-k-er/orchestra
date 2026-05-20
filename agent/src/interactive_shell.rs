@@ -320,7 +320,7 @@ pub fn list_shells() -> Result<Vec<ShellInfo>, String> {
         .lock()
         .map_err(|e| format!("ShellManager lock poisoned: {e}"))?;
     let mut list = Vec::new();
-    for (_, session) in &mgr.sessions {
+    for session in mgr.sessions.values() {
         list.push(ShellInfo {
             session_id: session.session_id,
             shell_type: session.shell_type.clone(),
@@ -353,7 +353,7 @@ pub fn resize_shell(session_id: u32, _cols: u16, _rows: u16) -> Result<String, S
 /// Pause all reader threads (called when entering sleep obfuscation).
 pub fn pause_all_readers() {
     let mgr = manager().lock().unwrap_or_else(|e| e.into_inner());
-    for (_, session) in &mgr.sessions {
+    for session in mgr.sessions.values() {
         session.pause_readers.store(true, Ordering::SeqCst);
     }
 }
@@ -361,7 +361,7 @@ pub fn pause_all_readers() {
 /// Resume all reader threads (called when waking from sleep obfuscation).
 pub fn resume_all_readers() {
     let mgr = manager().lock().unwrap_or_else(|e| e.into_inner());
-    for (_, session) in &mgr.sessions {
+    for session in mgr.sessions.values() {
         session.pause_readers.store(false, Ordering::SeqCst);
     }
 }

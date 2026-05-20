@@ -186,10 +186,11 @@ pub enum PacContext {
 /// within `_KTHREAD`.  The other keys follow at +16, +32, +48.
 ///
 /// Offsets verified against ARM64 Windows 11 public PDB symbols:
-/// - Build 22000 (Win11 21H2): not yet populated (PAC was optional)
+/// - Build 22000 (Win11 21H2): PAC keys at same offset as 22H2
 /// - Build 22621 (Win11 22H2): PAC keys at known offsets
 /// - Build 22631 (Win11 23H2): same as 22H2
-/// - Build 26100 (Win11 24H2): offset may differ
+/// - Build 26100 (Win11 24H2): offset shifted by +8
+/// - Build 26120 (Win11 24H2 cumulative): same as 26100
 ///
 /// For builds not in this table, the probing mechanism in
 /// `probe_pac_key_offset` attempts to discover the correct offset
@@ -200,10 +201,16 @@ pub enum PacContext {
 #[cfg(feature = "kernel-callback")]
 const PAC_KEY_OFFSETS: &[(u32, usize)] = &[
     // (minimum_build, ApiAKey_offset_in_KTHREAD)
+    // ARM64 Windows 11 21H2 — same KTHREAD layout as 22H2.
+    (22000, 0x380),
     // ARM64 Windows 11 22H2+ — verified from public PDB symbols.
     (22621, 0x380),
-    // ARM64 Windows 11 24H2 — verified from public PDB symbols.
+    // ARM64 Windows 11 23H2 — same KTHREAD layout as 22H2.
+    (22631, 0x380),
+    // ARM64 Windows 11 24H2 — KTHREAD grew by 8 bytes before PAC keys.
     (26100, 0x388),
+    // ARM64 Windows 11 24H2 cumulative update — same as base 24H2.
+    (26120, 0x388),
 ];
 
 // ── BTI Gadget Database ──────────────────────────────────────────────────
@@ -970,19 +977,31 @@ mod key_extraction {
 
     /// ARM64 `_EPROCESS.ThreadListHead` offset.
     const EPROCESS_THREAD_LIST_HEAD_OFFSETS: &[(u32, usize)] = &[
+        // Windows 11 21H2 ARM64 — same layout as 22H2.
+        (22000, 0x780),
         // Windows 11 22H2 ARM64
         (22621, 0x780),
-        // Windows 11 24H2 ARM64
+        // Windows 11 23H2 ARM64 — same layout as 22H2.
+        (22631, 0x780),
+        // Windows 11 24H2 ARM64 — EPROCESS grew by 8 bytes.
         (26100, 0x788),
+        // Windows 11 24H2 cumulative ARM64 — same as base 24H2.
+        (26120, 0x788),
     ];
 
     /// ARM64 `_KTHREAD.ThreadListEntry` offset (the LIST_ENTRY inside
     /// KTHREAD that is chained into EPROCESS.ThreadListHead).
     const KTHREAD_THREAD_LIST_ENTRY_OFFSETS: &[(u32, usize)] = &[
+        // Windows 11 21H2 ARM64 — same layout as 22H2.
+        (22000, 0x778),
         // Windows 11 22H2 ARM64
         (22621, 0x778),
-        // Windows 11 24H2 ARM64
+        // Windows 11 23H2 ARM64 — same layout as 22H2.
+        (22631, 0x778),
+        // Windows 11 24H2 ARM64 — KTHREAD grew by 8 bytes.
         (26100, 0x780),
+        // Windows 11 24H2 cumulative ARM64 — same as base 24H2.
+        (26120, 0x780),
     ];
 
     // Each PAC key is 128 bits = 16 bytes.  The four keys are laid out

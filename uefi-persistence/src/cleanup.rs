@@ -171,7 +171,7 @@ pub fn detect_existing_persistence(esp_path: &str) -> Result<ScanResult> {
             RiskLevel::Info => {}
         }
         artifacts.push(PersistenceArtifact {
-            artifact_type: detail.artifact_type.clone(),
+            artifact_type: detail.artifact_type,
             description: format!("Boot entry: {}", detail.reason),
             path: detail.location.clone(),
             risk_level: format!("{:?}", detail.risk_level),
@@ -189,7 +189,7 @@ pub fn detect_existing_persistence(esp_path: &str) -> Result<ScanResult> {
             RiskLevel::Info => {}
         }
         artifacts.push(PersistenceArtifact {
-            artifact_type: detail.artifact_type.clone(),
+            artifact_type: detail.artifact_type,
             description: format!("ESP file: {}", detail.reason),
             path: detail.location.clone(),
             risk_level: format!("{:?}", detail.risk_level),
@@ -207,7 +207,7 @@ pub fn detect_existing_persistence(esp_path: &str) -> Result<ScanResult> {
             RiskLevel::Info => {}
         }
         artifacts.push(PersistenceArtifact {
-            artifact_type: detail.artifact_type.clone(),
+            artifact_type: detail.artifact_type,
             description: format!("NVRAM variable: {}", detail.reason),
             path: detail.location.clone(),
             risk_level: format!("{:?}", detail.risk_level),
@@ -225,7 +225,7 @@ pub fn detect_existing_persistence(esp_path: &str) -> Result<ScanResult> {
             RiskLevel::Info => {}
         }
         artifacts.push(PersistenceArtifact {
-            artifact_type: detail.artifact_type.clone(),
+            artifact_type: detail.artifact_type,
             description: format!("Bootloader config: {}", detail.reason),
             path: detail.location.clone(),
             risk_level: format!("{:?}", detail.risk_level),

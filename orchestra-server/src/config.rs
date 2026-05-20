@@ -117,6 +117,18 @@ pub struct ServerConfig {
     /// mode. Set to `"tls"` to accept fake TLS-shaped framing from agents.
     #[serde(default)]
     pub agent_traffic_profile: Option<TrafficProfile>,
+    /// Minimum log level for the tracing subscriber.
+    ///
+    /// Accepts standard Rust log level names: `trace`, `debug`, `info`,
+    /// `warn`, `error`.  Defaults to `info` in release builds and `debug`
+    /// in debug builds.  Can be overridden at runtime with the `RUST_LOG`
+    /// environment variable.
+    ///
+    /// In production deployments, `warn` or `info` is recommended to avoid
+    /// logging sensitive agent IDs and command details that appear at lower
+    /// levels.
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
     /// Bearer token operators must present in `Authorization: Bearer ...`.
     pub admin_token: String,
     /// Path to a JSON-Lines audit log (created if missing, append-only).
@@ -304,6 +316,13 @@ fn default_smb_relay_max_instances() -> u32 {
 fn default_http_c2_addr() -> SocketAddr {
     "127.0.0.1:8446".parse().unwrap()
 }
+fn default_log_level() -> String {
+    if cfg!(debug_assertions) {
+        "debug".to_string()
+    } else {
+        "info".to_string()
+    }
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -312,6 +331,7 @@ impl Default for ServerConfig {
             agent_addr: "127.0.0.1:8444".parse().unwrap(),
             agent_shared_secret: "change-me-pre-shared-secret".into(),
             agent_traffic_profile: None,
+            log_level: default_log_level(),
             admin_token: "change-me-admin-token".into(),
             audit_log_path: PathBuf::from("orchestra-audit.jsonl"),
             tls_cert_path: None,

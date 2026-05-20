@@ -169,17 +169,62 @@ fn cf_type_to_string(cf: CFTypeRef) -> Option<String> {
         return None;
     }
     let bytes = unsafe { std::slice::from_raw_parts(byte_ptr as *const u8, len as usize) };
-    // Many Keychain blobs are printable ASCII/UTF-8; strip non-printable.
-    let cleaned: String = bytes
-        .iter()
-        .take_while(|&&b| b != 0)
-        .filter(|&&b| b >= 0x20)
-        .map(|&b| b as char)
-        .collect();
-    if cleaned.is_empty() {
-        None
+
+    // Count non-printable (non-ASCII and control) bytes up to the first NUL.
+    // If more than 30% of bytes are non-printable, treat the blob as binary
+    // and hex-encode it instead of stripping — this preserves Keychain data
+    // like certificates, keys, and other DER-encoded structures.
+    let content_bytes: &[u8] = if let Some(nul_pos) = bytes.iter().position(|&b| b == 0) {
+        &bytes[..nul_pos]
     } else {
-        Some(cleaned)
+        bytes
+    };
+
+    if content_bytes.is_empty() {
+        // Empty or all-NUL data — return hex of first few bytes for diagnostics.
+        let display_len = bytes.len().min(32);
+        return Some(format!(
+            "(empty, {} bytes total) {}",
+            bytes.len(),
+            hex::encode(&bytes[..display_len])
+        ));
+    }
+
+    let non_printable_count = content_bytes
+        .iter()
+        .filter(|&&b| b < 0x20 || b > 0x7E)
+        .count();
+    let ratio = non_printable_count as f32 / content_bytes.len() as f32;
+
+    if ratio > 0.30 {
+        // Binary data (certificates, keys, DER blobs) — hex-encode with
+        // a size hint so the operator can tell what kind of data this is.
+        let display_len = bytes.len().min(256);
+        let suffix = if bytes.len() > 256 {
+            format!("... ({} bytes total)", bytes.len())
+        } else {
+            String::new()
+        };
+        Some(format!(
+            "(binary) {}{}",
+            hex::encode(&bytes[..display_len]),
+            suffix
+        ))
+    } else {
+        // Mostly printable ASCII/UTF-8 — strip non-printable bytes as before.
+        let cleaned: String = content_bytes
+            .iter()
+            .filter(|&&b| b >= 0x20 && b <= 0x7E)
+            .map(|&b| b as char)
+            .collect();
+        if cleaned.is_empty() {
+            Some(format!(
+                "(binary) {}",
+                hex::encode(&bytes[..bytes.len().min(64)])
+            ))
+        } else {
+            Some(cleaned)
+        }
     }
 }
 

@@ -459,21 +459,27 @@ impl PskRotationState {
     pub fn rotate(&self) -> u64 {
         let new_counter = self.rotation_counter.fetch_add(1, AtomicOrdering::SeqCst) + 1;
 
+        // CRITICAL SECTION: hold current_psk lock continuously from read
+        // through install to prevent TOCTOU races (MED-012).  Without this,
+        // two concurrent rotate() calls could both read the same parent PSK
+        // before either installs the new one, breaking the one-way HKDF
+        // rotation chain and permanently diverging agent/server PSK state.
         let mut new_psk_bytes = {
-            let psk = self.current_psk.lock().unwrap();
-            derive_rotated_psk(psk.as_bytes(), new_counter)
-        };
+            let mut cur_guard = self.current_psk.lock().unwrap();
+            let derived = derive_rotated_psk(cur_guard.as_bytes(), new_counter);
 
-        // Move current PSK to previous (for transition window), then install
-        // the new PSK.  LockedSecret zeroizes the old previous_psk on drop.
-        {
-            let mut prev = self.previous_psk.lock().unwrap();
-            let cur = self.current_psk.lock().unwrap();
-            *prev = Some(LockedSecret::new(cur.as_bytes()));
-            drop(cur);
-            let mut cur = self.current_psk.lock().unwrap();
-            *cur = LockedSecret::new(&new_psk_bytes);
-        }
+            // Move old PSK to previous_psk (transition window), then install
+            // the new PSK, all while holding current_psk lock.
+            // Lock ordering: current_psk → previous_psk (must match
+            // apply_rotation() to avoid deadlock).
+            {
+                let mut prev_guard = self.previous_psk.lock().unwrap();
+                *prev_guard = Some(LockedSecret::new(cur_guard.as_bytes()));
+                *cur_guard = LockedSecret::new(&derived);
+            }
+
+            derived
+        };
 
         // Record the rotation timestamp for transition-window expiry.
         if let Ok(mut rt) = self.rotation_time.lock() {
@@ -683,7 +689,7 @@ pub fn encode_ecdh_bin_frame(ecdh_b64: &str) -> Vec<u8> {
 /// If the buffer starts with `ECDH_BIN_MARKER`, parses the frame, returns
 /// the base64 payload string, and the remaining bytes after the frame.
 /// If no marker is found, returns `None` (no ECDH data in this message).
-pub fn try_extract_ecdh_bin_frame<'a>(data: &'a [u8]) -> Option<(String, &'a [u8])> {
+pub fn try_extract_ecdh_bin_frame(data: &[u8]) -> Option<(String, &[u8])> {
     if data.len() < 4 {
         return None;
     }

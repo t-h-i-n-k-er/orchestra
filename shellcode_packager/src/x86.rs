@@ -316,9 +316,6 @@ impl Emitter {
             // RSP/R12 need SIB byte
             self.emit_byte(Self::modrm(2, src, 4)); // mod=10 → disp32, rm=100 → SIB
             self.emit_byte(Self::sib(0, 4, base)); // scale=0, index=none(4), base
-        } else if base == Self::RBP || base == Self::R13 {
-            // RBP/R13 always need mod != 00, so mod=10 (disp32)
-            self.emit_byte(Self::modrm(2, src, base));
         } else {
             self.emit_byte(Self::modrm(2, src, base));
         }
@@ -332,8 +329,6 @@ impl Emitter {
         if base == Self::RSP || base == Self::R12 {
             self.emit_byte(Self::modrm(2, dst, 4));
             self.emit_byte(Self::sib(0, 4, base));
-        } else if base == Self::RBP || base == Self::R13 {
-            self.emit_byte(Self::modrm(2, dst, base));
         } else {
             self.emit_byte(Self::modrm(2, dst, base));
         }

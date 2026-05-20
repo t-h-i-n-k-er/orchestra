@@ -86,6 +86,12 @@ pub struct RedirectorState {
     pub stale_timeout_secs: u64,
 }
 
+impl Default for RedirectorState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RedirectorState {
     pub fn new() -> Self {
         Self {

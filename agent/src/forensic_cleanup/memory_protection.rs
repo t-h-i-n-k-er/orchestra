@@ -921,12 +921,7 @@ pub fn corrupt_memory_on_dump_detect() -> Result<CorruptionResult> {
 fn get_timestamp() -> u64 {
     unsafe {
         let mut ft: u64 = 0;
-        crate::syscall!(
-            "NtQueryPerformanceCounter",
-            &mut ft as *mut u64 as u64,
-            0u64,
-        )
-        .ok();
+        crate::syscall!("NtQuerySystemTime", &mut ft as *mut u64 as u64,).ok();
         ft
     }
 }

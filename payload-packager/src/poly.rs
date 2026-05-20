@@ -15,22 +15,25 @@
 //! [1 byte:  flags]
 //!     bit 0:   length-field endianness (0 = big-endian, 1 = little-endian)
 //!     bit 1:   padding present (0 = none, 1 = present)
-//!     bits 2-7: padding byte count (0-63; only emitted when bit 1 = 1)
-//! [0 or N bytes: random padding (N = flags >> 2, only if bit 1 = 1)]
+//!     bit 6:   separate MAC key present (1 = yes, MED-018 key separation)
+//!     bits 2-5: padding byte count (0-15; only emitted when bit 1 = 1)
+//! [0 or N bytes: random padding (N = (flags>>2)&0xF, only if bit 1 = 1)]
 //! [4 bytes: key_len   (endianness per bit 0)]
-//! [key_len bytes: key]
+//! [key_len bytes: encryption key]
+//! [4 bytes: mac_key_len (endianness per bit 0, only if bit 6 = 1)]
+//! [mac_key_len bytes: MAC key (only if bit 6 = 1)]
 //! [4 bytes: ciphertext_len (endianness per bit 0)]
 //! [ciphertext_len bytes: ciphertext]
 //! [32 bytes: HMAC-SHA256 authentication tag]
 //! ```
 //!
 //! The HMAC-SHA256 tag authenticates **all** preceding bytes (magic through
-//! ciphertext).  The HMAC key is derived from the blob's own encryption key
-//! via HKDF-SHA256 with the fixed info string `b"orchestra-poly-mac"` so that
-//! no additional out-of-band secret is required — any tampering with the
-//! scheme, key, or ciphertext is detected before decryption.  The tag is
-//! computed as HMAC-SHA256(hkdf_key, header || key || ciphertext) where
-//! `hkdf_key = HKDF-Expand(salt=b"", info=b"orchestra-poly-mac", 32)`.
+//! ciphertext).  The HMAC key is derived from the blob's **dedicated MAC
+//! key** (independent of the encryption key) via HKDF-SHA256 with the
+//! domain-separated info constant `common::hkdf_info::POLY_MAC` so that
+//! compromise of the encryption key does not break integrity verification.
+//! The tag is computed as HMAC-SHA256(hkdf_key, header || enc_key || mac_key || ciphertext)
+//! where `hkdf_key = HKDF-Expand(salt=b"", info=POLY_MAC, 32)`.
 //!
 //! **Backward compatibility**: if the first 4 bytes equal `b"POLY"` the
 //! legacy v1 format is assumed:
@@ -98,6 +101,10 @@ pub struct PolyBlob {
     /// For RawStub: the machine-code stub bytes (key is embedded inside).
     pub key: Vec<u8>,
     pub ciphertext: Vec<u8>,
+    /// Independent MAC key — separate from the encryption key so that
+    /// compromise of one does not break integrity of the other (MED-018).
+    /// 32 random bytes generated alongside the encryption key.
+    pub mac_key: Vec<u8>,
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -112,21 +119,27 @@ pub fn poly_wrap(plaintext: &[u8]) -> PolyBlob {
         PolyScheme::AesCtrStream => {
             // 48 bytes: 32-byte AES-256 key + 16-byte initial counter block.
             let key: Vec<u8> = (0..48).map(|_| rng.gen()).collect();
+            // MED-018: independent MAC key — not derived from encryption key.
+            let mac_key: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
             let ct = aes256_ctr_stream(plaintext, &key);
             PolyBlob {
                 scheme,
                 key,
                 ciphertext: ct,
+                mac_key,
             }
         }
         PolyScheme::ChaCha20Stream => {
             // 44 bytes: 32-byte ChaCha20 key + 12-byte nonce
             let key: Vec<u8> = (0..44).map(|_| rng.gen()).collect();
+            // MED-018: independent MAC key — not derived from encryption key.
+            let mac_key: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
             let ct = chacha20_stream(plaintext, &key);
             PolyBlob {
                 scheme,
                 key,
                 ciphertext: ct,
+                mac_key,
             }
         }
         PolyScheme::RawStub => {
@@ -166,10 +179,13 @@ pub fn poly_wrap(plaintext: &[u8]) -> PolyBlob {
                     emit_stub(StubKind::RawStubInline, &key_44, seed)
                 }
             };
+            // MED-018: independent MAC key — not derived from encryption key.
+            let mac_key: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
             PolyBlob {
                 scheme,
                 key: stub.code, // wire format "key" field carries the stub bytes
                 ciphertext: ct,
+                mac_key,
             }
         }
     }
@@ -191,7 +207,7 @@ pub fn poly_wrap(plaintext: &[u8]) -> PolyBlob {
 pub fn poly_serialize(blob: &PolyBlob, seed: u64) -> Vec<u8> {
     let mut rng = rand::thread_rng();
     let use_le: bool = rng.gen_bool(0.5);
-    let pad_len: u8 = rng.gen_range(0u8..=16u8);
+    let pad_len: u8 = rng.gen_range(0u8..=15u8); // max 15: bits 2-5 in flags byte hold only 0-15
     poly_serialize_with_params(blob, seed, use_le, pad_len)
 }
 
@@ -201,10 +217,30 @@ pub fn poly_serialize(blob: &PolyBlob, seed: u64) -> Vec<u8> {
 /// Useful for tests that need to assert exact byte offsets.
 ///
 /// The output includes a 32-byte HMAC-SHA256 authentication tag appended
-/// after the ciphertext.  The HMAC key is derived from the blob's encryption
-/// key via HKDF-SHA256 with info `b"orchestra-poly-mac"` (empty salt).
-/// This provides Encrypt-then-MAC integrity: any tampering with scheme,
-/// padding, key, or ciphertext is detected before decryption.
+/// after the ciphertext.  The HMAC key is derived from the blob's
+/// **dedicated MAC key** (independent of the encryption key) via
+/// HKDF-SHA256 with the info constant `common::hkdf_info::POLY_MAC`
+/// (empty salt).  This provides Encrypt-then-MAC integrity with key
+/// separation: compromising the encryption key does not break integrity.
+///
+/// **Wire format (v2 with separate MAC key — flag bit 7 = 1):**
+/// ```text
+/// [4 bytes: magic — FNV-1a-32(seed)]
+/// [1 byte: scheme]
+/// [1 byte: flags]
+///     bit 0:   endianness (0 = BE, 1 = LE)
+///     bit 1:   padding present
+///     bit 6:   separate MAC key present (always 1 for new blobs)
+///     bits 2-5: padding byte count (0-15)
+/// [0..N bytes: random padding]
+/// [4 bytes: key_len]
+/// [key_len bytes: encryption key]
+/// [4 bytes: mac_key_len]
+/// [mac_key_len bytes: MAC key]
+/// [4 bytes: ciphertext_len]
+/// [ciphertext_len bytes: ciphertext]
+/// [32 bytes: HMAC-SHA256 authentication tag]
+/// ```
 pub fn poly_serialize_with_params(
     blob: &PolyBlob,
     seed: u64,
@@ -222,8 +258,10 @@ pub fn poly_serialize_with_params(
     // Flags byte:
     //   bit 0:   endianness (1 = LE)
     //   bit 1:   padding present (1 = yes)
-    //   bits 2-7: padding byte count
-    let flags: u8 = (use_le as u8) | ((has_padding as u8) << 1) | (pad_len << 2);
+    //   bit 6:   separate MAC key present (1 = yes, MED-018)
+    //   bits 2-5: padding byte count (0-15)
+    const FLAG_SEP_MAC: u8 = 1 << 6;
+    let flags: u8 = (use_le as u8) | ((has_padding as u8) << 1) | (pad_len << 2) | FLAG_SEP_MAC;
 
     let padding: Vec<u8> = (0..pad_len).map(|_| rng.gen::<u8>()).collect();
 
@@ -236,7 +274,16 @@ pub fn poly_serialize_with_params(
     };
 
     let mut out = Vec::with_capacity(
-        4 + 1 + 1 + pad_len as usize + 4 + blob.key.len() + 4 + blob.ciphertext.len() + 32,
+        4 + 1
+            + 1
+            + pad_len as usize
+            + 4
+            + blob.key.len()
+            + 4
+            + blob.mac_key.len()
+            + 4
+            + blob.ciphertext.len()
+            + 32,
     );
     out.extend_from_slice(&magic);
     out.push(blob.scheme.byte());
@@ -244,12 +291,15 @@ pub fn poly_serialize_with_params(
     out.extend_from_slice(&padding);
     out.extend_from_slice(&encode_u32(blob.key.len() as u32));
     out.extend_from_slice(&blob.key);
+    // MED-018: include the independent MAC key in the wire format.
+    out.extend_from_slice(&encode_u32(blob.mac_key.len() as u32));
+    out.extend_from_slice(&blob.mac_key);
     out.extend_from_slice(&encode_u32(blob.ciphertext.len() as u32));
     out.extend_from_slice(&blob.ciphertext);
 
-    // Encrypt-then-MAC: derive the HMAC key from the blob's encryption key
-    // via HKDF-SHA256, then compute HMAC-SHA256 over all preceding bytes.
-    let mac_key = derive_poly_mac_key(&blob.key);
+    // Encrypt-then-MAC: derive the HMAC key from the blob's dedicated MAC
+    // key (independent of the encryption key) via HKDF-SHA256.
+    let mac_key = derive_poly_mac_key(&blob.mac_key);
     let mut mac = HmacSha256::new_from_slice(&mac_key).expect("HMAC-SHA256 accepts any key length");
     mac.update(&out);
     let tag = mac.finalize().into_bytes();
@@ -258,13 +308,13 @@ pub fn poly_serialize_with_params(
     out
 }
 
-/// Derive a 32-byte HMAC-SHA256 key from the poly blob's encryption key
-/// (or stub bytes) using HKDF-SHA256 with an empty salt and the fixed
-/// info string `b"orchestra-poly-mac"`.
-fn derive_poly_mac_key(blob_key: &[u8]) -> [u8; 32] {
-    let hkdf = Hkdf::<Sha256>::new(None, blob_key);
+/// Derive a 32-byte HMAC-SHA256 key from the poly blob's dedicated MAC
+/// key using HKDF-SHA256 with the domain-separated info constant
+/// `common::hkdf_info::POLY_MAC` (empty salt).
+fn derive_poly_mac_key(mac_key_material: &[u8]) -> [u8; 32] {
+    let hkdf = Hkdf::<Sha256>::new(None, mac_key_material);
     let mut mac_key = [0u8; 32];
-    hkdf.expand(b"orchestra-poly-mac", &mut mac_key)
+    hkdf.expand(common::hkdf_info::POLY_MAC, &mut mac_key)
         .expect("32 bytes is a valid HKDF-SHA256 output length");
     mac_key
 }
@@ -1126,7 +1176,8 @@ mod tests {
         // Decode flags.
         let flags = serialized[5];
         let use_le = (flags & 1) != 0;
-        let pad_len = (flags >> 2) as usize;
+        // MED-018: flag bit 6 is SEP_MAC — mask pad_len to bits 2-5 only.
+        let pad_len = ((flags >> 2) & 0xF) as usize;
 
         let decode_u32 = |b: &[u8]| -> usize {
             let arr: [u8; 4] = b.try_into().unwrap();
@@ -1147,10 +1198,18 @@ mod tests {
             PolyScheme::RawStub => assert!(key_len > 0, "RawStub stub code must be non-empty"),
         }
 
-        let ct_len_off = key_len_off + 4 + key_len;
+        // MED-018: skip the MAC key field when SEP_MAC flag (bit 6) is set.
+        let has_sep_mac = (flags & 0x40) != 0;
+        let mut pos = key_len_off + 4 + key_len;
+        if has_sep_mac {
+            let mac_key_len = decode_u32(&serialized[pos..pos + 4]);
+            pos += 4 + mac_key_len;
+        }
+
+        let ct_len_off = pos;
         let ct_len = decode_u32(&serialized[ct_len_off..ct_len_off + 4]);
         assert_eq!(ct_len, blob.ciphertext.len());
-        // Total = header + key_len(4) + key + ct_len(4) + ct + 32-byte HMAC-SHA256 tag.
+        // Total = header + padding + key_len(4) + key + mac_key_len(4) + mac_key + ct_len(4) + ct + 32-byte HMAC tag.
         assert_eq!(serialized.len(), ct_len_off + 4 + ct_len + 32);
     }
 
@@ -1173,6 +1232,7 @@ mod tests {
             scheme: PolyScheme::ChaCha20Stream,
             key: vec![0xAAu8; 44],
             ciphertext: vec![0xBBu8; 32],
+            mac_key: vec![0xCCu8; 32],
         };
         let seed = 42u64;
         let use_le = false; // big-endian
@@ -1183,6 +1243,9 @@ mod tests {
         let use_le_flag = (flags & 1) != 0;
         assert!(!use_le_flag, "expected big-endian flags");
 
+        // bit 6 must be set (separate MAC key present).
+        assert!((flags & 0x40) != 0, "expected SEP_MAC flag set");
+
         let decode_u32 = |b: &[u8]| -> usize {
             let arr: [u8; 4] = b.try_into().unwrap();
             u32::from_be_bytes(arr) as usize
@@ -1191,13 +1254,20 @@ mod tests {
         assert_eq!(decode_u32(&serialized[6..10]), 44);
         // key bytes follow.
         assert_eq!(&serialized[10..54], vec![0xAAu8; 44].as_slice());
-        // ct_len field.
+        // mac_key_len field.
         assert_eq!(decode_u32(&serialized[54..58]), 32);
+        // mac_key bytes.
+        assert_eq!(&serialized[58..90], vec![0xCCu8; 32].as_slice());
+        // ct_len field.
+        assert_eq!(decode_u32(&serialized[90..94]), 32);
         // ciphertext bytes.
-        assert_eq!(&serialized[58..90], vec![0xBBu8; 32].as_slice());
+        assert_eq!(&serialized[94..126], vec![0xBBu8; 32].as_slice());
         // Total length = magic(4) + scheme(1) + flags(1) + pad(0) + key_len(4) + key(44)
-        //               + ct_len(4) + ct(32) + HMAC-SHA256 tag(32).
-        assert_eq!(serialized.len(), 4 + 1 + 1 + 0 + 4 + 44 + 4 + 32 + 32);
+        //               + mac_key_len(4) + mac_key(32) + ct_len(4) + ct(32) + HMAC-SHA256 tag(32).
+        assert_eq!(
+            serialized.len(),
+            (4 + 1 + 1) + 4 + 44 + 4 + 32 + 4 + 32 + 32
+        );
     }
 
     #[test]
@@ -1207,6 +1277,7 @@ mod tests {
             scheme: PolyScheme::AesCtrStream,
             key: vec![1u8; 48],
             ciphertext: vec![2u8; 16],
+            mac_key: vec![3u8; 32],
         };
         let a = poly_serialize(&blob, 1);
         let b = poly_serialize(&blob, 2);

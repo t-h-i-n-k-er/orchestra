@@ -111,7 +111,7 @@ impl AuditLog {
                             key_path.display()
                         )
                     })?;
-                write!(f, "{b64}\n")?;
+                writeln!(f, "{b64}")?;
             }
             #[cfg(not(unix))]
             {

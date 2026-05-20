@@ -167,15 +167,15 @@ dynamic_fn!(
 );
 
 dynamic_fn!(
-    LOOKUP_ACCOUNT_SID_A,
+    LOOKUP_ACCOUNT_SID_W,
     b"advapi32.dll\0",
-    b"LookupAccountSidA\0",
+    b"LookupAccountSidW\0",
     unsafe extern "system" fn(
         LPVOID,
         LPVOID,
-        *mut i8,
+        *mut u16,
         *mut DWORD,
-        *mut i8,
+        *mut u16,
         *mut DWORD,
         *mut DWORD,
     ) -> i32
@@ -553,37 +553,34 @@ fn query_token_user(token: HANDLE) -> Result<(String, String, String)> {
         "(unknown)".to_string()
     };
 
-    // Look up domain and user name from the SID.
-    let mut name_buf = [0u8; 256];
+    // Look up domain and user name from the SID (Unicode/W variant for
+    // non-ASCII username support).
+    let mut name_buf = [0u16; 256];
     let mut name_len: DWORD = 256;
-    let mut domain_buf = [0u8; 256];
+    let mut domain_buf = [0u16; 256];
     let mut domain_len: DWORD = 256;
     let mut sid_type: DWORD = 0;
     let lookup_sid = resolve_fn(
-        &LOOKUP_ACCOUNT_SID_A,
+        &LOOKUP_ACCOUNT_SID_W,
         b"advapi32.dll\0",
-        b"LookupAccountSidA\0",
+        b"LookupAccountSidW\0",
     )
-    .ok_or_else(|| anyhow!("failed to resolve LookupAccountSidA dynamically"))?;
+    .ok_or_else(|| anyhow!("failed to resolve LookupAccountSidW dynamically"))?;
     let ok = unsafe {
         lookup_sid(
             std::ptr::null_mut(),
             sid,
-            name_buf.as_mut_ptr() as *mut _,
+            name_buf.as_mut_ptr(),
             &mut name_len,
-            domain_buf.as_mut_ptr() as *mut _,
+            domain_buf.as_mut_ptr(),
             &mut domain_len,
             &mut sid_type,
         )
     };
 
     if ok != 0 {
-        let name = std::ffi::CStr::from_bytes_with_nul(&name_buf[..name_len as usize])
-            .map(|c| c.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "(unknown)".to_string());
-        let domain = std::ffi::CStr::from_bytes_with_nul(&domain_buf[..domain_len as usize])
-            .map(|c| c.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "(unknown)".to_string());
+        let name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
+        let domain = String::from_utf16_lossy(&domain_buf[..domain_len as usize]);
         Ok((name, domain, sid_string))
     } else {
         Ok(("(unknown)".to_string(), "(unknown)".to_string(), sid_string))

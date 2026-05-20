@@ -516,15 +516,13 @@ fn find_esp_partition_linux() -> Result<String> {
                         return Ok(device.to_string());
                     }
                     // Might be a UUID= or PARTUUID= reference.
-                    if device.starts_with("UUID=") {
-                        let uuid = &device[5..];
+                    if let Some(uuid) = device.strip_prefix("UUID=") {
                         let dev_by_uuid = format!("/dev/disk/by-uuid/{}", uuid);
                         if Path::new(&dev_by_uuid).exists() {
                             return Ok(dev_by_uuid);
                         }
                     }
-                    if device.starts_with("PARTUUID=") {
-                        let partuuid = &device[9..];
+                    if let Some(partuuid) = device.strip_prefix("PARTUUID=") {
                         let dev_by_partuuid = format!("/dev/disk/by-partuuid/{}", partuuid);
                         if Path::new(&dev_by_partuuid).exists() {
                             return Ok(dev_by_partuuid);

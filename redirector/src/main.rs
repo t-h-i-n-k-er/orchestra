@@ -31,7 +31,7 @@
 use anyhow::Result;
 use clap::Parser;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::{
@@ -390,7 +390,7 @@ async fn handle_request(State(state): State<Arc<RedirectorState>>, req: Request<
 }
 
 /// Guess MIME type from file extension.
-fn guess_content_type(path: &PathBuf) -> &'static str {
+fn guess_content_type(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
         Some("html") | Some("htm") => "text/html",
         Some("css") => "text/css",
@@ -584,22 +584,17 @@ async fn main() -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&cli.listen_addr).await?;
 
-    if cli.tls_cert.is_some() && cli.tls_key.is_some() {
+    if let (Some(cert_path), Some(key_path)) = (&cli.tls_cert, &cli.tls_key) {
         // TLS mode via axum_server.
-        // P2-15: Use expect() with context — these are guaranteed by the
-        // `if` guard above but we make the invariant explicit.
-        let cert_path = cli.tls_cert.expect("tls_cert guaranteed by enclosing if");
-        let key_path = cli.tls_key.expect("tls_key guaranteed by enclosing if");
-
-        let cert_pem = std::fs::read(&cert_path)?;
-        let key_pem = std::fs::read(&key_path)?;
+        let cert_pem = std::fs::read(cert_path)?;
+        let key_pem = std::fs::read(key_path)?;
 
         // P2-09: Build RustlsConfig, optionally requiring client certificates
         // (mutual TLS / mTLS) for inbound agent connections.
-        let tls_cfg = if let Some(ca_path) = cli.tls_client_ca {
+        let tls_cfg = if let Some(ca_path) = &cli.tls_client_ca {
             // mTLS mode — load CA and build a ServerConfig with client cert
             // verification enabled.
-            let ca_pem = std::fs::read(&ca_path)?;
+            let ca_pem = std::fs::read(ca_path)?;
 
             let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_pem.as_slice()))
                 .collect::<Result<Vec<_>, _>>()?;

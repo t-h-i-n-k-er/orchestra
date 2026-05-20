@@ -220,13 +220,41 @@ enum RedirectorAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().init();
+    // Parse CLI first to get the config path, but don't log yet.
+    let cli = Cli::parse();
+
+    // Load config early so we can configure the log level before any
+    // tracing calls.  Fall back to defaults if no config path given.
+    let early_cfg = match cli.config.as_deref() {
+        Some(p) => ServerConfig::load(p)?,
+        None => ServerConfig::default(),
+    };
+
+    // Initialise the tracing subscriber with the configured log level.
+    // RUST_LOG takes precedence when set; otherwise the `log_level` field
+    // from the config file determines the ceiling.
+    use tracing_subscriber::EnvFilter;
+    let filter = match EnvFilter::try_from_default_env() {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "WARNING: RUST_LOG env var is set but could not be parsed: {e}. \
+                 Falling back to config log_level='{}'",
+                early_cfg.log_level
+            );
+            EnvFilter::new(&early_cfg.log_level)
+        }
+    };
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+
+    tracing::info!(
+        log_level = %early_cfg.log_level,
+        "log level initialised (override with RUST_LOG env var)"
+    );
 
     // rustls 0.23 with the `ring` backend requires a process-wide default
     // CryptoProvider. Install it before any TLS code paths run.
     let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let cli = Cli::parse();
 
     // Handle subcommands.
     match &cli.command {
@@ -239,10 +267,7 @@ async fn main() -> Result<()> {
         }
         Some(CliCommand::Redirector { action }) => {
             // CLI redirector commands need a server config for the API URL.
-            let mut cfg = match cli.config.as_deref() {
-                Some(p) => ServerConfig::load(p)?,
-                None => ServerConfig::default(),
-            };
+            let mut cfg = early_cfg.clone();
             if let Some(t) = &cli.admin_token {
                 cfg.admin_token = t.clone();
             }
@@ -349,10 +374,7 @@ async fn main() -> Result<()> {
         None => {}
     }
 
-    let mut cfg = match cli.config.as_deref() {
-        Some(p) => ServerConfig::load(p)?,
-        None => ServerConfig::default(),
-    };
+    let mut cfg = early_cfg;
     if let Some(t) = cli.admin_token {
         cfg.admin_token = t;
     }

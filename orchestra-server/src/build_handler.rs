@@ -548,10 +548,24 @@ pub async fn handle_build(
         ));
     }
 
-    // Initialize lazily if not done
+    // If the build queue is not initialized, return SERVICE_UNAVAILABLE
+    // instead of silently falling back to 1 worker. The main() body must
+    // call init_build_queue() before the server starts accepting requests.
     if JOB_SENDER.get().is_none() {
-        // As a fallback to avoid crash if not properly initialized in main
-        init_build_queue(1, PathBuf::from("/var/lib/orchestra/builds"), 7);
+        tracing::error!(
+            "build queue not initialized — call init_build_queue() before accepting requests"
+        );
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(BuildResponse {
+                job_id: None,
+                log: None,
+                status: None,
+                error: Some(
+                    "Build queue not initialized — server may still be starting up".to_string(),
+                ),
+            }),
+        ));
     }
 
     let job_id = Uuid::new_v4().to_string();
@@ -683,6 +697,7 @@ pub async fn handle_build_status(
     Err((StatusCode::NOT_FOUND, "Job not found".to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_build_safely(
     job_id: String,
     req: BuildRequest,
@@ -1279,7 +1294,7 @@ fn validate_build_options(req: &BuildRequest) -> anyhow::Result<()> {
 
 fn validate_embedded_driver_options(req: &BuildRequest) -> anyhow::Result<()> {
     if req.features.embedded_driver {
-        if req.os.to_ascii_lowercase() != "windows" {
+        if !req.os.eq_ignore_ascii_case("windows") {
             anyhow::bail!("embedded_driver is only supported for Windows builds");
         }
         if req

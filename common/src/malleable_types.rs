@@ -971,7 +971,7 @@ pub(crate) fn netbios_encode(input: &[u8], uppercase: bool) -> Vec<u8> {
 
 /// NetBIOS decode: two ASCII characters per byte.
 pub(crate) fn netbios_decode(input: &[u8], uppercase: bool) -> Result<Vec<u8>> {
-    if input.len() % 2 != 0 {
+    if !input.len().is_multiple_of(2) {
         return Err(anyhow!(
             "netbios input length must be even, got {}",
             input.len()

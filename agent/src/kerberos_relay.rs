@@ -895,7 +895,7 @@ pub fn execute_kerberos_relay(
     let result = match ticket_result {
         Ok(ticket) => {
             let relay_result = RelayResult {
-                ticket: Some(ticket),
+                ticket: Some(ticket.clone()),
                 status: format!(
                     "Successfully captured Kerberos ticket via COM activation. \
                      Activation thread status: {}",
@@ -907,17 +907,20 @@ pub fn execute_kerberos_relay(
                 ),
                 method: format!("COM/{clsid_name}"),
             };
+            // ticket is guaranteed present — we just constructed it as Some(ticket) above.
+            // Bind fields directly to avoid redundant .as_ref().unwrap() calls.
+            let t = &ticket;
             serde_json::to_string_pretty(&serde_json::json!({
                 "success": true,
                 "status": relay_result.status,
                 "method": relay_result.method,
                 "ticket": {
-                    "spn": relay_result.ticket.as_ref().unwrap().spn,
-                    "ap_req_size": relay_result.ticket.as_ref().unwrap().ap_req_raw.len(),
-                    "ticket_blob_size": relay_result.ticket.as_ref().unwrap().ticket_blob.len(),
-                    "authenticator_size": relay_result.ticket.as_ref().unwrap().authenticator_blob.len(),
-                    "ap_req_hex": hex::encode(&relay_result.ticket.as_ref().unwrap().ap_req_raw),
-                    "ticket_blob_hex": hex::encode(&relay_result.ticket.as_ref().unwrap().ticket_blob),
+                    "spn": t.spn,
+                    "ap_req_size": t.ap_req_raw.len(),
+                    "ticket_blob_size": t.ticket_blob.len(),
+                    "authenticator_size": t.authenticator_blob.len(),
+                    "ap_req_hex": hex::encode(&t.ap_req_raw),
+                    "ticket_blob_hex": hex::encode(&t.ticket_blob),
                 },
             }))?
         }

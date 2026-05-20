@@ -109,12 +109,17 @@ russh = { version = "0.60.2", optional = true, default-features = false, feature
 quinn = { version = "0.11", optional = true }
 notify = { version = "6.1", optional = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(all(target_os = "linux", not(target_os = "android")))'.dependencies]
 enigo = { version = "0.2", optional = true, default-features = false, features = ["x11rb"] }
 image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 x11rb = { version = "0.13", optional = true, features = ["image"] }
 zbus = { version = "4", optional = true, default-features = false, features = ["tokio"] }
 futures-util = { version = "0.3", optional = true, default-features = false }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "0.21", features = ["invocation"], optional = true }
+android_logger = { version = "0.14", optional = true }
+log = { version = "0.4", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 enigo = { version = "0.2", optional = true }
@@ -652,6 +657,13 @@ entra-app-abuse = ["entra-ptc"]
 # joined Windows environment.  Windows-only via `#[cfg(windows)]` in the
 # module.  No new crate dependencies beyond what is already in the tree.
 adcs-attacks = ["dep:ring"]
+
+# Mobile post-exploitation: Android and iOS persistence and post-exploitation
+# modules.  When enabled, the full implementation modules in android/ and ios/
+# are compiled.  When disabled (default), stub functions return clear error
+# messages indicating that `mobile-postexp` must be enabled.  Cross-platform
+# (Android aarch64/x86_64, iOS aarch64).  No additional crate dependencies.
+mobile-postexp = []
 
 # macOS post-exploitation: TCC bypass (database manipulation, synthetic click,
 # vulnerable process delegation), SIP status assessment and capability

@@ -27,6 +27,36 @@ pub const NONCE_LEN: usize = 12;
 /// `salt(32) || nonce(12) || ciphertext_with_tag`.
 pub const PROTOCOL_VERSION: u32 = 2;
 
+/// Minimum wire-protocol version the server will accept from an agent.
+///
+/// Agents advertising a version lower than this are rejected during the
+/// `VersionHandshake`.  Bump this when dropping support for legacy agents.
+pub const MIN_PROTOCOL_VERSION: u32 = 2;
+
+/// Maximum wire-protocol version the server supports.
+///
+/// When an agent advertises a version higher than this, the server responds
+/// with this value, signalling the highest version it can support.  The agent
+/// MUST downgrade or disconnect if it cannot operate at this version.
+pub const MAX_PROTOCOL_VERSION: u32 = 2;
+
+/// Determine the negotiated protocol version given the peer's offered version.
+///
+/// Returns `Some(version)` if a compatible version exists in the
+/// `[MIN_PROTOCOL_VERSION, MAX_PROTOCOL_VERSION]` range, or `None` if the
+/// peer's version is too old to be supported.
+///
+/// # Negotiation rule
+/// - If `offered < MIN` → incompatible (`None`).
+/// - If `offered` is within `[MIN, MAX]` → use `offered`.
+/// - If `offered > MAX` → use `MAX` (server's highest supported).
+pub fn negotiate_protocol_version(offered: u32) -> Option<u32> {
+    if offered < MIN_PROTOCOL_VERSION {
+        return None;
+    }
+    Some(offered.min(MAX_PROTOCOL_VERSION))
+}
+
 /// Audit event logging for operator actions and agent state changes.
 pub mod audit;
 /// Agent and server configuration structures (TOML deserialization).
@@ -1719,19 +1749,15 @@ pub enum Command {
 ///   COM activation infrastructure.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum KerberosRelayMethod {
     /// COM cross-session activation (CoCreateInstanceEx).
+    #[default]
     ComActivation,
     /// Relay captured ticket to LDAP for AD operations.
     LdapRelay,
     /// Raw RPC bind ticket capture.
     RpcBind,
-}
-
-impl Default for KerberosRelayMethod {
-    fn default() -> Self {
-        Self::ComActivation
-    }
 }
 
 fn default_kerberos_clsid() -> String {
@@ -1920,6 +1946,7 @@ pub enum CryptoError {
 ///      warning and require a specific `--allow-legacy-crypto` flag.
 ///    - **Phase 3 (Removal):** Static PSK code paths are entirely dropped, and the PSK
 ///      is used exclusively for authenticating the ephemeral DH exchange.
+///
 /// Number of encrypt/decrypt operations after which the session key is
 /// automatically re-derived from the PSK to limit the amount of ciphertext
 /// an attacker can collect under a single key.
@@ -1991,7 +2018,7 @@ impl LockedSecret {
 
     /// Lock the backing memory so the OS will not page it to swap.
     fn lock_memory(&self) {
-        let ptr = self.data.as_ptr() as *const u8;
+        let ptr = self.data.as_ptr();
         let len = self.data.len();
         // Best-effort — failure to lock is logged but not fatal.
         #[cfg(unix)]
@@ -2010,7 +2037,7 @@ impl LockedSecret {
 
     /// Unlock the backing memory (called from Drop).
     fn unlock_memory(&self) {
-        let ptr = self.data.as_ptr() as *const u8;
+        let ptr = self.data.as_ptr();
         let len = self.data.len();
         #[cfg(unix)]
         unsafe {
@@ -2174,7 +2201,14 @@ pub struct CryptoSession {
     salt: std::sync::RwLock<[u8; SALT_LEN]>,
     /// Optional pre-shared secret used to derive per-message keys from wire salts.
     /// Wrapped in `LockedSecret` for mlock + zeroize-on-drop protection.
+    ///
+    /// For `from_shared_secret` sessions this holds the original PSK.
+    /// For `from_key` sessions this holds the original raw key so that
+    /// periodic rekeying can derive fresh keys via HKDF.
     pre_shared_secret: Option<LockedSecret>,
+    /// `true` when the session was created via `from_key()`.  Determines
+    /// which HKDF info constant is used during rekeying.
+    from_key_mode: bool,
     /// Monotonic counter of encrypt + decrypt operations; triggers re-keying
     /// every [`REKEY_INTERVAL`] operations.
     op_counter: std::sync::atomic::AtomicU64,
@@ -2196,7 +2230,7 @@ struct CryptoInner {
 impl CryptoInner {
     /// Lock the key bytes in physical RAM (best-effort, non-fatal on failure).
     fn lock_key_memory(&mut self) {
-        let ptr = self.key.as_ptr() as *const u8;
+        let ptr = self.key.as_ptr();
         let len = self.key.len();
         #[cfg(unix)]
         unsafe {
@@ -2225,7 +2259,7 @@ impl CryptoInner {
         if !self.key_locked {
             return;
         }
-        let ptr = self.key.as_ptr() as *const u8;
+        let ptr = self.key.as_ptr();
         let len = self.key.len();
         #[cfg(unix)]
         unsafe {
@@ -2317,18 +2351,27 @@ impl CryptoSession {
             inner: std::sync::RwLock::new(inner),
             salt: std::sync::RwLock::new(salt_bytes),
             pre_shared_secret: Some(LockedSecret::new(pre_shared_secret)),
+            from_key_mode: false,
             op_counter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// Build a session directly from a 32-byte key.
-    pub fn from_key(key_bytes: [u8; KEY_LEN]) -> Self {
+    ///
+    /// The key is stored in a `LockedSecret` so that periodic rekeying can
+    /// derive fresh keys via HKDF using the [`hkdf_info::FROM_KEY_REKEY`]
+    /// domain-separation constant.
+    pub fn from_key(mut key_bytes: [u8; KEY_LEN]) -> Self {
         let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
         let mut salt = [0u8; SALT_LEN];
         rand::thread_rng().fill_bytes(&mut salt);
         // P2-12: Generate a random 4-byte nonce prefix.
         let mut nonce_prefix = [0u8; 4];
         rand::thread_rng().fill_bytes(&mut nonce_prefix);
+
+        // Store a copy in LockedSecret so periodic rekeying can derive fresh
+        // keys via HKDF.
+        let stored_key = LockedSecret::new(&key_bytes);
 
         let mut inner = CryptoInner {
             cipher: Aes256Gcm::new(key),
@@ -2340,10 +2383,16 @@ impl CryptoSession {
         // P2-09: Lock the key memory.
         inner.lock_key_memory();
 
+        // MED-016: Zeroize the caller's copy of the key now that we have
+        // absorbed it into LockedSecret + CryptoInner.  Defense in depth —
+        // the stack copy would otherwise linger until the frame is reused.
+        key_bytes.zeroize();
+
         Self {
             inner: std::sync::RwLock::new(inner),
             salt: std::sync::RwLock::new(salt),
-            pre_shared_secret: None,
+            pre_shared_secret: Some(stored_key),
+            from_key_mode: true,
             op_counter: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -2358,12 +2407,23 @@ impl CryptoSession {
     fn rekey_locked(&self, inner: &mut CryptoInner) {
         let psk = match self.pre_shared_secret.as_ref() {
             Some(p) => p,
-            None => return, // from_key sessions have no PSK to re-derive from
+            None => return, // should not happen — both paths now store a PSK
         };
 
         let mut new_salt = [0u8; SALT_LEN];
         rand::thread_rng().fill_bytes(&mut new_salt);
-        let new_key_bytes = Self::derive_key_bytes(psk.as_bytes(), &new_salt);
+
+        let new_key_bytes = if self.from_key_mode {
+            // from_key() sessions rekey via HKDF with a dedicated info
+            // constant for domain separation from the PSK path.
+            let hk = hkdf::Hkdf::<Sha256>::new(Some(&new_salt), psk.as_bytes());
+            let mut out = [0u8; KEY_LEN];
+            hk.expand(hkdf_info::FROM_KEY_REKEY, &mut out)
+                .expect("HKDF-SHA256 expand must succeed");
+            out
+        } else {
+            Self::derive_key_bytes(psk.as_bytes(), &new_salt)
+        };
         let new_key = Key::<Aes256Gcm>::from_slice(&new_key_bytes);
 
         inner.unlock_key_memory();
@@ -2412,7 +2472,7 @@ impl CryptoSession {
         // Bump the counter first (outside the lock) to decide whether rekey
         // is needed.  AcqRel ensures visibility across threads.
         let prev = self.op_counter.fetch_add(1, Ordering::AcqRel);
-        let should_rekey = prev > 0 && prev % REKEY_INTERVAL == 0;
+        let should_rekey = prev > 0 && prev.is_multiple_of(REKEY_INTERVAL);
 
         // Hold the write lock for the entire rekey + encrypt sequence.
         let mut inner = self.inner.write().unwrap();
@@ -2449,7 +2509,7 @@ impl CryptoSession {
         // Bump the counter first (outside the lock) to decide whether rekey
         // is needed.  AcqRel ensures visibility across threads.
         let prev = self.op_counter.fetch_add(1, Ordering::AcqRel);
-        let should_rekey = prev > 0 && prev % REKEY_INTERVAL == 0;
+        let should_rekey = prev > 0 && prev.is_multiple_of(REKEY_INTERVAL);
 
         // Hold the write lock for the entire rekey + decrypt sequence.
         // Even though decrypt only needs read access to the cipher in the
@@ -2465,20 +2525,25 @@ impl CryptoSession {
         if ciphertext.len() >= SALT_LEN + NONCE_LEN {
             let (salt, rest) = ciphertext.split_at(SALT_LEN);
 
-            // If this session was created from a PSK, derive the per-message
-            // key from the embedded salt so independently-created sessions
-            // sharing the same PSK can still interoperate.
-            if let Some(psk) = self.pre_shared_secret.as_ref() {
+            // CRIT-001 fix: from_key() sessions store the raw key directly
+            // and encrypt with it — they do NOT use HKDF(salt, key) during
+            // encryption.  For these sessions, skip the salt-based HKDF
+            // re-derivation and decrypt directly with inner.cipher.
+            // For from_shared_secret() sessions, re-derive the key from
+            // PSK + embedded salt so independently-created sessions sharing
+            // the same PSK can still interoperate.
+            if self.from_key_mode {
+                // from_key sessions: salt is purely cosmetic in the wire
+                // format.  Decrypt directly with the session's stored cipher.
+                if let Ok(plain) = Self::decrypt_nonce_prefixed(&inner.cipher, rest) {
+                    return Ok(plain);
+                }
+            } else if let Some(psk) = self.pre_shared_secret.as_ref() {
+                // from_shared_secret sessions: re-derive key from PSK + salt.
                 let key_bytes = Self::derive_key_bytes(psk.as_bytes(), salt);
                 let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
                 let cipher = Aes256Gcm::new(key);
                 if let Ok(plain) = Self::decrypt_nonce_prefixed(&cipher, rest) {
-                    return Ok(plain);
-                }
-            } else {
-                if let Ok(plain) = Self::decrypt_nonce_prefixed(&inner.cipher, rest) {
-                    // from_key sessions don't have a PSK; fall back to decrypting
-                    // the salt-stripped payload with the session key.
                     return Ok(plain);
                 }
             }

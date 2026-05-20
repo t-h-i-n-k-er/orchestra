@@ -8,7 +8,57 @@ use tracing::{info, warn};
 use crate::config::{
     partition_features, read_agent_features, PayloadConfig, PayloadFormat, PayloadTransport,
 };
+use crate::mobile::{MobileConfig, MobilePlatform};
 use crate::pe_artifact_kit;
+
+/// Build the agent for a mobile platform (Android/iOS) and return the
+/// resulting artifact bytes along with build metadata.
+#[allow(dead_code)]
+pub fn build_mobile_agent(mobile_cfg: &MobileConfig) -> Result<Vec<u8>> {
+    mobile_cfg
+        .validate()
+        .map_err(|e| anyhow!("Mobile config validation failed: {e}"))?;
+
+    let triples = mobile_cfg.target_triples();
+    if triples.is_empty() {
+        anyhow::bail!("No valid target triples for mobile build");
+    }
+
+    // For now, build for the first target triple.  Multi-arch builds
+    // (e.g., Android arm64 + x86_64) require lipo / multi-APK support
+    // that will be added when the full NDK/Xcode pipeline is in place.
+    let triple = triples[0];
+    let output_name = mobile_cfg.output_filename();
+
+    info!(
+        platform = ?mobile_cfg.platform,
+        triple,
+        package_type = ?mobile_cfg.package_type,
+        output = output_name,
+        "Building mobile agent payload"
+    );
+
+    // Build the agent with mobile-postexp + appropriate target features.
+    let features = vec!["mobile-postexp".to_string()];
+    if mobile_cfg.platform == MobilePlatform::Android {
+        // Android needs jni + android_logger support
+        // TODO: Add android-specific features when target_os = "android"
+    }
+
+    let extra_env: Vec<(String, String)> = Vec::new();
+    let bin_path = cargo_build("agent", "agent-standalone", triple, &features, &extra_env)?;
+
+    if let Err(e) = strip_if_available(&bin_path, triple) {
+        warn!("strip step skipped for mobile build: {e:#}");
+    }
+
+    // Post-processing: for .so outputs, copy directly. For APK/IPA,
+    // the packaging step happens in the Java/Swift build systems.
+    let binary = std::fs::read(&bin_path)
+        .with_context(|| format!("Failed to read mobile binary {}", bin_path.display()))?;
+
+    Ok(binary)
+}
 
 /// Build the agent for the given profile and return the raw binary bytes.
 ///
@@ -260,7 +310,7 @@ fn validate_embedded_driver_config(
         return Ok(());
     }
 
-    if cfg.target_os.to_ascii_lowercase() != "windows" {
+    if !cfg.target_os.eq_ignore_ascii_case("windows") {
         anyhow::bail!("embedded_driver is only supported for Windows builds");
     }
 

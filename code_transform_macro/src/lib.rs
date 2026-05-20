@@ -413,7 +413,7 @@ fn extract_and_transform(func: &ItemFn, seed: u64) -> Result<Vec<u8>, String> {
     if transformed.is_empty() {
         return Err("code_transform::transform returned empty output".to_string());
     }
-    if !transformed.iter().any(|&b| b == 0xC3) {
+    if !transformed.contains(&0xC3) {
         return Err(
             "transformed function bytes do not contain a RET (0xC3); refusing to emit".to_string(),
         );

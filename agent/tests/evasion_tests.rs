@@ -139,7 +139,7 @@ fn scrubbed_debug_regs_propagates_panic() {
 /// `with_scrubbed_debug_regs` must work with mutable borrows and side-effects.
 #[test]
 fn scrubbed_debug_regs_allows_mutation() {
-    let mut buf = vec![0u8; 16];
+    let mut buf = [0u8; 16];
     agent::evasion::with_scrubbed_debug_regs(|| {
         for (i, b) in buf.iter_mut().enumerate() {
             *b = i as u8;

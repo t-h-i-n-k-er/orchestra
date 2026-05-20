@@ -24,6 +24,7 @@ rustls-pemfile = "2.2.0"
 hkdf = { version = "0.13" }
 hmac = { version = "0.13" }
 zeroize = "1"
+string_crypt = { path = "../string_crypt" }
 
 # Optional: Ed25519 signatures for module verification.
 # Enabled by the `module-signatures` feature.

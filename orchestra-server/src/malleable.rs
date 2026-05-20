@@ -85,7 +85,7 @@ fn netbios_encode(input: &[u8], uppercase: bool) -> Vec<u8> {
 }
 
 fn netbios_decode(input: &[u8], uppercase: bool) -> Result<Vec<u8>> {
-    if input.len() % 2 != 0 {
+    if !input.len().is_multiple_of(2) {
         anyhow::bail!("netbios input length must be even, got {}", input.len());
     }
     let base = if uppercase { b'A' } else { b'a' };
@@ -728,7 +728,15 @@ impl MultiProfileManager {
             file_timestamps: Arc::new(RwLock::new(HashMap::new())),
         }
     }
+}
 
+impl Default for MultiProfileManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MultiProfileManager {
     /// Load all `.toml` profiles from a directory.
     ///
     /// Each file must be a valid malleable profile TOML. Profiles are
@@ -777,7 +785,7 @@ impl MultiProfileManager {
 
     /// Load from a single profile file (backward compat with `--profile`).
     pub fn load_from_file(path: &Path) -> Result<Self> {
-        let profile = MalleableProfile::from_file(&path.to_path_buf())?;
+        let profile = MalleableProfile::from_file(path)?;
         let name = profile.profile.name.clone();
         let mut manager = Self::new();
 
@@ -1063,7 +1071,7 @@ pub fn validate_profile(path: &Path) -> ValidationReport {
     let path_str = path.to_string_lossy().to_string();
 
     // Step 1: Parse.
-    let profile = match MalleableProfile::from_file(&path.to_path_buf()) {
+    let profile = match MalleableProfile::from_file(path) {
         Ok(p) => p,
         Err(e) => {
             return ValidationReport {
@@ -1348,8 +1356,10 @@ enabled = false
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             // Create a profile with only http_get.
-            let mut profile = MalleableProfile::default();
-            profile.http_post = None;
+            let profile = MalleableProfile {
+                http_post: None,
+                ..Default::default()
+            };
             let mgr = ProfileManager::new(profile);
 
             let err = mgr.get_transformer("http_post").await;
@@ -1382,9 +1392,11 @@ enabled = false
 
     #[test]
     fn profile_validation_rejects_no_transactions() {
-        let mut profile = MalleableProfile::default();
-        profile.http_get = None;
-        profile.http_post = None;
+        let profile = MalleableProfile {
+            http_get: None,
+            http_post: None,
+            ..Default::default()
+        };
         assert!(profile.validate().is_err());
     }
 

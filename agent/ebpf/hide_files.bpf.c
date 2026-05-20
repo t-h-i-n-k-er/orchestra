@@ -89,7 +89,7 @@ int filter_files(struct sys_exit_getdents64_args *ctx)
     int bpos = 0;
     int total = (int)ctx->ret;
 
-    for (int i = 0; i < 256; i++) {
+    for (int i = 0; i < 512; i++) {
         if (bpos + (int)sizeof(struct linux_dirent64) > total)
             break;
 

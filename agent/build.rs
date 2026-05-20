@@ -348,13 +348,13 @@ fn forward_validated_kill_date(source: &str, target: &str) {
                 )
             });
             assert!(
-                m >= 1 && m <= 12,
+                (1..=12).contains(&m),
                 "build: {} month must be 1–12, got {}",
                 source,
                 m
             );
             assert!(
-                d >= 1 && d <= 31,
+                (1..=31).contains(&d),
                 "build: {} day must be 1–31, got {}",
                 source,
                 d

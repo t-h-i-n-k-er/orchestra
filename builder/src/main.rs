@@ -3,6 +3,7 @@
 mod build;
 mod config;
 mod deps;
+mod mobile;
 mod pe_artifact_kit;
 
 use anyhow::{Context, Result};

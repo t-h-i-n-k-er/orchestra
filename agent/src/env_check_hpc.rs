@@ -154,18 +154,16 @@ enum CpuVendor {
 }
 
 fn detect_cpu_vendor() -> CpuVendor {
-    unsafe {
-        let leaf0 = __cpuid(0);
-        let mut vendor: [u8; 12] = [0; 12];
-        vendor[0..4].copy_from_slice(&leaf0.ebx.to_le_bytes());
-        vendor[4..8].copy_from_slice(&leaf0.edx.to_le_bytes());
-        vendor[8..12].copy_from_slice(&leaf0.ecx.to_le_bytes());
-        let vendor_str = std::str::from_utf8(&vendor).unwrap_or("");
-        match vendor_str {
-            "GenuineIntel" => CpuVendor::Intel,
-            "AuthenticAMD" | "HygonGenuine" => CpuVendor::Amd,
-            _ => CpuVendor::Unknown,
-        }
+    let leaf0 = __cpuid(0);
+    let mut vendor: [u8; 12] = [0; 12];
+    vendor[0..4].copy_from_slice(&leaf0.ebx.to_le_bytes());
+    vendor[4..8].copy_from_slice(&leaf0.edx.to_le_bytes());
+    vendor[8..12].copy_from_slice(&leaf0.ecx.to_le_bytes());
+    let vendor_str = std::str::from_utf8(&vendor).unwrap_or("");
+    match vendor_str {
+        "GenuineIntel" => CpuVendor::Intel,
+        "AuthenticAMD" | "HygonGenuine" => CpuVendor::Amd,
+        _ => CpuVendor::Unknown,
     }
 }
 
@@ -271,7 +269,7 @@ mod linux_perf {
 #[cfg(target_os = "linux")]
 thread_local! {
     static ACTIVE_PERF_FDS: std::cell::Cell<Option<[i32; 4]>> =
-        std::cell::Cell::new(None);
+        const { std::cell::Cell::new(None) };
 }
 
 /// Open a single raw hardware performance-counter fd via `perf_event_open`.
@@ -477,7 +475,7 @@ fn probe_rdpmc() -> bool {
 
         let mut new_sa: libc::sigaction = unsafe { std::mem::zeroed() };
         new_sa.sa_sigaction = rdpmc_fault_handler as *const () as usize;
-        new_sa.sa_flags = (libc::SA_SIGINFO | libc::SA_RESETHAND) as i32;
+        new_sa.sa_flags = (libc::SA_SIGINFO | libc::SA_RESETHAND);
         unsafe {
             libc::sigemptyset(&mut new_sa.sa_mask);
         }
@@ -666,7 +664,7 @@ fn probe_rdpmc() -> bool {
 /// The result is cached after the first probe so subsequent calls are
 /// essentially free and, crucially, never trigger a second fault.
 fn rdpmc_available() -> bool {
-    *RDPMC_AVAILABLE.get_or_init(|| probe_rdpmc())
+    *RDPMC_AVAILABLE.get_or_init(probe_rdpmc)
 }
 
 // ─── Measurement: Cache Miss Ratio ────────────────────────────────────────
@@ -683,8 +681,8 @@ fn measure_cache_miss_ratio_once() -> Option<f64> {
     let mut buffer = vec![0u64; ARRAY_SIZE];
 
     // Warm up — ensure the buffer is allocated.
-    for i in 0..ARRAY_SIZE {
-        buffer[i] = i as u64;
+    for (i, slot) in buffer.iter_mut().enumerate() {
+        *slot = i as u64;
     }
 
     #[target_feature(enable = "sse2")]
@@ -693,8 +691,8 @@ fn measure_cache_miss_ratio_once() -> Option<f64> {
 
     // Sequential access pattern — highly predictable, well-prefetched.
     let mut acc: u64 = 0;
-    for i in 0..ARRAY_SIZE {
-        acc = acc.wrapping_add(buffer[i]);
+    for value in &buffer {
+        acc = acc.wrapping_add(*value);
     }
 
     let end_l3 = unsafe { read_l3() };

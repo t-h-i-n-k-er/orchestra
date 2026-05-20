@@ -1,19 +1,12 @@
 use crate::injection::Injector;
 use anyhow::{anyhow, Result};
 
+#[derive(Default)]
 pub struct LinuxPtraceInjector {
     /// When false (default), keep the original fire-and-forget behaviour.
     /// When true, execute payload via a trampoline and restore original
     /// registers after payload return + INT3 breakpoint.
     pub restore_after: bool,
-}
-
-impl Default for LinuxPtraceInjector {
-    fn default() -> Self {
-        Self {
-            restore_after: false,
-        }
-    }
 }
 
 impl LinuxPtraceInjector {
@@ -296,14 +289,12 @@ impl AttachGuard {
             }
             // scope=2: only processes with CAP_SYS_PTRACE may attach.
             // Fail early if the effective capability set does not include it.
-            Some(2) => {
-                if !has_cap_sys_ptrace() {
-                    return Err(anyhow!(
-                        "LinuxPtraceInjector: PTRACE_ATTACH({pid}) requires CAP_SYS_PTRACE \
+            Some(2) if !has_cap_sys_ptrace() => {
+                return Err(anyhow!(
+                    "LinuxPtraceInjector: PTRACE_ATTACH({pid}) requires CAP_SYS_PTRACE \
                          (kernel.yama.ptrace_scope=2). Run as root or grant the capability \
                          with: setcap cap_sys_ptrace+ep <binary>"
-                    ));
-                }
+                ));
             }
             // scope=1: attachment is restricted to parent/child relationships
             // or processes that called prctl(PR_SET_PTRACER).  Check whether
@@ -821,7 +812,7 @@ fn remote_mmap_rw(
         }
     };
     let min_len = requested_len.max(1);
-    let alloc_len = ((min_len + page_size - 1) / page_size) * page_size;
+    let alloc_len = min_len.div_ceil(page_size) * page_size;
 
     let rip = original_regs.rip as usize;
     let _patch = RipPatchGuard::install(pid, rip)?;
@@ -873,7 +864,7 @@ fn remote_mprotect_rx(
     let end_addr = remote_addr
         .checked_add(min_len)
         .ok_or_else(|| anyhow!("LinuxPtraceInjector: mprotect range overflow"))?;
-    let aligned_end = ((end_addr + page_size - 1) / page_size) * page_size;
+    let aligned_end = end_addr.div_ceil(page_size) * page_size;
     let prot_len = aligned_end
         .checked_sub(aligned_start)
         .ok_or_else(|| anyhow!("LinuxPtraceInjector: invalid mprotect range"))?;

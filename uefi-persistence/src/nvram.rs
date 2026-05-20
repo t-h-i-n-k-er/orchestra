@@ -25,7 +25,7 @@ const LOAD_OPTION_HIDDEN: u16 = 0x0008;
 const _LOAD_OPTION_CATEGORY: u16 = 0x01F0;
 
 // ─── EFI Device Path types ──────────────────────────────────────────────
-const _END_DEVICE_PATH_TYPE: u8 = 0x7F;
+const END_DEVICE_PATH_TYPE: u8 = 0x7F;
 const END_ENTIRE_DEVICE_PATH_SUBTYPE: u8 = 0xFF;
 const HARDWARE_DEVICE_PATH: u8 = 0x01;
 const ACPI_DEVICE_PATH: u8 = 0x02;
@@ -125,7 +125,7 @@ pub fn write_efi_variable(
 pub fn delete_efi_variable(name: &str, guid: &EfiGuid) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        let path = format!("/sys/firmware/efi/efivars/{}-{}", name, guid.to_string());
+        let path = format!("/sys/firmware/efi/efivars/{}-{}", name, guid);
         let p = std::path::Path::new(&path);
         if !p.exists() {
             bail!("EFI variable {} does not exist", name);
@@ -142,6 +142,10 @@ pub fn delete_efi_variable(name: &str, guid: &EfiGuid) -> Result<()> {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
+        // SAFETY: wide_name and wide_guid are null-terminated UTF-16
+        // strings with lifetimes exceeding the FFI call. The null data
+        // pointer + zero length signals a delete operation (documented
+        // MSDN behavior). No dangling pointers or shared mutable state.
         unsafe {
             let result =
                 windows_sys::Win32::System::WindowsProgramming::SetFirmwareEnvironmentVariableW(
@@ -192,7 +196,7 @@ pub fn delete_efi_variable(name: &str, guid: &EfiGuid) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn read_efi_variable_linux(name: &str, guid: &EfiGuid) -> Result<Vec<u8>> {
-    let path = format!("/sys/firmware/efi/efivars/{}-{}", name, guid.to_string());
+    let path = format!("/sys/firmware/efi/efivars/{}-{}", name, guid);
     let data = std::fs::read(&path)
         .with_context(|| format!("Failed to read EFI variable {} from {}", name, path))?;
     // Linux efivars format: first 4 bytes are attributes, rest is data.
@@ -214,7 +218,7 @@ fn write_efi_variable_linux(
     data: &[u8],
     attrs: EfiVarAttributes,
 ) -> Result<()> {
-    let path = format!("/sys/firmware/efi/efivars/{}-{}", name, guid.to_string());
+    let path = format!("/sys/firmware/efi/efivars/{}-{}", name, guid);
     let p = std::path::Path::new(&path);
 
     // Linux efivars format: 4 bytes attributes + data.
@@ -275,6 +279,11 @@ fn read_efi_variable_windows(name: &str, guid: &EfiGuid) -> Result<Vec<u8>> {
         .chain(std::iter::once(0))
         .collect();
 
+    // SAFETY: wide_name and wide_guid are null-terminated UTF-16
+    // strings with lifetimes exceeding both FFI calls. The first call
+    // passes a null buffer to query the required size; the second call
+    // passes `buf` which is allocated to exactly `size` bytes as returned
+    // by the query. No aliasing or use-after-free is possible.
     unsafe {
         // First call to get the required buffer size.
         let size = windows_sys::Win32::System::WindowsProgramming::GetFirmwareEnvironmentVariableW(
@@ -506,7 +515,7 @@ fn strip_linux_attr_header(data: &[u8]) -> &[u8] {
 pub fn read_boot_order() -> Result<Vec<u16>> {
     let data = read_efi_variable("BootOrder", &EfiGuid::EFI_GLOBAL_VARIABLE)?;
     let payload = strip_linux_attr_header(&data);
-    if payload.len() % 2 != 0 {
+    if !payload.len().is_multiple_of(2) {
         bail!(
             "BootOrder variable has odd length ({} bytes)",
             payload.len()
@@ -667,7 +676,7 @@ fn parse_device_path_list(data: &[u8]) -> String {
         paths.push(desc);
 
         // Check for end-of-device-path.
-        if dp_type == (_END_DEVICE_PATH_TYPE & 0x7F) && subtype == END_ENTIRE_DEVICE_PATH_SUBTYPE {
+        if dp_type == (END_DEVICE_PATH_TYPE & 0x7F) && subtype == END_ENTIRE_DEVICE_PATH_SUBTYPE {
             break;
         }
 
@@ -889,22 +898,12 @@ fn chrono_now_iso() -> String {
     format!("unix:{}", duration.as_secs())
 }
 
-/// Rebuild data with the Linux 4-byte attribute header if the original had it.
-fn rebuild_with_attr_header(original: &[u8], new_payload: &[u8]) -> Vec<u8> {
-    // Check if the original started with a Linux efivars attribute header.
-    // Heuristic: if original has 4 extra bytes at the start that look like
-    // a valid attribute mask, prepend the same attributes.
-    let original_payload = strip_linux_attr_header(original);
-    if original.len() > original_payload.len() {
-        // Linux format: prepend 4-byte attributes from original.
-        let mut out = Vec::with_capacity(4 + new_payload.len());
-        out.extend_from_slice(&original[..4]); // preserve attributes
-        out.extend_from_slice(new_payload);
-        out
-    } else {
-        new_payload.to_vec()
-    }
-}
+// `rebuild_with_attr_header()` REMOVED — it was dead code that contradicted
+// surrounding safety comments. The functions at lines 760-763 and 838-841
+// explicitly state "we must NOT call rebuild_with_attr_header here — that
+// would cause a double-prepend" of the Linux efivars 4-byte attribute header.
+// Since the function was never called, it's been removed to prevent accidental
+// misuse. If needed again, re-implement with clearer calling contract.
 
 /// Find the next available boot entry number.
 pub fn find_free_boot_entry() -> Result<u16> {

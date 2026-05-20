@@ -98,6 +98,26 @@ pub const ENTRA_APP_SECRET: &[u8] =
 pub const FS_HTTP_SESSION: &[u8] =
     b"\x12\xc9\xe0\x58\x3b\xa7\x6d\xf1\x44\x82\x95\xbe\x0c\x63\xd8\xaf";
 
+/// Evanesco page-tracker per-region XChaCha20-Poly1305 key derivation.
+/// Domain-separated from all other key derivations so that a compromised
+/// per-region key cannot be used to recover the master key or any other
+/// region's key.
+pub const EVANESCO_REGION_KEY: &[u8] =
+    b"\x13\xd4\xa1\x7c\x5e\x29\xb3\xf0\x8d\x46\xe2\x97\x3a\xcb\x81\x4e";
+
+/// `CryptoSession::from_key` rekey — domain separation for HKDF-based
+/// key rotation in sessions created from a raw 32-byte key (no PSK).
+/// Ensures the rekey derivation is distinct from PSK-based rekey and
+/// from all other HKDF contexts.
+pub const FROM_KEY_REKEY: &[u8] =
+    b"\x14\x6b\xf2\x93\xd0\x18\xc7\xe5\x4a\x5d\xb1\x3e\x8f\x72\x04\xad";
+
+/// Poly-blob HMAC-SHA256 key derivation — domain separation for deriving
+/// the authentication sub-key from the poly blob's dedicated MAC key.
+/// The MAC key is independent of the encryption key so that compromise of
+/// one does not break integrity of the other (MED-018).
+pub const POLY_MAC: &[u8] = b"\x15\xa8\xe1\x3c\xd7\x42\x9f\xb6\x50\x83\x2a\x6e\xc1\x0d\xf5\x84";
+
 /// Collect all info slices into a single array for uniqueness tests.
 #[cfg(test)]
 fn all_infos() -> Vec<&'static [u8]> {
@@ -120,6 +140,9 @@ fn all_infos() -> Vec<&'static [u8]> {
         REFLECTIVE_LOADER,
         ENTRA_APP_SECRET,
         FS_HTTP_SESSION,
+        EVANESCO_REGION_KEY,
+        FROM_KEY_REKEY,
+        POLY_MAC,
     ]
 }
 

@@ -40,11 +40,7 @@ fn rss_kib() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
-            return rest
-                .trim()
-                .split_whitespace()
-                .next()
-                .and_then(|n| n.parse().ok());
+            return rest.split_whitespace().next().and_then(|n| n.parse().ok());
         }
     }
     None
@@ -179,7 +175,7 @@ async fn soak_handler_dispatch() {
                 iterations += 1;
             }
 
-            if iterations % 5_000 == 0 {
+            if iterations.is_multiple_of(5_000) {
                 tokio::task::yield_now().await;
             }
         }

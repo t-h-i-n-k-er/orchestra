@@ -74,11 +74,12 @@
 //!
 //! # Feature gating
 //!
-//! Gated behind `#[cfg(all(windows, feature = "stack-spoof", target_arch = "x86_64"))]`,
-//! same as `stack_db`.  When the feature is off, `spoof_call` falls back to
-//! the single-gadget approach.
+//! Gated behind `#[cfg(all(windows, feature = "stack-spoof"))]`.
+//! Supported on both x86_64 and aarch64 targets.
+//! When the feature is off, `spoof_call` falls back to the single-gadget
+//! approach.
 
-#![cfg(all(windows, feature = "stack-spoof", target_arch = "x86_64"))]
+#![cfg(all(windows, feature = "stack-spoof"))]
 
 use common::lock::MutexExt;
 use std::sync::{Mutex, OnceLock};
@@ -110,9 +111,10 @@ pub enum GadgetKind {
     Jmp,
 }
 
-/// Byte patterns for x86-64 indirect branch gadgets we search for.
+/// Byte patterns for indirect branch gadgets we search for.
 ///
 /// Each entry is (byte_pattern, gadget_kind, register_description).
+#[cfg(target_arch = "x86_64")]
 const GADGET_PATTERNS: &[(&[u8], GadgetKind, &'static str)] = &[
     // `call rax` — most common indirect call target
     (&[0xFF, 0xD0], GadgetKind::Call, "call rax"),
@@ -139,6 +141,90 @@ const GADGET_PATTERNS: &[(&[u8], GadgetKind, &'static str)] = &[
     // `jmp r11` — common in ntdll syscall stubs
     (&[0x41, 0xFF, 0xE3], GadgetKind::Jmp, "jmp r11"),
 ];
+
+/// ARM64 gadget patterns — BLR Xn (indirect call) and BR Xn (indirect branch).
+///
+/// ARM64 instructions are 4 bytes, little-endian:
+///   BLR Xn = 0xD63F0000 | (Rn << 5)
+///   BR  Xn = 0xD61F0000 | (Rn << 5)
+///   RET    = 0xD65F03C0
+#[cfg(target_arch = "aarch64")]
+const GADGET_PATTERNS: &[(&[u8], GadgetKind, &'static str)] = &[
+    // `blr x0` — most common indirect call target
+    (&[0x00, 0x00, 0x3F, 0xD6], GadgetKind::Call, "blr x0"),
+    // `blr x1`
+    (&[0x20, 0x00, 0x3F, 0xD6], GadgetKind::Call, "blr x1"),
+    // `blr x2`
+    (&[0x40, 0x00, 0x3F, 0xD6], GadgetKind::Call, "blr x2"),
+    // `blr x3`
+    (&[0x60, 0x00, 0x3F, 0xD6], GadgetKind::Call, "blr x3"),
+    // `blr x8` — platform register / indirect result location
+    (&[0x00, 0x01, 0x3F, 0xD6], GadgetKind::Call, "blr x8"),
+    // `blr x9`
+    (&[0x20, 0x01, 0x3F, 0xD6], GadgetKind::Call, "blr x9"),
+    // `br x0`
+    (&[0x00, 0x00, 0x1F, 0xD6], GadgetKind::Jmp, "br x0"),
+    // `br x1`
+    (&[0x20, 0x00, 0x1F, 0xD6], GadgetKind::Jmp, "br x1"),
+    // `br x2`
+    (&[0x40, 0x00, 0x1F, 0xD6], GadgetKind::Jmp, "br x2"),
+    // `br x3`
+    (&[0x60, 0x00, 0x1F, 0xD6], GadgetKind::Jmp, "br x3"),
+    // `br x8`
+    (&[0x00, 0x01, 0x1F, 0xD6], GadgetKind::Jmp, "br x8"),
+    // `br x9`
+    (&[0x20, 0x01, 0x1F, 0xD6], GadgetKind::Jmp, "br x9"),
+];
+
+/// The byte value of the `RET` instruction to scan for in function bodies.
+#[cfg(target_arch = "x86_64")]
+const RET_BYTE: u8 = 0xC3;
+
+/// ARM64 `RET` instruction bytes (little-endian).
+#[cfg(target_arch = "aarch64")]
+const ARM64_RET: [u8; 4] = [0xC0, 0x03, 0x5F, 0xD6];
+
+/// Scan for a `RET` instruction in a function body.
+///
+/// On x86_64, looks for the single-byte `RET` (0xC3).
+/// On aarch64, looks for the 4-byte `RET` instruction (0xD65F03C0).
+///
+/// Returns the address of the `RET` instruction if found, or `None`.
+fn find_ret_in_function(func_addr: usize, size: usize, func_rva: usize) -> Option<usize> {
+    let probe_len = 64.min(size.saturating_sub(func_rva));
+    let probe = unsafe { std::slice::from_raw_parts(func_addr as *const u8, probe_len) };
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        for (i, &byte) in probe.iter().enumerate() {
+            if byte == RET_BYTE {
+                let ret_addr = func_addr + i;
+                if has_valid_unwind(ret_addr) {
+                    return Some(ret_addr);
+                }
+                break;
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // ARM64 instructions are always 4-byte aligned.  Scan in 4-byte steps.
+        let step = 4;
+        for i in (0..probe_len.saturating_sub(3)).step_by(step) {
+            if probe[i..i + 4] == ARM64_RET {
+                let ret_addr = func_addr + i;
+                if has_valid_unwind(ret_addr) {
+                    return Some(ret_addr);
+                }
+                break;
+            }
+        }
+    }
+
+    #[allow(unreachable_code)]
+    None
+}
 
 // ── Call frame ──────────────────────────────────────────────────────────────
 
@@ -443,19 +529,11 @@ fn scan_exports_for_return_addrs(dll_base: usize, dll_name: &str) -> Vec<usize> 
 
         let func_addr = dll_base + func_rva;
 
-        // Scan for a `ret` (0xC3) within the first 64 bytes of the function.
-        // The ret gadget becomes the return address — it's inside a real
-        // function body and has valid unwind metadata.
-        let probe =
-            unsafe { std::slice::from_raw_parts(func_addr as *const u8, 64.min(size - func_rva)) };
-        for (i, &byte) in probe.iter().enumerate() {
-            if byte == 0xC3 {
-                let ret_addr = func_addr + i;
-                if has_valid_unwind(ret_addr) {
-                    addrs.push(ret_addr);
-                }
-                break; // Only need one ret per function
-            }
+        // Scan for a `RET` instruction within the first 64 bytes of the
+        // function.  The ret gadget becomes the return address — it's inside
+        // a real function body and has valid unwind metadata.
+        if let Some(ret_addr) = find_ret_in_function(func_addr, size, func_rva) {
+            addrs.push(ret_addr);
         }
     }
 
@@ -632,22 +710,10 @@ pub fn build_spoofed_stack() -> Option<SyntheticCallChain> {
                     }
                 };
 
-            // Find a `ret` gadget within the function body for the return address
+            // Find a `RET` instruction within the function body for the return address
             let size = unsafe { pe_size_of_image(dll_base) };
             let func_rva = func_addr - dll_base;
-            let probe_len = 64.min(size.saturating_sub(func_rva));
-            let probe = unsafe { std::slice::from_raw_parts(func_addr as *const u8, probe_len) };
-
-            let mut found_ret = None;
-            for (i, &byte) in probe.iter().enumerate() {
-                if byte == 0xC3 {
-                    let ret_addr = func_addr + i;
-                    if has_valid_unwind(ret_addr) {
-                        found_ret = Some(ret_addr);
-                        break;
-                    }
-                }
-            }
+            let found_ret = find_ret_in_function(func_addr, size, func_rva);
 
             match found_ret {
                 Some(ret_addr) => {
@@ -802,14 +868,31 @@ pub fn revalidate() {
 
 /// Calculate the number of u64 slots needed for the synthetic stack buffer.
 ///
-/// Layout:
+/// Layout (x86_64):
 ///   [0 .. N-1]      = chain frame return addresses
 ///   [N]              = continuation address (filled by asm)
 ///   [N+1 .. N+3]    = shadow home space (3 slots for registers rdx, r8, r9)
 ///   [N+4 .. N+4+ns] = stack arguments
+///
+/// Layout (aarch64):
+///   [0 .. N-1]      = chain frame return addresses (8 bytes each)
+///   [N]              = continuation address (filled by asm)
+///   [N+1 .. N+4]    = argument spill area (x0-x3, 4 registers)
+///   [N+5 .. N+5+ns] = stack arguments (x5+)
 #[inline]
 pub fn frame_buffer_slots(n_frames: usize, n_stack_args: usize) -> usize {
-    n_frames + 1 + 3 + n_stack_args
+    #[cfg(target_arch = "x86_64")]
+    {
+        n_frames + 1 + 3 + n_stack_args
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        n_frames + 1 + 4 + n_stack_args
+    }
+    #[allow(unreachable_code)]
+    {
+        n_frames + 1 + 3 + n_stack_args
+    }
 }
 
 /// Populate a synthetic stack frame buffer.
@@ -817,8 +900,8 @@ pub fn frame_buffer_slots(n_frames: usize, n_stack_args: usize) -> usize {
 /// Fills `buf` with:
 ///   - Chain frame return addresses at positions [0..N]
 ///   - Zeroed placeholder for continuation at position [N]
-///   - Zeroed shadow space at positions [N+1..N+3]
-///   - Stack arguments at positions [N+4..N+4+ns]
+///   - Zeroed argument spill / shadow space
+///   - Stack arguments at the appropriate positions
 ///
 /// Returns the index of the continuation slot (which must be filled by the
 /// inline asm with the address of the real continuation label).
@@ -838,14 +921,28 @@ pub fn populate_frame_buffer(
     // Continuation slot (filled by asm)
     buf[cont_idx] = 0;
 
-    // Shadow space (zeroed)
-    for i in 0..3 {
-        buf[cont_idx + 1 + i] = 0;
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Shadow space (zeroed) — x86_64 Windows calling convention
+        for i in 0..3 {
+            buf[cont_idx + 1 + i] = 0;
+        }
+        // Stack arguments
+        for (i, &arg) in stack_args.iter().enumerate() {
+            buf[cont_idx + 4 + i] = arg;
+        }
     }
 
-    // Stack arguments
-    for (i, &arg) in stack_args.iter().enumerate() {
-        buf[cont_idx + 4 + i] = arg;
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Argument spill area (zeroed) — ARM64 can spill x0-x3 to the stack
+        for i in 0..4 {
+            buf[cont_idx + 1 + i] = 0;
+        }
+        // Stack arguments (x5+ passed on stack)
+        for (i, &arg) in stack_args.iter().enumerate() {
+            buf[cont_idx + 5 + i] = arg;
+        }
     }
 
     cont_idx

@@ -243,7 +243,7 @@ unsafe fn decrypt_elf_sections() {
         if offset != 0 {
             return None;
         }
-        let addr_range = parts.get(0)?;
+        let addr_range = parts.first()?;
         let start_str = addr_range.split('-').next()?;
         usize::from_str_radix(start_str, 16).ok()
     }) {
@@ -320,7 +320,7 @@ unsafe fn decrypt_elf64_sections(base: usize, key: &[u8; 32], nonce: &[u8; 12]) 
 
     // Walk section headers looking for .data
     for i in 0..e_shnum {
-        let sh_off = e_shoff + (i as usize) * e_shentsize;
+        let sh_off = e_shoff + i * e_shentsize;
         // Elf64_Shdr layout:
         //   sh_name:      +0x00 (4 bytes) — offset into shstrtab
         //   sh_type:      +0x04 (4 bytes)
@@ -475,7 +475,7 @@ unsafe fn decrypt_elf32_sections(base: usize, key: &[u8; 32], nonce: &[u8; 12]) 
     ) as usize;
 
     for i in 0..e_shnum {
-        let sh_off = e_shoff + (i as usize) * e_shentsize;
+        let sh_off = e_shoff + i * e_shentsize;
         // Elf32_Shdr layout:
         //   sh_name:   +0x00 (4 bytes)
         //   sh_addr:   +0x0C (4 bytes)

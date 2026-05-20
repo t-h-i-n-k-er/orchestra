@@ -8,21 +8,12 @@ use crate::pe::PeImage;
 use anyhow::Result;
 
 /// Configuration for the shellcode packager.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ShellcodeConfig {
     /// Seed for deterministic output (affects stub diversity).
     pub seed: u64,
     /// Whether to apply code_transform obfuscation to the loader stub.
     pub obfuscate: bool,
-}
-
-impl Default for ShellcodeConfig {
-    fn default() -> Self {
-        Self {
-            seed: 0,
-            obfuscate: false,
-        }
-    }
 }
 
 /// Convert a PE binary into a position-independent shellcode blob.
@@ -120,7 +111,6 @@ mod tests {
         // - No imports
 
         let mut pe = Vec::new();
-        let pe_off: usize;
 
         // DOS header
         pe.extend_from_slice(b"MZ");
@@ -128,7 +118,7 @@ mod tests {
         pe.extend_from_slice(&128u32.to_le_bytes()); // e_lfanew = 128
         pe.extend(&[0u8; 64]); // pad to 128
 
-        pe_off = pe.len();
+        let pe_off: usize = pe.len();
 
         // PE signature
         pe.extend_from_slice(b"PE\0\0");

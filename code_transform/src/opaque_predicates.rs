@@ -759,29 +759,29 @@ fn enc_tbnz(rt: u32, bit: u32, imm14: i32) -> u32 {
     (b5 << 31) | 0x3700_0000 | (b40 << 19) | (imm_bits << 5) | rt
 }
 
-/// Wait, the encoding is wrong. Let me fix: TBNZ encoding:
-/// bit[31] = op (1 for TBNZ, 0 for TBZ)
-/// bit[30:24] = 0110111 for TBNZ 64-bit (b5=1) or 0110110 for 32-bit
-/// Actually: sf|1 110111 b5 imm14 Rt[4:0] where Rt is bits[4:0]
-/// And bit position = b5:b40 where b5 is bit[31], b40 is bits[19:15]... no.
-///
-/// TBNZ: bit[31] = b5 (top bit of test position)
-///        bits[30:24] = 0110111 (for TBNZ with sf=1)
-///        bits[23:19] = imm14[18:5]... no.
-///
-/// Correct encoding from ARM ARM:
-/// TBNZ: 1 b5 011011 imm14 Rt
-///   where b5 is the MSB of the bit index for 64-bit (X register)
-///   Rt = bits[4:0]
-///   imm14 = bits[18:5] (signed, 14 bits)
-///   b5 = bit[31]
-///
-/// For X register with bit index < 32: b5 = 0, sf = 1
-///   1 0 011011 imm14 Rt
-///   = 0x3700_0000 | (imm14 << 5) | Rt
-///
-/// For bit 0 of X16 (reg 16):
-///   b5 = 0, imm14 = +2 (skip 2 instructions = 8 bytes, imm14 = 8/4 = 2)
+// Wait, the encoding is wrong. Let me fix: TBNZ encoding:
+// bit[31] = op (1 for TBNZ, 0 for TBZ)
+// bit[30:24] = 0110111 for TBNZ 64-bit (b5=1) or 0110110 for 32-bit
+// Actually: sf|1 110111 b5 imm14 Rt[4:0] where Rt is bits[4:0]
+// And bit position = b5:b40 where b5 is bit[31], b40 is bits[19:15]... no.
+//
+// TBNZ: bit[31] = b5 (top bit of test position)
+//        bits[30:24] = 0110111 (for TBNZ with sf=1)
+//        bits[23:19] = imm14[18:5]... no.
+//
+// Correct encoding from ARM ARM:
+// TBNZ: 1 b5 011011 imm14 Rt
+//   where b5 is the MSB of the bit index for 64-bit (X register)
+//   Rt = bits[4:0]
+//   imm14 = bits[18:5] (signed, 14 bits)
+//   b5 = bit[31]
+//
+// For X register with bit index < 32: b5 = 0, sf = 1
+//   1 0 011011 imm14 Rt
+//   = 0x3700_0000 | (imm14 << 5) | Rt
+//
+// For bit 0 of X16 (reg 16):
+//   b5 = 0, imm14 = +2 (skip 2 instructions = 8 bytes, imm14 = 8/4 = 2)
 
 /// Family 0 — EOR-zero + CBNZ.
 ///
@@ -836,49 +836,49 @@ fn aarch64_mul_odd_tbnz(rng: &mut impl Rng) -> Vec<u32> {
     // TBNZ with imm14 = +2 means offset = +8 bytes (skip 2 instructions)
     // B with imm26 = +1 means offset = +4 bytes (skip 1 instruction)
     vec![
-        enc_movz_x(16, odd as u32 & 0xFFFF), // X16 = odd
-        enc_tbnz(16, 0, 2),                  // TBNZ X16, #0, #+8 (always taken)
-        0x1400_0001,                         // B #+4 (dead code)
+        enc_movz_x(16, odd & 0xFFFF), // X16 = odd
+        enc_tbnz(16, 0, 2),           // TBNZ X16, #0, #+8 (always taken)
+        0x1400_0001,                  // B #+4 (dead code)
     ]
 }
 
-/// Fix TBNZ encoding: the layout is:
-/// bit[31] = b5 (bit 5 of the test position, 0 for bit 0-31)
-/// bits[30:24] = 0110111 (for TBNZ, 0 for TBZ)
-/// bits[23:19] ... wait, the standard layout:
-///
-/// TBNZ: 1 b5 011011 imm14 Rn
-///   bit[31] = b5
-///   bits[30:24] = 011011 (for TBNZ variant, 1 is in bit[24]?)
-///
-/// Let me just use the correct constant. TBNZ X16, #0, #+8:
-/// For bit 0 of a 64-bit register: b5=0
-/// TBNZ = op=1 in bit[24]... no, bit[31] = b5.
-///
-/// ARM64 encoding for TBNZ:
-///   1 b5 011011 imm14 Rn
-///   - b5 at bit[31]
-///   - 011011 at bits[30:25] = 0x1B << 25 = 0x3600_0000
-///   - But we also need op bit somewhere...
-///
-/// Actually from ARM ARM:
-/// TBZ:  b5 011011 0 imm14 Rt   → 0x36000000 | (b5<<31) | (imm14<<5) | Rt
-/// TBNZ: b5 011011 1 imm14 Rt   → 0x37000000 | (b5<<31) | (imm14<<5) | Rt
-///
-/// Wait no. The full encoding is:
-/// bit[31]    = b5
-/// bits[30:25] = 011011
-/// bit[24]    = op (0=TBZ, 1=TBNZ)
-/// bits[23:5] = imm14 (14 bits)
-/// bits[4:0]  = Rt
-///
-/// For TBNZ: bit[31]=b5=0 (for bit 0), bits[30:25]=011011, bit[24]=1
-///   = 0b0_011011_1_... = 0x3700_0000 base
-///   Then imm14 at bits[18:5], Rt at bits[4:0]
-///
-/// TBNZ X16, bit0, #+8:
-///   imm14 = 8/4 = 2
-///   0x3700_0000 | (2 << 5) | 16 = 0x3700_0000 | 0x20 | 0x10 = 0x3700_0030
+// Fix TBNZ encoding: the layout is:
+// bit[31] = b5 (bit 5 of the test position, 0 for bit 0-31)
+// bits[30:24] = 0110111 (for TBNZ, 0 for TBZ)
+// bits[23:19] ... wait, the standard layout:
+//
+// TBNZ: 1 b5 011011 imm14 Rn
+//   bit[31] = b5
+//   bits[30:24] = 011011 (for TBNZ variant, 1 is in bit[24]?)
+//
+// Let me just use the correct constant. TBNZ X16, #0, #+8:
+// For bit 0 of a 64-bit register: b5=0
+// TBNZ = op=1 in bit[24]... no, bit[31] = b5.
+//
+// ARM64 encoding for TBNZ:
+//   1 b5 011011 imm14 Rn
+//   - b5 at bit[31]
+//   - 011011 at bits[30:25] = 0x1B << 25 = 0x3600_0000
+//   - But we also need op bit somewhere...
+//
+// Actually from ARM ARM:
+// TBZ:  b5 011011 0 imm14 Rt   -> 0x36000000 | (b5<<31) | (imm14<<5) | Rt
+// TBNZ: b5 011011 1 imm14 Rt   -> 0x37000000 | (b5<<31) | (imm14<<5) | Rt
+//
+// Wait no. The full encoding is:
+// bit[31]    = b5
+// bits[30:25] = 011011
+// bit[24]    = op (0=TBZ, 1=TBNZ)
+// bits[23:5] = imm14 (14 bits)
+// bits[4:0]  = Rt
+//
+// For TBNZ: bit[31]=b5=0 (for bit 0), bits[30:25]=011011, bit[24]=1
+//   = 0b0_011011_1_... = 0x3700_0000 base
+//   Then imm14 at bits[18:5], Rt at bits[4:0]
+//
+// TBNZ X16, bit0, #+8:
+//   imm14 = 8/4 = 2
+//   0x3700_0000 | (2 << 5) | 16 = 0x3700_0000 | 0x20 | 0x10 = 0x3700_0030
 
 /// Family 4 — ORR-self + CBNZ.
 ///

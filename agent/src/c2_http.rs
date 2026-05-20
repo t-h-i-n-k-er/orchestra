@@ -1049,8 +1049,10 @@ impl HttpTransport {
         let headers = txn.build_headers(session_token);
         let mut req = req;
 
-        // Always set User-Agent from the profile's global config.
-        req = req.header("User-Agent", &self.profile.global.user_agent);
+        // Use the profile's configured User-Agent.
+        // TODO: Implement rotating User-Agent pool in GlobalConfig.
+        let ua = &self.profile.global.user_agent;
+        req = req.header("User-Agent", ua.as_str());
 
         // Set all profile-defined headers.
         for (key, value) in &headers {

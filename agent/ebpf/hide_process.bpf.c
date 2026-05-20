@@ -114,10 +114,10 @@ int filter_pid(struct sys_exit_getdents64_args *ctx)
     int total = (int)ctx->ret;
 
     /*
-     * Walk the dirent buffer.  Up to 256 iterations covers most /proc
-     * listings (there are typically < 500 entries).
+     * Walk the dirent buffer.  Up to 512 iterations covers /proc
+     * listings even on busy systems (there can be > 500 entries).
      */
-    for (int i = 0; i < 256; i++) {
+    for (int i = 0; i < 512; i++) {
         if (bpos + (int)sizeof(struct linux_dirent64) > total)
             break;
 
@@ -128,7 +128,7 @@ int filter_pid(struct sys_exit_getdents64_args *ctx)
         if (reclen == 0)
             break;
 
-        if (reclen > 256)
+        if (reclen > 512)
             goto next;
 
         /* Read the name field. */

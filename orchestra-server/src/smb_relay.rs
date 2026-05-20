@@ -444,9 +444,7 @@ async fn bridge_tcp_connection(
     let client_to_agent: tokio::task::JoinHandle<std::io::Result<()>> = tokio::spawn(async move {
         let mut len_buf = [0u8; 4];
         loop {
-            if let Err(e) = client_r.read_exact(&mut len_buf).await {
-                return Err(e);
-            }
+            client_r.read_exact(&mut len_buf).await?;
             let len = u32::from_le_bytes(len_buf) as usize;
             if len > 16 * 1024 * 1024 {
                 return Err(std::io::Error::new(
@@ -456,21 +454,15 @@ async fn bridge_tcp_connection(
             }
             let mut frame = vec![0u8; 4 + len];
             frame[0..4].copy_from_slice(&len_buf);
-            if let Err(e) = client_r.read_exact(&mut frame[4..]).await {
-                return Err(e);
-            }
-            if let Err(e) = agent_w.write_all(&frame).await {
-                return Err(e);
-            }
+            client_r.read_exact(&mut frame[4..]).await?;
+            agent_w.write_all(&frame).await?
         }
     });
 
     let agent_to_client: tokio::task::JoinHandle<std::io::Result<()>> = tokio::spawn(async move {
         let mut len_buf = [0u8; 4];
         loop {
-            if let Err(e) = agent_r.read_exact(&mut len_buf).await {
-                return Err(e);
-            }
+            agent_r.read_exact(&mut len_buf).await?;
             let len = u32::from_le_bytes(len_buf) as usize;
             if len > 16 * 1024 * 1024 {
                 return Err(std::io::Error::new(
@@ -480,12 +472,8 @@ async fn bridge_tcp_connection(
             }
             let mut frame = vec![0u8; 4 + len];
             frame[0..4].copy_from_slice(&len_buf);
-            if let Err(e) = agent_r.read_exact(&mut frame[4..]).await {
-                return Err(e);
-            }
-            if let Err(e) = client_w.write_all(&frame).await {
-                return Err(e);
-            }
+            agent_r.read_exact(&mut frame[4..]).await?;
+            client_w.write_all(&frame).await?
         }
     });
 

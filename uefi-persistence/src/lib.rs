@@ -119,10 +119,12 @@ impl EfiGuid {
             },
         })
     }
+}
 
-    /// Format the GUID as a standard string.
-    pub fn to_string(&self) -> String {
-        format!(
+impl fmt::Display for EfiGuid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
             "{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
             self.data1,
             self.data2,
@@ -136,12 +138,6 @@ impl EfiGuid {
             self.data4[6],
             self.data4[7],
         )
-    }
-}
-
-impl fmt::Display for EfiGuid {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.to_string())
     }
 }
 
@@ -320,7 +316,7 @@ pub fn check_secure_boot_status() -> SecureBootStatus {
         Ok(data) => {
             // Linux efivars: first 4 bytes are attributes, then the value.
             // Windows GetFirmwareEnvironmentVariableA: raw value only.
-            if data.len() >= 1 {
+            if !data.is_empty() {
                 let val = data[data.len() - 1];
                 if val == 1 {
                     SecureBootStatus::Enabled
@@ -335,7 +331,7 @@ pub fn check_secure_boot_status() -> SecureBootStatus {
             // Variable may not exist on systems without Secure Boot support.
             // Try SetupMode to distinguish.
             match nvram::read_efi_variable("SetupMode", &EfiGuid::EFI_GLOBAL_VARIABLE) {
-                Ok(data) if data.len() >= 1 && data[data.len() - 1] == 1 => {
+                Ok(data) if !data.is_empty() && data[data.len() - 1] == 1 => {
                     SecureBootStatus::SetupMode
                 }
                 _ => SecureBootStatus::Unknown,

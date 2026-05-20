@@ -11,7 +11,9 @@ use axum::{
     Json, Router,
 };
 use axum_server::accept::Accept;
-use common::{CryptoSession, Message, PROTOCOL_VERSION};
+use common::{
+    negotiate_protocol_version, CryptoSession, Message, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
+};
 use dashmap::{mapref::entry::Entry, DashMap};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -62,6 +64,10 @@ struct DohRuntime {
 struct IpRateBucket {
     window_start: Instant,
     count: u32,
+    /// Timestamp of the last rate-limit check from this IP.
+    /// Used by the sweep task to evict buckets that have been idle
+    /// longer than the session timeout.
+    last_access: Instant,
 }
 
 struct DohSession {
@@ -221,6 +227,7 @@ impl DohRuntime {
         match self.rate_buckets.entry(ip) {
             Entry::Occupied(mut occupied) => {
                 let bucket = occupied.get_mut();
+                bucket.last_access = now;
                 if now.saturating_duration_since(bucket.window_start) >= window {
                     bucket.window_start = now;
                     bucket.count = 1;
@@ -236,6 +243,7 @@ impl DohRuntime {
                 vacant.insert(IpRateBucket {
                     window_start: now,
                     count: 1,
+                    last_access: now,
                 });
                 true
             }
@@ -562,22 +570,44 @@ impl DohRuntime {
         let connection_id = format!("doh-{session_id}");
 
         match msg {
-            Message::VersionHandshake { version } => {
-                if version != PROTOCOL_VERSION {
+            Message::VersionHandshake { version } => match negotiate_protocol_version(version) {
+                Some(negotiated) => {
+                    if negotiated != version {
+                        tracing::info!(
+                            session_id = %session_id,
+                            agent_version = version,
+                            negotiated_version = negotiated,
+                            "DoH protocol version negotiated (agent downgrade)"
+                        );
+                    } else {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            version,
+                            "DoH version handshake completed"
+                        );
+                    }
+                    self.enqueue_outbound(
+                        session_id,
+                        Message::VersionHandshake {
+                            version: negotiated,
+                        },
+                    );
+                }
+                None => {
                     tracing::warn!(
                         session_id = %session_id,
                         agent_version = version,
-                        server_version = PROTOCOL_VERSION,
-                        "DoH agent/server protocol version mismatch"
+                        min_supported = MIN_PROTOCOL_VERSION,
+                        "DoH agent protocol version too old; rejecting"
+                    );
+                    self.enqueue_outbound(
+                        session_id,
+                        Message::VersionHandshake {
+                            version: PROTOCOL_VERSION,
+                        },
                     );
                 }
-                self.enqueue_outbound(
-                    session_id,
-                    Message::VersionHandshake {
-                        version: PROTOCOL_VERSION,
-                    },
-                );
-            }
+            },
             Message::Heartbeat {
                 agent_id,
                 status,
@@ -608,7 +638,9 @@ impl DohRuntime {
                 task_id, result, ..
             } => {
                 if let Some((_, sender)) = self.app.pending.remove(&task_id) {
-                    let _ = sender.send(result);
+                    if let Err(e) = sender.send(result) {
+                        tracing::warn!(%task_id, "failed to deliver TaskResponse to operator (disconnected?): {e:?}");
+                    }
                 }
             }
             Message::AuditLog(ev) => {
@@ -687,7 +719,29 @@ impl DohRuntime {
             self.staging.remove(session_id);
         }
 
-        stale.len() + staging_count
+        // Evict rate-limit buckets that have not been accessed within the
+        // stale-after window.  Without this the bucket map grows without
+        // bound on long-running servers (HIGH-010).
+        let bucket_stale: Vec<IpAddr> = self
+            .rate_buckets
+            .iter()
+            .filter_map(|entry| {
+                let ip = *entry.key();
+                let bucket = entry.value();
+                if now.saturating_duration_since(bucket.last_access) > stale_after {
+                    Some(ip)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let bucket_count = bucket_stale.len();
+        for ip in &bucket_stale {
+            self.rate_buckets.remove(ip);
+        }
+
+        stale.len() + staging_count + bucket_count
     }
 }
 
@@ -710,12 +764,10 @@ where
     fn accept(&self, stream: TcpStream, service: S) -> Self::Future {
         let acceptor = self.inner.clone();
         Box::pin(async move {
-            let tls = acceptor.accept(stream).await.map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("DoH TLS handshake failed: {e}"),
-                )
-            })?;
+            let tls = acceptor
+                .accept(stream)
+                .await
+                .map_err(|e| io::Error::other(format!("DoH TLS handshake failed: {e}")))?;
             Ok((tls, service))
         })
     }
@@ -780,11 +832,7 @@ fn try_reassemble_messages(sess: &mut DohSession, crypto: &CryptoSession) -> Vec
         let mut seq = start;
         let mut resolved: Option<(u32, Message)> = None;
 
-        loop {
-            let chunk = match sess.fragments.get(&seq) {
-                Some(c) => c.clone(),
-                None => break,
-            };
+        while let Some(chunk) = sess.fragments.get(&seq).cloned() {
             assembled.push_str(&chunk);
 
             if let Some(ciphertext) = b32_decode(&assembled) {

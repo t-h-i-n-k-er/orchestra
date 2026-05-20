@@ -700,7 +700,16 @@ fn encrypt_region_chunks(
         tags.push(tag);
 
         offset = end;
-        chunk_idx += 1;
+        // HIGH-004: Detect counter wrap — a u32 chunk counter at 64 KB chunks
+        // wraps after 2^32 × 64 KB = 256 TB, which is practically impossible,
+        // but violating the unique-nonce invariant would be catastrophic.
+        chunk_idx = chunk_idx.checked_add(1).ok_or_else(|| {
+            anyhow!(
+                "[sleep_obfuscation] chunk counter overflow: region {:p} size {} exceeds 256 TB",
+                base,
+                size
+            )
+        })?;
     }
 
     Ok((nonce, tags))
@@ -766,7 +775,16 @@ fn decrypt_region_chunks(
         drop(pt);
 
         offset = end;
-        chunk_idx += 1;
+        // HIGH-004: Detect counter wrap on the decrypt path as well — if the
+        // counter were to overflow during encryption we would have already
+        // errored, but check here too for defence-in-depth.
+        chunk_idx = chunk_idx.checked_add(1).ok_or_else(|| {
+            anyhow!(
+                "[sleep_obfuscation] chunk counter overflow (decrypt): region {:p} size {}",
+                base,
+                size
+            )
+        })?;
     }
 
     Ok(())

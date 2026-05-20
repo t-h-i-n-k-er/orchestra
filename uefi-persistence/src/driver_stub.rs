@@ -791,6 +791,7 @@ fn build_coff_header(_entry_point_rva: u32, _base_of_code: u32) -> [u8; 20] {
 }
 
 /// Build the PE32+ optional header.
+#[allow(clippy::too_many_arguments)]
 fn build_optional_header(
     size_of_headers: u32,
     size_of_image: u32,
@@ -1965,7 +1966,7 @@ fn append_file_path_device_path(rdata: &mut Vec<u8>, path: &str) -> Result<()> {
     rdata.push(0xFF);
     rdata.extend_from_slice(&4u16.to_le_bytes());
 
-    while rdata.len() % 16 != 0 {
+    while !rdata.len().is_multiple_of(16) {
         rdata.push(0x00);
     }
 

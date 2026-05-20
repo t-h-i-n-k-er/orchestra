@@ -649,62 +649,68 @@ fn generate_interpreter(table: &OpcodeTable) -> Vec<Instruction> {
 
     // ── Prologue ─────────────────────────────────────────────────────────
     // push rbp
-    let mut push_rbp = Instruction::with1(Code::Push_r64, Register::RBP).unwrap();
+    let mut push_rbp =
+        Instruction::with1(Code::Push_r64, Register::RBP).expect("valid iced-x86 instruction");
     set_next_ip!(push_rbp, ip_counter);
     out.push(push_rbp);
 
     // mov rbp, rsp
-    let mut mov_bp_sp =
-        Instruction::with2(Code::Mov_r64_rm64, Register::RBP, Register::RSP).unwrap();
+    let mut mov_bp_sp = Instruction::with2(Code::Mov_r64_rm64, Register::RBP, Register::RSP)
+        .expect("valid iced-x86 instruction");
     set_next_ip!(mov_bp_sp, ip_counter);
     out.push(mov_bp_sp);
 
     // push rbx (callee-saved, used as reg-file pointer)
-    let mut push_rbx = Instruction::with1(Code::Push_r64, Register::RBX).unwrap();
+    let mut push_rbx =
+        Instruction::with1(Code::Push_r64, Register::RBX).expect("valid iced-x86 instruction");
     set_next_ip!(push_rbx, ip_counter);
     out.push(push_rbx);
 
     // push r12 (used as bytecode pointer)
-    let mut push_r12 = Instruction::with1(Code::Push_r64, Register::R12).unwrap();
+    let mut push_r12 =
+        Instruction::with1(Code::Push_r64, Register::R12).expect("valid iced-x86 instruction");
     set_next_ip!(push_r12, ip_counter);
     out.push(push_r12);
 
     // push r13 (used as bytecode length)
-    let mut push_r13 = Instruction::with1(Code::Push_r64, Register::R13).unwrap();
+    let mut push_r13 =
+        Instruction::with1(Code::Push_r64, Register::R13).expect("valid iced-x86 instruction");
     set_next_ip!(push_r13, ip_counter);
     out.push(push_r13);
 
     // push r14 (used as PC)
-    let mut push_r14 = Instruction::with1(Code::Push_r64, Register::R14).unwrap();
+    let mut push_r14 =
+        Instruction::with1(Code::Push_r64, Register::R14).expect("valid iced-x86 instruction");
     set_next_ip!(push_r14, ip_counter);
     out.push(push_r14);
 
     // push r15 (used as scratch)
-    let mut push_r15 = Instruction::with1(Code::Push_r64, Register::R15).unwrap();
+    let mut push_r15 =
+        Instruction::with1(Code::Push_r64, Register::R15).expect("valid iced-x86 instruction");
     set_next_ip!(push_r15, ip_counter);
     out.push(push_r15);
 
     // mov rbx, r8      ; rbx = register file base
-    let mut mov_bx_r8 =
-        Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::R8).unwrap();
+    let mut mov_bx_r8 = Instruction::with2(Code::Mov_r64_rm64, Register::RBX, Register::R8)
+        .expect("valid iced-x86 instruction");
     set_next_ip!(mov_bx_r8, ip_counter);
     out.push(mov_bx_r8);
 
     // mov r12, rdi      ; r12 = bytecode pointer
-    let mut mov_r12_rdi =
-        Instruction::with2(Code::Mov_r64_rm64, Register::R12, Register::RDI).unwrap();
+    let mut mov_r12_rdi = Instruction::with2(Code::Mov_r64_rm64, Register::R12, Register::RDI)
+        .expect("valid iced-x86 instruction");
     set_next_ip!(mov_r12_rdi, ip_counter);
     out.push(mov_r12_rdi);
 
     // mov r13, rsi      ; r13 = bytecode length
-    let mut mov_r13_rsi =
-        Instruction::with2(Code::Mov_r64_rm64, Register::R13, Register::RSI).unwrap();
+    let mut mov_r13_rsi = Instruction::with2(Code::Mov_r64_rm64, Register::R13, Register::RSI)
+        .expect("valid iced-x86 instruction");
     set_next_ip!(mov_r13_rsi, ip_counter);
     out.push(mov_r13_rsi);
 
     // xor r14d, r14d    ; r14 = PC = 0
-    let mut xor_r14 =
-        Instruction::with2(Code::Xor_r32_rm32, Register::R14D, Register::R14D).unwrap();
+    let mut xor_r14 = Instruction::with2(Code::Xor_r32_rm32, Register::R14D, Register::R14D)
+        .expect("valid iced-x86 instruction");
     set_next_ip!(xor_r14, ip_counter);
     out.push(xor_r14);
 
@@ -712,14 +718,15 @@ fn generate_interpreter(table: &OpcodeTable) -> Vec<Instruction> {
     let dispatch_ip = bump(&mut ip_counter);
 
     // CMP r14, r13   (PC < len?)
-    let mut cmp_pc_len =
-        Instruction::with2(Code::Cmp_r64_rm64, Register::R14, Register::R13).unwrap();
+    let mut cmp_pc_len = Instruction::with2(Code::Cmp_r64_rm64, Register::R14, Register::R13)
+        .expect("valid iced-x86 instruction");
     set_next_ip!(cmp_pc_len, ip_counter);
     out.push(cmp_pc_len);
 
     // JAE epilogue (if PC >= len, exit)
     let epilogue_ip = 0xFFFE_FFFF_0000_0000u64; // will be fixed up
-    let mut jae_epilogue = Instruction::with_branch(Code::Jae_rel32_64, epilogue_ip).unwrap();
+    let mut jae_epilogue = Instruction::with_branch(Code::Jae_rel32_64, epilogue_ip)
+        .expect("valid iced-x86 instruction");
     set_next_ip!(jae_epilogue, ip_counter);
     out.push(jae_epilogue);
     let jae_epilogue_idx = out.len() - 1;
@@ -744,7 +751,8 @@ fn generate_interpreter(table: &OpcodeTable) -> Vec<Instruction> {
     out.push(movzx_r15);
 
     // Increment PC past the opcode byte: inc r14
-    let mut inc_r14 = Instruction::with1(Code::Inc_rm64, Register::R14).unwrap();
+    let mut inc_r14 =
+        Instruction::with1(Code::Inc_rm64, Register::R14).expect("valid iced-x86 instruction");
     set_next_ip!(inc_r14, ip_counter);
     out.push(inc_r14);
 
@@ -764,8 +772,8 @@ fn generate_interpreter(table: &OpcodeTable) -> Vec<Instruction> {
             out.push(cmp);
 
             // JE handler (placeholder target — will fix up below)
-            let mut je =
-                Instruction::with_branch(Code::Je_rel32_64, 0xFFFE_FFFF_0000_0000u64).unwrap();
+            let mut je = Instruction::with_branch(Code::Je_rel32_64, 0xFFFE_FFFF_0000_0000u64)
+                .expect("valid iced-x86 instruction");
             je.set_ip(bump(&mut ip_counter));
             out.push(je);
 
@@ -774,7 +782,8 @@ fn generate_interpreter(table: &OpcodeTable) -> Vec<Instruction> {
         .collect();
 
     // If no opcode matched, jump to epilogue (invalid opcode → exit).
-    let mut jmp_epilogue2 = Instruction::with_branch(Code::Jmp_rel32_64, epilogue_ip).unwrap();
+    let mut jmp_epilogue2 = Instruction::with_branch(Code::Jmp_rel32_64, epilogue_ip)
+        .expect("valid iced-x86 instruction");
     jmp_epilogue2.set_ip(bump(&mut ip_counter));
     out.push(jmp_epilogue2);
     let jmp_epilogue2_idx = out.len() - 1;
@@ -813,32 +822,38 @@ fn generate_interpreter(table: &OpcodeTable) -> Vec<Instruction> {
     let _epilogue_start_ip = ip_counter;
 
     // pop r15
-    let mut pop_r15 = Instruction::with1(Code::Pop_r64, Register::R15).unwrap();
+    let mut pop_r15 =
+        Instruction::with1(Code::Pop_r64, Register::R15).expect("valid iced-x86 instruction");
     pop_r15.set_ip(bump(&mut ip_counter));
     out.push(pop_r15);
 
     // pop r14
-    let mut pop_r14 = Instruction::with1(Code::Pop_r64, Register::R14).unwrap();
+    let mut pop_r14 =
+        Instruction::with1(Code::Pop_r64, Register::R14).expect("valid iced-x86 instruction");
     pop_r14.set_ip(bump(&mut ip_counter));
     out.push(pop_r14);
 
     // pop r13
-    let mut pop_r13 = Instruction::with1(Code::Pop_r64, Register::R13).unwrap();
+    let mut pop_r13 =
+        Instruction::with1(Code::Pop_r64, Register::R13).expect("valid iced-x86 instruction");
     pop_r13.set_ip(bump(&mut ip_counter));
     out.push(pop_r13);
 
     // pop r12
-    let mut pop_r12 = Instruction::with1(Code::Pop_r64, Register::R12).unwrap();
+    let mut pop_r12 =
+        Instruction::with1(Code::Pop_r64, Register::R12).expect("valid iced-x86 instruction");
     pop_r12.set_ip(bump(&mut ip_counter));
     out.push(pop_r12);
 
     // pop rbx
-    let mut pop_rbx = Instruction::with1(Code::Pop_r64, Register::RBX).unwrap();
+    let mut pop_rbx =
+        Instruction::with1(Code::Pop_r64, Register::RBX).expect("valid iced-x86 instruction");
     pop_rbx.set_ip(bump(&mut ip_counter));
     out.push(pop_rbx);
 
     // pop rbp
-    let mut pop_rbp = Instruction::with1(Code::Pop_r64, Register::RBP).unwrap();
+    let mut pop_rbp =
+        Instruction::with1(Code::Pop_r64, Register::RBP).expect("valid iced-x86 instruction");
     pop_rbp.set_ip(bump(&mut ip_counter));
     out.push(pop_rbp);
 
@@ -890,7 +905,8 @@ fn emit_handler(
             $out.push(movzx);
 
             // inc r14
-            let mut inc = Instruction::with1(Code::Inc_rm64, Register::R14).unwrap();
+            let mut inc = Instruction::with1(Code::Inc_rm64, Register::R14)
+                .expect("valid iced-x86 instruction");
             inc.set_ip(next_ip());
             $out.push(inc);
         }};
@@ -920,7 +936,8 @@ fn emit_handler(
             $out.push(movsxd);
 
             // add r14, 4
-            let mut add4 = Instruction::with2(Code::Add_rm64_imm8, Register::R14, 4i32).unwrap();
+            let mut add4 = Instruction::with2(Code::Add_rm64_imm8, Register::R14, 4i32)
+                .expect("valid iced-x86 instruction");
             add4.set_ip(next_ip());
             $out.push(add4);
         }};
@@ -950,7 +967,8 @@ fn emit_handler(
             $out.push(mov_q);
 
             // add r14, 8
-            let mut add8 = Instruction::with2(Code::Add_rm64_imm8, Register::R14, 8i32).unwrap();
+            let mut add8 = Instruction::with2(Code::Add_rm64_imm8, Register::R14, 8i32)
+                .expect("valid iced-x86 instruction");
             add8.set_ip(next_ip());
             $out.push(add8);
         }};
@@ -959,7 +977,8 @@ fn emit_handler(
     // Helper: jump back to dispatch.
     macro_rules! jmp_dispatch {
         ($out:expr) => {{
-            let mut jmp = Instruction::with_branch(Code::Jmp_rel32_64, dispatch_ip).unwrap();
+            let mut jmp = Instruction::with_branch(Code::Jmp_rel32_64, dispatch_ip)
+                .expect("valid iced-x86 instruction");
             jmp.set_ip(next_ip());
             $out.push(jmp);
         }};
@@ -986,12 +1005,14 @@ fn emit_handler(
             load_reg_idx!(out); // eax = dst reg index
 
             // shl eax, 3 (dst * 8 for qword array offset)
-            let mut shl1 = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32).unwrap();
+            let mut shl1 = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32)
+                .expect("valid iced-x86 instruction");
             shl1.set_ip(next_ip());
             out.push(shl1);
 
             // Save dst*8 on the stack
-            let mut push_dst = Instruction::with1(Code::Push_r64, Register::RAX).unwrap();
+            let mut push_dst = Instruction::with1(Code::Push_r64, Register::RAX)
+                .expect("valid iced-x86 instruction");
             push_dst.set_ip(next_ip());
             out.push(push_dst);
 
@@ -999,7 +1020,8 @@ fn emit_handler(
             load_reg_idx!(out); // eax = src reg index
 
             // shl eax, 3 (src * 8)
-            let mut shl2 = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32).unwrap();
+            let mut shl2 = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32)
+                .expect("valid iced-x86 instruction");
             shl2.set_ip(next_ip());
             out.push(shl2);
 
@@ -1014,7 +1036,8 @@ fn emit_handler(
             out.push(load_src);
 
             // pop rcx — restore dst*8
-            let mut pop_dst = Instruction::with1(Code::Pop_r64, Register::RCX).unwrap();
+            let mut pop_dst = Instruction::with1(Code::Pop_r64, Register::RCX)
+                .expect("valid iced-x86 instruction");
             pop_dst.set_ip(next_ip());
             out.push(pop_dst);
 
@@ -1045,12 +1068,14 @@ fn emit_handler(
             load_reg_idx!(out); // eax = dst reg index
 
             // shl eax, 3
-            let mut shl1 = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32).unwrap();
+            let mut shl1 = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32)
+                .expect("valid iced-x86 instruction");
             shl1.set_ip(next_ip());
             out.push(shl1);
 
             // Save dst*8 on the stack
-            let mut push_dst = Instruction::with1(Code::Push_r64, Register::RAX).unwrap();
+            let mut push_dst = Instruction::with1(Code::Push_r64, Register::RAX)
+                .expect("valid iced-x86 instruction");
             push_dst.set_ip(next_ip());
             out.push(push_dst);
 
@@ -1058,7 +1083,8 @@ fn emit_handler(
             load_imm64!(out, Register::RAX); // rax = immediate value
 
             // pop rcx — restore dst*8
-            let mut pop_dst = Instruction::with1(Code::Pop_r64, Register::RCX).unwrap();
+            let mut pop_dst = Instruction::with1(Code::Pop_r64, Register::RCX)
+                .expect("valid iced-x86 instruction");
             pop_dst.set_ip(next_ip());
             out.push(pop_dst);
 
@@ -1100,12 +1126,14 @@ fn emit_handler(
             load_reg_idx!(out); // eax = dst reg index
 
             // shl eax, 3
-            let mut shl1 = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32).unwrap();
+            let mut shl1 = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32)
+                .expect("valid iced-x86 instruction");
             shl1.set_ip(next_ip());
             out.push(shl1);
 
             // Save dst*8 on the stack
-            let mut push_dst = Instruction::with1(Code::Push_r64, Register::RAX).unwrap();
+            let mut push_dst = Instruction::with1(Code::Push_r64, Register::RAX)
+                .expect("valid iced-x86 instruction");
             push_dst.set_ip(next_ip());
             out.push(push_dst);
 
@@ -1113,7 +1141,8 @@ fn emit_handler(
             load_reg_idx!(out); // eax = src reg index
 
             // shl eax, 3
-            let mut shl2 = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32).unwrap();
+            let mut shl2 = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32)
+                .expect("valid iced-x86 instruction");
             shl2.set_ip(next_ip());
             out.push(shl2);
 
@@ -1128,12 +1157,14 @@ fn emit_handler(
             out.push(load_src);
 
             // Save src value
-            let mut push_src = Instruction::with1(Code::Push_r64, Register::RAX).unwrap();
+            let mut push_src = Instruction::with1(Code::Push_r64, Register::RAX)
+                .expect("valid iced-x86 instruction");
             push_src.set_ip(next_ip());
             out.push(push_src);
 
             // pop rcx — restore dst*8
-            let mut pop_dst = Instruction::with1(Code::Pop_r64, Register::RCX).unwrap();
+            let mut pop_dst = Instruction::with1(Code::Pop_r64, Register::RCX)
+                .expect("valid iced-x86 instruction");
             pop_dst.set_ip(next_ip());
             out.push(pop_dst);
 
@@ -1148,7 +1179,8 @@ fn emit_handler(
             out.push(load_dst);
 
             // pop rax — restore src value
-            let mut pop_src = Instruction::with1(Code::Pop_r64, Register::RAX).unwrap();
+            let mut pop_src = Instruction::with1(Code::Pop_r64, Register::RAX)
+                .expect("valid iced-x86 instruction");
             pop_src.set_ip(next_ip());
             out.push(pop_src);
 
@@ -1193,21 +1225,25 @@ fn emit_handler(
                     // Shift dst by cl (low byte of src). Use rcx for shift count.
                     // rax already has src value; move low byte to cl.
                     let mut mov_cl =
-                        Instruction::with2(Code::Mov_rm8_r8, Register::CL, Register::AL).unwrap();
+                        Instruction::with2(Code::Mov_rm8_r8, Register::CL, Register::AL)
+                            .expect("valid iced-x86 instruction");
                     mov_cl.set_ip(next_ip());
                     out.push(mov_cl);
                     let mut alu =
-                        Instruction::with2(Code::Shl_rm64_CL, Register::RDX, Register::CL).unwrap();
+                        Instruction::with2(Code::Shl_rm64_CL, Register::RDX, Register::CL)
+                            .expect("valid iced-x86 instruction");
                     alu.set_ip(next_ip());
                     out.push(alu);
                 }
                 VmOp::Shr => {
                     let mut mov_cl =
-                        Instruction::with2(Code::Mov_rm8_r8, Register::CL, Register::AL).unwrap();
+                        Instruction::with2(Code::Mov_rm8_r8, Register::CL, Register::AL)
+                            .expect("valid iced-x86 instruction");
                     mov_cl.set_ip(next_ip());
                     out.push(mov_cl);
                     let mut alu =
-                        Instruction::with2(Code::Shr_rm64_CL, Register::RDX, Register::CL).unwrap();
+                        Instruction::with2(Code::Shr_rm64_CL, Register::RDX, Register::CL)
+                            .expect("valid iced-x86 instruction");
                     alu.set_ip(next_ip());
                     out.push(alu);
                 }
@@ -1243,12 +1279,14 @@ fn emit_handler(
             load_reg_idx!(out); // eax = a reg index
 
             // shl eax, 3
-            let mut shl1 = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32).unwrap();
+            let mut shl1 = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32)
+                .expect("valid iced-x86 instruction");
             shl1.set_ip(next_ip());
             out.push(shl1);
 
             // Save a*8 on the stack
-            let mut push_a = Instruction::with1(Code::Push_r64, Register::RAX).unwrap();
+            let mut push_a = Instruction::with1(Code::Push_r64, Register::RAX)
+                .expect("valid iced-x86 instruction");
             push_a.set_ip(next_ip());
             out.push(push_a);
 
@@ -1256,7 +1294,8 @@ fn emit_handler(
             load_reg_idx!(out); // eax = b reg index
 
             // shl eax, 3
-            let mut shl2 = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32).unwrap();
+            let mut shl2 = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32)
+                .expect("valid iced-x86 instruction");
             shl2.set_ip(next_ip());
             out.push(shl2);
 
@@ -1271,7 +1310,8 @@ fn emit_handler(
             out.push(load_b);
 
             // pop rcx — restore a*8
-            let mut pop_a = Instruction::with1(Code::Pop_r64, Register::RCX).unwrap();
+            let mut pop_a = Instruction::with1(Code::Pop_r64, Register::RCX)
+                .expect("valid iced-x86 instruction");
             pop_a.set_ip(next_ip());
             out.push(pop_a);
 
@@ -1293,8 +1333,8 @@ fn emit_handler(
             // Load 4-byte offset, set PC = offset.
             load_imm32!(out, Register::RAX); // offset → rax
                                              // mov r14, rax  (PC = offset)
-            let mut mov_pc =
-                Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RAX).unwrap();
+            let mut mov_pc = Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RAX)
+                .expect("valid iced-x86 instruction");
             mov_pc.set_ip(next_ip());
             out.push(mov_pc);
             jmp_dispatch!(out);
@@ -1326,11 +1366,13 @@ fn emit_handler(
             // Save branch target and condition code on stack so they
             // survive the popfq below.
             // push rcx (branch target)
-            let mut push_target = Instruction::with1(Code::Push_r64, Register::RCX).unwrap();
+            let mut push_target = Instruction::with1(Code::Push_r64, Register::RCX)
+                .expect("valid iced-x86 instruction");
             push_target.set_ip(next_ip());
             out.push(push_target);
             // push rax (condition code)
-            let mut push_cc = Instruction::with1(Code::Push_r64, Register::RAX).unwrap();
+            let mut push_cc = Instruction::with1(Code::Push_r64, Register::RAX)
+                .expect("valid iced-x86 instruction");
             push_cc.set_ip(next_ip());
             out.push(push_cc);
 
@@ -1340,7 +1382,8 @@ fn emit_handler(
             out.push(popfq);
 
             // Restore condition code: pop rax
-            let mut pop_cc = Instruction::with1(Code::Pop_r64, Register::RAX).unwrap();
+            let mut pop_cc = Instruction::with1(Code::Pop_r64, Register::RAX)
+                .expect("valid iced-x86 instruction");
             pop_cc.set_ip(next_ip());
             out.push(pop_cc);
 
@@ -1360,55 +1403,67 @@ fn emit_handler(
             //   jmp not_taken (fall through)
 
             // Condition 0: ZF=1 (JE/JZ)
-            let mut cmp0 = Instruction::with2(Code::Cmp_rm32_imm8, Register::EAX, 0i32).unwrap();
+            let mut cmp0 = Instruction::with2(Code::Cmp_rm32_imm8, Register::EAX, 0i32)
+                .expect("valid iced-x86 instruction");
             cmp0.set_ip(next_ip());
             out.push(cmp0);
-            let mut je0 = Instruction::with_branch(Code::Je_rel32_64, 0xFFFE_FFFF_u64).unwrap();
+            let mut je0 = Instruction::with_branch(Code::Je_rel32_64, 0xFFFE_FFFF_u64)
+                .expect("valid iced-x86 instruction");
             je0.set_ip(next_ip());
             out.push(je0);
             let je0_idx = out.len() - 1;
 
             // Condition 1: ZF=0 (JNE/JNZ)
-            let mut cmp1 = Instruction::with2(Code::Cmp_rm32_imm8, Register::EAX, 1i32).unwrap();
+            let mut cmp1 = Instruction::with2(Code::Cmp_rm32_imm8, Register::EAX, 1i32)
+                .expect("valid iced-x86 instruction");
             cmp1.set_ip(next_ip());
             out.push(cmp1);
-            let mut je1 = Instruction::with_branch(Code::Je_rel32_64, 0xFFFE_FFFF_u64).unwrap();
+            let mut je1 = Instruction::with_branch(Code::Je_rel32_64, 0xFFFE_FFFF_u64)
+                .expect("valid iced-x86 instruction");
             je1.set_ip(next_ip());
             out.push(je1);
             let je1_idx = out.len() - 1;
 
             // Condition 2: SF!=OF (JL)
-            let mut cmp2 = Instruction::with2(Code::Cmp_rm32_imm8, Register::EAX, 2i32).unwrap();
+            let mut cmp2 = Instruction::with2(Code::Cmp_rm32_imm8, Register::EAX, 2i32)
+                .expect("valid iced-x86 instruction");
             cmp2.set_ip(next_ip());
             out.push(cmp2);
-            let mut je2 = Instruction::with_branch(Code::Je_rel32_64, 0xFFFE_FFFF_u64).unwrap();
+            let mut je2 = Instruction::with_branch(Code::Je_rel32_64, 0xFFFE_FFFF_u64)
+                .expect("valid iced-x86 instruction");
             je2.set_ip(next_ip());
             out.push(je2);
             let je2_idx = out.len() - 1;
 
             // Condition 3: SF==OF (JGE)
-            let mut cmp3 = Instruction::with2(Code::Cmp_rm32_imm8, Register::EAX, 3i32).unwrap();
+            let mut cmp3 = Instruction::with2(Code::Cmp_rm32_imm8, Register::EAX, 3i32)
+                .expect("valid iced-x86 instruction");
             cmp3.set_ip(next_ip());
             out.push(cmp3);
-            let mut je3 = Instruction::with_branch(Code::Je_rel32_64, 0xFFFE_FFFF_u64).unwrap();
+            let mut je3 = Instruction::with_branch(Code::Je_rel32_64, 0xFFFE_FFFF_u64)
+                .expect("valid iced-x86 instruction");
             je3.set_ip(next_ip());
             out.push(je3);
             let je3_idx = out.len() - 1;
 
             // Condition 4: ZF=0 && SF==OF (JG)
-            let mut cmp4 = Instruction::with2(Code::Cmp_rm32_imm8, Register::EAX, 4i32).unwrap();
+            let mut cmp4 = Instruction::with2(Code::Cmp_rm32_imm8, Register::EAX, 4i32)
+                .expect("valid iced-x86 instruction");
             cmp4.set_ip(next_ip());
             out.push(cmp4);
-            let mut je4 = Instruction::with_branch(Code::Je_rel32_64, 0xFFFE_FFFF_u64).unwrap();
+            let mut je4 = Instruction::with_branch(Code::Je_rel32_64, 0xFFFE_FFFF_u64)
+                .expect("valid iced-x86 instruction");
             je4.set_ip(next_ip());
             out.push(je4);
             let je4_idx = out.len() - 1;
 
             // Condition 5: ZF=1 || SF!=OF (JLE)
-            let mut cmp5 = Instruction::with2(Code::Cmp_rm32_imm8, Register::EAX, 5i32).unwrap();
+            let mut cmp5 = Instruction::with2(Code::Cmp_rm32_imm8, Register::EAX, 5i32)
+                .expect("valid iced-x86 instruction");
             cmp5.set_ip(next_ip());
             out.push(cmp5);
-            let mut je5 = Instruction::with_branch(Code::Je_rel32_64, 0xFFFE_FFFF_u64).unwrap();
+            let mut je5 = Instruction::with_branch(Code::Je_rel32_64, 0xFFFE_FFFF_u64)
+                .expect("valid iced-x86 instruction");
             je5.set_ip(next_ip());
             out.push(je5);
             let je5_idx = out.len() - 1;
@@ -1416,7 +1471,8 @@ fn emit_handler(
             // Fall-through: unknown condition or not taken.
             // Pop the saved branch target and continue.
             let not_taken_ip = next_ip();
-            let mut pop_discard = Instruction::with1(Code::Pop_r64, Register::RCX).unwrap();
+            let mut pop_discard = Instruction::with1(Code::Pop_r64, Register::RCX)
+                .expect("valid iced-x86 instruction");
             pop_discard.set_ip(next_ip());
             out.push(pop_discard);
             jmp_dispatch!(out);
@@ -1428,85 +1484,97 @@ fn emit_handler(
 
             // Pad 0: JE/JZ (ZF=1)
             let pad0_ip = next_ip();
-            let mut jz0 = Instruction::with_branch(Code::Jne_rel32_64, not_taken_ip).unwrap();
+            let mut jz0 = Instruction::with_branch(Code::Jne_rel32_64, not_taken_ip)
+                .expect("valid iced-x86 instruction");
             jz0.set_ip(next_ip());
             out.push(jz0);
             // taken path: pop rcx (target), mov r14, rcx
-            let mut pop0 = Instruction::with1(Code::Pop_r64, Register::RCX).unwrap();
+            let mut pop0 = Instruction::with1(Code::Pop_r64, Register::RCX)
+                .expect("valid iced-x86 instruction");
             pop0.set_ip(next_ip());
             out.push(pop0);
-            let mut set_pc0 =
-                Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RCX).unwrap();
+            let mut set_pc0 = Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RCX)
+                .expect("valid iced-x86 instruction");
             set_pc0.set_ip(next_ip());
             out.push(set_pc0);
             jmp_dispatch!(out);
 
             // Pad 1: JNE/JNZ (ZF=0)
             let pad1_ip = next_ip();
-            let mut jnz1 = Instruction::with_branch(Code::Je_rel32_64, not_taken_ip).unwrap();
+            let mut jnz1 = Instruction::with_branch(Code::Je_rel32_64, not_taken_ip)
+                .expect("valid iced-x86 instruction");
             jnz1.set_ip(next_ip());
             out.push(jnz1);
-            let mut pop1 = Instruction::with1(Code::Pop_r64, Register::RCX).unwrap();
+            let mut pop1 = Instruction::with1(Code::Pop_r64, Register::RCX)
+                .expect("valid iced-x86 instruction");
             pop1.set_ip(next_ip());
             out.push(pop1);
-            let mut set_pc1 =
-                Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RCX).unwrap();
+            let mut set_pc1 = Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RCX)
+                .expect("valid iced-x86 instruction");
             set_pc1.set_ip(next_ip());
             out.push(set_pc1);
             jmp_dispatch!(out);
 
             // Pad 2: JL (SF!=OF)
             let pad2_ip = next_ip();
-            let mut jl2 = Instruction::with_branch(Code::Jge_rel32_64, not_taken_ip).unwrap();
+            let mut jl2 = Instruction::with_branch(Code::Jge_rel32_64, not_taken_ip)
+                .expect("valid iced-x86 instruction");
             jl2.set_ip(next_ip());
             out.push(jl2);
-            let mut pop2 = Instruction::with1(Code::Pop_r64, Register::RCX).unwrap();
+            let mut pop2 = Instruction::with1(Code::Pop_r64, Register::RCX)
+                .expect("valid iced-x86 instruction");
             pop2.set_ip(next_ip());
             out.push(pop2);
-            let mut set_pc2 =
-                Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RCX).unwrap();
+            let mut set_pc2 = Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RCX)
+                .expect("valid iced-x86 instruction");
             set_pc2.set_ip(next_ip());
             out.push(set_pc2);
             jmp_dispatch!(out);
 
             // Pad 3: JGE (SF==OF)
             let pad3_ip = next_ip();
-            let mut jge3 = Instruction::with_branch(Code::Jl_rel32_64, not_taken_ip).unwrap();
+            let mut jge3 = Instruction::with_branch(Code::Jl_rel32_64, not_taken_ip)
+                .expect("valid iced-x86 instruction");
             jge3.set_ip(next_ip());
             out.push(jge3);
-            let mut pop3 = Instruction::with1(Code::Pop_r64, Register::RCX).unwrap();
+            let mut pop3 = Instruction::with1(Code::Pop_r64, Register::RCX)
+                .expect("valid iced-x86 instruction");
             pop3.set_ip(next_ip());
             out.push(pop3);
-            let mut set_pc3 =
-                Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RCX).unwrap();
+            let mut set_pc3 = Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RCX)
+                .expect("valid iced-x86 instruction");
             set_pc3.set_ip(next_ip());
             out.push(set_pc3);
             jmp_dispatch!(out);
 
             // Pad 4: JG (ZF=0 && SF==OF) — use JLE as inverted test
             let pad4_ip = next_ip();
-            let mut jg4 = Instruction::with_branch(Code::Jle_rel32_64, not_taken_ip).unwrap();
+            let mut jg4 = Instruction::with_branch(Code::Jle_rel32_64, not_taken_ip)
+                .expect("valid iced-x86 instruction");
             jg4.set_ip(next_ip());
             out.push(jg4);
-            let mut pop4 = Instruction::with1(Code::Pop_r64, Register::RCX).unwrap();
+            let mut pop4 = Instruction::with1(Code::Pop_r64, Register::RCX)
+                .expect("valid iced-x86 instruction");
             pop4.set_ip(next_ip());
             out.push(pop4);
-            let mut set_pc4 =
-                Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RCX).unwrap();
+            let mut set_pc4 = Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RCX)
+                .expect("valid iced-x86 instruction");
             set_pc4.set_ip(next_ip());
             out.push(set_pc4);
             jmp_dispatch!(out);
 
             // Pad 5: JLE (ZF=1 || SF!=OF) — use JG as inverted test
             let pad5_ip = next_ip();
-            let mut jle5 = Instruction::with_branch(Code::Jg_rel32_64, not_taken_ip).unwrap();
+            let mut jle5 = Instruction::with_branch(Code::Jg_rel32_64, not_taken_ip)
+                .expect("valid iced-x86 instruction");
             jle5.set_ip(next_ip());
             out.push(jle5);
-            let mut pop5 = Instruction::with1(Code::Pop_r64, Register::RCX).unwrap();
+            let mut pop5 = Instruction::with1(Code::Pop_r64, Register::RCX)
+                .expect("valid iced-x86 instruction");
             pop5.set_ip(next_ip());
             out.push(pop5);
-            let mut set_pc5 =
-                Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RCX).unwrap();
+            let mut set_pc5 = Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RCX)
+                .expect("valid iced-x86 instruction");
             set_pc5.set_ip(next_ip());
             out.push(set_pc5);
             jmp_dispatch!(out);
@@ -1527,7 +1595,8 @@ fn emit_handler(
             load_reg_idx!(out); // reg index → eax
 
             // shl eax, 3 (reg_index * 8)
-            let mut shl = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32).unwrap();
+            let mut shl = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32)
+                .expect("valid iced-x86 instruction");
             shl.set_ip(next_ip());
             out.push(shl);
 
@@ -1542,7 +1611,8 @@ fn emit_handler(
             out.push(load_val);
 
             // push rax (push value onto virtual stack)
-            let mut push = Instruction::with1(Code::Push_r64, Register::RAX).unwrap();
+            let mut push = Instruction::with1(Code::Push_r64, Register::RAX)
+                .expect("valid iced-x86 instruction");
             push.set_ip(next_ip());
             out.push(push);
 
@@ -1554,22 +1624,26 @@ fn emit_handler(
             load_reg_idx!(out); // reg index → eax
 
             // Save reg index: push rax
-            let mut save_idx = Instruction::with1(Code::Push_r64, Register::RAX).unwrap();
+            let mut save_idx = Instruction::with1(Code::Push_r64, Register::RAX)
+                .expect("valid iced-x86 instruction");
             save_idx.set_ip(next_ip());
             out.push(save_idx);
 
             // pop rcx (pop value from stack → rcx)
-            let mut pop_val = Instruction::with1(Code::Pop_r64, Register::RCX).unwrap();
+            let mut pop_val = Instruction::with1(Code::Pop_r64, Register::RCX)
+                .expect("valid iced-x86 instruction");
             pop_val.set_ip(next_ip());
             out.push(pop_val);
 
             // Restore reg index: pop rax
-            let mut restore_idx = Instruction::with1(Code::Pop_r64, Register::RAX).unwrap();
+            let mut restore_idx = Instruction::with1(Code::Pop_r64, Register::RAX)
+                .expect("valid iced-x86 instruction");
             restore_idx.set_ip(next_ip());
             out.push(restore_idx);
 
             // shl eax, 3 (reg_index * 8)
-            let mut shl = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32).unwrap();
+            let mut shl = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32)
+                .expect("valid iced-x86 instruction");
             shl.set_ip(next_ip());
             out.push(shl);
 
@@ -1590,8 +1664,8 @@ fn emit_handler(
             // Jump to epilogue. We need the epilogue IP but we don't have it
             // here. For now, set PC to bytecode length to trigger exit.
             // mov r14, r13  (PC = len → exit on next dispatch)
-            let mut mov_pc =
-                Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::R13).unwrap();
+            let mut mov_pc = Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::R13)
+                .expect("valid iced-x86 instruction");
             mov_pc.set_ip(next_ip());
             out.push(mov_pc);
             jmp_dispatch!(out);
@@ -1604,13 +1678,14 @@ fn emit_handler(
 
             // Push return address (current R14 = PC after this instruction)
             // onto the virtual stack. R14 already points past the operands.
-            let mut push_ret = Instruction::with1(Code::Push_r64, Register::R14).unwrap();
+            let mut push_ret = Instruction::with1(Code::Push_r64, Register::R14)
+                .expect("valid iced-x86 instruction");
             push_ret.set_ip(next_ip());
             out.push(push_ret);
 
             // Set PC to target: mov r14, rax
-            let mut mov_pc =
-                Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RAX).unwrap();
+            let mut mov_pc = Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RAX)
+                .expect("valid iced-x86 instruction");
             mov_pc.set_ip(next_ip());
             out.push(mov_pc);
 
@@ -1623,7 +1698,8 @@ fn emit_handler(
             load_reg_idx!(out); // reg index → eax
 
             // shl eax, 3 (reg_index * 8)
-            let mut shl = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32).unwrap();
+            let mut shl = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32)
+                .expect("valid iced-x86 instruction");
             shl.set_ip(next_ip());
             out.push(shl);
 
@@ -1654,7 +1730,8 @@ fn emit_handler(
             load_reg_idx!(out); // reg index → eax
 
             // shl eax, 3 (reg_index * 8)
-            let mut shl = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32).unwrap();
+            let mut shl = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32)
+                .expect("valid iced-x86 instruction");
             shl.set_ip(next_ip());
             out.push(shl);
 
@@ -1681,7 +1758,8 @@ fn emit_handler(
             out.push(load);
 
             // inc/dec rcx
-            let mut alu = Instruction::with1(code, Register::RCX).unwrap();
+            let mut alu =
+                Instruction::with1(code, Register::RCX).expect("valid iced-x86 instruction");
             alu.set_ip(next_ip());
             out.push(alu);
 
@@ -1925,7 +2003,7 @@ pub fn virtualize(code: &[u8], rng: &mut ChaCha8Rng) -> Vec<u8> {
         Register::R10,
         Register::R11,
     ] {
-        let mut push = Instruction::with1(Code::Push_r64, reg).unwrap();
+        let mut push = Instruction::with1(Code::Push_r64, reg).expect("valid iced-x86 instruction");
         push.set_ip(next_sip());
         final_insns.push(push);
     }
@@ -1967,7 +2045,7 @@ pub fn virtualize(code: &[u8], rng: &mut ChaCha8Rng) -> Vec<u8> {
     .iter()
     .rev()
     {
-        let mut pop = Instruction::with1(Code::Pop_r64, reg).unwrap();
+        let mut pop = Instruction::with1(Code::Pop_r64, reg).expect("valid iced-x86 instruction");
         pop.set_ip(next_sip());
         final_insns.push(pop);
     }

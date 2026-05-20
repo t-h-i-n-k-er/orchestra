@@ -417,6 +417,9 @@ pub unsafe fn patch_etw_with_mode(mode: common::config::EtwPatchMode) -> anyhow:
 }
 
 #[cfg(not(windows))]
+/// # Safety
+///
+/// This non-Windows implementation does not touch process memory and always returns an error.
 pub unsafe fn patch_etw_with_mode(_mode: common::config::EtwPatchMode) -> anyhow::Result<()> {
     Err(anyhow::anyhow!("ETW patching is only available on Windows"))
 }
@@ -440,6 +443,9 @@ pub unsafe fn patch_etw() {
 }
 
 #[cfg(not(windows))]
+/// # Safety
+///
+/// This non-Windows implementation is a no-op.
 pub unsafe fn patch_etw() {}
 
 /// Restore `EtwEventWrite`, `EtwEventWriteEx`, and `NtTraceEvent` to their
@@ -457,6 +463,9 @@ pub unsafe fn unpatch_etw() {
 }
 
 #[cfg(not(windows))]
+/// # Safety
+///
+/// This non-Windows implementation is a no-op.
 pub unsafe fn unpatch_etw() {}
 
 /// Check whether the agent has already patched any ETW function locally.

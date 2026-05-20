@@ -6,6 +6,16 @@ All notable changes to Orchestra are documented here.
 
 ## [Unreleased]
 
+### Added
+- **Mobile platform support (Alpha):** Android and iOS platform adapter layer with stub implementations for environment validation, persistence, and post-exploitation.
+- Android JNI bridge (`agent/src/android/jni_bridge.rs`) with `nativeInit`, `nativeStart`, and `nativeStop` entry points.
+- iOS C bridge (`mobile/ios/OrchestraBridge/`) with `orchestra_init`, `orchestra_start`, and `orchestra_stop` C ABI functions.
+- Android app wrapper (`mobile/android/`) with foreground service (`AgentService`), boot receiver (`BootReceiver`), and Gradle build configuration.
+- Android build script (`mobile/android/build_agent.sh`) supporting `cargo-ndk` compilation.
+- iOS build script (`mobile/ios/build_agent.sh`) for Xcode static library compilation.
+- Comprehensive mobile support documentation (`docs/MOBILE_SUPPORT.md`) covering build instructions, dependency compatibility matrix, architecture overview, and known limitations.
+
+
 ### Documentation
 
 - Synchronized documentation with codebase (doc-sync pass):

@@ -92,7 +92,7 @@ mod linux_impl {
 
         let page_start = (fn_ptr as usize) & !(page_size - 1);
         let cover = fn_len + (fn_ptr as usize - page_start);
-        let mmap_len = ((cover + page_size - 1) / page_size) * page_size;
+        let mmap_len = cover.div_ceil(page_size) * page_size;
 
         mprotect(page_start as *mut _, mmap_len, PROT_READ | PROT_WRITE);
 
@@ -154,7 +154,7 @@ mod linux_impl {
 
         let page_start = (fn_ptr as usize) & !(page_size - 1);
         let cover = fn_len + (fn_ptr as usize - page_start);
-        let mmap_len = ((cover + page_size - 1) / page_size) * page_size;
+        let mmap_len = cover.div_ceil(page_size) * page_size;
 
         mprotect(page_start as *mut _, mmap_len, PROT_READ | PROT_WRITE);
 

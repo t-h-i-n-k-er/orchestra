@@ -444,7 +444,7 @@ fn compute_live_in(instructions: &[Instruction]) -> HashSet<Register> {
 
     // Pre-compute use/def and successor lists for every block.
     let use_def: Vec<(HashSet<Register>, HashSet<Register>)> =
-        blocks.iter().map(|b| block_use_def(b)).collect();
+        blocks.iter().map(block_use_def).collect();
     let successors: Vec<Vec<usize>> = blocks
         .iter()
         .map(|b| block_successors(b, &ip_to_block))

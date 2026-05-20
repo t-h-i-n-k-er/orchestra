@@ -1,15 +1,25 @@
-#![allow(dead_code)]
+// --- Lint suppressions ---
+// `non_camel_case_types` and `non_snake_case` are required for Windows FFI
+// (WinAPI types, NTSTATUS, HANDLE, etc.) and inline assembly. Do not remove.
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
-#![allow(unexpected_cfgs)]
-#![allow(unreachable_patterns)]
-#![allow(unused_assignments)]
+// `dead_code`, `unused_imports`, and `unused_variables` are suppressed because
+// many modules are feature-gated; removing these would produce ~200+ warnings
+// across disabled feature blocks.  TODO(security): remove these suppressions
+// and instead use `#[cfg_attr(not(feature = "..."), allow(dead_code))]` on
+// individual feature-gated modules.
+#![allow(dead_code)]
 #![allow(unused_imports)]
-#![allow(unused_must_use)]
+#![allow(unused_variables)]
+// `unused_assignments`, `unused_mut`, and `unused_parens` are kept for the
+// same reason — feature-gated code paths create false positives.
+// TODO(security): gate these per-module instead of blanket.
+#![allow(unused_assignments)]
 #![allow(unused_mut)]
 #![allow(unused_parens)]
-#![allow(unused_unsafe)]
-#![allow(unused_variables)]
+// `unreachable_patterns` is kept for cross-platform code where pattern arms
+// become unreachable on specific target_os/target_arch combinations.
+#![allow(unreachable_patterns)]
 
 pub mod config;
 pub mod env_check;
@@ -48,6 +58,9 @@ pub mod remote_assist;
 
 #[cfg(feature = "hci-research")]
 pub mod hci_logging;
+
+#[cfg(feature = "traffic-normalization")]
+pub mod traffic_normalize;
 
 // Automated internal reconnaissance: AD enumeration, attack path discovery,
 // cloud fingerprinting, and credential attack automation.
@@ -1769,3 +1782,11 @@ pub mod c2_graph;
 pub mod c2_http;
 #[cfg(feature = "quic-transport")]
 pub mod c2_quic;
+
+// ── Android platform adapter ────────────────────────────────────────────────
+#[cfg(target_os = "android")]
+pub mod android;
+
+// ── iOS platform adapter ────────────────────────────────────────────────────
+#[cfg(target_os = "ios")]
+pub mod ios;

@@ -70,20 +70,15 @@ pub enum LinkRole {
 /// In a tree topology every link is either `Parent` or `Child`.  In a mesh
 /// or hybrid topology, two agents at the same level can form a `Peer` link
 /// for lateral communication that does not pass through the server.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum LinkType {
     /// Upstream link toward the server.
     Parent,
     /// Downstream link away from the server.
+    #[default]
     Child,
     /// Lateral / peer link between agents at the same level.
     Peer,
-}
-
-impl Default for LinkType {
-    fn default() -> Self {
-        Self::Child
-    }
 }
 
 fn link_type_wire_value(link_type: LinkType) -> u8 {
@@ -99,7 +94,7 @@ fn link_type_wire_value(link_type: LinkType) -> u8 {
 /// The operating mode of the P2P mesh.
 ///
 /// Controls whether peer links are allowed and how routing is handled.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum MeshMode {
     /// Classic tree topology — no peer links, no route discovery.
     Tree,
@@ -108,13 +103,8 @@ pub enum MeshMode {
     Mesh,
     /// Hybrid — tree topology with optional peer links for lateral routing.
     /// This is the default mode.
+    #[default]
     Hybrid,
-}
-
-impl Default for MeshMode {
-    fn default() -> Self {
-        Self::Hybrid
-    }
 }
 
 // ── Link quality monitoring ───────────────────────────────────────────────
@@ -194,7 +184,11 @@ impl LinkQuality {
     /// Returns `true` if the link should be declared dead.
     pub fn record_missed_heartbeat(&mut self) -> bool {
         self.consecutive_failures += 1;
-        if self.consecutive_failures > 0 && self.consecutive_failures % Self::LOSS_THRESHOLD == 0 {
+        if self.consecutive_failures > 0
+            && self
+                .consecutive_failures
+                .is_multiple_of(Self::LOSS_THRESHOLD)
+        {
             self.packet_loss = (self.packet_loss + 0.05).min(1.0);
         }
         self.consecutive_failures >= Self::DEAD_THRESHOLD
@@ -757,7 +751,7 @@ impl P2pMesh {
     /// Insert a link into the mesh and register it as a child, parent, or peer.
     pub fn insert_link(&mut self, link: P2pLink) {
         let role = link.role.clone();
-        let link_type = link.link_type.clone();
+        let link_type = link.link_type;
         let id = link.link_id;
         self.links.insert(id, link);
         match role {
@@ -814,7 +808,7 @@ impl P2pMesh {
 
     /// Returns `true` if the mesh has a usable parent link.
     pub fn has_connected_parent(&self) -> bool {
-        self.parent_link().map_or(false, |l| l.state.is_usable())
+        self.parent_link().is_some_and(|l| l.state.is_usable())
     }
 
     /// Default maximum number of children.
@@ -1221,6 +1215,7 @@ impl P2pMesh {
 // ── Listener event ────────────────────────────────────────────────────────
 
 /// Event emitted by the P2P listener background task.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum P2pListenerEvent {
     /// A new child link was established successfully.
@@ -2641,7 +2636,7 @@ impl P2pMesh {
             .filter(|(_, link)| {
                 link.peer_certificate
                     .as_ref()
-                    .map_or(false, |c| c.agent_id_hash == revoked_hash)
+                    .is_some_and(|c| c.agent_id_hash == revoked_hash)
             })
             .map(|(&id, _)| id)
             .collect();
@@ -2980,8 +2975,7 @@ impl P2pMesh {
                     let elapsed = now.duration_since(started).as_secs();
                     if elapsed > common::p2p_proto::KEY_ROTATION_TIMEOUT_SECS {
                         link.key_rotation_retries += 1;
-                        if link.key_rotation_retries
-                            >= common::p2p_proto::MAX_KEY_ROTATION_RETRIES as u32
+                        if link.key_rotation_retries >= common::p2p_proto::MAX_KEY_ROTATION_RETRIES
                         {
                             tracing::warn!(
                                 "key rotation on link {:#010X} exceeded max retries ({}), terminating",
@@ -3070,6 +3064,7 @@ impl ReconnectBackoff {
     /// - Attempt 1 → 5s
     /// - Attempt 2 → 15s
     /// - Attempt 3+ → 60s (maximum)
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> std::time::Duration {
         let delay = match self.attempt {
             0 => std::time::Duration::ZERO,
@@ -5292,6 +5287,7 @@ pub mod tcp_transport {
     }
 
     /// Connect result stub.
+    #[allow(clippy::large_enum_variant)]
     #[derive(Debug)]
     pub enum ConnectResult {
         Connected(super::P2pLink),
@@ -6319,6 +6315,7 @@ pub mod nt_pipe_server {
     }
 
     /// Stub connect result — mirrors the Windows variant's API.
+    #[allow(clippy::large_enum_variant)]
     #[derive(Debug)]
     pub enum ConnectResult {
         Connected(super::P2pLink),

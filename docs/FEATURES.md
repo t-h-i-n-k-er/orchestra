@@ -93,6 +93,7 @@ profile `features = [...]` list. They are not separate fields in the current
 | `callback-inject` | Callback injection via 12 Windows API callback-dispatch functions |
 | `hardware-persistence` | Hardware/firmware persistence and DMA-oriented tradecraft modules |
 | `lpe` | Local privilege escalation modules |
+| `mobile-postexp` | Android and iOS persistence and post-exploitation modules |
 | `macos-postexp` | macOS post-exploitation modules (TCC/SIP/XPC/Keychain workflows) |
 | `pac-bypass` | ARM64 BTI/PAC bypass support |
 | `quic-transport` | QUIC/HTTP3 C2 transport |

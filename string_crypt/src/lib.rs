@@ -717,7 +717,7 @@ pub fn enc_str(input: TokenStream) -> TokenStream {
         // ── Method 3: ChaCha20 with per-string nonce ──────────────────────
         let (key, nonce) = derive_chacha20_key_nonce(&seed, &label_bytes);
         let ct = chacha20_encrypt(&pt_with_null, &key, &nonce);
-        let num_blocks = (len + 63) / 64;
+        let num_blocks = len.div_ceil(64);
         let key_bytes: Vec<u8> = key.to_vec();
         let nonce_bytes: Vec<u8> = nonce.to_vec();
 
@@ -1215,7 +1215,7 @@ pub fn enc_wstr(input: TokenStream) -> TokenStream {
     } else {
         let (key, nonce) = derive_chacha20_key_nonce(&seed, &label_bytes);
         let ct = chacha20_encrypt(&pt_bytes, &key, &nonce);
-        let num_blocks = (len + 63) / 64;
+        let num_blocks = len.div_ceil(64);
         let key_bytes: Vec<u8> = key.to_vec();
         let nonce_bytes: Vec<u8> = nonce.to_vec();
         let expanded = quote! {

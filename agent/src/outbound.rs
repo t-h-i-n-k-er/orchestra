@@ -31,7 +31,7 @@ use anyhow::{anyhow, Result};
 use common::forward_secrecy;
 use common::normalized_transport::{NormalizedTransport, Role, TrafficProfile};
 use common::tls_transport::{PinnedCertVerifier, TlsTransport};
-use common::{LockedSecret, Message, Transport};
+use common::{LockedSecret, Message, Transport, MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use rustls::ClientConfig;
@@ -61,6 +61,7 @@ fn malleable_profile_from_config(
 ) -> crate::malleable::MalleableProfile {
     let mut profile = crate::malleable::MalleableProfile::default();
     profile.global.user_agent = cfg.malleable_profile.user_agent.clone();
+    profile.global.user_agent_pool = cfg.malleable_profile.user_agent_pool.clone();
     profile.global.sleep_time = cfg.sleep.base_interval_secs;
     profile.global.sleep_time_ms = cfg.sleep.base_interval_ms;
     profile.global.jitter = cfg.sleep.jitter_percent.min(100) as u8;
@@ -489,15 +490,18 @@ async fn run_with_heartbeat(
 
     match transport.recv().await {
         Ok(Message::VersionHandshake { version }) => {
-            if version != common::PROTOCOL_VERSION {
+            // Server responds with the negotiated version — the highest version
+            // both sides support.  Reject if the server's negotiated version
+            // falls outside our acceptable range.
+            if version < MIN_PROTOCOL_VERSION || version > MAX_PROTOCOL_VERSION {
                 anyhow::bail!(
-                    "protocol version mismatch: server={version}, agent={}. \
-                     Rebuild the agent or update the server to the same release.",
-                    common::PROTOCOL_VERSION
+                    "negotiated protocol version {version} is outside agent's \
+                     supported range [{MIN_PROTOCOL_VERSION}, {MAX_PROTOCOL_VERSION}]. \
+                     Rebuild the agent or update the server to the same release."
                 );
             }
             info!(
-                "outbound-c: protocol version {} accepted by server",
+                "outbound-c: protocol version {} negotiated with server",
                 version
             );
         }

@@ -66,7 +66,7 @@ fn parse_pe_offsets(buf: &[u8]) -> Result<(usize, usize, usize, usize, usize, bo
 
 /// Randomize the TimeDateStamp field in the COFF FileHeader to a plausible
 /// date (random timestamp between 2020-01-01 and 2025-12-31 UTC).
-pub fn randomize_timestamp(buf: &mut Vec<u8>) {
+pub fn randomize_timestamp(buf: &mut [u8]) {
     let Ok((_, fh_off, _, _, _, _)) = parse_pe_offsets(buf) else {
         warn!("randomize_timestamp: not a PE file, skipping");
         return;
@@ -83,7 +83,7 @@ pub fn randomize_timestamp(buf: &mut Vec<u8>) {
 
 /// Zero the TimeDateStamp field (legacy API preserved for compatibility).
 #[allow(dead_code)]
-pub fn zero_timestamp(buf: &mut Vec<u8>) {
+pub fn zero_timestamp(buf: &mut [u8]) {
     let Ok((_, fh_off, _, _, _, _)) = parse_pe_offsets(buf) else {
         return;
     };
@@ -106,7 +106,7 @@ pub fn zero_timestamp(buf: &mut Vec<u8>) {
 ///   XOR mask value   (4 bytes, unmasked)
 ///   zero padding to PE signature
 /// ```
-pub fn remove_rich_header(buf: &mut Vec<u8>) {
+pub fn remove_rich_header(buf: &mut [u8]) {
     let Ok((pe_off, _, _, _, _, _)) = parse_pe_offsets(buf) else {
         warn!("remove_rich_header: not a PE file, skipping");
         return;
@@ -170,7 +170,7 @@ pub fn remove_rich_header(buf: &mut Vec<u8>) {
 }
 
 /// Replace each 8-byte section name with random a-zA-Z characters.
-pub fn randomize_section_names(buf: &mut Vec<u8>) {
+pub fn randomize_section_names(buf: &mut [u8]) {
     let Ok((_, _, _, sec_off, n_sec, _)) = parse_pe_offsets(buf) else {
         warn!("randomize_section_names: not a PE file, skipping");
         return;
@@ -204,7 +204,7 @@ pub fn add_entropy_padding(buf: &mut Vec<u8>) {
 ///
 /// The DOS header fields (e_magic, e_lfanew, etc.) are preserved; only the
 /// stub program and its embedded string are replaced.
-pub fn replace_dos_stub(buf: &mut Vec<u8>) {
+pub fn replace_dos_stub(buf: &mut [u8]) {
     let Ok((pe_off, _, _, _, _, _)) = parse_pe_offsets(buf) else {
         warn!("replace_dos_stub: not a PE file, skipping");
         return;
@@ -304,7 +304,7 @@ pub fn strip_overlay(buf: &mut Vec<u8>) {
 
 /// Zero the IMAGE_DIRECTORY_ENTRY_SECURITY (index 4) data directory entry
 /// and blank out the certificate table data it references.
-pub fn strip_signature(buf: &mut Vec<u8>) {
+pub fn strip_signature(buf: &mut [u8]) {
     let Ok((_, _, oh_off, _, _, is_plus)) = parse_pe_offsets(buf) else {
         warn!("strip_signature: not a PE file, skipping");
         return;
@@ -334,7 +334,7 @@ pub fn strip_signature(buf: &mut Vec<u8>) {
 /// Each IMAGE_DEBUG_DIRECTORY entry is 28 bytes.  For CODEVIEW entries
 /// (type 2), the data starts with "RSDS" (4 bytes) + GUID (16 bytes) + age
 /// (4 bytes) followed by a null-terminated UTF-8 PDB path.
-pub fn replace_pdb_path(buf: &mut Vec<u8>) {
+pub fn replace_pdb_path(buf: &mut [u8]) {
     let Ok((_, _, oh_off, _, _, is_plus)) = parse_pe_offsets(buf) else {
         warn!("replace_pdb_path: not a PE file, skipping");
         return;
@@ -397,7 +397,7 @@ pub fn replace_pdb_path(buf: &mut Vec<u8>) {
                         let path_start = data_file_off + 24;
                         let path_end = data_file_off + data_size as usize;
                         let buf_len = buf.len();
-                        if path_start + pdb_path.len() + 1 <= path_end.min(buf_len) {
+                        if path_start + pdb_path.len() < path_end.min(buf_len) {
                             // Clear old path.
                             buf[path_start..path_end.min(buf_len)].fill(0);
                             // Write new path.
@@ -413,7 +413,7 @@ pub fn replace_pdb_path(buf: &mut Vec<u8>) {
 
 /// Zero the IMAGE_DIRECTORY_ENTRY_DEBUG (index 6) entry and the debug data it
 /// references (which contains the PDB path).
-pub fn strip_debug_directory(buf: &mut Vec<u8>) {
+pub fn strip_debug_directory(buf: &mut [u8]) {
     let Ok((_, _, oh_off, _, _, is_plus)) = parse_pe_offsets(buf) else {
         warn!("strip_debug_directory: not a PE file, skipping");
         return;
@@ -444,7 +444,7 @@ pub fn strip_debug_directory(buf: &mut Vec<u8>) {
 /// words, sum them all (carrying the high half into the low half), then add
 /// the file length. The CheckSum field itself must be zero during the
 /// computation.
-pub fn recalculate_checksum(buf: &mut Vec<u8>) {
+pub fn recalculate_checksum(buf: &mut [u8]) {
     let Ok((_, _, oh_off, _, _, _)) = parse_pe_offsets(buf) else {
         warn!("recalculate_checksum: not a PE file, skipping");
         return;
@@ -470,7 +470,7 @@ pub fn recalculate_checksum(buf: &mut Vec<u8>) {
         i += 2;
     }
     // Handle odd trailing byte.
-    if file_len % 2 != 0 {
+    if !file_len.is_multiple_of(2) {
         let word = buf[file_len - 1] as u32;
         sum = sum.wrapping_add(word);
         if sum > 0xFFFF {
@@ -514,7 +514,7 @@ fn utf16le_padded(s: &str) -> Vec<u8> {
         .flat_map(|c| c.to_le_bytes())
         .collect();
     // Pad to 4-byte alignment.
-    while bytes.len() % 4 != 0 {
+    while !bytes.len().is_multiple_of(4) {
         bytes.push(0);
     }
     bytes
@@ -590,7 +590,7 @@ fn build_vs_versioninfo(cfg: &VersionInfoConfig) -> Vec<u8> {
         let header_len = 6 + key_bytes.len();
         let total_unpadded = header_len + val_utf16.len();
         // Pad total to 4-byte boundary.
-        let pad = if total_unpadded % 4 != 0 {
+        let pad = if !total_unpadded.is_multiple_of(4) {
             4 - total_unpadded % 4
         } else {
             0
@@ -819,8 +819,13 @@ impl ResourceSectionBuilder {
         // For simplicity we support exactly the entries we add and assume
         // type_id / name_id combinations are well-formed.
         use std::collections::BTreeMap;
+        type ResourceTree = BTreeMap<u32, BTreeMap<u32, BTreeMap<u32, Vec<u8>>>>;
+        type LangEntries = Vec<(u32, usize)>;
+        type NameEntries = Vec<(u32, LangEntries)>;
+        type TypeEntries = Vec<(u32, NameEntries)>;
+
         // type -> name -> lang -> data
-        let mut tree: BTreeMap<u32, BTreeMap<u32, BTreeMap<u32, Vec<u8>>>> = BTreeMap::new();
+        let mut tree: ResourceTree = BTreeMap::new();
         for (t, n, l, d) in &self.entries {
             tree.entry(*t)
                 .or_default()
@@ -862,7 +867,7 @@ impl ResourceSectionBuilder {
         }
         let mut leaves: Vec<Leaf> = Vec::new();
         // type_entry: (type_id, [(name_id, [(lang_id, leaf_idx)])])
-        let mut type_entries: Vec<(u32, Vec<(u32, Vec<(u32, usize)>)>)> = Vec::new();
+        let mut type_entries: TypeEntries = Vec::new();
         for (&type_id, names) in &tree {
             let mut name_entries: Vec<(u32, Vec<(u32, usize)>)> = Vec::new();
             for (&name_id, langs) in names {
@@ -943,7 +948,7 @@ impl ResourceSectionBuilder {
                 offs.push(cur);
                 cur += leaf.data.len();
                 // 4-byte align.
-                if cur % 4 != 0 {
+                if !cur.is_multiple_of(4) {
                     cur += 4 - cur % 4;
                 }
             }
@@ -954,7 +959,7 @@ impl ResourceSectionBuilder {
             match last_leaf {
                 Some(i) => {
                     let end = leaf_offsets[i] + leaves[i].data.len();
-                    if end % 4 != 0 {
+                    if !end.is_multiple_of(4) {
                         end + (4 - end % 4)
                     } else {
                         end
@@ -1194,6 +1199,9 @@ fn add_version_info_to_builder(
 /// When called standalone, this creates a new `.rsrc` section containing only
 /// the version info. When multiple resource types are needed, prefer using
 /// [`apply_all`] which coalesces all resources into a single section.
+///
+/// Public API — may be called by external consumers outside this workspace.
+#[allow(dead_code)]
 pub fn inject_version_info(buf: &mut Vec<u8>, cfg: &VersionInfoConfig) -> Result<()> {
     let mut rsrc = ResourceSectionBuilder::default();
     add_version_info_to_builder(&mut rsrc, cfg)?;
@@ -1246,6 +1254,9 @@ fn add_icon_to_builder(rsrc: &mut ResourceSectionBuilder, ico_path: &str) -> Res
 /// When called standalone, this creates a new `.rsrc` section containing only
 /// the icon resources. When multiple resource types are needed, prefer using
 /// [`apply_all`] which coalesces all resources into a single section.
+///
+/// Public API — may be called by external consumers outside this workspace.
+#[allow(dead_code)]
 pub fn inject_icon(buf: &mut Vec<u8>, ico_path: &str) -> Result<()> {
     let mut rsrc = ResourceSectionBuilder::default();
     add_icon_to_builder(&mut rsrc, ico_path)?;
@@ -1270,6 +1281,9 @@ fn add_manifest_to_builder(rsrc: &mut ResourceSectionBuilder, manifest: &str) {
 /// When called standalone, this creates a new `.rsrc` section containing only
 /// the manifest. When multiple resource types are needed, prefer using
 /// [`apply_all`] which coalesces all resources into a single section.
+///
+/// Public API — may be called by external consumers outside this workspace.
+#[allow(dead_code)]
 pub fn inject_manifest(buf: &mut Vec<u8>, manifest: &str) -> Result<()> {
     let mut rsrc = ResourceSectionBuilder::default();
     add_manifest_to_builder(&mut rsrc, manifest);
@@ -1347,7 +1361,7 @@ fn extract_version_info_blob(pe_bytes: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Jitter the build number in a VS_FIXEDFILEINFO blob by a random 1-99.
-fn jitter_version_build(blob: &mut Vec<u8>) {
+fn jitter_version_build(blob: &mut [u8]) {
     // VS_VERSION_INFO header is at the start.  VS_FIXEDFILEINFO starts after
     // the header (6 bytes) + key ("VS_VERSION_INFO" in UTF-16LE = 30 + 2 bytes null = 32 bytes,
     // padded to 4 = 32) = 38 bytes. Then aligned to 4 = 40.

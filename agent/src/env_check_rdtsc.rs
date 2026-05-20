@@ -162,11 +162,11 @@ unsafe fn serialize_cpuid() {
 /// timing in that case.
 fn has_invariant_tsc() -> bool {
     // First check that extended CPUID leaf 0x80000007 is supported.
-    let max_ext = unsafe { __cpuid(0x80000000) };
+    let max_ext = __cpuid(0x80000000);
     if max_ext.eax < 0x80000007 {
         return false;
     }
-    let leaf7 = unsafe { __cpuid(0x80000007) };
+    let leaf7 = __cpuid(0x80000007);
     // EDX bit 8 = invariant TSC.
     (leaf7.edx & (1 << 8)) != 0
 }
@@ -781,8 +781,8 @@ mod tests {
     #[test]
     fn test_detection_thresholds_sanity() {
         // Verify the thresholds are internally consistent.
-        assert!(NOP_MIN_THRESHOLD < CPUID_MEDIAN_THRESHOLD);
-        assert!(NOP_STDDEV_THRESHOLD > 0.0);
-        assert!(NOP_RATIO_THRESHOLD > 1.0);
+        assert!(std::hint::black_box(NOP_MIN_THRESHOLD) < std::hint::black_box(CPUID_MEDIAN_THRESHOLD));
+        assert!(std::hint::black_box(NOP_STDDEV_THRESHOLD) > 0.0);
+        assert!(std::hint::black_box(NOP_RATIO_THRESHOLD) > 1.0);
     }
 }

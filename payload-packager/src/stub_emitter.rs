@@ -394,7 +394,7 @@ impl Emitter {
         self.byte(0x0F);
         self.byte(0xB6);
         // ModRM: mod=00, reg=dst, rm=100 (SIB follows)
-        self.byte((0x00) | ((dst.field & 7) << 3) | 0x04);
+        self.byte(((dst.field & 7) << 3) | 0x04);
         // SIB: scale=00, index=idx, base=base
         self.byte(((idx.field & 7) << 3) | (base.field & 7));
     }
@@ -410,7 +410,7 @@ impl Emitter {
         self.byte(0x40 | rex_r | rex_b | rex_x);
         self.byte(0x88);
         // ModRM: mod=00, reg=src, rm=100 (SIB follows)
-        self.byte((0x00) | ((src.field & 7) << 3) | 0x04);
+        self.byte(((src.field & 7) << 3) | 0x04);
         // SIB: scale=00, index=idx, base=base
         self.byte(((idx.field & 7) << 3) | (base.field & 7));
     }
@@ -427,7 +427,7 @@ impl Emitter {
             self.byte(0x40 | need_rex);
         }
         self.byte(0x32);
-        self.byte((0x00) | ((dst.field & 7) << 3) | 0x04);
+        self.byte(((dst.field & 7) << 3) | 0x04);
         self.byte(((idx.field & 7) << 3) | (base.field & 7));
     }
 
@@ -638,7 +638,7 @@ impl Emitter {
     /// Style 0: INC r64  (FF /0 with REX.W)
     /// Style 1: ADD r64, 1  (83 /0 ib with REX.W)
     pub fn inc_r64_diverse(&mut self, r: Reg, style: u8) {
-        if style % 2 == 0 {
+        if style.is_multiple_of(2) {
             self.inc_r64(r);
         } else {
             // ADD r64, imm8(1)  — REX.W 83 /0 ib
@@ -653,7 +653,7 @@ impl Emitter {
     /// Style 0: DEC r64  (FF /1 with REX.W)
     /// Style 1: SUB r64, 1  (83 /5 ib with REX.W)
     pub fn dec_r64_diverse(&mut self, r: Reg, style: u8) {
-        if style % 2 == 0 {
+        if style.is_multiple_of(2) {
             self.dec_r64(r);
         } else {
             // SUB r64, imm8(1)
@@ -668,7 +668,7 @@ impl Emitter {
     /// Style 0: TEST r64, r64
     /// Style 1: CMP r64, 0  (83 /7 ib with REX.W)
     pub fn test_zero_r64(&mut self, r: Reg, style: u8) {
-        if style % 2 == 0 {
+        if style.is_multiple_of(2) {
             self.test_rr(r);
         } else {
             // CMP r64, imm8(0)
@@ -901,7 +901,7 @@ pub fn emit_xor_keystream_stub(
 
     let loop_top = e.len();
 
-    if div.loop_style % 2 == 0 {
+    if div.loop_style.is_multiple_of(2) {
         // ── Style 0: Increment loop counter, compare at top ───────────────
         // CMP r_idx, r_len  ;  JGE loop_end
         e.cmp_rr(alloc.r_idx, alloc.r_len);
@@ -1192,7 +1192,7 @@ fn emit_chacha20_inline_stub(key44: &[u8], alloc: &RegAlloc, div: &StubDiversity
     let inner_jge_pos = e.len();
     e.byte(0x00);
 
-    if div.inner_loop_style % 2 == 0 {
+    if div.inner_loop_style.is_multiple_of(2) {
         // ── Style 0: Forward index with SIB addressing (original) ────────
         // movzx eax, byte [rsp + rcx]   (0F B6 04 0C)
         e.bytes(&[0x0F, 0xB6, 0x04, 0x0C]);
@@ -1236,7 +1236,7 @@ fn emit_chacha20_inline_stub(key44: &[u8], alloc: &RegAlloc, div: &StubDiversity
     let cur = e.len();
     let back = (inner_loop_top as isize) - (cur as isize) - 2;
     debug_assert!(
-        back >= -128 && back <= 127,
+        (-128..=127).contains(&back),
         "inner loop too large for rel8 jmp"
     );
     e.byte(0xEB);
@@ -1424,7 +1424,7 @@ mod tests {
                 PROT_WRITE,
             };
             let page_size = 4096usize;
-            let code_len = ((stub.code.len() + page_size - 1) / page_size) * page_size;
+            let code_len = stub.code.len().div_ceil(page_size) * page_size;
 
             let page = mmap(
                 std::ptr::null_mut(),
@@ -1562,7 +1562,7 @@ mod tests {
                 PROT_WRITE,
             };
             let page_size = 4096usize;
-            let code_len = ((stub.len() + page_size - 1) / page_size) * page_size;
+            let code_len = stub.len().div_ceil(page_size) * page_size;
             let page = mmap(
                 std::ptr::null_mut(),
                 code_len,

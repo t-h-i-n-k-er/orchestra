@@ -446,8 +446,6 @@ impl PeerTarget {
 ///
 /// Note: the actual P2P frame already carries `payload_len`, so the
 /// serialization here is simply the raw padding bytes.  The 4-byte length
-/// prefix is **not** duplicated — it lives in the frame header.
-
 /// Default bandwidth probe payload size (4 KiB).
 pub const BANDWIDTH_PROBE_SIZE: usize = 4096;
 
@@ -1232,6 +1230,91 @@ impl KeyRotationAckData {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// Per-link sequence tracker (anti-replay)
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Thread-safe per-link sequence number tracker for anti-replay protection.
+///
+/// Each outbound frame increments the sequence for its `link_id`; each
+/// inbound frame is checked against the last-seen sequence for that link.
+/// Frames with a sequence <= the last-seen value are rejected as replays.
+///
+/// On first frame from a new link, any sequence is accepted (bootstrap).
+pub struct PerLinkSequence {
+    outbound: Mutex<HashMap<u32, AtomicU64>>,
+    inbound: Mutex<HashMap<u32, u64>>,
+}
+
+impl PerLinkSequence {
+    /// Create a new empty tracker.
+    pub fn new() -> Self {
+        Self {
+            outbound: Mutex::new(HashMap::new()),
+            inbound: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Get the next outbound sequence number for `link_id`, allocating
+    /// a new counter (starting at 0) if this is the first frame on the link.
+    /// Returns the sequence to write into the frame.
+    pub fn next_outbound(&self, link_id: u32) -> u64 {
+        let map = self.outbound.lock().unwrap();
+        if let Some(counter) = map.get(&link_id) {
+            counter.fetch_add(1, Ordering::Relaxed)
+        } else {
+            drop(map);
+            let mut map = self.outbound.lock().unwrap();
+            map.entry(link_id).or_insert_with(|| AtomicU64::new(0));
+            // First frame gets sequence 0; next will be 1.
+            map.get(&link_id).unwrap().fetch_add(1, Ordering::Relaxed)
+        }
+    }
+
+    /// Check whether an inbound frame's sequence is valid (monotonically
+    /// increasing).  Returns `Ok(())` if the frame should be accepted.
+    ///
+    /// On first frame from a new `link_id`, any sequence is accepted
+    /// (bootstrap).  After that, the sequence must be strictly greater
+    /// than the last-seen value.
+    pub fn check_inbound(&self, link_id: u32, sequence: u64) -> Result<(), String> {
+        let mut map = self.inbound.lock().unwrap();
+        match map.get(&link_id) {
+            Some(&last) => {
+                if sequence > last {
+                    map.insert(link_id, sequence);
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "P2P replay detected: link_id={link_id} seq={sequence} <= last={last}"
+                    ))
+                }
+            }
+            None => {
+                // Bootstrap: accept first frame with any sequence.
+                map.insert(link_id, sequence);
+                Ok(())
+            }
+        }
+    }
+
+    /// Remove tracking state for a disconnected link.
+    pub fn remove_link(&self, link_id: u32) {
+        if let Ok(mut map) = self.outbound.lock() {
+            map.remove(&link_id);
+        }
+        if let Ok(mut map) = self.inbound.lock() {
+            map.remove(&link_id);
+        }
+    }
+}
+
+impl Default for PerLinkSequence {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1460,90 +1543,5 @@ mod tests {
         assert_eq!(bytes.len(), KeyRotationAckData::WIRE_SIZE);
         let parsed = KeyRotationAckData::from_bytes(&bytes).unwrap();
         assert_eq!(parsed.responder_new_public_key, key);
-    }
-}
-
-// ══════════════════════════════════════════════════════════════════════════
-// Per-link sequence tracker (anti-replay)
-// ══════════════════════════════════════════════════════════════════════════
-
-/// Thread-safe per-link sequence number tracker for anti-replay protection.
-///
-/// Each outbound frame increments the sequence for its `link_id`; each
-/// inbound frame is checked against the last-seen sequence for that link.
-/// Frames with a sequence <= the last-seen value are rejected as replays.
-///
-/// On first frame from a new link, any sequence is accepted (bootstrap).
-pub struct PerLinkSequence {
-    outbound: Mutex<HashMap<u32, AtomicU64>>,
-    inbound: Mutex<HashMap<u32, u64>>,
-}
-
-impl PerLinkSequence {
-    /// Create a new empty tracker.
-    pub fn new() -> Self {
-        Self {
-            outbound: Mutex::new(HashMap::new()),
-            inbound: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// Get the next outbound sequence number for `link_id`, allocating
-    /// a new counter (starting at 0) if this is the first frame on the link.
-    /// Returns the sequence to write into the frame.
-    pub fn next_outbound(&self, link_id: u32) -> u64 {
-        let map = self.outbound.lock().unwrap();
-        if let Some(counter) = map.get(&link_id) {
-            counter.fetch_add(1, Ordering::Relaxed)
-        } else {
-            drop(map);
-            let mut map = self.outbound.lock().unwrap();
-            map.entry(link_id).or_insert_with(|| AtomicU64::new(0));
-            // First frame gets sequence 0; next will be 1.
-            map.get(&link_id).unwrap().fetch_add(1, Ordering::Relaxed)
-        }
-    }
-
-    /// Check whether an inbound frame's sequence is valid (monotonically
-    /// increasing).  Returns `Ok(())` if the frame should be accepted.
-    ///
-    /// On first frame from a new `link_id`, any sequence is accepted
-    /// (bootstrap).  After that, the sequence must be strictly greater
-    /// than the last-seen value.
-    pub fn check_inbound(&self, link_id: u32, sequence: u64) -> Result<(), String> {
-        let mut map = self.inbound.lock().unwrap();
-        match map.get(&link_id) {
-            Some(&last) => {
-                if sequence > last {
-                    map.insert(link_id, sequence);
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "P2P replay detected: link_id={link_id} seq={sequence} <= last={last}"
-                    ))
-                }
-            }
-            None => {
-                // Bootstrap: accept first frame with any sequence.
-                map.insert(link_id, sequence);
-                Ok(())
-            }
-        }
-    }
-
-    /// Remove tracking state for a disconnected link.
-    pub fn remove_link(&self, link_id: u32) {
-        if let Ok(mut map) = self.outbound.lock() {
-            map.remove(&link_id);
-        }
-        if let Ok(mut map) = self.inbound.lock() {
-            map.remove(&link_id);
-        }
-    }
-}
-
-impl Default for PerLinkSequence {
-    fn default() -> Self {
-        Self::new()
     }
 }

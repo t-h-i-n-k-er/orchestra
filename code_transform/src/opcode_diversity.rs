@@ -168,7 +168,7 @@ pub(crate) fn try_add_to_sub(
     let neg = -imm_i64;
     let reg = inst.op0_register();
 
-    let sub_code = match (is_64bit, neg >= -128 && neg <= 127) {
+    let sub_code = match (is_64bit, (-128..=127).contains(&neg)) {
         (true, true) => Code::Sub_rm64_imm8,
         (true, false) => Code::Sub_rm64_imm32,
         (false, true) => Code::Sub_rm32_imm8,
@@ -634,8 +634,8 @@ fn find_basic_blocks(instructions: &[Instruction]) -> Vec<std::ops::Range<usize>
 
     let mut blocks: Vec<std::ops::Range<usize>> = Vec::new();
     let mut start = 0;
-    for i in 1..instructions.len() {
-        if leaders.contains(&instructions[i].ip()) {
+    for (i, inst) in instructions.iter().enumerate().skip(1) {
+        if leaders.contains(&inst.ip()) {
             blocks.push(start..i);
             start = i;
         }

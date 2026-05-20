@@ -210,7 +210,7 @@ pub fn guard_memory() -> Result<()> {
     // Store the handle in a thread-local so unguard_memory can consume it.
     thread_local! {
         static GUARD_HANDLE: std::cell::RefCell<Option<KeyHandle>> =
-            std::cell::RefCell::new(None);
+            const { std::cell::RefCell::new(None) };
     }
     let handle = lock()?;
     GUARD_HANDLE.with(|h| {
@@ -227,7 +227,7 @@ pub fn guard_memory() -> Result<()> {
 pub fn unguard_memory() -> Result<()> {
     thread_local! {
         static GUARD_HANDLE: std::cell::RefCell<Option<KeyHandle>> =
-            std::cell::RefCell::new(None);
+            const { std::cell::RefCell::new(None) };
     }
     GUARD_HANDLE.with(|h| {
         if let Some(handle) = h.borrow_mut().take() {

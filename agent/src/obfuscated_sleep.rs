@@ -1153,6 +1153,11 @@ pub mod stack_mask {
     /// For each section the page is made writable with `VirtualProtect`, the
     /// bytes are XOR'd with a ChaCha20 keystream, and the original protection
     /// is restored.  Returns per-section state needed for decryption.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure no other thread is executing from or reading the
+    /// target sections while they are temporarily writable/encrypted.
     #[cfg(windows)]
     pub unsafe fn encrypt_with_key(key: &[u8; 32]) -> Vec<SectionEntry> {
         let sections = super::crypto::get_code_sections();
@@ -1195,8 +1200,13 @@ pub mod stack_mask {
     /// Each section is made writable, XOR'd with the same keystream to recover
     /// the original bytes, and the original protection is restored.
     /// Per-section nonces are zeroed in place after use.
+    ///
+    /// # Safety
+    ///
+    /// `sections` must have been returned by [`encrypt_with_key`] for the same
+    /// process image and key, and no other thread may concurrently access them.
     #[cfg(windows)]
-    pub unsafe fn decrypt_with_key(sections: &mut Vec<SectionEntry>, key: &[u8; 32]) {
+    pub unsafe fn decrypt_with_key(sections: &mut [SectionEntry], key: &[u8; 32]) {
         for section in sections.iter_mut() {
             if section.addr.is_null() || section.len == 0 {
                 continue;
@@ -1226,6 +1236,11 @@ pub mod stack_mask {
     }
 
     /// Non-Windows: encrypt using `mprotect` to make sections writable.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure no other thread is executing from or reading the
+    /// target sections while they are temporarily writable/encrypted.
     #[cfg(not(windows))]
     pub unsafe fn encrypt_with_key(key: &[u8; 32]) -> Vec<SectionEntry> {
         let sections = super::crypto::get_code_sections();
@@ -1258,8 +1273,13 @@ pub mod stack_mask {
     }
 
     /// Non-Windows: decrypt using `mprotect` to make sections writable.
+    ///
+    /// # Safety
+    ///
+    /// `sections` must have been returned by [`encrypt_with_key`] for the same
+    /// process image and key, and no other thread may concurrently access them.
     #[cfg(not(windows))]
-    pub unsafe fn decrypt_with_key(sections: &mut Vec<SectionEntry>, key: &[u8; 32]) {
+    pub unsafe fn decrypt_with_key(sections: &mut [SectionEntry], key: &[u8; 32]) {
         for section in sections.iter_mut() {
             if section.addr.is_null() || section.len == 0 {
                 continue;

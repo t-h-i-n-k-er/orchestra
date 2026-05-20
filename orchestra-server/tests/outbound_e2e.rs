@@ -199,6 +199,7 @@ async fn outbound_agent_connects_and_registers() {
 
     // Clean up the child process before asserting so it doesn't linger.
     let _ = child.kill();
+    let _ = child.wait();
 
     assert!(found, "outbound agent never appeared in /api/agents");
 }

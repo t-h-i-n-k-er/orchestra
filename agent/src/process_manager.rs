@@ -171,7 +171,7 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                 .split_whitespace()
                 .nth(1)
                 .and_then(|hex| u64::from_str_radix(hex, 16).ok())
-                .map_or(false, |bits| bits & CAP_SYS_PTRACE_BIT != 0)
+                .is_some_and(|bits| bits & CAP_SYS_PTRACE_BIT != 0)
         }
 
         if our_uid != 0 && our_uid != target_uid && !has_cap_sys_ptrace() {
@@ -363,7 +363,7 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                     // or u64::MAX, missing all intermediate error codes.
                     let rax = result_regs.rax;
                     let rax_signed = rax as i64;
-                    if rax_signed >= -4096 && rax_signed < 0 {
+                    if (-4096..0).contains(&rax_signed) {
                         let errno = -rax_signed;
                         return Err(anyhow::anyhow!(
                             "run_syscall: remote syscall {sys} returned error {errno} ({})",

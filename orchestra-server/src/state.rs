@@ -7,6 +7,12 @@
 //! agent's slot by claiming its `agent_id`; the worst it can do is add a
 //! duplicate entry under its own connection ID, which the operator can see in
 //! the dashboard and clean up by closing the rogue connection.
+//!
+//! ## `AgentId` newtype
+//!
+//! An [`AgentId`] wraps a `String` to distinguish agent identifiers from other
+//! strings (connection IDs, hostnames, operator IDs).  This prevents accidental
+//! misuse — e.g. passing a `connection_id` where an `agent_id` is expected.
 
 use crate::audit::AuditLog;
 use crate::config::{OperatorRecord, ServerConfig};
@@ -20,6 +26,96 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, oneshot, RwLock};
+
+// ── AgentId newtype ────────────────────────────────────────────────────
+
+/// Type-safe wrapper around an agent identifier string.
+///
+/// Prevents accidental confusion between `agent_id`, `connection_id`,
+/// `hostname`, and other string-typed identifiers.  The inner value is the
+/// agent's self-reported identifier (e.g. `"DESKTOP-WIN10-agent-01"`).
+///
+/// Implements the usual traits for use as `HashMap` keys, `DashMap` keys,
+/// Axum path extraction, JSON (de)serialization, etc.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct AgentId(pub String);
+
+impl AgentId {
+    /// Create a new `AgentId` from a string.
+    #[inline]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// Borrow the inner string.
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for AgentId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for AgentId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for AgentId {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+impl std::str::FromStr for AgentId {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_string()))
+    }
+}
+
+impl AsRef<str> for AgentId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::borrow::Borrow<str> for AgentId {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<String> for AgentId {
+    fn eq(&self, other: &String) -> bool {
+        &self.0 == other
+    }
+}
+
+impl PartialEq<str> for AgentId {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<AgentId> for String {
+    fn eq(&self, other: &AgentId) -> bool {
+        self == &other.0
+    }
+}
+
+impl<'a> PartialEq<&'a str> for AgentId {
+    fn eq(&self, other: &&'a str) -> bool {
+        self.0 == *other
+    }
+}
 
 /// One connected agent.  `connection_id` is assigned by the server on accept.
 /// `agent_id` and `hostname` are whatever the agent reported in its Heartbeat.
@@ -260,7 +356,7 @@ impl AppState {
     /// `AuthenticatedUser` extension.
     pub fn authenticate_operator(&self, presented_token: &str) -> Option<(String, Vec<String>)> {
         let presented_hash = OperatorRecord::hash_token(presented_token);
-        for (_id, op) in &self.operators {
+        for op in self.operators.values() {
             let ok: bool = presented_hash
                 .as_bytes()
                 .ct_eq(op.token_hash.as_bytes())
@@ -342,8 +438,95 @@ impl AppState {
         reporter_agent_id: &str,
         children: &[common::P2pChildInfo],
     ) {
+        // ── Validation ────────────────────────────────────────────────
+        // 1. The reporter must be a known, connected agent.
+        if self.find_by_agent_id(reporter_agent_id).is_none() {
+            tracing::warn!(
+                reporter = %reporter_agent_id,
+                "rejected topology report: reporter not in agent registry"
+            );
+            return;
+        }
+
+        let child_ids: Vec<String> = children.iter().map(|c| c.agent_id.clone()).collect();
+
+        // 2. Reject self-referential reports (agent claiming itself as child).
+        if child_ids.iter().any(|id| id == reporter_agent_id) {
+            tracing::warn!(
+                reporter = %reporter_agent_id,
+                "rejected topology report: reporter listed itself as a child"
+            );
+            return;
+        }
+
+        // 3. Reject duplicate children in a single report.
+        {
+            let mut seen = std::collections::HashSet::new();
+            for id in &child_ids {
+                if !seen.insert(id.as_str()) {
+                    tracing::warn!(
+                        reporter = %reporter_agent_id,
+                        duplicate = %id,
+                        "rejected topology report: duplicate child agent_id"
+                    );
+                    return;
+                }
+            }
+        }
+
+        // Acquire the write lock only after cheap checks pass.
         let mut topo = self.topology.write().await;
 
+        // 4. Each reported child must be either already known in the
+        //    topology map *or* present in the agent registry.  Unknown
+        //    children are silently rejected to prevent a rogue agent from
+        //    polluting the topology with phantom nodes.
+        for child_id in &child_ids {
+            let known_in_topology = topo.nodes.contains_key(child_id);
+            let known_in_registry = self.find_by_agent_id(child_id).is_some();
+            if !known_in_topology && !known_in_registry {
+                tracing::warn!(
+                    reporter = %reporter_agent_id,
+                    child = %child_id,
+                    "rejected topology report: unknown child agent_id"
+                );
+                return;
+            }
+        }
+
+        // 5. Cycle detection: walk from each child's *existing* parent
+        //    chain (if any) toward the root and verify it does not pass
+        //    through the reporter.  This prevents a child from becoming
+        //    its own ancestor.
+        for child_id in &child_ids {
+            let mut cursor = Some(child_id.clone());
+            let mut steps = 0u32;
+            let max_depth = topo.nodes.len().saturating_add(1) as u32;
+            while let Some(id) = cursor {
+                if id == reporter_agent_id {
+                    tracing::warn!(
+                        reporter = %reporter_agent_id,
+                        child = %child_id,
+                        "rejected topology report: cycle detected"
+                    );
+                    return;
+                }
+                steps += 1;
+                if steps > max_depth {
+                    // Safety valve: the existing topology has a cycle.
+                    // Break out rather than looping forever.
+                    tracing::warn!(
+                        reporter = %reporter_agent_id,
+                        child = %child_id,
+                        "rejected topology report: existing topology contains a cycle"
+                    );
+                    return;
+                }
+                cursor = topo.nodes.get(&id).and_then(|n| n.parent.clone());
+            }
+        }
+
+        // ── Apply updates ─────────────────────────────────────────────
         // Determine the reporter's depth.  If the reporter is directly
         // connected (no parent in the topology), depth is 0.
         let reporter_depth = topo
@@ -353,9 +536,6 @@ impl AppState {
             .and_then(|parent_id| topo.nodes.get(parent_id))
             .map(|n| n.depth + 1)
             .unwrap_or(0);
-
-        // Collect child agent_ids.
-        let child_ids: Vec<String> = children.iter().map(|c| c.agent_id.clone()).collect();
 
         // Populate the child_link_map with link_ids from the report.
         for child in children {
@@ -465,6 +645,7 @@ impl AppState {
     }
 
     /// Record a link failure report from an agent.
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_link_failure(
         &self,
         agent_id: &str,
@@ -608,6 +789,65 @@ impl AppState {
             avg_fanout,
         }
     }
+}
+
+/// Send a `Message` to a child agent through the P2P relay chain.
+///
+/// If the child is directly connected, sends directly via its `tx`.
+/// Otherwise, wraps the message in `P2pToChild` routing envelopes and
+/// sends it through the first directly-connected hop.
+pub async fn send_to_child(
+    state: &AppState,
+    child_agent_id: &str,
+    msg: &Message,
+) -> anyhow::Result<()> {
+    // If the child is directly connected, send directly.
+    if let Some(entry) = state.find_by_agent_id(child_agent_id) {
+        return entry
+            .tx
+            .send(msg.clone())
+            .await
+            .map_err(|_| anyhow::anyhow!("child agent disconnected"));
+    }
+
+    // Not directly connected — route through P2P relay chain.
+    let route = state
+        .route_to_agent(child_agent_id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("no route to child agent '{}'", child_agent_id))?;
+
+    // Serialize the inner message.
+    let mut payload = bincode::serde::encode_to_vec(msg, bincode::config::legacy())?;
+
+    // Wrap in routing blobs from innermost hop to outermost,
+    // skipping the first hop (its link_id goes in the P2pToChild envelope).
+    for (_, link_id) in route.iter().skip(1).rev() {
+        let mut blob = Vec::with_capacity(4 + 4 + payload.len());
+        blob.extend_from_slice(&link_id.to_le_bytes());
+        blob.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&payload);
+        payload = blob;
+    }
+
+    // Send the outermost P2pToChild to the directly-connected agent.
+    let first_hop_agent_id = &route[0].0;
+    let first_hop_entry = state
+        .find_by_agent_id(first_hop_agent_id)
+        .ok_or_else(|| anyhow::anyhow!("first-hop agent '{}' disconnected", first_hop_agent_id))?;
+
+    let first_link_id = route[0].1;
+    let p2p_msg = Message::P2pToChild {
+        child_link_id: first_link_id,
+        data: payload,
+    };
+
+    first_hop_entry
+        .tx
+        .send(p2p_msg)
+        .await
+        .map_err(|_| anyhow::anyhow!("first-hop agent send failed"))?;
+
+    Ok(())
 }
 
 /// Summary statistics for the P2P mesh topology.

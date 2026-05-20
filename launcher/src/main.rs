@@ -149,7 +149,8 @@ fn is_poly_blob(data: &[u8]) -> bool {
         return false;
     }
     let flags = data[5];
-    let pad_len = (flags >> 2) as usize;
+    // MED-018: mask pad_len to bits 2-5 only; bit 6 is SEP_MAC.
+    let pad_len = ((flags >> 2) & 0xF) as usize;
     // New-format spec: padding is capped at 16 bytes.
     if pad_len > 16 {
         return false;
@@ -171,13 +172,30 @@ fn is_poly_blob(data: &[u8]) -> bool {
         }
     };
     let key_len = decode_u32(&data[key_len_offset..key_len_offset + 4]) as usize;
-    let ct_len_offset = key_len_offset + 4 + key_len;
+
+    // MED-018: if bit 6 (SEP_MAC) is set, skip the MAC key field
+    // (mac_key_len + mac_key) before reaching ct_len.
+    let has_sep_mac = (flags & 0x40) != 0;
+    let mut pos = key_len_offset + 4 + key_len;
+    if has_sep_mac {
+        if data.len() < pos + 4 {
+            return false;
+        }
+        let mac_key_len = decode_u32(&data[pos..pos + 4]) as usize;
+        pos += 4;
+        if data.len() < pos + mac_key_len {
+            return false;
+        }
+        pos += mac_key_len;
+    }
+
+    let ct_len_offset = pos;
     if data.len() < ct_len_offset + 4 {
         return false;
     }
     let ct_len = decode_u32(&data[ct_len_offset..ct_len_offset + 4]) as usize;
     // v2 format with MAC: total = header + padding + key_len(4) + key +
-    // ct_len(4) + ct + 32-byte HMAC tag.
+    // (mac_key_len + mac_key if SEP_MAC) + ct_len(4) + ct + 32-byte HMAC tag.
     data.len() >= ct_len_offset + 4 + ct_len + 32
 }
 
@@ -223,8 +241,34 @@ fn poly_decrypt_legacy(data: &[u8]) -> Result<Vec<u8>> {
     }
     let ct = &data[ct_offset + 4..ct_offset + 4 + ct_len];
     let tag = &data[ct_offset + 4 + ct_len..ct_offset + 4 + ct_len + 32];
-    verify_poly_mac(key, &data[..ct_offset + 4 + ct_len], tag)?;
+    verify_poly_mac_legacy(key, &data[..ct_offset + 4 + ct_len], tag)?;
     dispatch_scheme(scheme, ct, key)
+}
+
+/// Legacy HMAC verification for v1 blobs — uses the old info string
+/// `b"orchestra-poly-mac"` for backward compatibility with existing blobs.
+fn verify_poly_mac_legacy(
+    enc_key: &[u8],
+    authenticated_data: &[u8],
+    expected_tag: &[u8],
+) -> Result<()> {
+    use hkdf::Hkdf;
+    use hmac::{Hmac, KeyInit, Mac};
+    type HmacSha256 = Hmac<sha2::Sha256>;
+
+    let hkdf = Hkdf::<sha2::Sha256>::new(None, enc_key);
+    let mut mac_key = [0u8; 32];
+    hkdf.expand(b"orchestra-poly-mac", &mut mac_key)
+        .map_err(|_| anyhow!("HKDF expand failed for legacy poly MAC key"))?;
+
+    let mut mac = HmacSha256::new_from_slice(&mac_key).expect("HMAC-SHA256 accepts any key length");
+    mac.update(authenticated_data);
+    mac.verify_slice(expected_tag).map_err(|_| {
+        anyhow!(
+            "POLY v1 blob authentication tag verification failed — blob may be tampered or corrupted"
+        )
+    })?;
+    Ok(())
 }
 
 /// Decode and execute a v2 POLY-format encrypted payload.
@@ -234,8 +278,11 @@ fn poly_decrypt_legacy(data: &[u8]) -> Result<Vec<u8>> {
 /// [4 bytes: seed-derived magic][1 byte: scheme][1 byte: flags]
 ///     flags bit 0: endianness (0=BE, 1=LE)
 ///     flags bit 1: padding present
-///     flags bits 2-7: padding byte count (0-16)
-/// [0..N bytes: random padding][4 bytes: key_len][key_len bytes: key]
+///     flags bit 6: separate MAC key present (MED-018)
+///     flags bits 2-5: padding byte count (0-15)
+/// [0..N bytes: random padding]
+/// [4 bytes: key_len][key_len bytes: encryption key]
+/// [4 bytes: mac_key_len][mac_key_len bytes: MAC key]   ← only if bit 6 = 1
 /// [4 bytes: ct_len][ct_len bytes: ciphertext]
 /// [32 bytes: HMAC-SHA256 authentication tag]
 /// ```
@@ -247,8 +294,9 @@ fn poly_decrypt_v2(data: &[u8]) -> Result<Vec<u8>> {
     let flags = data[5];
     let use_le = (flags & 1) != 0;
     let has_padding = (flags & 2) != 0;
+    let has_sep_mac = (flags & 0x40) != 0;
     let pad_len = if has_padding {
-        (flags >> 2) as usize
+        (flags >> 2) & 0xF // bits 2-5 (max 15)
     } else {
         0
     };
@@ -265,21 +313,43 @@ fn poly_decrypt_v2(data: &[u8]) -> Result<Vec<u8>> {
         }
     };
 
-    let key_len_offset = 6 + pad_len;
+    let key_len_offset = 6 + pad_len as usize;
     if data.len() < key_len_offset + 4 {
         anyhow::bail!("POLY v2 blob truncated before key_len field");
     }
     let key_len = decode_u32(&data[key_len_offset..key_len_offset + 4]) as usize;
 
     let key_offset = key_len_offset + 4;
-    if data.len() < key_offset + key_len + 4 {
+    if data.len() < key_offset + key_len {
         anyhow::bail!("POLY v2 blob truncated in key field");
     }
     let key = &data[key_offset..key_offset + key_len];
 
-    let ct_len_offset = key_offset + key_len;
-    let ct_len = decode_u32(&data[ct_len_offset..ct_len_offset + 4]) as usize;
-    let ct_offset = ct_len_offset + 4;
+    // MED-018: Parse the independent MAC key when flag bit 6 is set.
+    let mut pos = key_offset + key_len;
+    let mac_key: &[u8];
+    if has_sep_mac {
+        if data.len() < pos + 4 {
+            anyhow::bail!("POLY v2 blob truncated before mac_key_len field");
+        }
+        let mac_key_len = decode_u32(&data[pos..pos + 4]) as usize;
+        pos += 4;
+        if data.len() < pos + mac_key_len {
+            anyhow::bail!("POLY v2 blob truncated in mac_key field");
+        }
+        mac_key = &data[pos..pos + mac_key_len];
+        pos += mac_key_len;
+    } else {
+        // Legacy blobs without separate MAC key: derive from encryption key.
+        mac_key = key;
+    }
+
+    if data.len() < pos + 4 {
+        anyhow::bail!("POLY v2 blob truncated before ct_len field");
+    }
+    let ct_len = decode_u32(&data[pos..pos + 4]) as usize;
+    pos += 4;
+    let ct_offset = pos;
     let payload_end = ct_offset + ct_len;
     let expected_len = payload_end + 32; // +32 for HMAC tag
     if data.len() < payload_end {
@@ -290,26 +360,30 @@ fn poly_decrypt_v2(data: &[u8]) -> Result<Vec<u8>> {
     // Verify HMAC-SHA256 authentication tag.
     if data.len() >= expected_len {
         let tag = &data[payload_end..expected_len];
-        verify_poly_mac(key, &data[..payload_end], tag)?;
+        verify_poly_mac(mac_key, &data[..payload_end], tag)?;
     }
     // If the blob has no MAC (legacy), proceed without verification.
 
     dispatch_scheme(scheme, ct, key)
 }
 
-/// Derive the poly-MAC key from the blob's encryption key via HKDF-SHA256
+/// Derive the poly-MAC key from the MAC key material via HKDF-SHA256
 /// and verify the HMAC-SHA256 tag over the authenticated data.
 ///
 /// Uses the same derivation as the packager:
-/// `hkdf_key = HKDF-Expand(salt=b"", info=b"orchestra-poly-mac", 32)`.
-fn verify_poly_mac(blob_key: &[u8], authenticated_data: &[u8], expected_tag: &[u8]) -> Result<()> {
+/// `hkdf_key = HKDF-Expand(salt=b"", info=common::hkdf_info::POLY_MAC, 32)`.
+fn verify_poly_mac(
+    mac_key_material: &[u8],
+    authenticated_data: &[u8],
+    expected_tag: &[u8],
+) -> Result<()> {
     use hkdf::Hkdf;
     use hmac::{Hmac, KeyInit, Mac};
     type HmacSha256 = Hmac<sha2::Sha256>;
 
-    let hkdf = Hkdf::<sha2::Sha256>::new(None, blob_key);
+    let hkdf = Hkdf::<sha2::Sha256>::new(None, mac_key_material);
     let mut mac_key = [0u8; 32];
-    hkdf.expand(b"orchestra-poly-mac", &mut mac_key)
+    hkdf.expand(common::hkdf_info::POLY_MAC, &mut mac_key)
         .map_err(|_| anyhow!("HKDF expand failed for poly MAC key"))?;
 
     let mut mac = HmacSha256::new_from_slice(&mac_key).expect("HMAC-SHA256 accepts any key length");
@@ -367,7 +441,7 @@ fn poly_decrypt_chacha20(ct: &[u8], key: &[u8]) -> Result<Vec<u8>> {
 fn poly_exec_raw_stub(ct: &[u8], stub: &[u8]) -> Result<Vec<u8>> {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        return poly_exec_raw_stub_linux(ct, stub);
+        poly_exec_raw_stub_linux(ct, stub)
     }
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {
@@ -690,7 +764,7 @@ fn poly_exec_raw_stub_linux(ct: &[u8], stub: &[u8]) -> Result<Vec<u8>> {
     }
 
     let page_size = 4096usize;
-    let stub_pages = ((stub.len() + page_size - 1) / page_size) * page_size;
+    let stub_pages = stub.len().div_ceil(page_size) * page_size;
 
     // Allocate and populate stub page.
     // SAFETY: standard mmap / mprotect usage with validated inputs.
@@ -1192,10 +1266,14 @@ mod tests {
 
     /// Build a minimal v2 POLY blob for the given scheme, key, and ciphertext,
     /// including the HMAC-SHA256 authentication tag expected by the v2 format.
+    /// Uses the MED-018 wire format with a separate MAC key (flag bit 6).
     fn make_v2_blob(scheme: u8, use_le: bool, pad: &[u8], key: &[u8], ct: &[u8]) -> Vec<u8> {
         let pad_len = pad.len() as u8;
         let has_padding = pad_len > 0;
-        let flags: u8 = (use_le as u8) | ((has_padding as u8) << 1) | (pad_len << 2);
+        // MED-018: set bit 6 for separate MAC key.
+        const FLAG_SEP_MAC: u8 = 1 << 6;
+        let flags: u8 =
+            (use_le as u8) | ((has_padding as u8) << 1) | ((pad_len & 0xF) << 2) | FLAG_SEP_MAC;
 
         let encode_u32 = |v: u32| -> [u8; 4] {
             if use_le {
@@ -1205,6 +1283,9 @@ mod tests {
             }
         };
 
+        // Generate a random MAC key independent of the encryption key.
+        let mac_key: Vec<u8> = vec![0xDDu8; 32];
+
         let mut blob = Vec::new();
         blob.extend_from_slice(b"\xAB\xCD\xEF\x01"); // arbitrary non-POLY magic
         blob.push(scheme);
@@ -1212,26 +1293,29 @@ mod tests {
         blob.extend_from_slice(pad);
         blob.extend_from_slice(&encode_u32(key.len() as u32));
         blob.extend_from_slice(key);
+        blob.extend_from_slice(&encode_u32(mac_key.len() as u32));
+        blob.extend_from_slice(&mac_key);
         blob.extend_from_slice(&encode_u32(ct.len() as u32));
         blob.extend_from_slice(ct);
 
         // Compute and append the HMAC-SHA256 tag using the same derivation
         // as verify_poly_mac.
-        let tag = compute_poly_mac_tag(key, &blob);
+        let tag = compute_poly_mac_tag(&mac_key, &blob);
         blob.extend_from_slice(&tag);
 
         blob
     }
 
     /// Compute the poly MAC tag for test blob construction.
-    fn compute_poly_mac_tag(blob_key: &[u8], authenticated_data: &[u8]) -> [u8; 32] {
+    fn compute_poly_mac_tag(mac_key_material: &[u8], authenticated_data: &[u8]) -> [u8; 32] {
         use hkdf::Hkdf;
         use hmac::{Hmac, KeyInit, Mac};
         type HmacSha256 = Hmac<sha2::Sha256>;
 
-        let hkdf = Hkdf::<sha2::Sha256>::new(None, blob_key);
+        let hkdf = Hkdf::<sha2::Sha256>::new(None, mac_key_material);
         let mut mac_key = [0u8; 32];
-        hkdf.expand(b"orchestra-poly-mac", &mut mac_key).unwrap();
+        hkdf.expand(common::hkdf_info::POLY_MAC, &mut mac_key)
+            .unwrap();
 
         let mut mac = HmacSha256::new_from_slice(&mac_key).unwrap();
         mac.update(authenticated_data);

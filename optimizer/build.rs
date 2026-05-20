@@ -41,7 +41,7 @@ fn harvest_entropy() -> [u8; 64] {
     words.push(tid);
     words.push(stack_addr);
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(unix)]
     {
         use std::io::Read;
 
@@ -51,6 +51,24 @@ fn harvest_entropy() -> [u8; 64] {
                 for chunk in buf.chunks_exact(8) {
                     words.push(u64::from_le_bytes(chunk.try_into().unwrap()));
                 }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::ffi::c_void;
+
+        #[link(name = "advapi32")]
+        extern "system" {
+            fn SystemFunction036(random_buffer: *mut c_void, random_buffer_length: u32) -> u8;
+        }
+
+        let mut buf = [0u8; 32];
+        let ok = unsafe { SystemFunction036(buf.as_mut_ptr().cast(), buf.len() as u32) } != 0;
+        if ok {
+            for chunk in buf.chunks_exact(8) {
+                words.push(u64::from_le_bytes(chunk.try_into().unwrap()));
             }
         }
     }

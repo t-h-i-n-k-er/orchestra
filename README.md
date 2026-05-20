@@ -5,7 +5,7 @@ A cross-platform, operationally secure command-and-control framework built in Ru
 | | |
 |---|---|
 | **Language** | Rust 2021 edition |
-| **Targets** | `x86_64-pc-windows-gnu`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin` |
+| **Targets** | `x86_64-pc-windows-gnu`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, `aarch64-linux-android`, `x86_64-linux-android`, `aarch64-apple-ios` |
 | **License** | Proprietary |
 
 ---
@@ -1067,6 +1067,7 @@ curl -X POST https://c2.example.com/api/mesh/broadcast \
 | `manual-map` | Reflective/manual module mapping |
 | `module-stomp` | Module stomping — overwrites legitimate DLL in memory with payload |
 | `memory-guard` | Heap region encryption during idle windows |
+| `mobile-postexp` | Android and iOS persistence and post-exploitation modules |
 | `module-signatures` | Signed module verification |
 | `strict-module-key` | Hard error if no runtime module signing key — production hardening |
 | `network-discovery` | ARP scan, ping sweep, port scan |

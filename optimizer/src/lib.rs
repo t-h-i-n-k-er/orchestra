@@ -97,57 +97,101 @@ pub fn apply_passes_at(base: u64, code: &[u8]) -> Vec<u8> {
         p.run(&mut instrs);
     }
 
-    // Helper: compute the IP each instruction will be placed at by doing a
-    // trial encode.  We need this to rewrite near-branch targets correctly.
-    let compute_ips = |instrs: &[Instruction]| -> Vec<u64> {
+    // MED-022 fix: iterative fixed-point branch-target remapping.
+    //
+    // When a pass inserts, removes, or resizes instructions, every branch
+    // target that was recorded as an original IP must be remapped to the new
+    // IP of the target instruction.  The catch: changing a branch target can
+    // itself change the branch's encoded size (e.g. short jmp rel8 → near jmp
+    // rel32 when the displacement exceeds ±127 bytes), which shifts all
+    // subsequent IPs and may invalidate *other* branch targets.
+    //
+    // Solution: iterate remap → recompute IPs until the encoded size of every
+    // instruction stabilises.
+
+    use std::collections::HashMap;
+
+    /// Build old_ip → new_ip map so branch targets can be remapped.
+    fn build_ip_map(instrs: &[Instruction], new_ips: &[u64]) -> HashMap<u64, u64> {
+        let mut map: HashMap<u64, u64> = HashMap::new();
+        for (ins, &nip) in instrs.iter().zip(new_ips.iter()) {
+            // NOP instructions inserted by NopInsertionPass have ip()==0; they
+            // carry no branch targets so we can skip duplicate-key entries.
+            map.entry(ins.ip()).or_insert(nip);
+        }
+        map
+    }
+
+    /// Rewrite near-branch targets using the IP map.  Returns true if any
+    /// branch target was changed (which may change encoded sizes).
+    fn remap_branches(instrs: &mut [Instruction], ip_map: &HashMap<u64, u64>) -> bool {
+        let mut changed = false;
+        for ins in instrs.iter_mut() {
+            let needs_fix = (0..ins.op_count()).any(|i| {
+                matches!(
+                    ins.op_kind(i),
+                    OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+                )
+            });
+            if needs_fix {
+                let old_target = ins.near_branch64();
+                if let Some(&new_target) = ip_map.get(&old_target) {
+                    if new_target != old_target {
+                        ins.set_near_branch64(new_target);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// Compute the IP each instruction will be placed at by doing a trial
+    /// encode.  Returns (ips, sizes) where sizes[i] is the encoded length of
+    /// instruction i.
+    fn compute_ips_and_sizes(instrs: &[Instruction], base: u64) -> (Vec<u64>, Vec<usize>) {
         let mut ips = Vec::with_capacity(instrs.len());
+        let mut sizes = Vec::with_capacity(instrs.len());
         let mut cur = base;
         let mut enc = Encoder::new(64);
         for ins in instrs {
             ips.push(cur);
-            // encode at `cur` to get the correct encoded size for this IP;
-            // the result might be inaccurate if the branch target changed later,
-            // but a second pass corrects that.
-            cur += enc.encode(ins, cur).unwrap_or(1) as u64;
+            let sz = enc.encode(ins, cur).unwrap_or(1);
             let _ = enc.take_buffer();
+            sizes.push(sz);
+            cur += sz as u64;
         }
-        ips
-    };
-
-    // First pass: approximate new IPs.
-    let approx_ips = compute_ips(&instrs);
-
-    // Build old_ip → new_ip map so branch targets can be remapped.
-    use std::collections::HashMap;
-    let mut ip_map: HashMap<u64, u64> = HashMap::new();
-    for (ins, &new_ip) in instrs.iter().zip(approx_ips.iter()) {
-        // NOP instructions inserted by NopInsertionPass have ip()==0; they
-        // carry no branch targets so we can skip duplicate-key entries.
-        ip_map.entry(ins.ip()).or_insert(new_ip);
+        (ips, sizes)
     }
 
-    // Rewrite near branch targets using the new IP map.
-    use iced_x86::OpKind;
-    for ins in &mut instrs {
-        let needs_fix = (0..ins.op_count()).any(|i| {
-            matches!(
-                ins.op_kind(i),
-                OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
-            )
-        });
-        if needs_fix {
-            let old_target = ins.near_branch64();
-            if let Some(&new_target) = ip_map.get(&old_target) {
-                ins.set_near_branch64(new_target);
+    // Iterate until encoded sizes stabilise.
+    let mut prev_sizes: Vec<usize> = Vec::new();
+    let max_iters = 16; // generous upper bound; typically converges in 2-3.
+    for _iter in 0..max_iters {
+        let (ips, sizes) = compute_ips_and_sizes(&instrs, base);
+        let ip_map = build_ip_map(&instrs, &ips);
+
+        // If sizes are identical to the previous round we've converged.
+        if sizes == prev_sizes {
+            // Final encode at converged IPs.
+            let mut encoder = Encoder::new(64);
+            for (ins, &ip) in instrs.iter().zip(ips.iter()) {
+                let _ = encoder.encode(ins, ip);
             }
+            return encoder.take_buffer();
         }
+        prev_sizes = sizes;
+
+        // Remap branch targets and loop.
+        remap_branches(&mut instrs, &ip_map);
     }
 
-    // Recompute IPs now that branch targets (and therefore branch sizes) are
-    // final, then encode at those IPs.
-    let final_ips = compute_ips(&instrs);
+    // If we didn't converge after max_iters, fall back to a single encode with
+    // whatever state we have — this is still correct as long as the last round
+    // of remapping was applied.
+    let (ips, _) = compute_ips_and_sizes(&instrs, base);
     let mut encoder = Encoder::new(64);
-    for (ins, &ip) in instrs.iter().zip(final_ips.iter()) {
+    for (ins, &ip) in instrs.iter().zip(ips.iter()) {
         let _ = encoder.encode(ins, ip);
     }
     encoder.take_buffer()

