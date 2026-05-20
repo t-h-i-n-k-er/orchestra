@@ -40,7 +40,7 @@ control which Cargo feature gates are activated in the resulting binary:
 | `doh_transport` | `doh-transport` | DNS-over-HTTPS C2 |
 | `ssh_transport` | `ssh-transport` | SSH subsystem C2 |
 | `smb_pipe_transport` | `smb-pipe-transport` | SMB named pipe C2 |
-| `evasion_transform` | `evasion-transform` | Runtime EDR signature transform |
+| `evasion_transform` | `evasion-transform` | Runtime EDR signature transform (implies `self-reencode`) |
 | `p2p` | `p2p-tcp` | P2P mesh networking |
 | `stack_spoof` | `stack-spoof` | NtContinue call stack spoofing |
 | `manual_map` | `manual-map` | Reflective/manual module mapping |
@@ -184,20 +184,19 @@ c_server_secret = "<psk>"
 
 ---
 
-### `forward-secrecy`
+### `forward-secrecy` (NOW ALWAYS ENABLED)
 
-**Default: no** | **Maturity: stable (TLS/SSH/SMB), experimental (HTTP/DoH)**
+**Status: Always compiled.** The old `forward-secrecy` feature flag has been
+removed because it was a no-op stub that gated nothing. Application-layer
+forward secrecy (X25519 ECDH + HKDF-SHA256 key derivation) is now compiled
+unconditionally via `common/src/forward_secrecy.rs` and available in all
+builds. The session key is derived from an ephemeral ECDH exchange after
+the TLS handshake, providing per-session key freshness. Even if the PSK is
+later compromised, recorded sessions cannot be decrypted.
 
-Adds an ephemeral X25519 Diffie-Hellman key exchange after the TLS handshake,
-deriving a unique session key via HKDF-SHA256. Even if the PSK is later
-compromised, recorded sessions cannot be decrypted.
-
-> **⚠️ Experimental — HTTP/DoH:** When combined with `http-transport` or
-> `doh-transport`, the ECDH handshake is carried via `X-ECDH-Pub` headers
-> or DNS TXT record labels rather than a persistent stream.  This mode is
-> **experimental** and has not been validated under all malleable-profile
-> transforms.  Both sides fall back to static PSK if the ECDH exchange
-> fails.  Forward secrecy over TLS, SSH, and SMB transports is stable.
+> **Note:** Forward secrecy over HTTP/DoH transports uses `X-ECDH-Pub`
+> headers or DNS TXT record labels rather than a persistent stream.
+> Both sides fall back to static PSK if the ECDH exchange fails.
 
 | Attribute | Value |
 |-----------|-------|

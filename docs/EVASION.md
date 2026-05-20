@@ -40,14 +40,12 @@ Orchestra provides three AMSI bypass strategies with different tradeoffs:
 | Strategy | Mechanism | Persistence | Detection Risk | Stability |
 |----------|-----------|-------------|----------------|-----------|
 | **HWBP** (Hardware Breakpoints) | Sets architecture-native execute breakpoints on AMSI entry points | Process lifetime | Low — no memory modification | High — VEH handles exceptions cleanly |
-| **Memory Patch** | Patches `AmsiScanBuffer` prologue to return `AMSI_RESULT_CLEAN` | Process lifetime | Medium — memory integrity checks detect | High — simple patch |
-| **Write-Raid** | Data-only race on `AmsiInitFailed` flag | Transient (race window) | Very Low — no code/permission/breakpoint changes | Medium — requires precise timing |
+| **Write-Raid** | Data-only race on `AmsiInitFailed` flag | Process lifetime (race thread) | Very Low — no code/permission/breakpoint changes | High — race thread auto-pauses for sleep |
 
 ### When to Use Each
 
 - **HWBP** (default): Best balance of stealth and stability. No memory modification to ntdll/amsi DLLs, making integrity checks pass.
-- **Memory Patch**: Fallback when HWBP is unavailable (e.g., debug registers already in use). Higher detection risk from memory scanning.
-- **Write-Raid**: Most stealthy option. No code modifications at all — only races a boolean flag. Preferred for short-lived operations where maximum stealth is critical.
+- **Write-Raid**: Most stealthy option. No code modifications at all — only races a boolean flag in amsi.dll's .data section. Uses a dedicated race thread that pauses during sleep obfuscation cycles.
 
 ### AMSI Write-Raid Technical Details
 

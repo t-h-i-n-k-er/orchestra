@@ -12,8 +12,8 @@ When the agent binary starts, modules initialize in a specific sequence to ensur
 
 ```
 1. config.rs          — Load or embed configuration
-2. env_check.rs       — Sandbox/debugger/VM detection
-3. env_check_sandbox.rs — Extended sandbox scoring
+2. env_check.rs       — Sandbox/debugger/VM detection (includes extended sandbox scoring internally)
+3. env_check_hpc.rs   — Hardware performance counter checks
 4. nt_syscall         — Map clean ntdll, resolve SSNs (Windows)
 5. evanesco           — Continuous page tracker init (BEFORE evasion)
 5b. syscall_emulation — Emulation layer init (BEFORE any injection/syscalls)
@@ -21,7 +21,7 @@ When the agent binary starts, modules initialize in a specific sequence to ensur
 5d. token_impersonation — Token-only impersonation init (pipe token cache, auto-revert config)
 5e. forensic_cleanup  — Prefetch evidence removal init (cleanup method, auto-clean config)
 6. evasion.rs         — AMSI bypass, ETW patching
-7. amsi_defense.rs    — Write-Raid / HWBP / memory-patch AMSI bypass
+7. amsi_defense.rs    — Write-Raid / HWBP AMSI bypass (no memory-patch standalone mode)
 8. etw_patch.rs       — ETW function hooking
 9. c2_*.rs            — Transport initialization
 10. sleep_obfuscation  — Memory region tracking

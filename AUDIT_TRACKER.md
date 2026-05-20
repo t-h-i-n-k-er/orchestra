@@ -269,7 +269,7 @@
 - **Status:** WONTFIX (design decision)
 - **Description:** 8 `.unwrap()` calls parse fixed-size integer fields from a SYSTEM_PROCESS_INFORMATION buffer. The buffer comes from `NtQuerySystemInformation` which returns a well-defined struct — the byte slices are fixed-length (`[0..4]` for u32, `[0..8]` for usize) and the surrounding bounds check at lines 658-661 ensures buffer validity. The `unwrap()` calls are statically guaranteed to succeed given a valid system information buffer. Converting to graceful error handling would obscure the deterministic nature of the parse.
 
-### Cycle 3 — HIGH Issues
+### Cycle 3 — Documentation Fix Issues
 
 #### [HIGH-008] poly_wrap pad_len overflow corrupts SEP_MAC flag bit — FIXED
 - **File:** `payload-packager/src/poly.rs:209`
@@ -372,5 +372,6 @@ These are documented limitations — they require Windows targets with specific 
 - `cargo clippy --workspace` ✅ 1 pre-existing warning only
 - Zero OPEN tracker items ✅
 - 3 audit cycles completed ✅
+- Documentation stale-reference sweep ✅ (Cycle 3 doc fixes applied to 5 files)
 
-**AUDIT COMPLETE.** All 46 issues across 3 cycles are resolved (15 FIXED, 31 WONTFIX). No outstanding open items.
+**AUDIT COMPLETE.** All 46 code issues across 3 cycles are resolved (15 FIXED, 31 WONTFIX). Documentation stale references fixed in 5 files. No outstanding open items.

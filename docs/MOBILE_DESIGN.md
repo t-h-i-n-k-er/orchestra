@@ -22,7 +22,7 @@
 | `evasion` | `evasion.rs` | `#[cfg(windows)]`, `#[cfg(target_arch = "x86_64")]` inline asm, `#[cfg(target_os = "linux")]` for Linux-specific paths | **PLATFORM-ADAPTER** |
 | `amsi_defense` | `amsi_defense.rs` | `#[cfg(windows)]` — AMSI/ETW patching is Windows-only | **WINDOWS-ONLY** |
 | `etw_patch` | `etw_patch.rs` | `#[cfg(windows)]` — ETW is Windows-only | **WINDOWS-ONLY** |
-| `injection` | `injection.rs` | `#[cfg(windows)]` entire module | **WINDOWS-ONLY** |
+| `injection` | `injection/mod.rs` | `#[cfg(windows)]` entire module | **WINDOWS-ONLY** |
 | `injection_engine` | `injection_engine.rs` | `#[cfg(windows)]` | **WINDOWS-ONLY** |
 | `injection_transacted` | `injection_transacted.rs` | `#[cfg(all(windows, feature = "transacted-hollowing"))]` | **WINDOWS-ONLY** |
 | `injection_doppelganging` | `injection_doppelganging.rs` | `#[cfg(all(windows, feature = "transacted-hollowing"))]` | **WINDOWS-ONLY** |
@@ -42,7 +42,7 @@
 | `c2_graph` | `c2_graph.rs` | `#[cfg(feature = "graph-transport")]` | **PLATFORM-AGNOSTIC** |
 | `c2_quic` | `c2_quic.rs` | `#[cfg(feature = "quic-transport")]` | **PLATFORM-AGNOSTIC** |
 | `p2p` | `p2p.rs` | `#[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]` | **PLATFORM-ADAPTER** |
-| `persistence` | `persistence.rs` | `#[cfg(feature = "persistence")]` with `#[cfg(target_os = "linux")]`, `#[cfg(target_os = "macos")]`, `#[cfg(windows)]` | **NEEDS-MOBILE-ADAPTER** |
+| `persistence` | `persistence/mod.rs` | `#[cfg(feature = "persistence")]` with `#[cfg(target_os = "linux")]`, `#[cfg(target_os = "macos")]`, `#[cfg(windows)]` | **NEEDS-MOBILE-ADAPTER** |
 | `net_discovery` | `net_discovery.rs` | `#[cfg(feature = "network-discovery")]` with OS-specific probes | **NEEDS-MOBILE-ADAPTER** |
 | `lateral_movement` | `lateral_movement.rs` | `#[cfg(windows)]` | **WINDOWS-ONLY** |
 | `token_manipulation` | `token_manipulation.rs` | `#[cfg(windows)]` | **WINDOWS-ONLY** |
@@ -51,7 +51,7 @@
 | `surveillance` | `surveillance.rs` | `#[cfg(feature = "surveillance")]` with `#[cfg(windows)]`, `#[cfg(target_os = "linux")]`, `#[cfg(target_os = "macos")]` | **NEEDS-MOBILE-ADAPTER** |
 | `interactive_shell` | `interactive_shell.rs` | Platform-agnostic (uses `portable-pty`) | **PLATFORM-AGNOSTIC** |
 | `malleable` | `malleable.rs` | None — pure config parsing | **PLATFORM-AGNOSTIC** |
-| `recon` | `recon.rs` | `#[cfg(all(windows, feature = "recon"))]` | **WINDOWS-ONLY** |
+| `recon` | `recon/mod.rs` | `#[cfg(all(windows, feature = "recon"))]` | **WINDOWS-ONLY** |
 | `adcs_attacks` | `adcs_attacks.rs` | `#[cfg(all(windows, feature = "adcs-attacks"))]` | **WINDOWS-ONLY** |
 | `kerberos_relay` | `kerberos_relay.rs` | `#[cfg(all(windows, feature = "kerberos-relay"))]` | **WINDOWS-ONLY** |
 | `dpapi_backup` | `dpapi_backup.rs` | `#[cfg(all(windows, feature = "dpapi-backup"))]` | **WINDOWS-ONLY** |
@@ -69,7 +69,7 @@
 | `remote_assist` | `remote_assist.rs` | `#[cfg(feature = "remote-assist")]` with per-OS backends | **NEEDS-MOBILE-ADAPTER** |
 | `hci_logging` | `hci_logging.rs` | `#[cfg(feature = "hci-research")]` | **PLATFORM-AGNOSTIC** |
 | `adaptive_timing` | `adaptive_timing.rs` | `#[cfg(feature = "adaptive-timing")]` | **PLATFORM-AGNOSTIC** |
-| `hardware_persistence` | `hardware_persistence.rs` | `#[cfg(feature = "hardware-persistence")]` cross-platform | **PLATFORM-AGNOSTIC** (but irrelevant to mobile) |
+| `hardware_persistence` | `hardware_persistence/mod.rs` | `#[cfg(feature = "hardware-persistence")]` cross-platform | **PLATFORM-AGNOSTIC** (but irrelevant to mobile) |
 | `entra_ptc` | `entra_ptc.rs` | `#[cfg(feature = "entra-ptc")]` | **PLATFORM-AGNOSTIC** |
 | `entra_attacks` | `entra_attacks.rs` | `#[cfg(feature = "entra-attacks")]` | **PLATFORM-AGNOSTIC** |
 | `entra_app_abuse` | `entra_app_abuse.rs` | `#[cfg(feature = "entra-app-abuse")]` | **PLATFORM-AGNOSTIC** |
@@ -86,8 +86,8 @@
 | `etw_ti_bypass` | `etw_ti_bypass.rs` | `#[cfg(all(windows, feature = "kernel-callback"))]` | **WINDOWS-ONLY** |
 | `kernel_apc_pivot` | `kernel_apc_pivot.rs` | `#[cfg(all(windows, feature = "kernel-callback", target_arch = "x86_64"))]` | **WINDOWS-ONLY** |
 | `token_impersonation` | `token_impersonation.rs` | `#[cfg(all(windows, feature = "token-impersonation"))]` | **WINDOWS-ONLY** |
-| `lpe` | `lpe.rs` | `#[cfg(all(windows, feature = "lpe"))]` | **WINDOWS-ONLY** |
-| `forensic_cleanup` | `forensic_cleanup.rs` | `#[cfg(all(windows, feature = "forensic-cleanup"))]` | **WINDOWS-ONLY** |
+| `lpe` | `lpe/mod.rs` | `#[cfg(all(windows, feature = "lpe"))]` | **WINDOWS-ONLY** |
+| `forensic_cleanup` | `forensic_cleanup/mod.rs` | `#[cfg(all(windows, feature = "forensic-cleanup"))]` | **WINDOWS-ONLY** |
 | `assembly_loader` | `assembly_loader.rs` | `#[cfg(windows)]` | **WINDOWS-ONLY** |
 | `coff_loader` | `coff_loader.rs` | `#[cfg(windows)]` | **WINDOWS-ONLY** |
 | `code_cave` | `code_cave.rs` | `#[cfg(windows)]` | **WINDOWS-ONLY** |
@@ -699,7 +699,7 @@ crate-type = [
 
 ### Priority 3: JNI Bridge (Android) / C Bridge (iOS)
 1. `agent/src/android/jni_bridge.rs` — JNI entry points
-2. `agent/src/ios/ffi_bridge.rs` — C ABI entry points
+2. `agent/src/ios/bridge.rs` — C ABI entry points
 3. Android project scaffolding (`mobile/android/`)
 4. iOS project scaffolding (`mobile/ios/`)
 
@@ -714,8 +714,8 @@ crate-type = [
 2. `agent/src/ios/persistence.rs`
 
 ### Priority 6: Post-Exploitation
-1. `agent/src/android/post_exploitation/`
-2. `agent/src/ios/post_exploitation/`
+1. `agent/src/android/post_exploitation.rs`
+2. `agent/src/ios/post_exploitation.rs`
 
 ### Priority 7: C2 Transport Adaptation
 1. Transport retry/reconnection logic for mobile

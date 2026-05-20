@@ -100,6 +100,7 @@ A cross-platform, operationally secure command-and-control framework built in Ru
 | `dev-server` | bin | Lightweight static file server for local testing |
 | `orchestra-pe-hardener` | lib | PE header hardening transformations |
 | `orchestra-side-load-gen` | lib | DLL side-load payload generator |
+| `plugins/hello_plugin` | lib | Reference plugin demonstrating module signing and loading integration |
 
 ---
 
